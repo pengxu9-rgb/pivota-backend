@@ -40,6 +40,10 @@ import pytest
 MERCHANT = "merch_oopq_fixture"
 AGENT_A = "agent_oopq_a"
 AGENT_B = "agent_oopq_b"
+# Two of the service's own internal keys (one being rotated out, one in). Quote ownership treats
+# every such key as ONE caller, so a quote previewed under one is usable under the other.
+TRUSTED_A = "agent_internal_trusted_aaaa1111"
+TRUSTED_B = "agent_internal_trusted_bbbb2222"
 
 # (market, shipping country, the quote's currency, the quote's total). "none" is a request that
 # names no market at all: its quote is in a currency no default in this codebase would produce.
@@ -391,8 +395,11 @@ class World:
         async def require_quote_for_caller(quote_id: str, context: Any) -> None:
             from fastapi import HTTPException
 
+            from services.quote_service import _quote_owner_identity
+
             q = quotes.quotes.get(quote_id)
-            if q is None or q["agent_id"] != getattr(context, "agent_id", None):
+            caller = _quote_owner_identity(getattr(context, "agent_id", None))
+            if q is None or not caller or _quote_owner_identity(q["agent_id"]) != caller:
                 raise HTTPException(status_code=404, detail="Quote not found")
 
         mp.setattr(agent_api, "require_quote_for_caller", require_quote_for_caller)
@@ -1161,20 +1168,117 @@ async def test_without_the_claims_table_the_order_is_written_and_a_warning_says_
     assert "one-order-per-quote guard is OFF" in text and "order_quote_claims" in text and first.order_id in text
 
 
+class _PgError(Exception):
+    """Shaped like a PostgreSQL driver error: a class name and a SQLSTATE; the text is the server's."""
+
+    def __init__(self, message: str, sqlstate: Optional[str] = None, pgcode: Optional[str] = None) -> None:
+        super().__init__(message)
+        if sqlstate is not None:
+            self.sqlstate = sqlstate
+        if pgcode is not None:
+            self.pgcode = pgcode
+
+
+class UndefinedTableError(_PgError):
+    pass
+
+
+class UndefinedColumnError(_PgError):
+    pass
+
+
+class OperationalError(Exception):
+    pass
+
+
 def test_only_the_missing_claims_table_turns_the_guard_off() -> None:
     import db.orders as orders_module
 
     missing = orders_module._is_missing_quote_claims_table
-    assert missing(RuntimeError("no such table: order_quote_claims"))
-    assert missing(RuntimeError('relation "order_quote_claims" does not exist'))
+    # PostgreSQL: the class or the SQLSTATE of an undefined TABLE, whatever the text says.
+    assert missing(UndefinedTableError('relation "order_quote_claims" does not exist', sqlstate="42P01"))
+    assert missing(UndefinedTableError("anything"))
+    assert missing(_PgError("anything", sqlstate="42P01"))
+    assert missing(_PgError("anything", pgcode="42P01"))
     wrapped = RuntimeError("wrapped")
-    wrapped.__cause__ = RuntimeError('relation "order_quote_claims" does not exist')
+    wrapped.__cause__ = UndefinedTableError('relation "order_quote_claims" does not exist', sqlstate="42P01")
     assert missing(wrapped)
-    assert not missing(RuntimeError("no such table: orders"))
-    assert not missing(RuntimeError('relation "orders" does not exist'))
+    # SQLite: the one exact message of an OperationalError.
+    assert missing(OperationalError("no such table: order_quote_claims"))
+
+    # Everything else is NOT an absent table, however much its text looks like one.
+    column = 'column "order_id" of relation "order_quote_claims" does not exist'
+    assert not missing(UndefinedColumnError(column, sqlstate="42703"))
+    assert not missing(_PgError(column, pgcode="42703"))
+    assert not missing(RuntimeError('relation "order_quote_claims" does not exist'))  # text alone decides nothing
+    assert not missing(RuntimeError("no such table: order_quote_claims"))  # not the driver's error class
+    assert not missing(OperationalError("no such table: orders"))
+    assert not missing(OperationalError("table order_quote_claims has no column named order_id"))
+    assert not missing(OperationalError("no such table: order_quote_claims_old"))
+    assert not missing(_PgError('function order_quote_claims() does not exist', sqlstate="42883"))
+    assert not missing(_PgError('schema "order_quote_claims" does not exist', sqlstate="3F000"))
     assert not missing(RuntimeError(BUSY))
-    assert not missing(RuntimeError("permission denied for table order_quote_claims"))
-    assert not missing(RuntimeError('duplicate key value violates unique constraint "order_quote_claims_pkey"'))
+    assert not missing(_PgError("permission denied for table order_quote_claims", sqlstate="42501"))
+    assert not missing(_PgError('duplicate key value violates unique constraint "order_quote_claims_pkey"', sqlstate="23505"))
+
+
+async def _rebuild_claims_table(w: World) -> None:
+    from db.database import engine, metadata
+
+    await w.db._real.execute("DROP TABLE IF EXISTS order_quote_claims")
+    metadata.create_all(engine, tables=[w.orders_module.order_quote_claims])
+
+
+@pytest.mark.parametrize("route", ["v1", "v2"])
+async def test_a_claims_table_with_a_column_missing_refuses_the_order_it_does_not_turn_the_guard_off(
+    world: World, route: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The table is there but is not the table this code writes (a column has another name). On
+    PostgreSQL the error reads `column "order_id" of relation "order_quote_claims" does not
+    exist`: that is not an absent table. Refused, retriably, with no order written."""
+    w = world
+    quote = w.quotes.add()
+    await w.db._real.execute("ALTER TABLE order_quote_claims RENAME COLUMN order_id TO order_ref")
+    try:
+        with caplog.at_level(logging.WARNING, logger="db.orders"):
+            answer = await w.create(route, quote, key="key-1")
+
+        assert_retriable_503(answer, "ORDER_QUOTE_GUARD_UNAVAILABLE")
+        assert w.create_runs == ["r1"]
+        assert w.db.count("order_insert") == 0
+        assert await w.orders_for(quote) == []
+        messages = [r.getMessage() for r in caplog.records if r.name == "db.orders"]
+        assert messages and not any("guard is OFF" in m for m in messages), messages
+    finally:
+        await _rebuild_claims_table(w)
+
+
+async def test_a_claims_table_with_a_column_missing_is_cannot_tell_at_the_guard_itself(world: World) -> None:
+    w = world
+    quote = _quote_id()
+    await w.db._real.execute("ALTER TABLE order_quote_claims RENAME COLUMN order_id TO order_ref")
+    try:
+        with pytest.raises(w.orders_module.OrderQuoteClaimUnavailable):
+            await w.orders_module.create_order(_order_data(quote))
+        assert w.db.count("order_insert") == 0 and await w.orders_for(quote) == []
+    finally:
+        await _rebuild_claims_table(w)
+
+
+async def test_a_truly_absent_claims_table_is_the_documented_fallback_at_the_guard_itself(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    w = world
+    quote = _quote_id()
+    await w.db._real.execute("DROP TABLE order_quote_claims")
+    try:
+        with caplog.at_level(logging.WARNING, logger="db.orders"):
+            order_id = await w.orders_module.create_order(_order_data(quote))
+        assert [r["order_id"] for r in await w.orders_for(quote)] == [order_id]
+        off = [r.getMessage() for r in caplog.records if r.name == "db.orders" and "guard is OFF" in r.getMessage()]
+        assert len(off) == 1 and order_id in off[0]
+    finally:
+        await _rebuild_claims_table(w)
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1493,88 @@ async def test_a_guard_that_cannot_tell_is_named_as_the_guard_in_the_refusal(wor
 
     assert_retriable_503(answer, "ORDER_QUOTE_GUARD_UNAVAILABLE")
     assert await w.orders_for(quote) == []
+
+
+@pytest.mark.parametrize("second_key", ["key-1", "key-2"], ids=["same_key", "another_key"])
+@pytest.mark.parametrize("route", ["v1", "v2"])
+async def test_two_internal_keys_are_one_caller_one_claim_and_one_order(world: World, route: str, second_key: str) -> None:
+    """A key rotation: the create arrives under one internal key and the resend under the other.
+    Quote ownership lets both use the quote, so the claim and the replay must see them as one
+    caller too, or the resend writes a second order (the consume is kept from landing here)."""
+    w = world
+    w.quotes.consume_lands = False
+    quote = w.quotes.add(agent=TRUSTED_A)
+
+    first = await w.create(route, quote, key="key-1", agent=TRUSTED_A, tag="r1")
+    second = await w.create(route, quote, key=second_key, agent=TRUSTED_B, tag="r2")
+    third = await w.create(route, quote, key=second_key, agent=TRUSTED_A, tag="r3")
+
+    rows = await w.orders_for(quote)
+    assert len(rows) == 1, f"{len(rows)} orders for one quote: {[(r['agent_id'], r['order_id']) for r in rows]}"
+    assert rows[0]["agent_id"] == TRUSTED_A
+    assert [a.status for a in (first, second, third)] == [200, 200, 200], (second.body, third.body)
+    assert first.order_id == second.order_id == third.order_id == rows[0]["order_id"]
+    claims = await w.claims_for(quote)
+    assert [(c["agent_id"], c["order_id"]) for c in claims] == [("agent_internal_trusted_", rows[0]["order_id"])]
+    assert w.create_runs == ["r1"], "the resend under the other key was not replayed before the write step"
+
+
+async def test_an_internal_key_and_an_ordinary_agent_never_share_a_claim_or_an_order(world: World) -> None:
+    """A quote id both may use (no owner recorded). The internal key's order is not the ordinary
+    agent's and the other way round: two claims, two orders, each replayed only to its own caller."""
+    w = world
+    w.quotes.consume_lands = False
+    quote = w.quotes.add()
+    w.quotes.quotes[quote]["agent_id"] = None
+
+    async def anyone(_quote_id: str, _context: Any) -> None:
+        return None
+
+    import routes.agent_api as agent_api
+
+    w.monkeypatch.setattr(agent_api, "require_quote_for_caller", anyone)
+
+    t1 = await w.create_v1(quote, key="key-1", agent=TRUSTED_A, tag="t1")
+    o1 = await w.create_v1(quote, key="key-1", agent=AGENT_A, tag="o1")
+    t2 = await w.create_v1(quote, key="key-2", agent=TRUSTED_B, tag="t2")
+    o2 = await w.create_v1(quote, key="key-2", agent=AGENT_A, tag="o2")
+    x1 = await w.create_v1(quote, key="key-1", agent=AGENT_B, tag="x1")
+
+    assert [a.status for a in (t1, o1, t2, o2, x1)] == [200] * 5
+    assert t1.order_id == t2.order_id and o1.order_id == o2.order_id
+    assert len({t1.order_id, o1.order_id, x1.order_id}) == 3
+    for mine, others in ((o1, (t1, x1)), (o2, (t1, x1)), (x1, (t1, o1)), (t2, (o1, x1))):
+        for other in others:
+            assert other.order_id not in json.dumps(mine.body)
+    claims = {c["agent_id"]: c["order_id"] for c in await w.claims_for(quote)}
+    assert claims == {"agent_internal_trusted_": t1.order_id, AGENT_A: o1.order_id, AGENT_B: x1.order_id}
+
+
+async def test_the_replay_lookup_widens_only_for_internal_keys(world: World) -> None:
+    """The lookup itself, on real rows: an internal key finds an order any internal key made; an
+    ordinary agent finds only its own, including an agent whose id merely looks similar."""
+    w = world
+    find = w.orders_module.find_replayable_order_for_create
+    quote = _quote_id()
+    lookalike = "agent_internalXtrustedXzzzz"
+    made = {}
+    for agent in (TRUSTED_A, AGENT_A, lookalike):
+        data = _order_data(quote, agent)
+        data["metadata"]["idempotency_key"] = "key-shared"
+        made[agent] = await w.orders_module.create_order(data)
+
+    async def found(agent: str, **by: Any) -> Optional[str]:
+        row = await find(merchant_id=MERCHANT, agent_id=agent, **by)
+        return row["order_id"] if row else None
+
+    for by in ({"idempotency_key": "key-shared"}, {"quote_id": quote}):
+        assert await found(TRUSTED_A, **by) == made[TRUSTED_A]
+        assert await found(TRUSTED_B, **by) == made[TRUSTED_A]
+        assert await found(AGENT_A, **by) == made[AGENT_A]
+        assert await found(lookalike, **by) == made[lookalike]
+        assert await found(AGENT_B, **by) is None
+        assert await found("agent_internal_trusted", **by) is None  # not the prefix: an ordinary id
+    assert len(await w.claims_for(quote)) == 3
 
 
 async def test_a_quote_the_caller_does_not_own_is_refused_before_anything_is_read(world: World) -> None:

@@ -24,6 +24,8 @@ from db.schema_guard import (
     guarded_ddl,
 )
 
+from utils.agent_identity import INTERNAL_TRUSTED_AGENT_PREFIX, caller_identity, is_internal_trusted_identity
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,7 +129,9 @@ ORDER_QUOTE_CLAIMS_TABLE = "order_quote_claims"
 order_quote_claims = Table(
     ORDER_QUOTE_CLAIMS_TABLE,
     metadata,
-    # '' for an order created with a quote and no agent (the admin create route).
+    # The CALLER the order's agent acts as (utils.agent_identity.caller_identity): the agent id,
+    # one shared value for every internal trusted key, and '' for an order created with a quote
+    # and no agent (the admin create route).
     Column("agent_id", String(255), primary_key=True),
     Column("quote_id", String(255), primary_key=True),
     Column("order_id", String(50), nullable=False),
@@ -166,31 +170,47 @@ def _quote_claim_key(order_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     Read from the row itself, from the same places the replay lookup reads
     (`metadata.pricing_quote.quote_id`, `agent_id`), so the guard and the lookup cannot disagree
     about which order belongs to which quote.
+
+    The agent is the caller it acts as, by the SAME rule quote ownership uses
+    (`caller_identity`): ownership lets every internal trusted key use a quote any of them
+    previewed, so they must share its one claim too. Keyed by the raw id, a create under one key
+    and a resend under another (a key rotation) each took a claim and each wrote an order.
     """
     md = order_data.get("metadata")
     pricing_quote = md.get("pricing_quote") if isinstance(md, dict) else None
     quote_id = str((pricing_quote.get("quote_id") if isinstance(pricing_quote, dict) else "") or "").strip()
     if not quote_id:
         return None
-    return {"agent_id": str(order_data.get("agent_id") or "").strip(), "quote_id": quote_id}
+    return {"agent_id": caller_identity(order_data.get("agent_id")), "quote_id": quote_id}
+
+
+_SQLITE_NO_CLAIMS_TABLE = f"no such table: {ORDER_QUOTE_CLAIMS_TABLE}"
 
 
 def _is_missing_quote_claims_table(exc: BaseException) -> bool:
-    """True only when the error says the claims table itself does not exist (asyncpg
-    UndefinedTableError / SQLSTATE 42P01, or SQLite "no such table"), and names that table."""
+    """True only when the claim INSERT failed because the claims TABLE does not exist.
+
+    PostgreSQL: decided by the error's class and SQLSTATE, never by its text. asyncpg raises
+    `UndefinedTableError` with `sqlstate` 42P01 (the `databases` layer passes it through
+    unwrapped); psycopg2, the sync driver, carries the same code as `pgcode`. The text is NOT
+    read, because "does not exist" is also how PostgreSQL words a missing COLUMN of this table
+    (42703), a missing function, a missing schema: none of those is an absent table, and each
+    must refuse the order (the caller turns every other error into "cannot tell").
+
+    SQLite has no error codes for this, so there it is the one exact message of an
+    `OperationalError`: "no such table: order_quote_claims".
+    """
     seen, candidates = set(), [exc]
     while candidates:
         current = candidates.pop()
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        message = str(current).lower()
-        if ORDER_QUOTE_CLAIMS_TABLE in message and (
-            getattr(current, "sqlstate", None) == "42P01"
-            or type(current).__name__ == "UndefinedTableError"
-            or "no such table" in message
-            or "does not exist" in message
-        ):
+        if getattr(current, "sqlstate", None) == "42P01" or getattr(current, "pgcode", None) == "42P01":
+            return True
+        if type(current).__name__ == "UndefinedTableError":
+            return True
+        if type(current).__name__ == "OperationalError" and str(current).strip().lower() == _SQLITE_NO_CLAIMS_TABLE:
             return True
         candidates.extend((current.__cause__, current.__context__, getattr(current, "orig", None)))
     return False
@@ -519,6 +539,11 @@ async def find_replayable_order_for_create(
     caller that agent's order: it simply does not match, and the caller gets a fresh create. With no
     agent there is nothing to scope by, so nothing replays. `intent_id` (a checkout token's session)
     narrows it further to the orders created under that token.
+
+    "The calling agent" is the caller it acts as (`caller_identity`), the rule quote ownership and
+    the quote claim use: an internal trusted key finds an order ANY internal trusted key made,
+    because they are one caller (the service's own credential, across a key rotation). Every
+    other agent matches its own id exactly, as before.
     """
     merchant_id = str(merchant_id or "").strip()
     if not merchant_id:
@@ -528,6 +553,13 @@ async def find_replayable_order_for_create(
         return None
     intent_id = str(intent_id or "").strip() or None
     intent_clause = "\n                  AND metadata ->> 'intent_id' = :intent_id" if intent_id else ""
+    # An exact match, or for the shared internal identity a match on its literal prefix (substr,
+    # not LIKE: the prefix contains `_`, which LIKE reads as "any character").
+    agent_values: Dict[str, Any] = {"agent_id": agent_id}
+    agent_clause = "agent_id = :agent_id"
+    if is_internal_trusted_identity(caller_identity(agent_id)):
+        agent_values = {"agent_id": INTERNAL_TRUSTED_AGENT_PREFIX, "agent_prefix_len": len(INTERNAL_TRUSTED_AGENT_PREFIX)}
+        agent_clause = "substr(agent_id, 1, :agent_prefix_len) = :agent_id"
 
     def _normalize_preferred_psp(value: Optional[str]) -> Optional[str]:
         normalized = str(value or "").strip().lower()
@@ -556,7 +588,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND agent_id = :agent_id
+                  AND {agent_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND metadata ->> 'idempotency_key' = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -573,7 +605,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND agent_id = :agent_id
+                  AND {agent_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -590,7 +622,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND agent_id = :agent_id
+                  AND {agent_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND agent_session_id = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -604,7 +636,7 @@ async def find_replayable_order_for_create(
     for query, match_value, replay_scope in candidate_queries:
         if not match_value:
             continue
-        values = {"merchant_id": merchant_id, "agent_id": agent_id, "match_value": match_value}
+        values = {"merchant_id": merchant_id, **agent_values, "match_value": match_value}
         if intent_id:
             values["intent_id"] = intent_id
         row = await database.fetch_one(query, values)

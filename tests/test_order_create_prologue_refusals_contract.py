@@ -59,7 +59,7 @@ ENVELOPE_PATH = REPO / "contracts" / "error_envelope_status_codes.json"
 # to it is a change to what the gateway may do with money and must land in both repositories. The
 # notes file is this repository's own; the envelope table is vendored by the gateway's test fixture.
 CONTRACT_SHA256 = "a353605e44e1fec5f304f075dfe4f7eac213865c56101d26f0eee1ecdefa839f"
-NOTES_SHA256 = "b186bd2bbc4bb7a2f32f3c561c0968ca3940ed4221f93c1c3d3d95a846ea1236"
+NOTES_SHA256 = "827e9e9ba5dfad682a745dd6adb0f1d3d0263573c5f6a0839ac33e7a635e2865"
 ENVELOPE_SHA256 = "74e2875f61e8c3a96ba7a4a768731c7052d346d0ee3faec10c7c8954fdd1a3f5"
 
 #: THE list. Every case below reads the pairs from the file; none is written out a second time.
@@ -145,10 +145,12 @@ def test_c0_no_case_in_this_file_writes_the_list_out_a_second_time() -> None:
 def test_c0_the_notes_say_where_the_code_and_the_reason_are() -> None:
     assert NOTES["envelope"]["code"] == "error.details.error"
     assert NOTES["envelope"]["reason"] == "error.details.reason"
-    assert ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"] == ["replay", "stale"]
-    assert sorted(set(ASSERTION_NOTES["reasons"]) - {"replay", "stale"}) == [
-        "bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "resource", "subject",
+    # The three a caller must keep its guard on, and the eight that say nothing was accepted.
+    assert ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"] == ["replay", "stale", "subject"]
+    assert sorted(set(ASSERTION_NOTES["reasons"]) - set(ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"])) == [
+        "bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "resource",
     ]
+    assert ASSERTION_NOTES["only_across_a_change_of_the_signing_secret"] == ["bad_mac", "no_secret"]
 
 
 def test_c0_no_503_and_none_of_the_could_not_tell_refusals_is_listed() -> None:
@@ -250,6 +252,87 @@ def test_c1_every_place_a_listed_code_is_written_is_known() -> None:
         "set, show that the new place cannot answer the listed status after an order row exists.\n"
         f"new: {sorted(found - (ON_PATH | OFF_PATH))}\ngone: {sorted((ON_PATH | OFF_PATH) - found)}"
     )
+
+
+def _first_call_line(fn: ast.AST, callee: str) -> int:
+    lines = [
+        call.lineno
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and (getattr(call.func, "id", None) == callee or getattr(call.func, "attr", None) == callee)
+    ]
+    assert lines, f"{callee} is no longer called here"
+    return min(lines)
+
+
+def listed_codes_at_or_after_the_write_step(source: str, function: str, callee: str) -> List[Tuple[int, str]]:
+    """(line, code) of every listed-code constant in `function` that is not lexically ABOVE the
+    function's first call of `callee` (the order write step, or the call that leads to it)."""
+    tree = ast.parse(source)
+    fn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+    )
+    first = _first_call_line(fn, callee)
+    return sorted(
+        (const.lineno, const.value)
+        for const in ast.walk(fn)
+        if isinstance(const, ast.Constant) and isinstance(const.value, str) and const.value in LISTED_CODES
+        and const.lineno >= first
+    )
+
+
+#: (file, the function that writes listed codes, the call after which an order row can exist)
+_PROLOGUE_FUNCTIONS = [
+    ("routes/agent_api.py", "agent_create_order", "create_new_order"),
+    ("routes/agent_v2.py", "create_order_v2", "agent_v1_create_order"),
+]
+
+
+@pytest.mark.parametrize("path, function, callee", _PROLOGUE_FUNCTIONS, ids=[f[1] for f in _PROLOGUE_FUNCTIONS])
+def test_c1_every_listed_code_sits_above_the_first_call_of_the_write_step(path: str, function: str, callee: str) -> None:
+    """The inventory above knows WHICH function writes a listed code, not WHERE in it. These two
+    functions hold both the prologue and everything after the order is written, so each listed
+    constant must also sit above the function's first call of the write step."""
+    source = (REPO / path).read_text(encoding="utf-8")
+    assert listed_codes_at_or_after_the_write_step(source, function, callee) == []
+    # ... and the function does write listed codes above it (the check is looking at something).
+    fn = next(n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef) and n.name == function)
+    above = [c for c in ast.walk(fn) if isinstance(c, ast.Constant) and c.value in LISTED_CODES]
+    assert len(above) >= 2
+
+
+@pytest.mark.parametrize(
+    "path, function, callee, anchor",
+    [
+        # In the post-create tail, inside one of its `try ... except Exception: pass` blocks.
+        ("routes/agent_api.py", "agent_create_order", "create_new_order",
+         "        _post_create_new_order_tail_started = time.perf_counter()\n"),
+        # Right after the create returned, in the v2 route.
+        ("routes/agent_v2.py", "create_order_v2", "agent_v1_create_order",
+         '    order_id = str((response or {}).get("order_id") or "").strip()\n'),
+    ],
+    ids=["agent_create_order_tail", "create_order_v2_after_the_create"],
+)
+@pytest.mark.parametrize("pair", sorted(LISTED), ids=lambda pair: f"{pair[0]}_{pair[1]}")
+def test_c1_a_listed_pair_raised_after_the_write_step_is_caught(
+    path: str, function: str, callee: str, anchor: str, pair: Tuple[int, str]
+) -> None:
+    """The mutant, applied to the source text in memory: a listed pair raised below the first call
+    of the write step, in a function the inventory already allows to write that code."""
+    status, code = pair
+    source = (REPO / path).read_text(encoding="utf-8")
+    assert source.count(anchor) == 1
+    indent = anchor[: len(anchor) - len(anchor.lstrip())]
+    planted = (
+        f"{indent}if order_request_is_odd:\n"
+        f'{indent}    raise HTTPException(status_code={status}, detail={{"error": "{code}", "message": "planted"}})\n'
+    )
+    mutated = source.replace(anchor, anchor + planted)
+
+    found = listed_codes_at_or_after_the_write_step(mutated, function, callee)
+
+    assert [c for _, c in found] == [code]
 
 
 def _functions_reading(path: str, name: str) -> Set[str]:
@@ -1224,7 +1307,37 @@ async def test_c5_an_accepted_request_delivered_again_is_only_ever_told_replay_o
                 assert first_use is False, f"accepted a second time {later - first}s after the first"
                 reason = "replay"
             told.add(reason)
-        assert told <= set(ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"]), told
+        assert told <= {"replay", "stale"}, told
+        assert told <= set(ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"])
         assert "stale" in told
     finally:
         assertion_replay_guard.reset_local_store()
+
+
+async def test_c5_an_accepted_request_delivered_again_while_the_agent_cannot_be_read_says_subject(
+    cw: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why `subject` is a reason a caller keeps its guard on. The first copy is accepted and makes
+    the order. The same bytes arrive again while the partner's agent record cannot be read: the
+    subject check runs BEFORE the nonce is looked at, and a failed read counts as no agent, so the
+    answer is `subject`, not `replay`. An order exists."""
+    import services.issuing_agent_assertion as ia
+
+    quote = cw.quotes.add()
+    raw, headers = signed(v2_body(quote))
+    first = await post_v2(cw, None, agent=GATEWAY, content=raw, headers=headers, tag="r1")
+    assert first.status == 200, first.body
+
+    async def unreadable(_agent_id: Any, _excluded: Any = None) -> Optional[str]:
+        raise RuntimeError(BUSY)
+
+    monkeypatch.setattr(ia, "_active_agent_id", unreadable)
+    again = await post_v2(cw, None, agent=GATEWAY, content=raw, headers=headers, tag="r2")
+
+    assert again.status == 409
+    details = again.body["error"]["details"]
+    assert (details["error"], details["reason"]) == ("PARTNER_ASSERTION_REJECTED", "subject")
+    assert details["reason"] in ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"]
+    assert len(cw.nonce_claims) == 1, "the second copy was refused before its nonce was looked at"
+    assert cw.body_entries == [AGENT_A] and cw.create_runs == ["r1"]
+    assert [r["order_id"] for r in await cw.orders_for(quote, AGENT_A)] == [first.order_id]

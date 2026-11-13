@@ -11,6 +11,7 @@ import os
 import secrets
 
 from db.quotes import compute_expires_at, expire_quote_if_needed, get_quote, insert_quote, mark_quote_consumed
+from utils.agent_identity import INTERNAL_TRUSTED_AGENT_PREFIX as _INTERNAL_TRUSTED_AGENT_PREFIX, caller_identity
 from services.pcs_hash import sha256_json
 from services.payment_offer_evidence_service import (
     PaymentOfferTarget,
@@ -130,14 +131,13 @@ QUOTE_NOT_FOUND_DETAIL = {"error": "QUOTE_NOT_FOUND", "message": "Quote not foun
 #: commerce kernel previews and creates with it), so they own quotes as ONE caller: otherwise a key
 #: rotation, with gateway revisions on both keys, would 404 a kernel checkout between its preview
 #: and its create.
-INTERNAL_TRUSTED_AGENT_PREFIX = "agent_internal_trusted_"
+#: The rule itself lives in utils/agent_identity.py, because the one-order-per-quote claim and the
+#: order-create replay lookup (db/orders.py) must use the same one.
+INTERNAL_TRUSTED_AGENT_PREFIX = _INTERNAL_TRUSTED_AGENT_PREFIX
 
 
 def _quote_owner_identity(agent_id: Any) -> str:
-    value = str(agent_id or "").strip()
-    if value.startswith(INTERNAL_TRUSTED_AGENT_PREFIX):
-        return INTERNAL_TRUSTED_AGENT_PREFIX
-    return value
+    return caller_identity(agent_id)
 
 
 def quote_owner_stamp(checkout_intent_id: Optional[str]) -> Dict[str, Optional[str]]:
