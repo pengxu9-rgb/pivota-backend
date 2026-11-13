@@ -134,7 +134,12 @@ import uuid
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
-from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
+from utils.transient_errors import (
+    ORDER_REPLAY_LOOKUP_UNAVAILABLE,
+    db_busy_http_exception,
+    is_asyncpg_busy_error,
+    order_existence_unknown_http_exception_fields,
+)
 
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-api"])
@@ -610,12 +615,28 @@ async def _cache_agent_order_create_response_best_effort(
         pass
 
 
+class OrderCreateReplayUnavailable(HTTPException):
+    """The replay lookup could not be read, so it is not known whether this order already exists.
+
+    Three outcomes of the lookup, never two: an order (replay it), no order (None: create), and
+    this one. An unreadable lookup is not "no order": treated as one, a resend under the database
+    pressure that failed the first attempt wrote a second order for the same quote. It is a
+    retriable 503 and an HTTPException, so wherever it is raised in order create the answer is the
+    refusal and nothing after it runs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(**order_existence_unknown_http_exception_fields(ORDER_REPLAY_LOOKUP_UNAVAILABLE))
+
+
 async def _load_replayable_agent_order_create_response(
     order_request: CreateOrderRequest,
     *,
     agent_id: Optional[str],
     intent_id: Optional[str],
 ) -> Optional[Dict[str, Any]]:
+    """The caller's existing order for this create as a response, or None when a lookup that
+    SUCCEEDED found none. Raises OrderCreateReplayUnavailable when the lookup failed."""
     replay_perf_order = getattr(order_request, "order_id", None)
     try:
         _t = time.perf_counter()
@@ -643,7 +664,12 @@ async def _load_replayable_agent_order_create_response(
             replay_perf_order,
             type(exc).__name__,
         )
-        return None
+        logger.warning(
+            "[agent_orders_create] replay lookup failed (%s); refusing the create with a "
+            "retriable 503 instead of treating it as no existing order",
+            type(exc).__name__,
+        )
+        raise OrderCreateReplayUnavailable() from exc
     if not existing_order:
         return None
     _t = time.perf_counter()
@@ -686,15 +712,26 @@ async def _load_replayable_agent_order_create_response_with_backoff(
     intent_id: Optional[str],
     attempts: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Poll for an already-persisted order after transient asyncpg busy failures."""
+    """Poll for an already-persisted order after transient asyncpg busy failures.
+
+    Returns the order's response, or None only when the LAST poll read the table and found no
+    order. A failed poll is retried like an empty one, but if the last poll failed the answer is
+    not "no order": OrderCreateReplayUnavailable is raised, so a caller can never re-create on it.
+    """
     total_attempts = max(1, attempts or ORDER_CREATE_BUSY_REPLAY_ATTEMPTS)
     delay = ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_SECONDS
+    last_poll_failure: Optional[OrderCreateReplayUnavailable] = None
     for attempt in range(total_attempts):
-        replay_response = await _load_replayable_agent_order_create_response(
-            order_request,
-            agent_id=agent_id,
-            intent_id=intent_id,
-        )
+        try:
+            replay_response = await _load_replayable_agent_order_create_response(
+                order_request,
+                agent_id=agent_id,
+                intent_id=intent_id,
+            )
+            last_poll_failure = None
+        except OrderCreateReplayUnavailable as unavailable:
+            replay_response = None
+            last_poll_failure = unavailable
         if replay_response:
             await _cache_agent_order_create_response_best_effort(
                 getattr(order_request, "idempotency_key", None),
@@ -711,7 +748,48 @@ async def _load_replayable_agent_order_create_response_with_backoff(
             pass
         if delay > 0:
             delay = min(ORDER_CREATE_BUSY_REPLAY_MAX_DELAY_SECONDS, delay * 2)
+    if last_poll_failure is not None:
+        raise last_poll_failure
     return None
+
+
+async def _replay_order_that_holds_quote(
+    order_request: CreateOrderRequest,
+    claimed_order_id: str,
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """The database guard refused a create because the quote already has its order
+    (`claimed_order_id`). Answer with that order when the ordinary replay lookup, with its
+    ordinary scope (this agent, this merchant, the token's intent, the provider choice), finds
+    exactly that order; otherwise None and the caller's refusal stands.
+
+    The session id is left out of the lookup: by this point it may be the per-second default,
+    which another of the agent's orders can share, and only the quote's own order may answer.
+    A failed lookup raises OrderCreateReplayUnavailable like every other.
+    """
+    try:
+        lookup_request = order_request.model_copy(update={"agent_session_id": None})
+    except Exception:
+        lookup_request = SimpleNamespace(**vars(order_request))
+        lookup_request.agent_session_id = None
+    replay_response = await _load_replayable_agent_order_create_response(
+        lookup_request,
+        agent_id=agent_id,
+        intent_id=intent_id,
+    )
+    if not isinstance(replay_response, dict):
+        return None
+    if str(replay_response.get("order_id") or "").strip() != str(claimed_order_id or "").strip():
+        return None
+    await _cache_agent_order_create_response_best_effort(
+        getattr(order_request, "idempotency_key", None),
+        replay_response,
+        agent_id=agent_id,
+        intent_id=intent_id,
+    )
+    return replay_response
 FIND_PRODUCTS_MULTI_SEED_BUDGET_MS = max(
     0,
     min(
@@ -9311,10 +9389,22 @@ async def agent_create_order(
                     int((time.perf_counter() - _t) * 1000),
                     _agent_order_id_for_perf,
                 )
+            except order_routes_module.OrderForQuoteExists as claimed:
+                # The database guard: this quote already has its order. Answer with it if the
+                # caller may replay it; otherwise the 409 stands. Never a second order.
+                replay_response = await _replay_order_that_holds_quote(
+                    order_request, claimed.order_id, **replay_owner
+                )
+                if replay_response:
+                    _agent_order_id_for_perf = replay_response.get("order_id")
+                    return replay_response
+                raise
             except Exception as e:
                 # `create_new_order` persists the order row before PSP creation.
                 # On a transient DB-busy failure, first try to replay that persisted
-                # order. Only if no order exists yet do we retry the full create.
+                # order. Only if a lookup that SUCCEEDED found no order do we retry the
+                # full create: a lookup that failed raises OrderCreateReplayUnavailable
+                # (503) out of here, because the row may be there.
                 if is_asyncpg_busy_error(e):
                     _t = time.perf_counter()
                     replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request, **replay_owner)
@@ -9352,6 +9442,14 @@ async def agent_create_order(
                             int((time.perf_counter() - _t) * 1000),
                             _agent_order_id_for_perf,
                         )
+                    except order_routes_module.OrderForQuoteExists as claimed:
+                        replay_response = await _replay_order_that_holds_quote(
+                            order_request, claimed.order_id, **replay_owner
+                        )
+                        if replay_response:
+                            _agent_order_id_for_perf = replay_response.get("order_id")
+                            return replay_response
+                        raise
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
                             _t = time.perf_counter()

@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import logging
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Numeric, Boolean
 from sqlalchemy.sql import func
@@ -16,11 +17,14 @@ from sqlalchemy import text
 
 from db.database import IS_POSTGRES, metadata, database
 from db.schema_guard import (
+    _is_unique_violation,
     column_is_not_null,
     column_type_differs,
     guarded_add_columns,
     guarded_ddl,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -94,6 +98,155 @@ orders = Table(
     # 软删除（防御性设计：订单不能真删除）
     Column("is_deleted", Boolean, default=False, index=True),
 )
+
+
+# ============================================================================
+# One order per quote, per agent
+# ============================================================================
+#
+# A quote backs at most one order for the agent that holds it. The row here is that promise, and
+# its primary key is what keeps it under concurrency: two creates for one (agent, quote) cannot
+# both insert it, on any isolation level, because a unique index is checked against rows other
+# transactions have written, not against a snapshot. A "does an order for this quote exist?" read
+# before the insert cannot give that: under READ COMMITTED two creates each read "no" and both
+# insert.
+#
+# The row names the ONE order id the quote may use, and `orders.order_id` is a primary key too. So
+# whoever writes the order writes it under that id, and at most one such write can succeed. That
+# is why claim and order need no shared transaction: a claim whose order was never written (the
+# process died between the two statements) is finished by the next create for that quote, under
+# the id the claim already names, and never blocks the quote.
+#
+# A new, empty table: no row written before it existed can violate it, so creating it cannot fail
+# on old data. `metadata.create_all` builds it at boot; db/migrations/284 is the record. Until it
+# exists `create_order` writes the order without it and says so at WARNING on every such order.
+# Rows are never deleted: a cancelled or soft-deleted order still used its quote.
+
+ORDER_QUOTE_CLAIMS_TABLE = "order_quote_claims"
+
+order_quote_claims = Table(
+    ORDER_QUOTE_CLAIMS_TABLE,
+    metadata,
+    # '' for an order created with a quote and no agent (the admin create route).
+    Column("agent_id", String(255), primary_key=True),
+    Column("quote_id", String(255), primary_key=True),
+    Column("order_id", String(50), nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
+# Module-level constants, identical on both dialects (the SQL prepare gate plans them).
+_QUOTE_CLAIM_INSERT_SQL = (
+    "INSERT INTO order_quote_claims (agent_id, quote_id, order_id) "
+    "VALUES (:agent_id, :quote_id, :order_id) "
+    "ON CONFLICT (agent_id, quote_id) DO NOTHING"
+)
+_QUOTE_CLAIM_SELECT_SQL = (
+    "SELECT order_id FROM order_quote_claims WHERE agent_id = :agent_id AND quote_id = :quote_id"
+)
+# Soft-deleted rows count: the question is whether the id is taken, not whether the order shows.
+_QUOTE_CLAIM_ORDER_EXISTS_SQL = "SELECT order_id FROM orders WHERE order_id = :order_id"
+
+
+class OrderQuoteAlreadyClaimed(Exception):
+    """This agent's quote already has its order. Nothing was written by this call."""
+
+    def __init__(self, order_id: str):
+        super().__init__(f"an order already exists for this quote: {order_id}")
+        self.order_id = order_id
+
+
+class OrderQuoteClaimUnavailable(Exception):
+    """The one-order-per-quote guard could not be read or written, so it is not known whether the
+    quote already has an order. No order was written by this call. Retriable."""
+
+
+def _quote_claim_key(order_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """(agent, quote) of an order about to be written, or None for an order with no quote.
+
+    Read from the row itself, from the same places the replay lookup reads
+    (`metadata.pricing_quote.quote_id`, `agent_id`), so the guard and the lookup cannot disagree
+    about which order belongs to which quote.
+    """
+    md = order_data.get("metadata")
+    pricing_quote = md.get("pricing_quote") if isinstance(md, dict) else None
+    quote_id = str((pricing_quote.get("quote_id") if isinstance(pricing_quote, dict) else "") or "").strip()
+    if not quote_id:
+        return None
+    return {"agent_id": str(order_data.get("agent_id") or "").strip(), "quote_id": quote_id}
+
+
+def _is_missing_quote_claims_table(exc: BaseException) -> bool:
+    """True only when the error says the claims table itself does not exist (asyncpg
+    UndefinedTableError / SQLSTATE 42P01, or SQLite "no such table"), and names that table."""
+    seen, candidates = set(), [exc]
+    while candidates:
+        current = candidates.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        message = str(current).lower()
+        if ORDER_QUOTE_CLAIMS_TABLE in message and (
+            getattr(current, "sqlstate", None) == "42P01"
+            or type(current).__name__ == "UndefinedTableError"
+            or "no such table" in message
+            or "does not exist" in message
+        ):
+            return True
+        candidates.extend((current.__cause__, current.__context__, getattr(current, "orig", None)))
+    return False
+
+
+async def _claim_quote_for_order(claim_key: Dict[str, str], order_id: str) -> Optional[str]:
+    """Claim the quote for `order_id`. Returns the order id the order MUST be written under, or
+    None when the claims table does not exist yet (the order is then written unguarded).
+
+    Raises OrderQuoteAlreadyClaimed when the quote's order is already written, and
+    OrderQuoteClaimUnavailable when that could not be told. Either way nothing else was written.
+    """
+    try:
+        await database.execute(_QUOTE_CLAIM_INSERT_SQL, {**claim_key, "order_id": order_id})
+    except Exception as exc:
+        if _is_missing_quote_claims_table(exc):
+            logger.warning(
+                "[orders] one-order-per-quote guard is OFF: table %s does not exist. Order %s is "
+                "written without it (quote %s). Create the table (db/migrations/284) or restart "
+                "the service so boot creates it.",
+                ORDER_QUOTE_CLAIMS_TABLE,
+                order_id,
+                claim_key["quote_id"],
+            )
+            return None
+        logger.warning(
+            "[orders] one-order-per-quote guard could not claim quote %s: %s; no order written",
+            claim_key["quote_id"],
+            type(exc).__name__,
+        )
+        raise OrderQuoteClaimUnavailable(str(exc)) from exc
+    try:
+        claim = await database.fetch_one(_QUOTE_CLAIM_SELECT_SQL, claim_key)
+        claimed_order_id = str((claim["order_id"] if claim else "") or "").strip()
+        if not claimed_order_id:
+            raise RuntimeError("quote claim row is missing after it was written")
+        if claimed_order_id == order_id:
+            return order_id
+        holder = await database.fetch_one(_QUOTE_CLAIM_ORDER_EXISTS_SQL, {"order_id": claimed_order_id})
+    except Exception as exc:
+        logger.warning(
+            "[orders] one-order-per-quote guard could not be read for quote %s: %s; no order written",
+            claim_key["quote_id"],
+            type(exc).__name__,
+        )
+        raise OrderQuoteClaimUnavailable(str(exc)) from exc
+    if holder:
+        raise OrderQuoteAlreadyClaimed(claimed_order_id)
+    # An earlier create claimed the quote and its order row is not there: it died before writing
+    # it, or is about to. Write the order under THAT id; the primary key lets one of us through.
+    logger.warning(
+        "[orders] quote %s was claimed for order %s, which was never written; writing it now",
+        claim_key["quote_id"],
+        claimed_order_id,
+    )
+    return claimed_order_id
 
 
 # ============================================================================
@@ -196,11 +349,26 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     is_test_ids = await read_is_test_merchant_ids([order_data.get("merchant_id")])
     _stamp_test_traffic(order_data, is_test_ids)
 
+    # One order per quote, per agent: claim the quote BEFORE the order is written. See
+    # `order_quote_claims` above. With the claim held, a primary-key refusal of the insert means
+    # the quote's order is already there (written by an earlier attempt of this create whose
+    # answer was lost, or by a concurrent create that finished the same claim).
+    quote_claim_held = False
+    claim_key = _quote_claim_key(order_data)
+    if claim_key is not None:
+        claimed_order_id = await _claim_quote_for_order(claim_key, order_id)
+        if claimed_order_id is not None:
+            quote_claim_held = True
+            order_id = claimed_order_id
+            order_data["order_id"] = order_id
+
     query = orders.insert().values(**order_data)
     try:
         await database.execute(query)
         return order_id
     except Exception as e:
+        if quote_claim_held and _is_unique_violation(e):
+            raise OrderQuoteAlreadyClaimed(order_id) from e
         # Auto-migrate missing columns on production DBs, then retry once
         err = str(e)
         try:
@@ -295,6 +463,8 @@ async def create_order(order_data: Dict[str, Any]) -> str:
             await database.execute(query)
             return order_id
         except Exception as mig_err:
+            if quote_claim_held and _is_unique_violation(mig_err):
+                raise OrderQuoteAlreadyClaimed(order_id) from mig_err
             # Surface original error if migration fails
             raise mig_err
 

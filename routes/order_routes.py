@@ -25,6 +25,7 @@ from models.order import (
     OrderListResponse, OrderItem, OrderStatus
 )
 from db.orders import (
+    OrderQuoteAlreadyClaimed, OrderQuoteClaimUnavailable,
     create_order, get_order, get_orders_by_merchant, get_orders_by_customer,
     update_order_status, update_payment_info, mark_order_paid, 
     update_fulfillment_info, mark_order_shipped, get_order_stats, update_order as update_order_row
@@ -117,6 +118,10 @@ from utils.database_readiness import (
     DatabaseUnavailableError,
     database_unavailable_http_exception,
     ensure_database_ready,
+)
+from utils.transient_errors import (
+    ORDER_QUOTE_GUARD_UNAVAILABLE,
+    order_existence_unknown_http_exception_fields,
 )
 
 
@@ -289,6 +294,23 @@ async def _bg_consume_quote_best_effort(
         await quote_service.consume_quote_best_effort(quote_id, order_id=order_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("background consume_quote_best_effort failed: %s", str(exc)[:200])
+
+
+class OrderForQuoteExists(HTTPException):
+    """409 QUOTE_CONSUMED: the one-order-per-quote guard refused the insert because this agent's
+    quote already has its order (`order_id`). This call wrote nothing. Agent order create catches
+    it and answers with that order when the caller may replay it."""
+
+    def __init__(self, order_id: str):
+        super().__init__(
+            status_code=409,
+            detail={
+                "error": "QUOTE_CONSUMED",
+                "message": "Quote already consumed",
+                "details": {"order_id": order_id},
+            },
+        )
+        self.order_id = order_id
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -4857,6 +4879,14 @@ async def create_new_order(
         )
     except DatabaseUnavailableError:
         raise database_unavailable_http_exception()
+    except OrderQuoteAlreadyClaimed as claimed:
+        # The database guard: this quote already has its order. Not a failure of this service.
+        raise OrderForQuoteExists(claimed.order_id) from claimed
+    except OrderQuoteClaimUnavailable as guard_unavailable:
+        # The guard could not say whether the quote has an order: refuse, retriably. No row written.
+        raise HTTPException(
+            **order_existence_unknown_http_exception_fields(ORDER_QUOTE_GUARD_UNAVAILABLE)
+        ) from guard_unavailable
     except HTTPException:
         raise
     except Exception as e:
