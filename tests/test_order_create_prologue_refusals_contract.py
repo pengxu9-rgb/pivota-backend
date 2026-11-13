@@ -52,18 +52,22 @@ from order_create_one_per_quote_cases import (  # noqa: F401
 
 REPO = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO / "contracts" / "order_create_prologue_refusals.json"
+NOTES_PATH = REPO / "contracts" / "order_create_prologue_refusals_notes.json"
 ENVELOPE_PATH = REPO / "contracts" / "error_envelope_status_codes.json"
 
-# Changing either file is a change to what the gateway may do with money. Update the hash here and
-# re-vendor the file in the gateway in the same change.
-CONTRACT_SHA256 = "a849af28a400f09c0f8e02d2c2e2d1e7d213356e73c3ae96a352fbd79ee3ebf0"
+# The list file is BYTE-IDENTICAL to the gateway's copy: the gateway pins the same sha256. A change
+# to it is a change to what the gateway may do with money and must land in both repositories. The
+# notes file is this repository's own; the envelope table is vendored by the gateway's test fixture.
+CONTRACT_SHA256 = "a353605e44e1fec5f304f075dfe4f7eac213865c56101d26f0eee1ecdefa839f"
+NOTES_SHA256 = "b186bd2bbc4bb7a2f32f3c561c0968ca3940ed4221f93c1c3d3d95a846ea1236"
 ENVELOPE_SHA256 = "74e2875f61e8c3a96ba7a4a768731c7052d346d0ee3faec10c7c8954fdd1a3f5"
 
-CONTRACT = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+#: THE list. Every case below reads the pairs from the file; none is written out a second time.
+CONTRACT_PAIRS: List[List[Any]] = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+NOTES = json.loads(NOTES_PATH.read_text(encoding="utf-8"))
+ASSERTION_NOTES = NOTES["PARTNER_ASSERTION_REJECTED"]
 ENVELOPE = json.loads(ENVELOPE_PATH.read_text(encoding="utf-8"))
-LISTED: Set[Tuple[int, str]] = {
-    (int(status), code) for status, codes in CONTRACT["refused_before_any_order"].items() for code in codes
-}
+LISTED: Set[Tuple[int, str]] = {(status, code) for status, code in CONTRACT_PAIRS}
 LISTED_CODES: Set[str] = {code for _, code in LISTED}
 CAPITAL_SNAKE = re.compile(r"^[A-Z][A-Z0-9_]+$")
 GATEWAY = "agent_oopq_gateway"
@@ -87,27 +91,64 @@ def assert_not_listed(answer: Answer) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_c0_the_list_is_the_nine_pairs_and_its_bytes_are_pinned() -> None:
-    assert hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest() == CONTRACT_SHA256, (
-        "contracts/order_create_prologue_refusals.json changed: update CONTRACT_SHA256 and re-vendor it in the gateway"
+def test_c0_the_list_file_is_byte_identical_to_the_gateways_copy() -> None:
+    raw = CONTRACT_PATH.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == CONTRACT_SHA256, (
+        "contracts/order_create_prologue_refusals.json no longer has the bytes the gateway pins. "
+        "Change it only together with the gateway's copy, and update CONTRACT_SHA256 on both sides."
     )
+    assert len(raw) == 305 and b"\r" not in raw and raw.endswith(b"]\n") and not raw.endswith(b"\n\n")
+    assert hashlib.sha256(NOTES_PATH.read_bytes()).hexdigest() == NOTES_SHA256
     assert hashlib.sha256(ENVELOPE_PATH.read_bytes()).hexdigest() == ENVELOPE_SHA256, (
         "contracts/error_envelope_status_codes.json changed: update ENVELOPE_SHA256 and re-vendor it in the gateway"
     )
-    assert LISTED == {
-        (400, "INVALID_QUOTE"),
-        (400, "INVALID_BUYER_CONTEXT"),
-        (400, "QUOTE_REQUIRED_BEFORE_PURCHASE"),
-        (400, "QUOTE_MERCHANT_MISMATCH"),
-        (400, "VARIANT_REQUIRED"),
-        (404, "QUOTE_NOT_FOUND"),
-        (409, "PARTNER_ASSERTION_REJECTED"),
-        (409, "UNSUPPORTED_COMMERCE_PATH"),
-        (409, "PREFLIGHT_FAILED"),
-    }
-    assert sum(len(codes) for codes in CONTRACT["refused_before_any_order"].values()) == 9, "a duplicate pair"
-    assert CONTRACT["envelope"] == {**CONTRACT["envelope"], "code": "error.details.error", "reason": "error.details.reason"}
-    assert CONTRACT["notes"]["PARTNER_ASSERTION_REJECTED"]["reason_that_is_not_a_plain_refusal"] == "replay"
+
+
+def test_c0_the_list_is_nine_distinct_pairs_sorted_by_status_then_code() -> None:
+    assert len(CONTRACT_PAIRS) == 9 == len(LISTED)
+    assert all(
+        isinstance(pair, list) and len(pair) == 2 and type(pair[0]) is int and isinstance(pair[1], str)
+        and CAPITAL_SNAKE.match(pair[1])
+        for pair in CONTRACT_PAIRS
+    )
+    assert CONTRACT_PAIRS == sorted(CONTRACT_PAIRS)
+    assert {status for status, _ in LISTED} == {400, 404, 409}
+    assert len(LISTED_CODES) == 9, "a code listed at two statuses: the inventory below reads codes, not pairs"
+
+
+def test_c0_no_case_in_this_file_writes_the_list_out_a_second_time() -> None:
+    """The pairs are read from the file. A listed code may be named in a case (the case that
+    triggers it), but never next to its status as a literal pair, and LISTED is built from the file."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Tuple, ast.List)) and len(node.elts) == 2:
+            first, second = node.elts
+            if (
+                isinstance(first, ast.Constant) and type(first.value) is int
+                and isinstance(second, ast.Constant) and second.value in LISTED_CODES
+                and (first.value, second.value) in LISTED
+            ):
+                # Allowed only as a membership question about LISTED (`(404, "X") in LISTED`).
+                parent_ok = any(
+                    isinstance(cmp, ast.Compare) and node is cmp.left
+                    and isinstance(cmp.comparators[0], ast.Name) and cmp.comparators[0].id == "LISTED"
+                    for cmp in ast.walk(tree)
+                )
+                assert parent_ok, f"a listed pair written out at line {node.lineno}"
+    assigns = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == "LISTED"
+    ]
+    assert len(assigns) == 1 and "CONTRACT_PAIRS" in ast.unparse(assigns[0].value)
+
+
+def test_c0_the_notes_say_where_the_code_and_the_reason_are() -> None:
+    assert NOTES["envelope"]["code"] == "error.details.error"
+    assert NOTES["envelope"]["reason"] == "error.details.reason"
+    assert ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"] == ["replay", "stale"]
+    assert sorted(set(ASSERTION_NOTES["reasons"]) - {"replay", "stale"}) == [
+        "bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "resource", "subject",
+    ]
 
 
 def test_c0_no_503_and_none_of_the_could_not_tell_refusals_is_listed() -> None:
@@ -339,6 +380,35 @@ def test_c1_the_write_step_answers_every_quote_error_with_409() -> None:
                 assert isinstance(kws.get("detail"), ast.Constant) and kws["detail"].value == "Merchant not found"
 
 
+def test_c1_a_listed_code_is_only_ever_written_as_the_error_member_of_a_detail() -> None:
+    """The gateway gives its guard back only when `error.details.error` IS the code. So no raise
+    site may put a listed code anywhere else: not as a bare text detail (which the envelope would
+    copy into `message`), not under another key. Each on-path constant is the value of an "error"
+    key of a dict literal; the one QuoteError code is that exception's first argument."""
+    for path in sorted({path for path, _, _ in ON_PATH}):
+        tree = _tree(path)
+        parents: Dict[int, ast.AST] = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in LISTED_CODES):
+                continue
+            parent = parents[id(node)]
+            if isinstance(parent, ast.Dict):
+                keys = [k.value for k, v in zip(parent.keys, parent.values) if v is node and isinstance(k, ast.Constant)]
+                assert keys == ["error"], f"{path}:{node.lineno}: {node.value} under key {keys}"
+            elif isinstance(parent, ast.Call):
+                assert getattr(parent.func, "id", None) == "QuoteError" and parent.args[0] is node, f"{path}:{node.lineno}"
+            else:
+                assert isinstance(parent, ast.Assign) and parent.targets[0].id == "REJECTED_CODE", f"{path}:{node.lineno}"
+    # ... and REJECTED_CODE itself is used as the "error" member, in `_reject` only.
+    owner = _tree("routes/agent_forwarded_owner.py")
+    uses = [
+        (k.value if isinstance(k, ast.Constant) else None)
+        for d in ast.walk(owner) if isinstance(d, ast.Dict)
+        for k, v in zip(d.keys, d.values) if isinstance(v, ast.Name) and v.id == "REJECTED_CODE"
+    ]
+    assert uses == ["error"]
+
+
 def test_c1_the_assertion_reasons_in_the_contract_are_the_ones_the_code_can_give() -> None:
     reasons: Set[str] = set()
     for node in ast.walk(_tree("services/bound_issuing_assertion.py")):
@@ -350,7 +420,8 @@ def test_c1_the_assertion_reasons_in_the_contract_are_the_ones_the_code_can_give
     owner_literals = {value for _, value in _scoped_constants("routes/agent_forwarded_owner.py")}
     assert {"subject", "replay"} <= owner_literals
     reasons |= {"subject", "replay"}
-    assert sorted(reasons) == CONTRACT["notes"]["PARTNER_ASSERTION_REJECTED"]["reasons"]
+    assert sorted(reasons) == ASSERTION_NOTES["reasons"]
+    assert len(reasons) == 11
     assert all(re.fullmatch(r"[a-z][a-z0-9_]*", r) for r in reasons)
 
 
@@ -437,6 +508,15 @@ async def cw(world: World, monkeypatch: pytest.MonkeyPatch) -> World:
     monkeypatch.setenv("ISSUING_AGENT_EXCLUDED_AGENT_IDS", GATEWAY)
     monkeypatch.setenv("PARTNER_IDENTITY_FORWARDING_ENABLED", "1")
     assertion_replay_guard.reset_local_store()
+    w.nonce_claims = []
+    real_claim = assertion_replay_guard.claim
+
+    async def counted_claim(jti: str, ttl: int, **kwargs: Any) -> Any:
+        w.nonce_claims.append(jti)
+        return await real_claim(jti, ttl, **kwargs)
+
+    monkeypatch.setattr(assertion_replay_guard, "claim", counted_claim)
+    w.agents = agents
     outcomes = dict(forwarded.FORWARDED_OWNER_OUTCOMES)
     try:
         yield w
@@ -1001,6 +1081,9 @@ _BAD_ASSERTIONS: List[Tuple[str, Dict[str, Any], str]] = [
     ("another_method", {"m": "GET"}, "method"),
     ("long_ago", {"ts": 1_000_000_000}, "stale"),
     ("nobody", {"sub": "agent_oopq_nobody"}, "subject"),
+    ("no_subject_kind", {"kind": "something_else"}, "subject"),
+    ("not_version_two", {"v": 3}, "malformed"),
+    ("a_nonce_too_short", {"jti": "short"}, "malformed"),
 ]
 
 
@@ -1018,8 +1101,9 @@ async def test_c5_a_refused_assertion_never_enters_the_route_body_and_says_why(
     assert cw.body_entries == [], "the route body ran before the assertion was refused"
     details = answer.body["error"]["details"]
     assert details["reason"] == reason
-    assert details["reason"] in CONTRACT["notes"]["PARTNER_ASSERTION_REJECTED"]["reasons"]
-    assert details["reason"] != CONTRACT["notes"]["PARTNER_ASSERTION_REJECTED"]["reason_that_is_not_a_plain_refusal"]
+    assert details["reason"] in ASSERTION_NOTES["reasons"]
+    assert details["reason"] in ASSERTION_NOTES["decided_before_the_nonce_is_claimed"]
+    assert cw.nonce_claims == [], "the nonce was claimed for an assertion that was then refused"
 
 
 async def test_c5_a_replayed_assertion_says_replay_and_the_first_copy_made_the_order(cw: World) -> None:
@@ -1035,7 +1119,112 @@ async def test_c5_a_replayed_assertion_says_replay_and_the_first_copy_made_the_o
     assert again.status == 409
     details = again.body["error"]["details"]
     assert details["error"] == "PARTNER_ASSERTION_REJECTED"
-    assert details["reason"] == "replay" == CONTRACT["notes"]["PARTNER_ASSERTION_REJECTED"]["reason_that_is_not_a_plain_refusal"]
+    assert details["reason"] == "replay"
+    assert details["reason"] in ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"]
+    assert len(cw.nonce_claims) == 2 and cw.nonce_claims[0] == cw.nonce_claims[1]
     assert cw.body_entries == [AGENT_A] and cw.create_runs == ["r1"]
     rows = await cw.orders_for(quote, AGENT_A)
     assert [r["order_id"] for r in rows] == [first.order_id]
+
+
+async def test_c5_the_one_refusal_after_the_nonce_is_claimed_is_subject_and_it_is_still_before_the_body(cw: World) -> None:
+    """The assertion verifies and its nonce is claimed; then the partner's agent record cannot be
+    read at adoption. Refused with `subject`, with the route body not entered and nothing written."""
+    import routes.agent_auth as agent_auth
+
+    quote = cw.quotes.add()
+    raw, headers = signed(v2_body(quote))
+
+    async def unreadable(_agent_id: str) -> None:
+        raise RuntimeError(BUSY)
+
+    cw.monkeypatch.setattr(agent_auth, "get_agent", unreadable)
+
+    answer = await post_v2(cw, None, agent=GATEWAY, content=raw, headers=headers)
+
+    assert_listed_refusal(cw, answer, 409, "PARTNER_ASSERTION_REJECTED")
+    assert answer.body["error"]["details"]["reason"] == "subject"
+    assert len(cw.nonce_claims) == 1 and cw.body_entries == []
+    assert ASSERTION_NOTES["subject_has_a_second_site"]
+
+
+def test_c5_in_the_verifier_every_reason_but_replay_is_returned_before_the_nonce_can_be_claimed() -> None:
+    """Static: the verifier never touches the nonce store, and the dependency claims the nonce in
+    exactly one place, after the verifier's verdict and after the subject was resolved."""
+    verifier = _tree("services/bound_issuing_assertion.py")
+    assert not any(isinstance(n, ast.Name) and n.id == "assertion_replay_guard" for n in ast.walk(verifier))
+    assert not any(isinstance(n, ast.Attribute) and n.attr == "claim" for n in ast.walk(verifier))
+    owner = _tree("routes/agent_forwarded_owner.py")
+    claims = [
+        (fn.name, call.lineno)
+        for fn in ast.walk(owner) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "claim"
+    ]
+    assert [name for name, _ in claims] == ["_verify_bound"]
+    fn = next(n for n in ast.walk(owner) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_verify_bound")
+    claim_line = claims[0][1]
+    line_of = lambda needle: next(  # noqa: E731
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", None)) == needle
+    )
+    assert line_of("verify_bound_issuing_agent_assertion") < line_of("_subject_agent_id") < claim_line
+    replay_returns = [
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Return) and any(isinstance(c, ast.Constant) and c.value == "replay" for c in ast.walk(n))
+    ]
+    assert len(replay_returns) == 1 and replay_returns[0] > claim_line
+    assert sorted(set(ASSERTION_NOTES["reasons"]) - {"replay"}) == ASSERTION_NOTES["decided_before_the_nonce_is_claimed"]
+
+
+@pytest.mark.parametrize("accepted_at", [-60, -17, 0, 31, 60], ids=lambda v: f"accepted_{v:+d}s")
+async def test_c5_an_accepted_request_delivered_again_is_only_ever_told_replay_or_stale(accepted_at: int) -> None:
+    """The nonce is kept longer than the timestamp window stays open. A request accepted at any
+    moment of its window and delivered again one second later, then every second after that, is
+    refused by its nonce until its timestamp refuses it: it is never accepted a second time.
+
+    Explicit clocks on both functions (their `now` parameters); no global clock is touched. This
+    holds for the store that claimed the nonce, with the secret and the request unchanged."""
+    import hashlib as _hashlib
+
+    from routes.agent_forwarded_owner import REPLAY_TTL_SECONDS
+    from services import assertion_replay_guard
+    from services.bound_issuing_assertion import (
+        MAX_SKEW_SECONDS_V2,
+        sign_bound_issuing_agent_assertion,
+        verify_bound_issuing_agent_assertion,
+    )
+
+    assert REPLAY_TTL_SECONDS > 2 * MAX_SKEW_SECONDS_V2
+    signed_at = 1_000_000  # a timestamp inside the token; never compared with a real clock
+    body_hash = _hashlib.sha256(b"{}").hexdigest()
+    jti = "oopq-fixture-nonce-" + secrets.token_urlsafe(12)
+    token = sign_bound_issuing_agent_assertion(
+        {"v": 2, "kind": "agent", "sub": AGENT_A, "op": "create_order", "ts": signed_at, "jti": jti,
+         "m": "POST", "p": "/agent/v2/orders", "rid": "q_oopq_fixture", "bh": body_hash},
+        ASSERTION_SECRET,
+    )
+
+    def verdict(now: float) -> str:
+        return verify_bound_issuing_agent_assertion(
+            token, ops=("create_order",), method="POST", path="/agent/v2/orders", resource_id="q_oopq_fixture",
+            body_hash=body_hash, secret=ASSERTION_SECRET, now=now,
+        ).reason
+
+    assertion_replay_guard.reset_local_store()
+    try:
+        first = signed_at + accepted_at
+        assert verdict(first) == "ok"
+        assert (await assertion_replay_guard.claim(jti, REPLAY_TTL_SECONDS, now=first))[0] is True
+        told = set()
+        for later in range(first + 1, first + REPLAY_TTL_SECONDS + 3 * MAX_SKEW_SECONDS_V2):
+            reason = verdict(later)
+            if reason == "ok":
+                first_use, _store = await assertion_replay_guard.claim(jti, REPLAY_TTL_SECONDS, now=later)
+                assert first_use is False, f"accepted a second time {later - first}s after the first"
+                reason = "replay"
+            told.add(reason)
+        assert told <= set(ASSERTION_NOTES["can_follow_an_accepted_earlier_copy"]), told
+        assert "stale" in told
+    finally:
+        assertion_replay_guard.reset_local_store()
