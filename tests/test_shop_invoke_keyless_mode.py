@@ -983,6 +983,22 @@ def test_the_classifier_names_each_header_set(harness, cred_id, expected):
     assert got in gw.INVOKE_VERIFIED_CREDENTIAL_CLASSES | gw.INVOKE_KEYLESS_CREDENTIAL_CLASSES
 
 
+def test_the_classifier_reads_the_money_gates_one_format_rule():
+    """Not a copy of it: the key pattern is named in the rule alone, and the classifier, the
+    money gate and the proxy each call the rule. A second copy could drift, and the keyless
+    step would then call a key well-formed that the money gate calls malformed."""
+    rule = "_agent_key_has_money_gate_format"
+    for reader in (gw._classify_invoke_credential_in_process, gw._money_operation_refusal_reason, gw._proxy_agent_api):
+        assert inspect.getsource(reader).count(f"{rule}(") == 1, reader.__name__
+    source = Path(gw.__file__).read_text()
+    pattern_lines = [line.strip() for line in source.splitlines() if "_AGENT_API_KEY_RE" in line]
+    assert pattern_lines == [
+        "_AGENT_API_KEY_RE,",  # the import
+        "return _is_internal_trusted_api_key(api_key) or bool(_AGENT_API_KEY_RE.match(api_key))",
+    ]
+    assert pattern_lines[1] in inspect.getsource(getattr(gw, rule))
+
+
 def test_the_two_class_sets_do_not_overlap():
     assert not (gw.INVOKE_VERIFIED_CREDENTIAL_CLASSES & gw.INVOKE_KEYLESS_CREDENTIAL_CLASSES)
     assert set(VERIFIED_CLASSES.values()) == set(gw.INVOKE_VERIFIED_CREDENTIAL_CLASSES)
