@@ -87,29 +87,77 @@ async def db(monkeypatch):
             await database.disconnect()
 
 
-async def _seed(db, sid, *, host="glow.example", variants=None, www=False):
+async def _seed(db, sid, *, host="glow.example", variants=None, www=False, currency="USD"):
+    """As the real writer writes a seed: the `market` column is the partition, 'US' for every seed."""
     variants = variants if variants is not None else [
         {"shopify_variant_id": "44000000000001", "price_amount": "30.00", "price_currency": "USD",
          "availability": "In Stock"}]
     url = f"https://{'www.' if www else ''}{host}/products/{sid}"
     await db.execute(
         "INSERT INTO external_product_seeds (id, market, domain, destination_url, canonical_url, price_currency,"
-        " availability, seed_data, status) VALUES (:id, 'US', :d, :u, :u, 'USD', 'in_stock', CAST(:sd AS jsonb),"
+        " availability, seed_data, status) VALUES (:id, 'US', :d, :u, :u, :c, 'in_stock', CAST(:sd AS jsonb),"
         " 'active')",
-        {"id": _SEED_PREFIX + sid, "d": ("WWW." if www else "") + host.upper(), "u": url,
+        {"id": _SEED_PREFIX + sid, "d": ("WWW." if www else "") + host.upper(), "u": url, "c": currency,
          "sd": json.dumps({"snapshot": {"variants": variants}})})
 
 
-async def test_the_daily_cap_holds_under_concurrent_reservations(db, monkeypatch):
+async def test_the_daily_cap_holds_under_concurrent_reservations_on_separate_connections(db):
+    """The reservation is ONE statement, so two processes cannot both take the last slot. Run on separate
+    connections (one `databases` connection would serialise the calls, review P3-7), 10 trials of 12 at cap 3."""
+    import asyncpg
+
+    from services import deal_code_verifier as dv
+    from tests.test_deal_code_verifier import NOW
+
+    sql = dv._RESERVE_SQL
+    for i, name in enumerate((":host", ":day", ":now", ":cap"), start=1):
+        sql = sql.replace(name, f"${i}")
+    dsn = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    conns = [await asyncpg.connect(dsn) for _ in range(12)]
+    try:
+        for trial in range(10):
+            host = f"race-{trial}.example"
+            start = asyncio.Event()
+
+            async def take(conn):
+                await start.wait()
+                return await conn.fetchrow(sql, host, NOW.date(), NOW, 3)
+
+            tasks = [asyncio.create_task(take(c)) for c in conns]
+            await asyncio.sleep(0)
+            start.set()
+            got = await asyncio.gather(*tasks)
+            assert sum(r is not None for r in got) == 3, trial
+            row = await db.fetch_one("SELECT carts FROM deal_verify_host_daily_carts WHERE host = :h", {"h": host})
+            assert row["carts"] == 3
+    finally:
+        for c in conns:
+            await c.close()
+
+
+async def test_the_reservation_takes_exactly_the_cap_through_the_service(db, monkeypatch):
     from db.deal_lane import deal_verify_host_daily_carts as caps
     from services import deal_code_verifier as dv
     from tests.test_deal_code_verifier import NOW
 
     monkeypatch.setenv("DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY", "3")
-    got = await asyncio.gather(*[dv.reserve_cart("glow.example", NOW) for _ in range(8)])
-    assert sum(got) == 3
+    got = [await dv.reserve_cart("glow.example", NOW) for _ in range(5)]
+    assert got == [True, True, True, False, False]
     [row] = await db.fetch_all(caps.select())
     assert row["carts"] == 3 and row["utc_day"] == NOW.date()
+
+
+async def test_an_sg_code_finds_its_sgd_seed_in_the_us_partition(db):
+    """Review P1-1, prod-shaped: partition 'US', SGD column and variant prices."""
+    from tests.test_deal_code_verifier import APPLIED, NOW, StubClient, offer, run
+
+    await _seed(db, "sg", host="sgshop.example", variants=[
+        {"shopify_variant_id": "44000000000008", "price_amount": "48.00", "price_currency": "SGD",
+         "availability": "in_stock"}], currency="SGD")
+    await offer(db, "sg", seller="sgshop.example", market="SG", observed=NOW - timedelta(hours=1))
+    client = StubClient([(200, dict(APPLIED[1], currency="SGD"))])
+    out = await run(client)
+    assert out["applied"] == 1 and client.calls[0]["json"]["variant_gid"] == "44000000000008"
 
 
 async def test_a_run_on_postgres_verifies_refuses_and_retries_as_on_sqlite(db):

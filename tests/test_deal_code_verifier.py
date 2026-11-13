@@ -96,15 +96,18 @@ async def offer(db, name, *, seller="glow.example", market="US", code=None, kind
     return deal_id
 
 
-async def seed(db, sid, *, host="glow.example", market="US", variants=None, currency="USD", status="active",
-               www=False, availability="in_stock"):
+async def seed(db, sid, *, host="glow.example", variants=None, currency="USD", status="active",
+               www=False, availability="in_stock", partition="US"):
+    """A seed shaped as the real writer writes it: the `market` column is the storage partition, 'US' for every
+    seed (ingestion.SEED_PARTITION_MARKET), SGD ones included; the seed's market is its currency's."""
     variants = variants if variants is not None else [
-        {"shopify_variant_id": "44000000000001", "price_amount": 30, "price_currency": "USD", "availability": "in_stock"}]
+        {"shopify_variant_id": "44000000000001", "price_amount": 30, "price_currency": currency,
+         "availability": "in_stock"}]
     url = f"https://{'www.' if www else ''}{host}/products/{sid}"
     await db.execute(
         "INSERT INTO external_product_seeds (id, market, domain, destination_url, canonical_url, price_currency,"
         " availability, seed_data, status) VALUES (:id, :m, :d, :u, :u, :c, :a, :sd, :s)",
-        {"id": "dcv-" + sid, "m": market, "d": ("www." if www else "") + host, "u": url, "c": currency,
+        {"id": "dcv-" + sid, "m": partition, "d": ("www." if www else "") + host, "u": url, "c": currency,
          "a": availability, "sd": json.dumps({"snapshot": {"variants": variants}}), "s": status})
 
 
@@ -159,19 +162,38 @@ async def run(client, now=NOW):
 
 # ---- gates -----------------------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("job,nonconnected,key,on", [
-    ("true", "true", KEY, True),
-    ("", "true", KEY, False),
-    ("true", "", KEY, False),
-    ("true", "true", "k" * 42, False),
-    ("true", "true", "", False),
-    ("1", "true", KEY, False),
+_URL = "https://gateway.test/internal/ucp/discount-code/verify"
+
+
+@pytest.mark.parametrize("job,nonconnected,key,url,on", [
+    ("true", "true", KEY, _URL, True),
+    ("", "true", KEY, _URL, False),
+    ("true", "", KEY, _URL, False),
+    ("true", "true", "k" * 42, _URL, False),
+    ("true", "true", "", _URL, False),
+    ("1", "true", KEY, _URL, False),
+    ("true", "true", KEY, "", False),  # no default URL (review P3-9)
+    ("true", "true", KEY, "http://gateway.test/internal/ucp/discount-code/verify", False),
 ])
-async def test_it_runs_only_with_both_flags_and_a_full_length_key(monkeypatch, job, nonconnected, key, on):
+async def test_it_runs_only_with_both_flags_a_full_length_key_and_an_https_url(monkeypatch, job, nonconnected, key,
+                                                                               url, on):
     monkeypatch.setenv("DEAL_VERIFY_JOB_ENABLED", job)
     monkeypatch.setenv("DEAL_VERIFY_NONCONNECTED_ENABLED", nonconnected)
     monkeypatch.setenv("DEAL_VERIFY_INTERNAL_KEY", key)
+    monkeypatch.setenv("DEAL_VERIFY_ROUTE_URL", url)
     assert dv.enabled() is on
+
+
+def test_the_route_url_has_no_default(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.delenv("DEAL_VERIFY_ROUTE_URL", raising=False)
+    assert settings.deal_verify_route_url == ""
+
+
+def test_only_markets_whose_currency_minor_unit_is_known_are_verified():
+    assert dv.MARKET_CURRENCY == {"US": "USD", "SG": "SGD"}
+    assert all(c in dv.MINOR_EXPONENT for c in dv.MARKET_CURRENCY.values())
 
 
 async def test_off_it_reads_nothing_and_returns_nothing(monkeypatch):
@@ -225,6 +247,8 @@ def _ver(state, *, hours_ago=1, expires_in=None, reason=None):
     ({}, [_ver("unverified", hours_ago=13, reason="not_priced:timeout")], 2),
     ({}, [_ver("unverified", hours_ago=24 * 6, reason="not_evaluated:seller_does_not_advertise")], None),
     ({}, [_ver("unverified", hours_ago=24 * 7 + 1, reason="not_evaluated:seller_does_not_advertise")], 2),
+    ({}, [_ver("unverified", hours_ago=24 * 6, reason="route:seller_host_refused")], None),  # review P2-1
+    ({}, [_ver("unverified", hours_ago=24 * 7 + 1, reason="route:transport_readtimeout")], 2),
 ])
 def test_which_rows_are_due(offer_kw, rows, expected):
     got = dv.due(_o(**offer_kw), rows, NOW)
@@ -235,7 +259,8 @@ def test_which_rows_are_due(offer_kw, rows, expected):
 
 def _seed(host="glow.example", variants=(), currency="USD", www=False, availability=None):
     url = f"https://{'www.' if www else ''}{host}/products/p"
-    return {"canonical_url": url, "destination_url": url, "price_currency": currency, "availability": availability,
+    return {"market": "US", "canonical_url": url, "destination_url": url, "price_currency": currency,
+            "availability": availability,
             "seed_data": {"snapshot": {"variants": list(variants)}}}
 
 
@@ -272,6 +297,24 @@ def test_ties_go_to_the_lowest_store_id_numerically_and_www_hosts_are_discovered
     assert ref.discovery_host == "www.glow.example"
 
 
+def test_an_sgd_seed_in_the_us_partition_serves_sg_and_never_us():
+    """Every seed is stored in partition 'US' (review P1-1): its market is its own currency's."""
+    sgd = _seed(currency="SGD", variants=[_var("44000000000003", 40, currency="SGD")])
+    usd = _seed(variants=[_var("44000000000004", 30)])
+    ref, _ = dv.pick_reference_variant([sgd, usd], seller="glow.example", market="SG", min_subtotal=None)
+    assert ref.variant_id == "44000000000003"
+    ref, _ = dv.pick_reference_variant([sgd, usd], seller="glow.example", market="US", min_subtotal=None)
+    assert ref.variant_id == "44000000000004"
+
+
+def test_a_seed_whose_column_and_page_currency_disagree_serves_no_market():
+    seed = _seed(currency="SGD", variants=[_var("44000000000003", 40, currency="SGD")])
+    seed["seed_data"]["snapshot"]["price_currency"] = "USD"
+    for market in ("SG", "US"):
+        ref, why = dv.pick_reference_variant([seed], seller="glow.example", market=market, min_subtotal=None)
+        assert ref is None and why == "no_reference_variant"
+
+
 def test_a_variant_without_its_own_stock_takes_the_seeds_and_without_either_is_not_used():
     v = {"shopify_variant_id": "44000000000003", "price_amount": 25, "price_currency": "USD"}
     ref, _ = dv.pick_reference_variant([_seed(variants=[v], availability="in_stock")], seller="glow.example",
@@ -293,18 +336,21 @@ def test_minor_units_become_major_units_only_for_an_integer_in_a_known_currency(
     assert dv.from_minor(amount, currency) == expected
 
 
-@pytest.mark.parametrize("status,body,result", [
-    (200, {"result": "applied"}, "applied"),
-    (200, {"result": "rejected", "reason": "discount_code_invalid"}, "rejected"),
-    (200, {"result": "invalid", "reason": "code_invalid"}, "error"),
-    (200, {"result": "surprise"}, "error"),
-    (200, ["applied"], "error"),
-    (400, {"error": "invalid_request"}, "error"),
-    (401, {"error": "unauthorized"}, "error"),
-    (404, {"error": "not_found"}, "error"),
+@pytest.mark.parametrize("status,body,result,reason", [
+    (200, {"result": "applied"}, "applied", ""),
+    (200, {"result": "rejected", "reason": "discount_code_invalid"}, "rejected", "discount_code_invalid"),
+    (200, {"result": "invalid", "reason": "code_invalid"}, "refused_request", "code_invalid"),
+    (400, {"error": "invalid_request", "reason": "seller_host_refused"}, "refused_request", "seller_host_refused"),
+    (400, "not json", "refused_request", "invalid_request"),
+    (200, {"result": "surprise"}, "error", "unknown_result"),
+    (200, ["applied"], "error", "http_200"),
+    (401, {"error": "unauthorized"}, "error", "http_401"),
+    (404, {"error": "not_found"}, "error", "http_404"),
+    (503, None, "error", "http_503"),
 ])
-def test_only_a_200_with_a_known_result_is_an_answer(status, body, result):
-    assert dv.read_answer(status, body).result == result
+def test_what_each_route_answer_reads_as(status, body, result, reason):
+    got = dv.read_answer(status, body)
+    assert (got.result, got.reason) == (result, reason)
 
 
 def test_a_reason_that_is_not_a_short_token_is_dropped():
@@ -350,6 +396,10 @@ def test_the_expiry_is_the_earlier_of_the_deals_end_and_the_ttl(monkeypatch):
     ({"discount": None}, "applied_incomplete"),
     ({"discount": {"amount": 0}}, "applied_without_amount"),
     ({"automatic": [{"amount": 1.5}]}, "automatic_unreadable"),
+    ({"discount": {"amount": 5000}}, "reference_cart_inconsistent"),  # more than the subtotal (review P3-2)
+    ({"totals": {"subtotal": 3500}}, "reference_cart_inconsistent"),  # subtotal above the unit price
+    ({"totals": {"subtotal": 2000}}, "reference_cart_inconsistent"),  # subtotal below the effective price
+    ({"automatic": [{"amount": 2600}]}, "reference_cart_inconsistent"),  # code + automatic above the unit price
 ])
 def test_an_applied_answer_without_a_whole_cart_in_the_markets_currency_is_not_a_verification(change, why):
     body = dict(APPLIED[1], **change)
@@ -432,18 +482,109 @@ async def test_a_verified_code_that_gets_no_answer_on_re_check_keeps_its_verific
     assert row["state"] == "failed" and row["verified_at"] is not None and row["ref_discount_amount"] is not None
 
 
-async def test_route_errors_write_nothing_and_spend_the_slot(db, monkeypatch):
+@pytest.mark.parametrize("answer,reason", [((401, {"error": "unauthorized"}), "http_401"),
+                                           ((404, {"error": "not_found"}), "http_404"),
+                                           ((502, None), "http_502")])
+async def test_a_route_that_is_down_or_misconfigured_stops_the_run_writes_nothing_and_spends_the_slot(
+        db, monkeypatch, answer, reason):
     from db.deal_lane import deal_verify_host_daily_carts as caps
 
     _on(monkeypatch)
-    deal = await offer(db, "e")
+    deal = await offer(db, "e", observed=NOW - timedelta(hours=1))
+    other = await offer(db, "f", seller="shop.example", observed=NOW - timedelta(hours=2))
     await seed(db, "s1")
-    out = await run(StubClient([(401, {"error": "unauthorized"})]))
-    assert out["route_errors"] == 1 and out["route_http_401"] == 1 and await verifications(db, deal) == []
+    await seed(db, "s2", host="shop.example")
+    client = StubClient([answer])
+    out = await run(client)
+    assert out["route_errors"] == 1 and out["route_" + reason] == 1 and out["left_route_stopped"] == 1
+    assert len(client.calls) == 1  # the next host gets no cart: the fault is the route's (review P2-1)
+    assert await verifications(db, deal) == [] and await verifications(db, other) == []
     [cap] = await db.fetch_all(caps.select())
-    assert cap["carts"] == 1
-    out = await run(StubClient([RuntimeError("connection reset")]))
-    assert out["route_errors"] == 1 and out["route_transport_runtimeerror"] == 1
+    assert (cap["host"], cap["carts"]) == ("glow.example", 1)
+
+
+async def test_a_request_the_route_refuses_backs_that_row_off_and_the_run_goes_on(db, monkeypatch):
+    _on(monkeypatch)
+    bad = await offer(db, "b", observed=NOW - timedelta(hours=1))
+    good = await offer(db, "g", seller="shop.example", observed=NOW - timedelta(hours=2))
+    await seed(db, "s1")
+    await seed(db, "s2", host="shop.example")
+    client = StubClient([(400, {"error": "invalid_request", "reason": "seller_host_refused"}), APPLIED])
+    out = await run(client)
+    assert out["route_seller_host_refused"] == 1 and out["applied"] == 1
+    [row] = await verifications(db, bad)
+    assert row["state"] == "unverified" and row["failure_reason"] == "route:seller_host_refused"
+    assert (await verifications(db, good))[0]["state"] == "checkout_verified"
+    # Backed off 7 days: it no longer takes a slot from the codes behind it on the next runs.
+    for days in (1, 3, 6):
+        client = StubClient(APPLIED)  # the good code is re-verified as it nears its expiry
+        await run(client, now=NOW + timedelta(days=days))
+        assert "glow.example" not in [c["json"]["seller_host"] for c in client.calls]
+    client = StubClient(NOT_PRICED)
+    await run(client, now=NOW + timedelta(days=7, hours=1))
+    assert "glow.example" in [c["json"]["seller_host"] for c in client.calls]
+
+
+async def test_a_lost_answer_is_recorded_on_the_row_backed_off_and_stops_the_run(db, monkeypatch):
+    _on(monkeypatch)
+    lost = await offer(db, "t", observed=NOW - timedelta(hours=1))
+    await offer(db, "u", seller="shop.example", observed=NOW - timedelta(hours=2))
+    await seed(db, "s1")
+    await seed(db, "s2", host="shop.example")
+    client = StubClient([RuntimeError("connection reset")])
+    out = await run(client)
+    assert out["route_errors"] == 1 and out["route_transport_runtimeerror"] == 1 and out["left_route_stopped"] == 1
+    assert len(client.calls) == 1
+    [row] = await verifications(db, lost)
+    assert row["state"] == "unverified" and row["failure_reason"] == "route:transport_runtimeerror"
+    assert dv.due({"kind": "percent", "market": "US", "code": "X"}, [dict(row)], NOW + timedelta(days=6)) is None
+
+
+async def test_no_cart_is_started_without_time_left_before_the_jobs_deadline(db, monkeypatch):
+    _on(monkeypatch)
+    await offer(db, "d")
+    await seed(db, "s1")
+    clock = [1000.0]
+    client = StubClient([])
+    out = await dv.run(now=NOW, client=client, sleep=_nosleep, monotonic=lambda: clock[0],
+                       deadline=1000.0 + dv.CART_HEADROOM_SECONDS - 1)
+    assert out["left_job_deadline"] == 1 and client.calls == []
+    from db.deal_lane import deal_verify_host_daily_carts as caps
+
+    assert await db.fetch_all(caps.select()) == []  # no slot taken either
+    client = StubClient([APPLIED])
+    out = await dv.run(now=NOW, client=client, sleep=_nosleep, monotonic=lambda: clock[0],
+                       deadline=1000.0 + dv.CART_HEADROOM_SECONDS + 1)
+    assert out["applied"] == 1
+
+
+async def test_an_sg_code_is_verified_on_an_sgd_seed_stored_in_the_us_partition(db, monkeypatch):
+    """Review P1-1, prod-shaped: the seed sits in partition 'US' with SGD prices."""
+    _on(monkeypatch)
+    deal = await offer(db, "sg", market="SG")
+    await seed(db, "s1", currency="SGD")
+    client = StubClient([(200, dict(APPLIED[1], currency="SGD"))])
+    out = await run(client)
+    assert out["applied"] == 1
+    assert client.calls[0]["json"]["market"] == "SG" and client.calls[0]["json"]["expected_currency"] == "SGD"
+    assert (await verifications(db, deal))[0]["ref_currency"] == "SGD"
+
+
+async def test_each_hosts_seeds_are_read_once_per_run(db, monkeypatch):
+    _on(monkeypatch)
+    await offer(db, "m1", min_subtotal=100, currency="USD", observed=NOW - timedelta(hours=1))
+    await offer(db, "m2", min_subtotal=200, currency="USD", observed=NOW - timedelta(hours=2))
+    await seed(db, "s1")
+    reads = []
+    real = dv._host_seeds
+
+    async def counting(host):
+        reads.append(host)
+        return await real(host)
+
+    monkeypatch.setattr(dv, "_host_seeds", counting)
+    out = await run(StubClient([]))
+    assert out["skipped_min_subtotal_unmet"] == 2 and reads == ["glow.example"]
 
 
 async def test_caps_one_cart_per_host_per_run_the_per_run_cap_and_the_daily_host_cap(db, monkeypatch):
@@ -554,18 +695,47 @@ async def test_the_refresh_run_reports_the_verifier_only_when_it_ran(monkeypatch
     monkeypatch.setattr(job, "run_external_referral_refresh_batch", batch)
     monkeypatch.setattr(job.deal_code_retention, "run", retention)
 
-    async def off():
+    async def off(**_):
         return {}
 
     monkeypatch.setattr(job.deal_code_verifier, "run", off)
     assert "deal_code_verifier" not in await job.run_daily_external_referral_refresh(limit=1)
 
-    async def on():
+    async def on(**_):
         return {"carts": 1, "applied": 1}
 
     monkeypatch.setattr(job.deal_code_verifier, "run", on)
     summary = await job.run_daily_external_referral_refresh(limit=1)
     assert summary["deal_code_verifier"] == {"carts": 1, "applied": 1}
+
+
+async def test_the_refresh_run_gives_the_verifier_its_task_timeout_less_a_margin(monkeypatch):
+    import time
+
+    import jobs.external_referral_refresh as job
+
+    async def batch(**_):
+        return {"status": "success"}
+
+    async def retention():
+        return {}
+
+    seen = {}
+
+    async def verifier(**kw):
+        seen.update(kw)
+        return {}
+
+    monkeypatch.setattr(job, "run_external_referral_refresh_batch", batch)
+    monkeypatch.setattr(job.deal_code_retention, "run", retention)
+    monkeypatch.setattr(job.deal_code_verifier, "run", verifier)
+    monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS", raising=False)
+    before = time.monotonic()
+    await job.run_daily_external_referral_refresh(limit=1)
+    assert before + 3480 - 1 <= seen["deadline"] <= time.monotonic() + 3480
+    for value, expected in (("7200", 7080.0), ("garbage", 3480.0), ("60", 3480.0), ("", 3480.0)):
+        monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS", value)
+        assert job.verifier_deadline_seconds() == expected
 
 
 async def test_retention_drops_refusal_hashes_after_30_days(db):
@@ -578,3 +748,5 @@ async def test_retention_drops_refusal_hashes_after_30_days(db):
     out = await deal_code_retention.run(now=NOW)
     assert out["deleted_refusal_hashes"] == 1
     assert [r["refusal_hash"] for r in await db.fetch_all(deal_code_refusals.select())] == ["young" * 4]
+    # Nothing to purge: no key, so the summary is the one it had before this rule (review P3-1).
+    assert "deleted_refusal_hashes" not in await deal_code_retention.run(now=NOW)

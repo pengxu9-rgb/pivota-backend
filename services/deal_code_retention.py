@@ -238,6 +238,9 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
         return purged
 
     await step("deleted_refusal_hashes", purge_refusals())
+    if counts.get("deleted_refusal_hashes") == 0:
+        # Reported only when it deleted something, so a run with no refusals keeps the summary it had (review P3-1).
+        del counts["deleted_refusal_hashes"]
     if any(counts.get(k) for k in counts):
         logger.warning("deal code retention: %s", {k: n for k, n in counts.items() if n})
     return counts

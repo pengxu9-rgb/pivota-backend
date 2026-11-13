@@ -646,11 +646,12 @@ class Settings(BaseSettings):
         return _deal_int("DEAL_VERIFY_MAX_CARTS_PER_RUN", default=10, low=1, high=200)
 
     # The gateway's internal verify route (gw#2552) and its X-Internal-Key. A key shorter than the route's own minimum
-    # (43 characters) keeps the verifier off, as the route keeps itself dark with one.
+    # (43 characters) keeps the verifier off, as the route keeps itself dark with one. NO default URL: unset (or not
+    # https) keeps the verifier off, so a staging job can never send its key to the prod gateway (review P3-9).
+    # Prod: https://gateway.pivota.cc/internal/ucp/discount-code/verify.
     @property
     def deal_verify_route_url(self) -> str:
-        return (os.getenv("DEAL_VERIFY_ROUTE_URL") or "").strip() or (
-            "https://gateway.pivota.cc/internal/ucp/discount-code/verify")
+        return (os.getenv("DEAL_VERIFY_ROUTE_URL") or "").strip()
 
     @property
     def deal_verify_internal_key(self) -> str:

@@ -7,7 +7,8 @@ these hold, and otherwise reads nothing:
   - DEAL_VERIFY_JOB_ENABLED (the job's kill switch) and DEAL_VERIFY_NONCONNECTED_ENABLED (a crawled store has no
     relationship with us: Q2's approval, given 2026-11-07 (Q17), is what authorizes the test: `authorized_by` is
     `q2_approval`) are both "true";
-  - the gateway route's key (DEAL_VERIFY_INTERNAL_KEY) is at least MIN_KEY_CHARS long, as the route requires.
+  - the gateway route's key (DEAL_VERIFY_INTERNAL_KEY) is at least MIN_KEY_CHARS long, as the route requires, and
+    its URL (DEAL_VERIFY_ROUTE_URL, no default) is https.
 
 THE CART. The gateway's internal route (`POST /internal/ucp/discount-code/verify`, gw#2552) runs the SAME discovery,
 create_cart, cart reader and discount reader the buyer's checkout door uses, on its own door (no bearer credential,
@@ -25,8 +26,9 @@ LIMITS (D3): at most DEAL_VERIFY_MAX_CARTS_PER_RUN carts per run, one per host p
 carts left today, DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY). No retries inside a run; a spent slot is never returned.
 
 THE PRODUCT IT TESTS ON (`reference_variant`): the cheapest in-stock variant, at quantity 1, of an active seed on the
-seller's host in the deal's market: a numeric store variant id, its own price in the market's currency and at least
-the code's minimum spend. Ties go to the lowest store id, so repeated tests land on the same variant. With none, no
+seller's host whose own currency serves the deal's market (services.seed_serving.seed_row_market; the seed's `market`
+column is a storage partition, 'US' for every seed, and is never read): a numeric store variant id, its own price in
+the market's currency and at least the code's minimum spend. Each host's seeds are read once per run. Ties go to the lowest store id, so repeated tests land on the same variant. With none, no
 cart is built and nothing is written (the verification row is keyed by the variant): counted.
 
 WHAT IS RECORDED, per answer:
@@ -37,7 +39,15 @@ WHAT IS RECORDED, per answer:
   - not_confirmed, not_evaluated, not_priced: not a verdict on the code. A row never verified stays `unverified`
                    with the reason and is retried after its backoff; a verified row keeps its verification (serving
                    stops at its expiry anyway) and records the reason;
-  - a malformed answer, a 4xx or a transport error: nothing is written; counted. The host gets no second cart this run.
+  - the route refused the request (400, or `invalid`): `unverified` with `route:<reason>`, backed off 7 days, and the
+                   run goes on;
+  - the answer was lost (a transport error; the gateway may have built a cart): the same, and the run stops;
+  - 401, 404, 5xx or an unreadable answer: the route's configuration or health, not the row's. Nothing is written,
+                   the slot stays spent, and the run stops.
+  - an applied answer whose cart is not whole and consistent (unit >= subtotal >= unit - code - automatic >= 0) is
+                   recorded as not confirmed.
+TIME: no cart is started with less than CART_HEADROOM_SECONDS left before the caller's deadline (the refresh job's
+task timeout less a margin), nor after RUN_BUDGET_SECONDS.
 Every write sets `updated_at`, and a later write never clears `verified_at`, `expires_at` or the reference amounts
 (retention's contract: services/deal_code_retention.applied_history).
 
@@ -71,14 +81,17 @@ logger = logging.getLogger(__name__)
 
 MIN_KEY_CHARS = 43  # the route's own minimum (src/services/ucpDiscountVerifyInternalRoute.js MIN_KEY_CHARS)
 VERIFIABLE_KINDS = ("percent", "amount")
-# The served markets and their currencies, as the writer keys market evidence.
-MARKET_CURRENCY = dict(writer._MARKET_CURRENCY)
 # Minor-unit exponents of the currencies a served market prices in. A currency not listed is never verified.
 MINOR_EXPONENT = {"USD": 2, "SGD": 2}
+# The markets codes are verified in: the writer's market evidence (US/USD, SG/SGD), and only where the currency's
+# minor unit is known here, so a market added there later is never sent a cart whose answer cannot be read (P3-3).
+MARKET_CURRENCY = {m: c for m, c in writer._MARKET_CURRENCY.items() if c in MINOR_EXPONENT}
 REVERIFY_WITHIN = timedelta(hours=3)
 RETRY_AFTER = timedelta(hours=12)
-# The store does not advertise the discount capability: asking again soon will not change that.
+# The store does not advertise the discount capability, or the route refused the request as malformed or answered
+# nothing (a transport failure may still have built a cart): asking again soon will not change that.
 NOT_EVALUATED_RETRY_AFTER = timedelta(days=7)
+_LONG_BACKOFF_PREFIXES = ("not_evaluated", "route:")
 REFUSAL_HASH_DAYS = 30
 VERIFIED_VIA = "ucp_checkout"
 AUTHORIZED_BY = "q2_approval"
@@ -88,6 +101,9 @@ CALL_TIMEOUT_SECONDS = 15.0
 CALL_SPACING_SECONDS = 1.0
 # The whole step stops starting carts after this long.
 RUN_BUDGET_SECONDS = 240.0
+# A cart is started only while this much time is left before the caller's deadline: one call's timeout, the spacing,
+# and the write after it.
+CART_HEADROOM_SECONDS = CALL_TIMEOUT_SECONDS + CALL_SPACING_SECONDS + 15.0
 # Candidate and seed reads are bounded.
 MAX_CANDIDATES = 2000
 MAX_SEEDS_PER_HOST = 200
@@ -97,8 +113,11 @@ _VARIANT_ID_RE = re.compile(r"^\d{6,20}$")
 
 
 def enabled() -> bool:
+    """Both flags, a full-length key and an https route URL: there is no default URL, so a staging job with the
+    flags on can never send its key to the prod gateway (review P3-9)."""
     return (settings.deal_verify_job_enabled and settings.deal_verify_nonconnected_enabled
-            and len(settings.deal_verify_internal_key) >= MIN_KEY_CHARS)
+            and len(settings.deal_verify_internal_key) >= MIN_KEY_CHARS
+            and settings.deal_verify_route_url.startswith("https://"))
 
 
 def refusal_hash(seller: str, market: str, code: str) -> str:
@@ -174,7 +193,7 @@ def due(offer: Mapping[str, Any], verifications: Iterable[Mapping[str, Any]], no
         return None
     last_attempt = max((_aware(r.get("updated_at")) or now for r in rows), default=now)
     reasons = [str(r.get("failure_reason") or "") for r in rows]
-    backoff = NOT_EVALUATED_RETRY_AFTER if any(x.startswith("not_evaluated") for x in reasons) else RETRY_AFTER
+    backoff = NOT_EVALUATED_RETRY_AFTER if any(x.startswith(_LONG_BACKOFF_PREFIXES) for x in reasons) else RETRY_AFTER
     if live:
         # A verified row near its expiry is re-checked, unless the last re-check did not get an answer recently.
         if any(x for x in reasons) and last_attempt > now - backoff:
@@ -230,10 +249,13 @@ class ReferenceVariant:
     discovery_host: Optional[str]
 
 
+# By host only: the seed's `market` column is a storage partition ('US' for every seed, SGD ones included), never
+# its market. The market a seed serves is its own currency's (services.seed_serving.seed_row_market), checked per
+# row in `pick_reference_variant` (review P1-1).
 _SEEDS_SQL = (
     "SELECT id, domain, destination_url, canonical_url, price_currency, availability, seed_data "
     "FROM external_product_seeds "
-    "WHERE status = 'active' AND market = :market "
+    "WHERE status = 'active' "
     "AND (lower(domain) IN (:host, :www) "
     "     OR destination_url LIKE :p1 ESCAPE '\\' OR destination_url LIKE :p2 ESCAPE '\\' "
     "     OR canonical_url LIKE :p1 ESCAPE '\\' OR canonical_url LIKE :p2 ESCAPE '\\') "
@@ -262,8 +284,13 @@ def _seed_variants(seed_data: Any) -> List[Dict[str, Any]]:
 
 def pick_reference_variant(seeds: Iterable[Mapping[str, Any]], *, seller: str, market: str,
                            min_subtotal: Optional[Decimal]) -> Tuple[Optional[ReferenceVariant], str]:
-    """The cheapest in-stock store variant on the seller's host for this market, or (None, why). Pure."""
+    """The cheapest in-stock store variant on the seller's host for this market, or (None, why). Pure.
+
+    A seed counts for the market its own currency serves (services.seed_serving.seed_row_market: USD -> US,
+    SGD -> SG, never the partition column), and each variant's own currency, when it states one, must be that
+    market's too."""
     from services.catalog_enrichment_agent.ingestion import variant_own_price
+    from services.seed_serving import seed_row_currency, seed_row_market
 
     currency = MARKET_CURRENCY.get(market)
     best: Optional[Tuple[Decimal, int, str, Optional[str]]] = None
@@ -272,7 +299,9 @@ def pick_reference_variant(seeds: Iterable[Mapping[str, Any]], *, seller: str, m
         form = _seed_host_form(seed, seller)
         if form is None:
             continue
-        seed_currency = str(seed.get("price_currency") or "").strip().upper() or None
+        if currency is None or seed_row_market(seed) != market:
+            continue
+        seed_currency = seed_row_currency(seed)
         for variant in _seed_variants(seed.get("seed_data")):
             vid = str(variant.get("shopify_variant_id") or "").strip()
             if not _VARIANT_ID_RE.match(vid):
@@ -302,9 +331,8 @@ def pick_reference_variant(seeds: Iterable[Mapping[str, Any]], *, seller: str, m
     return ReferenceVariant(variant_id=best[2], unit_price=best[0], discovery_host=best[3]), ""
 
 
-async def reference_variant(c: Candidate) -> Tuple[Optional[ReferenceVariant], str]:
-    host = c.seller
-    params = {"market": c.market, "host": host, "www": "www." + host,
+async def _host_seeds(host: str) -> List[Dict[str, Any]]:
+    params = {"host": host, "www": "www." + host,
               "p1": f"https://{_like(host)}/%", "p2": f"https://www.{_like(host)}/%", "lim": MAX_SEEDS_PER_HOST}
     rows = await database.fetch_all(_SEEDS_SQL, params)
     seeds = []
@@ -317,7 +345,19 @@ async def reference_variant(c: Candidate) -> Tuple[Optional[ReferenceVariant], s
             except ValueError:
                 seed["seed_data"] = {}
         seeds.append(seed)
-    return pick_reference_variant(seeds, seller=host, market=c.market, min_subtotal=c.min_subtotal)
+    return seeds
+
+
+async def reference_variant(c: Candidate, cache: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                            ) -> Tuple[Optional[ReferenceVariant], str]:
+    """The reference variant for a candidate. `cache` holds each host's seeds for one run (review P3-6)."""
+    if cache is not None and c.seller in cache:
+        seeds = cache[c.seller]
+    else:
+        seeds = await _host_seeds(c.seller)
+        if cache is not None:
+            cache[c.seller] = seeds
+    return pick_reference_variant(seeds, seller=c.seller, market=c.market, min_subtotal=c.min_subtotal)
 
 
 # ---- the daily cart cap --------------------------------------------------------------------------------------------
@@ -341,21 +381,31 @@ async def reserve_cart(host: str, now: datetime) -> bool:
 
 @dataclass(frozen=True)
 class Answer:
-    result: str  # one of _RESULTS, or "error"
+    result: str  # one of _RESULTS, "refused_request" (the route refused this row's request) or "error"
     reason: str
     body: Dict[str, Any]
 
 
+def _token(value: Any) -> str:
+    return value if isinstance(value, str) and _REASON_RE.match(value) else ""
+
+
 def read_answer(status: int, body: Any) -> Answer:
-    """The route's answer as a result, or `error` (a 4xx, a non-JSON body, an unknown result). Pure."""
+    """The route's answer. Pure.
+      - a 200 with a known result: that result;
+      - a 400, or a 200 answering `invalid`: `refused_request`, the route's reason kept. The request for THIS row is
+        what it refused (a host it never contacts, a code it cannot send), so the row backs off (review P2-1);
+      - anything else (401, 404, 5xx, a body that is not JSON, an unknown result): `error`. That is the route's
+        configuration or health, not the row's: the run stops."""
+    data = body if isinstance(body, dict) else {}
+    if status == 400 or (status == 200 and data.get("result") == "invalid"):
+        return Answer("refused_request", _token(data.get("reason")) or "invalid_request", {})
     if status != 200 or not isinstance(body, dict):
         return Answer("error", f"http_{status}", {})
     result = body.get("result")
     if result not in _RESULTS:
-        return Answer("error", "unknown_result" if result != "invalid" else "invalid", {})
-    reason = body.get("reason")
-    reason = reason if isinstance(reason, str) and _REASON_RE.match(reason) else ""
-    return Answer(result, reason, body)
+        return Answer("error", "unknown_result", {})
+    return Answer(result, _token(body.get("reason")), body)
 
 
 async def call_route(c: Candidate, ref: ReferenceVariant, *, client=None) -> Answer:
@@ -381,7 +431,8 @@ async def call_route(c: Candidate, ref: ReferenceVariant, *, client=None) -> Ans
         async with httpx.AsyncClient(timeout=CALL_TIMEOUT_SECONDS, follow_redirects=False) as owned:
             return await _post(owned)
     except Exception as exc:  # noqa: BLE001 - a failed call is counted, never raised
-        return Answer("error", "transport_" + type(exc).__name__.lower()[:40], {})
+        # The gateway may have built a cart before the answer was lost: recorded on the row, which backs off.
+        return Answer("transport_error", "transport_" + type(exc).__name__.lower()[:40], {})
 
 
 # ---- the record ----------------------------------------------------------------------------------------------------
@@ -403,6 +454,7 @@ def verified_values(answer: Answer, c: Candidate, ref: ReferenceVariant, now: da
     if amount <= 0:
         return None, "applied_without_amount"
     automatic = []
+    automatic_amount = Decimal(0)
     for item in body.get("automatic") if isinstance(body.get("automatic"), list) else []:
         a = from_minor(item.get("amount") if isinstance(item, dict) else None, currency)
         if a is None:
@@ -410,6 +462,12 @@ def verified_values(answer: Answer, c: Candidate, ref: ReferenceVariant, now: da
         # One unit: a line and an order allocation both come off that unit. The route does not say which, and the
         # deal decision reads either the same way (services/deal_lane_decision.automatic_total).
         automatic.append({"title": "", "type": "line", "amount": str(a), "currency": currency})
+        automatic_amount += a
+    # The deal decision's own check (services/deal_lane_decision: a subtotal outside [effective price, unit price]
+    # is refused): a cart that fails it is not recorded as verified (review P3-2), e.g. a discount above the subtotal.
+    effective = unit - amount - automatic_amount
+    if effective < 0 or not (effective <= subtotal <= unit):
+        return None, "reference_cart_inconsistent"
     ttl = timedelta(hours=settings.deal_verify_ttl_hours)
     expires = now + ttl if c.ends_at is None else min(c.ends_at, now + ttl)
     if expires <= now:
@@ -443,7 +501,11 @@ async def _write(deal_id: str, variant_id: str, values: dict, now: datetime) -> 
 
 
 async def record(answer: Answer, c: Candidate, ref: ReferenceVariant, now: datetime) -> str:
-    """Write what the store said. Returns the count name."""
+    """Write what the store (or the route) said. Returns the count name."""
+    if answer.result in ("refused_request", "transport_error"):
+        # Not the store's verdict: the row backs off 7 days ("route:" prefix, `due`), and a verified row keeps its
+        # verification as on any other no-answer.
+        answer = Answer("route", answer.reason, {})
     if answer.result == "applied":
         values, why = verified_values(answer, c, ref, now)
         if values is not None:
@@ -456,13 +518,15 @@ async def record(answer: Answer, c: Candidate, ref: ReferenceVariant, now: datet
         await _remember_refusal(c, reason, now)
         return "rejected"
     reason = (answer.result + ":" + answer.reason) if answer.reason else answer.result
+    if answer.result == "route":
+        reason = "route:" + (answer.reason or "refused")
     existing = await _existing(c.deal_id, ref.variant_id)
     if existing is not None and existing["state"] == "checkout_verified":
         # Not a verdict: the verification stands until its own expiry; the attempt is recorded.
         await _write(c.deal_id, ref.variant_id, {"failure_reason": reason[:128]}, now)
     else:
         await _write(c.deal_id, ref.variant_id, {"state": "unverified", "failure_reason": reason[:128]}, now)
-    return answer.result
+    return "route_" + answer.reason[:48] if answer.result == "route" else answer.result
 
 
 async def _remember_refusal(c: Candidate, reason: str, now: datetime) -> None:
@@ -490,8 +554,11 @@ async def _refused_recently(c: Candidate, now: datetime) -> bool:
 # ---- the step ------------------------------------------------------------------------------------------------------
 
 async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.sleep,
-              monotonic=time.monotonic) -> Dict[str, int]:
-    """Verify the due codes once. Never raises. Returns counts ({} when the verifier is off)."""
+              monotonic=time.monotonic, deadline: Optional[float] = None) -> Dict[str, int]:
+    """Verify the due codes once. Never raises. Returns counts ({} when the verifier is off).
+
+    `deadline` is a `monotonic()` time the step must be done by (the refresh job passes its task timeout less a
+    margin, review P2-2): no cart is started with less than CART_HEADROOM_SECONDS left before it."""
     if not enabled():
         return {}
     counts: Dict[str, int] = {}
@@ -519,7 +586,15 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
         carts = 0
         hosts_done: set = set()
         started = monotonic()
+        seeds_by_host: Dict[str, List[Dict[str, Any]]] = {}
+        stopped = False
         for c in candidates:
+            if stopped:
+                bump("left_route_stopped")
+                continue
+            if deadline is not None and monotonic() + CART_HEADROOM_SECONDS > deadline:
+                bump("left_job_deadline")
+                continue
             if carts >= per_run:
                 bump("left_for_next_run")
                 continue
@@ -536,7 +611,7 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
                 if await _refused_recently(c, now):
                     bump("skipped_refused_recently")
                     continue
-                ref, why = await reference_variant(c)
+                ref, why = await reference_variant(c, seeds_by_host)
                 if ref is None:
                     bump("skipped_" + why)
                     continue
@@ -550,9 +625,15 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
                 carts += 1
                 answer = await call_route(c, ref, client=client)
                 if answer.result == "error":
+                    # 401, 404, 5xx: the route's configuration or health, not this row. Nothing is written, and the
+                    # run stops: spending the next hosts' slots would not help (review P2-1).
                     bump("route_errors")
                     bump("route_" + answer.reason[:48])
+                    stopped = True
                     continue
+                if answer.result == "transport_error":
+                    bump("route_errors")
+                    stopped = True  # recorded below (a cart may exist), and then no more calls this run
                 bump(await record(answer, c, ref, now))
             except Exception as exc:  # noqa: BLE001 - one code's failure never costs the others or the run
                 bump("errors")
