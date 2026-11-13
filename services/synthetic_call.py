@@ -18,6 +18,8 @@ A request is synthetic only when ALL of these hold, and anything else is an ordi
   5. the request is one the five read tools make (SYNTHETIC_READ_ROUTES, SYNTHETIC_READ_INVOKE_OPS). The
      assertion signs no operation, so the scope is enforced here: a valid header on a money or order path
      is refused (op_not_allowed) and that request writes as a real one;
+     (one route beside the read tools' own is in scope: the checkout door's cart referral, which only
+     issues a click, so that a synthetic caller's click is stamped test traffic like the others);
   6. the caller is not an OAuth client registered to a partner agent (agent_oauth_clients). Listing one by
      mistake must not cost that partner its rows and attribution.
 
@@ -63,6 +65,9 @@ SYNTHETIC_READ_ROUTES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
         ("GET", r"^/agent/v1/products/search$"),
         ("POST", r"^/agent/internal/products/search$"),
         ("POST", r"^/agent/shop/v1/attribution/external-seed-links$"),
+        # Not a read tool: the checkout door's cart referral writes one issued click, and a synthetic
+        # caller's must be stamped as test traffic like the clicks the routes above issue.
+        ("POST", r"^/agent/v2/storefront-cart-referrals$"),
         ("GET", r"^/agent/v1/products/merchants/[^/]+/variant/[^/]+$"),
         ("GET", r"^/agent/v1/product-groups/resolve$"),
         ("GET", r"^/agent/v1/product-groups/resolve-by-product-id$"),

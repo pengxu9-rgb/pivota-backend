@@ -1,0 +1,18 @@
+{
+ "_doc": "Reference code lists for tests/test_market_currency_defaults_ratchet.py. Taken 2026-11-12. Replace a list only from the named source and say so here. The currency list is CLDR's, not the ISO 4217 table.",
+ "iso_3166_1_alpha_2": {
+  "source": "IANA tz database release 2026d, file iso3166.tab, column 1 (its header: ISO 3166-1 alpha-2, current as of ISO/TC 46 N1127, 2024-02-29). Public domain.",
+  "count": 249,
+  "codes": "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW"
+ },
+ "cldr_currency_codes": {
+  "source": "Unicode CLDR 47 currency codes as shipped in ICU 77.1, read with Intl.supportedValuesOf('currency') in Node.js 24.10.0. This is NOT the ISO 4217 table: it is CLDR's list of ISO 4217 codes, which keeps some withdrawn codes and the X-codes, and lacks a few active ones (VED and the fund codes). It is used to DETECT a currency literal, where a wider list is the safe direction.",
+  "count": 162,
+  "codes": "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HRK HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XCG XDR XOF XPF XSU YER ZAR ZMW ZWG ZWL"
+ },
+ "not_valid_for_a_market": {
+  "source": "Hand-kept on 2026-11-12 from the published ISO 4217 amendments as remembered, NOT checked offline against the maintenance agency's list: CUC, HRK, SLL and ZWL were withdrawn between 2021 and 2024; XDR and XSU are not national currencies. ANG (being replaced by XCG) is left out because its withdrawal could not be checked here. Used only to refuse a registry market priced in one of these codes.",
+  "withdrawn": "CUC HRK SLL ZWL",
+  "not_a_national_currency": "XDR XSU"
+ }
+}
