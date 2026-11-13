@@ -100,3 +100,32 @@ def test_create_payment_link_omits_absent_optionals(monkeypatch) -> None:
 
     # Only order_id is sent; no empty/None optionals leak into the upstream body.
     assert captured["body"] == {"order_id": "ORD_3"}
+
+
+def test_create_payment_link_on_the_invoke_route_needs_a_credential(monkeypatch) -> None:
+    """Through the route (2026-11-12): anonymous is refused before the proxy; a checkout token
+    reaches the same handler as before. See tests/test_invoke_money_ops_require_credential.py."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    async def fake_proxy(method, path, body, *, checkout_token=None):
+        calls.append((path, body, checkout_token))
+        return {"checkout_session": {"hosted_url": "https://checkout.example/x"}}
+
+    monkeypatch.delenv("SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL", raising=False)
+    monkeypatch.setattr(gw, "_proxy_agent_api", fake_proxy)
+    app = FastAPI()
+    app.include_router(gw.router)
+    client = TestClient(app)
+    body = {"operation": "create_payment_link", "payload": {"order_id": "ORD_4"}}
+
+    anonymous = client.post("/agent/shop/v1/invoke", json=body)
+    assert anonymous.status_code == 401
+    assert anonymous.json()["detail"]["error"] == "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+    assert calls == []
+
+    tokened = client.post("/agent/shop/v1/invoke", json=body, headers={"X-Checkout-Token": "ctok_fixture"})
+    assert tokened.status_code == 200
+    assert calls == [("/agent/v2/payments/checkout-sessions", {"order_id": "ORD_4"}, "ctok_fixture")]

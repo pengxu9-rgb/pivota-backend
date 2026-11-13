@@ -497,6 +497,43 @@ async def test_issued_vs_clicked_counts_issue_and_follow_separately(click_db, mo
     assert "click_write_failures_this_process" in report
 
 
+async def test_issued_vs_clicked_leaves_the_storefront_hand_off_surface_out(click_db, monkeypatch):
+    """Rows on the hand-off surface (a hand-off record, a store-cart referral) are issued but are not
+    links: nobody can follow one through /r. With them in the table the report answers exactly what
+    it answers without them, and a link on any other surface still counts."""
+    from services.click_reporting import issued_vs_clicked
+    from services.commerce_attribution_service import IssuedClick, issue_clicks
+    from services.storefront_handoff_record import HANDOFF_SURFACE
+
+    monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
+    now = datetime.now(timezone.utc)
+    window = dict(start_at=now - timedelta(days=1), end_at=now + timedelta(days=1))
+    await issue_clicks([IssuedClick(click_id=f"clk_{i}", merchant_id=REAL, surface="agent") for i in range(3)])
+    await click_db.execute("UPDATE surface_click_events SET click_count = 1 WHERE click_id = 'clk_0'")
+    before = await issued_vs_clicked(**window)
+    before_for_seller = await issued_vs_clicked(merchant_id=REAL, **window)
+    assert (before["issued"], before["clicked"], before["issued_not_clicked"], before["follow_rate"]) == (3, 1, 2, 0.3333)
+
+    await issue_clicks([
+        IssuedClick(click_id="esh_record", merchant_id=REAL, surface=HANDOFF_SURFACE, commerce_surface=HANDOFF_SURFACE,
+                    context={"kind": HANDOFF_SURFACE}),
+        IssuedClick(click_id="clk_referral", merchant_id=REAL, surface=HANDOFF_SURFACE, commerce_surface=HANDOFF_SURFACE,
+                    context={"kind": "ucp_storefront_cart_referral"}),
+        IssuedClick(click_id="clk_referral_orphan", surface=HANDOFF_SURFACE, context={"kind": "ucp_storefront_cart_referral"}),
+        IssuedClick(click_id="clk_referral_rig", merchant_id=RIG, surface=HANDOFF_SURFACE),
+    ])
+    assert await issued_vs_clicked(**window) == before
+    assert await issued_vs_clicked(merchant_id=REAL, **window) == before_for_seller
+
+    # Every other surface still counts.
+    await issue_clicks([IssuedClick(click_id="clk_other", merchant_id=REAL, surface="find_products_multi"),
+                        IssuedClick(click_id="clk_rig", merchant_id=RIG, surface="agent")])
+    await click_db.execute("UPDATE surface_click_events SET click_count = 1 WHERE click_id = 'clk_other'")
+    after = await issued_vs_clicked(**window)
+    assert (after["issued"], after["clicked"], after["issued_not_clicked"], after["follow_rate"]) == (4, 2, 2, 0.5)
+    assert after["test_traffic_rows_excluded"] == before["test_traffic_rows_excluded"] + 1
+
+
 def test_issued_vs_clicked_route_is_staff_only():
     import main
 

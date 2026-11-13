@@ -569,7 +569,9 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
         return None
 
 
-async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
+async def resolve_agent_id_by_api_key(
+    api_key: str, metrics_out: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
     """agent_id for an X-API-Key value of an ACTIVE agent, or None.
 
     Routes that only need the caller's agent_id used to run
@@ -583,11 +585,15 @@ async def resolve_agent_id_by_api_key(api_key: str) -> Optional[str]:
     get_agent_context 403s the same agent. get_agent_by_key itself stays neutral (it returns
     inactive agents) so get_agent_context can answer 403 rather than 401 and introspection
     can report is_active.
+
+    `metrics_out` is passed to get_agent_by_key: its `auth_source` reads "error" when the lookup
+    failed (get_agent_by_key answers None for that too), so a caller can tell "no such active
+    agent" from "could not look".
     """
     key = str(api_key or "").strip()
     if not key:
         return None
-    agent = await get_agent_by_key(key)
+    agent = await get_agent_by_key(key, metrics_out=metrics_out)
     if not agent_is_active(agent):
         return None
     agent_id = agent.get("agent_id")
