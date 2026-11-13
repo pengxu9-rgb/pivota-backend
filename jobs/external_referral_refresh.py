@@ -73,6 +73,7 @@ from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
 from services import deal_code_capture
 from services import deal_code_retention
+from services import deal_code_verifier
 from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
@@ -168,6 +169,12 @@ async def run_daily_external_referral_refresh(
     retention = await deal_code_retention.run()
     if any(retention.values()):
         summary["deal_code_retention"] = retention
+    # ADR-027 D3: test the crawled codes on each store's own UCP door (services/deal_code_verifier.py). Off unless
+    # DEAL_VERIFY_JOB_ENABLED, DEAL_VERIFY_NONCONNECTED_ENABLED and the route key are all set; then it returns {} and
+    # the summary is unchanged. After retention, so it never builds a cart for a row retention just deleted.
+    verifier = await deal_code_verifier.run()
+    if verifier:
+        summary["deal_code_verifier"] = verifier
     return summary
 
 
@@ -389,6 +396,8 @@ def main() -> int:
     print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
     if "deal_code_capture" in summary:
         print("DEAL_CODE_CAPTURE " + json.dumps(summary["deal_code_capture"], separators=(",", ":"), default=str))
+    if "deal_code_verifier" in summary:
+        print("DEAL_CODE_VERIFIER " + json.dumps(summary["deal_code_verifier"], separators=(",", ":"), default=str))
     # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
     print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
     # And for the handle-less read rule (EXTERNAL_SEED_HANDLELESS_READ): only on a run that decided a row.

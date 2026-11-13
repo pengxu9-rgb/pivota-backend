@@ -405,6 +405,7 @@ _FLAGS = {
 _LIMITS = {
     "DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY": ("deal_verify_max_carts_per_host_per_day", 20, 1, 100),
     "DEAL_VERIFY_TTL_HOURS": ("deal_verify_ttl_hours", 24, 1, 24),
+    "DEAL_VERIFY_MAX_CARTS_PER_RUN": ("deal_verify_max_carts_per_run", 10, 1, 200),
 }
 
 

@@ -287,6 +287,19 @@ deal_verify_host_daily_carts = Table(
 )
 
 
+# ADR-027 Q18 retention (peng 2026-11-07): a code the store refused is deleted 7 days after the refusal, and only a
+# hash of (seller, market, code) with the store's reason is kept, for 30 days, so the crawled-code verifier
+# (services/deal_code_verifier.py) never builds another cart for a dead code the crawl reads again. Never the code.
+deal_code_refusals = Table(
+    "deal_code_refusals",
+    metadata,
+    Column("refusal_hash", String(64), primary_key=True),
+    Column("reason", String(128), nullable=True),
+    Column("refused_at", DateTime(timezone=True), nullable=False),
+)
+Index("idx_deal_code_refusals_refused_at", deal_code_refusals.c.refused_at)
+
+
 # D7 stop rule: while a market has an uncleared row, serving, the deal decision and the `/r` re-check
 # behave as if the emit, ranking and discount-param flags were off, including for links already issued.
 # Only a person clears one.

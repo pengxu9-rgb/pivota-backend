@@ -28,7 +28,7 @@ async def db(monkeypatch):
     from db.database import database, engine, metadata
 
     tables = [deal_lane.observed_store_offers, deal_lane.observed_store_offer_verifications, deal_lane.deal_lane_optout,
-              catalog_products]
+              catalog_products, deal_lane.deal_code_refusals]
     metadata.create_all(engine, tables=tables)
     was_connected = database.is_connected
     if not was_connected:
@@ -224,7 +224,7 @@ async def test_nothing_raises_when_the_database_is_down(monkeypatch):
     monkeypatch.setattr(database, "fetch_all", down)
     monkeypatch.setattr(database, "execute", down)
     out = await r.run(now=NOW)
-    assert out["errors"] == 5  # every rule failed, none raised
+    assert out["errors"] == 6  # every rule failed, none raised
 
 
 
