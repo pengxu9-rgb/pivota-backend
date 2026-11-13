@@ -311,6 +311,9 @@ ADMITTED_AFTER = {
     "checkout_token_with_own_key": TOKEN_HEADERS,
     "checkout_token_with_unknown_key": TOKEN_HEADERS,
 }
+# The proxy's own answer, flag on, for a presented key without the money gate's key format.
+BAD_FORMAT_ANSWER = {"detail": {"detail": "Invalid API Key format"}}
+
 # Callers the money gate refuses; with that gate switched OFF they reach the proxy.
 GATE_OFF_ONLY = {
     "no_credential": {},
@@ -444,25 +447,34 @@ def test_flag_on_a_keyless_caller_is_untouched(harness, monkeypatch, operation):
 @pytest.mark.parametrize("case", ["malformed_key", "unknown_key", "deactivated_key"])
 @pytest.mark.parametrize("operation", MONEY_OPERATIONS)
 def test_flag_on_a_presented_key_is_never_swapped_for_the_service_key(harness, monkeypatch, operation, case):
-    """With the money gate switched off a bad key reaches the proxy. It goes upstream as it is,
-    for that route to refuse; this service's key is not lent to a caller that named a key."""
+    """With the money gate switched off a bad key reaches the proxy. A key with the right format
+    goes upstream as it is, for that route to refuse; one without it is refused by the proxy and
+    nothing is sent. Either way this service's key is not lent to a caller that named a key."""
     monkeypatch.setenv(FLAG, "1")
     monkeypatch.setenv(GATE, "0")
     headers = GATE_OFF_ONLY[case]
-    _post(harness, operation, _payload(operation), headers)
+    res = _post(harness, operation, _payload(operation), headers)
+    if case == "malformed_key":
+        assert res.status_code == 401, res.text
+        assert res.json() == BAD_FORMAT_ANSWER
+        assert harness["sent"] == []
+        return
     assert _upstream_headers(harness) == {"Content-Type": "application/json", "X-API-Key": headers["X-API-Key"]}
 
 
-def _raw_asgi_post(app, operation: str, payload: Dict[str, Any], raw_headers: List[tuple]):
-    body = json.dumps({"operation": operation, "payload": payload}).encode()
+def _raw_asgi_post(
+    app, operation: str, payload: Dict[str, Any], raw_headers: List[tuple], *, path: str = INVOKE,
+    raw_body: Optional[Dict[str, Any]] = None,
+):
+    body = json.dumps({"operation": operation, "payload": payload} if raw_body is None else raw_body).encode()
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": INVOKE,
-        "raw_path": INVOKE.encode(),
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [
@@ -1124,3 +1136,280 @@ def test_flag_on_another_callers_order_gets_no_payment_link(loop, monkeypatch):
     res = _invoke(loop, "create_payment_link", OTHER_CALLER_KEY, order_id=CALLER_ORDER)
     assert res.status_code == 403, res.text
     assert loop["intents"] == []
+
+
+# ══ flag on: only a key with the money gate's format goes upstream ════════════
+# With the money gate switched off, any value a caller put in X-API-Key used to reach the proxy
+# and be sent on; a value that could not be sent as a header failed while the request was built
+# and the 502 quoted it back. The proxy now applies the gate's own format rule first.
+
+# Raw header bytes, as an ASGI server would hand them over (decoded as latin-1 by the framework).
+BAD_FORMAT_KEYS: Dict[str, bytes] = {
+    "twenty_thousand_chars": b"ak_live_" + b"a" * 20000,
+    "cr_lf_then_a_header": CALLER_KEY.encode() + b"\r\nX-Checkout-Token: injected",
+    "lf_inside": b"ak_live_" + b"1" * 32 + b"\n" + b"1" * 32,
+    "tab_inside": b"ak_live_" + b"1" * 32 + b"\t" + b"1" * 32,
+    "nul_at_the_end": CALLER_KEY.encode() + b"\x00",
+    "del_at_the_end": CALLER_KEY.encode() + b"\x7f",
+    "non_ascii": b"ak_live_\xe9\xe9",
+    "good_shape_then_non_ascii": CALLER_KEY.encode() + b"\xe9",
+    "two_keys_comma_joined": CALLER_KEY.encode() + b", " + OTHER_CALLER_KEY.encode(),
+    "uppercase_hex": b"ak_live_" + b"A" * 64,
+    "one_char_short": CALLER_KEY.encode()[:-1],
+    "one_char_long": CALLER_KEY.encode() + b"1",
+    "wrong_prefix": b"sk_live_" + b"1" * 64,
+    "short_text": MALFORMED_KEY.encode(),
+}
+BAD_FORMAT_IDS = sorted(BAD_FORMAT_KEYS)
+
+
+def _raw_invoke(h, operation: str, raw_headers: List[tuple]):
+    status, content = _raw_asgi_post(h["app"], operation, _payload(operation), raw_headers)
+    return status, content
+
+
+@pytest.mark.parametrize("shape", BAD_FORMAT_IDS)
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_flag_on_a_key_without_the_gates_format_is_401_at_the_proxy_and_is_not_echoed(
+    harness, monkeypatch, caplog, operation, shape
+):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(GATE, "0")
+    caplog.set_level(logging.DEBUG)
+    raw = BAD_FORMAT_KEYS[shape]
+    for header in ((b"x-api-key", raw), (b"authorization", b"Bearer " + raw)):
+        harness["sent"].clear()
+        status, content = _raw_invoke(harness, operation, [header])
+        assert status == 401, (header[0], content)
+        # The whole body is fixed: none of the caller's bytes can be in it.
+        assert content == b'{"detail":{"detail":"Invalid API Key format"}}', header[0]
+        assert json.loads(content) == BAD_FORMAT_ANSWER
+        assert harness["sent"] == [], "nothing goes upstream, on any key"
+    assert raw.decode("latin-1").strip() not in caplog.text
+    assert "injected" not in caplog.text
+    assert harness["db_calls"] == []
+
+
+@pytest.mark.parametrize("shape", BAD_FORMAT_IDS)
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_flag_off_a_key_without_the_gates_format_is_served_as_before(harness, monkeypatch, operation, shape):
+    """Flag off, money gate off: the request sent before the flag existed (this service's key)."""
+    monkeypatch.setenv(GATE, "0")
+    status, content = _raw_invoke(harness, operation, [(b"x-api-key", BAD_FORMAT_KEYS[shape])])
+    assert status == 200, content
+    assert _upstream_headers(harness) == SERVICE_KEY_HEADERS
+
+
+@pytest.mark.parametrize("flag", [None, "1"], ids=["flag_off", "flag_on"])
+@pytest.mark.parametrize("shape", BAD_FORMAT_IDS)
+def test_the_money_gate_refuses_a_key_without_its_format_before_the_proxy_whatever_the_flag(
+    harness, monkeypatch, shape, flag
+):
+    _set_flag(monkeypatch, flag)
+    for operation in MONEY_OPERATIONS:
+        status, content = _raw_invoke(harness, operation, [(b"x-api-key", BAD_FORMAT_KEYS[shape])])
+        assert status == 401, content
+        assert json.loads(content)["detail"]["error"] == gw.CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION
+        assert harness["sent"] == []
+
+
+@pytest.mark.parametrize("shape", BAD_FORMAT_IDS)
+def test_the_proxy_refuses_a_key_without_the_gates_format_before_it_needs_any_key_of_its_own(
+    harness, monkeypatch, shape
+):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setattr(gw, "AGENT_API_KEY", None)
+    key = BAD_FORMAT_KEYS[shape].decode("latin-1")
+    with pytest.raises(gw.HTTPException) as refused:
+        _proxy(caller_api_key=key)
+    assert refused.value.status_code == 401
+    assert refused.value.detail == {"detail": "Invalid API Key format"}
+    assert harness["sent"] == []
+
+
+def test_the_proxys_bad_format_answer_is_a_fresh_copy_each_time(harness, monkeypatch):
+    """The answer is built from a module constant; a handler that changed one answer's detail
+    must not change the next one."""
+    monkeypatch.setenv(FLAG, "1")
+    details = []
+    for _ in range(2):
+        with pytest.raises(gw.HTTPException) as refused:
+            _proxy(caller_api_key=MALFORMED_KEY)
+        details.append(refused.value.detail)
+        refused.value.detail["detail"] = "changed by a handler"
+    assert details[0] is not details[1]
+    assert gw._FORWARD_CALLER_KEY_BAD_FORMAT_DETAIL == {"detail": "Invalid API Key format"}
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        (CALLER_KEY, True),
+        ("ak_" + "0" * 64, True),
+        (UNKNOWN_KEY, True),
+        (INTERNAL_KEY, True),
+        (MALFORMED_KEY, False),
+        ("", False),
+        ("ak_live_" + "a" * 20000, False),
+        (CALLER_KEY + "\r\nX-Checkout-Token: injected", False),
+        ("ak_live_\xe9\xe9", False),
+        (INTERNAL_KEY + "x", False),
+        (INTERNAL_KEY + "\xe9", False),
+    ],
+)
+def test_the_format_rule(harness, key, expected):
+    assert gw._agent_key_has_money_gate_format(key) is expected
+
+
+def _function(tree: ast.Module, name: str) -> ast.AST:
+    return next(
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
+
+
+def test_the_gate_and_the_proxy_read_one_format_rule():
+    """One rule, not two: the key regex is named in the rule only, and both the money gate and
+    the proxy call the rule. A second copy could drift and let the proxy send a value the gate
+    calls malformed."""
+    tree = _module_tree()
+    rule = "_agent_key_has_money_gate_format"
+    for reader in ("_money_operation_refusal_reason", "_proxy_agent_api"):
+        assert len(_calls_to(_function(tree, reader), rule)) == 1, reader
+    regex_readers = [
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(n, ast.Name) and n.id == "_AGENT_API_KEY_RE" for n in ast.walk(node))
+    ]
+    assert regex_readers == [rule]
+
+
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_flag_on_a_bad_format_key_is_401_through_the_real_upstream_routes_too(loop, monkeypatch, operation):
+    """Same answer as the upstream route gave for a malformed key, now without the upstream call."""
+    monkeypatch.setenv(GATE, "0")
+    monkeypatch.setenv(FLAG, "1")
+    res = _invoke(loop, operation, MALFORMED_KEY)
+    assert res.status_code == 401, res.text
+    assert res.json() == BAD_FORMAT_ANSWER
+    assert loop["sent"] == [] and loop["authenticated"] == []
+
+
+# ══ a non-ASCII key with an internal trusted key configured ═══════════════════
+# The trusted-key check compared two str in constant time, which raises on a non-ASCII
+# character: with any trusted key configured, a key carrying one byte >= 0x80 raised out of the
+# money gate (and out of the keyed routes' auth dependency) as a 500. It compares bytes now.
+
+NON_ASCII_KEYS: Dict[str, bytes] = {
+    "non_ascii": b"ak_live_\xe9\xe9",
+    "good_shape_then_non_ascii": CALLER_KEY.encode() + b"\xe9",
+    "trusted_key_then_non_ascii": INTERNAL_KEY.encode() + b"\xe9",
+    "one_high_byte": b"\xff",
+}
+
+
+@pytest.mark.parametrize("flag", [None, "1"], ids=["flag_off", "flag_on"])
+@pytest.mark.parametrize("shape", sorted(NON_ASCII_KEYS))
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_a_non_ascii_key_gets_the_money_gates_refusal_not_a_500_with_a_trusted_key_configured(
+    harness, monkeypatch, operation, shape, flag
+):
+    assert agent_auth._INTERNAL_TRUSTED_API_KEYS == (INTERNAL_KEY,)
+    _set_flag(monkeypatch, flag)
+    for header in ((b"x-api-key", NON_ASCII_KEYS[shape]), (b"authorization", b"Bearer " + NON_ASCII_KEYS[shape])):
+        status, content = _raw_invoke(harness, operation, [header])
+        assert status == 401, (header[0], content)
+        assert json.loads(content)["detail"] == {
+            "error": gw.CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION,
+            "message": (
+                "This operation creates or changes an order or a payment. Send an active agent "
+                "API key (X-API-Key or Authorization: Bearer) or a checkout token (X-Checkout-Token)."
+            ),
+            "operation": operation,
+        }
+        assert harness["sent"] == []
+    assert harness["db_calls"] == []
+
+
+@pytest.mark.parametrize("shape", sorted(NON_ASCII_KEYS))
+def test_a_non_ascii_key_is_the_keyed_routes_normal_401_with_a_trusted_key_configured(loop, monkeypatch, shape):
+    """The same helper runs in the keyed routes' auth dependency: called directly (not through
+    /invoke) with a non-ASCII key they answer their malformed-key 401, not a 500."""
+    monkeypatch.setattr(agent_auth, "_INTERNAL_TRUSTED_API_KEYS", (INTERNAL_KEY,))
+    status, content = _raw_asgi_post(
+        loop["client"].app, "", {}, [(b"x-api-key", NON_ASCII_KEYS[shape])],
+        path="/agent/v1/orders/payment-offer-evidence",
+        raw_body=_payload("record_payment_offer_evidence"),
+    )
+    assert status == 401, content
+    assert json.loads(content) == {"detail": "Invalid API Key format"}
+    assert loop["authenticated"] == []
+
+
+@pytest.mark.parametrize(
+    "trusted,candidate,expected",
+    [
+        ((INTERNAL_KEY,), INTERNAL_KEY, True),
+        ((INTERNAL_KEY,), f"  {INTERNAL_KEY} ", True),
+        (("other-fixture-key", INTERNAL_KEY), INTERNAL_KEY, True),
+        ((INTERNAL_KEY,), INTERNAL_KEY + "x", False),
+        ((INTERNAL_KEY,), INTERNAL_KEY[:-1], False),
+        ((INTERNAL_KEY,), "ak_live_\xe9\xe9", False),
+        ((INTERNAL_KEY,), INTERNAL_KEY + "\xe9", False),
+        ((INTERNAL_KEY,), "中文", False),
+        ((INTERNAL_KEY,), "\ud800", False),
+        (("fixture-k\xe9y",), "fixture-k\xe9y", True),
+        (("fixture-k\xe9y",), "fixture-key", False),
+        (("fixture-k\xe9y",), CALLER_KEY, False),
+        ((INTERNAL_KEY,), "", False),
+        ((INTERNAL_KEY,), None, False),
+        ((), INTERNAL_KEY, False),
+        ((), "ak_live_\xe9\xe9", False),
+    ],
+)
+def test_the_trusted_key_check_answers_for_any_text_and_never_raises(monkeypatch, trusted, candidate, expected):
+    monkeypatch.setattr(agent_auth, "_INTERNAL_TRUSTED_API_KEYS", trusted)
+    assert agent_auth._is_internal_trusted_api_key(candidate) is expected
+
+
+def test_the_other_readers_of_the_trusted_key_check_do_not_raise_on_a_non_ascii_key(monkeypatch):
+    monkeypatch.setattr(agent_auth, "_INTERNAL_TRUSTED_API_KEYS", (INTERNAL_KEY,))
+    monkeypatch.setattr(agent_auth, "get_agent_by_key", _get_agent_by_key)
+    for key in ("ak_live_\xe9\xe9", CALLER_KEY + "\xe9", INTERNAL_KEY + "\xe9"):
+        assert asyncio.run(agent_auth.resolve_issuing_agent_id(key)) is None
+        assert asyncio.run(agent_auth._is_service_caller(key)) is False
+    assert asyncio.run(agent_auth.resolve_issuing_agent_id(INTERNAL_KEY)) is None
+    assert asyncio.run(agent_auth._is_service_caller(INTERNAL_KEY)) is True
+
+
+# ══ pinned as it is: an empty X-API-Key header ahead of a real one ════════════
+# The key reader takes the FIRST X-API-Key header. When that one is empty the request counts as
+# carrying no key, whatever a later header says: the money gate refuses it, and with that gate
+# switched off it is served on this service's key like any keyless request, flag on or off.
+
+@pytest.mark.parametrize("flag", [None, "1"], ids=["flag_off", "flag_on"])
+@pytest.mark.parametrize("empty", [b"", b"   "], ids=["empty", "blank"])
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_pinned_an_empty_key_header_ahead_of_a_real_one_is_a_keyless_request(harness, monkeypatch, operation, empty, flag):
+    _set_flag(monkeypatch, flag)
+    duplicate = [(b"x-api-key", empty), (b"x-api-key", CALLER_KEY.encode())]
+
+    status, content = _raw_invoke(harness, operation, duplicate)
+    assert status == 401, content
+    assert json.loads(content)["detail"]["error"] == gw.CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION
+    assert harness["sent"] == []
+
+    monkeypatch.setenv(GATE, "0")
+    status, content = _raw_invoke(harness, operation, duplicate)
+    assert status == 200, content
+    assert _upstream_headers(harness) == SERVICE_KEY_HEADERS, "keyless: the caller's later key is not read"
+
+
+@pytest.mark.parametrize("operation", MONEY_OPERATIONS)
+def test_pinned_a_real_key_header_ahead_of_an_empty_one_is_that_key(harness, monkeypatch, operation):
+    monkeypatch.setenv(FLAG, "1")
+    status, content = _raw_invoke(
+        harness, operation, [(b"x-api-key", CALLER_KEY.encode()), (b"x-api-key", b"")]
+    )
+    assert status == 200, content
+    assert _upstream_headers(harness) == {"Content-Type": "application/json", "X-API-Key": CALLER_KEY}

@@ -585,6 +585,14 @@ def _invoke_money_ops_require_credential() -> bool:
     return raw not in _MONEY_OPS_REQUIRE_CREDENTIAL_OFF_VALUES
 
 
+def _agent_key_has_money_gate_format(api_key: str) -> bool:
+    """The money gate's key-format rule: an internal trusted key, or the agent key shape.
+
+    The ONE rule, read by the gate below and by _proxy_agent_api before it forwards a caller's
+    own key, so the proxy can never send upstream a value the gate would call malformed."""
+    return _is_internal_trusted_api_key(api_key) or bool(_AGENT_API_KEY_RE.match(api_key))
+
+
 async def _money_operation_refusal_reason(
     request: Request, *, checkout_token: Optional[str]
 ) -> Optional[str]:
@@ -601,10 +609,10 @@ async def _money_operation_refusal_reason(
     api_key = request_api_key(request)
     if not api_key:
         return "no_credential"
+    if not _agent_key_has_money_gate_format(api_key):
+        return "malformed_key"
     if _is_internal_trusted_api_key(api_key):
         return None
-    if not _AGENT_API_KEY_RE.match(api_key):
-        return "malformed_key"
     lookup: Dict[str, Any] = {}
     try:
         agent_id = await resolve_agent_id_by_api_key(api_key, metrics_out=lookup)
@@ -654,11 +662,16 @@ async def _require_credential_for_money_operation(
 # With SHOP_INVOKE_FORWARD_CALLER_KEY on, the key the caller presented (request_api_key: the
 # same value the money gate above judged) is what goes upstream, as X-API-Key. Precedence:
 # checkout token, then the caller's own key, then (no key presented) this service's key as
-# before. A presented key is never swapped for this service's key: the upstream route judges it.
+# before. A presented key is never swapped for this service's key: the upstream route judges it,
+# or, when it does not have the money gate's key format, the proxy answers 401 itself and sends
+# nothing upstream.
 # Read per call. Only 1/true/on/yes switch it on; unset or anything else is OFF, and OFF is
 # the request this route sent before the flag existed.
 _FORWARD_CALLER_KEY_ENV = "SHOP_INVOKE_FORWARD_CALLER_KEY"
 _FORWARD_CALLER_KEY_ON_VALUES = frozenset({"1", "true", "on", "yes"})
+# With the flag on, a presented key that fails the money gate's format rule
+# (_agent_key_has_money_gate_format) is answered 401 at the proxy with this fixed body.
+_FORWARD_CALLER_KEY_BAD_FORMAT_DETAIL = {"detail": "Invalid API Key format"}
 
 
 def _invoke_forwards_caller_key() -> bool:
@@ -18713,10 +18726,13 @@ async def _proxy_agent_api(
     if token:
         headers["X-Checkout-Token"] = token
     elif own_key:
-        if not own_key.isascii():
-            # Not sendable as a header and not a key the upstream route accepts; answer what
-            # that route answers for a malformed key instead of failing while building the request.
-            raise HTTPException(status_code=401, detail={"detail": "Invalid API Key format"})
+        if not _agent_key_has_money_gate_format(own_key):
+            # Reachable only with the money gate switched off (the gate refuses this value
+            # first). Not a key the upstream route accepts, and possibly not sendable as a
+            # header at all (over-long, control characters, non-ASCII): answer what that route
+            # answers for a malformed key, with a fixed body that carries none of the caller's
+            # bytes, instead of sending it or failing while building the request.
+            raise HTTPException(status_code=401, detail=dict(_FORWARD_CALLER_KEY_BAD_FORMAT_DETAIL))
         headers["X-API-Key"] = own_key
     else:
         if not AGENT_API_KEY:
