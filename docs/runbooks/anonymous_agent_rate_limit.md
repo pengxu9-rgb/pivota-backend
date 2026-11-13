@@ -528,6 +528,14 @@ That wait does NOT bound an order whose quote carries no `expires_at`: it is nev
 `QUOTE_EXPIRED`, so it stays payable by its owner, and refused to anyone else, for as long
 as it is unpaid. Such orders show as `quote=none`.
 
+The wait does NOT bound `confirm-payment` either. That route has no quote check and is
+called long after the quote has expired: to retry the merchant-order sync of an order
+that is already paid, and to finish an authorization-first payment (confirm the buyer's
+approval at the PSP, then capture) whenever the buyer comes back. Enforced, a confirm
+call made with any credential other than the one that created the order is refused for
+as long as the order exists: the sync retry never happens, and an approved authorization
+is never captured. Such calls show as `route=payment_confirm` with `quote=expired`.
+
 ### Credential mixes that are refused once enforced
 
 The owner is the agent of the credential the order was CREATED with. Paying, annotating,
@@ -575,6 +583,14 @@ one partner or one session:
      two agents look the same; ask before enforcing.
    - `caller_kind=checkout_token`: an order whose stored owner id differs from the token's
      agent only by whitespace. Fix the stored id.
+   - `route=payment_confirm` with `quote=expired` (or `quote=none`): a confirm call on an
+     order past its quote from a credential that did not create it. This is a real
+     payment whose capture or merchant-order sync would stop for good once enforced; the
+     wait of step 1 does not make these go away. Their count must be ZERO, or every one
+     explained, before step 3. To get there: let authorizations that were opened under
+     the old credential finish or lapse (the PSP's authorization window, days, not the
+     quote's minutes), and make every caller send its confirm calls with the credential
+     that created the order.
    - `route=payment_status` with `quote=expired`: a caller reading back an old payment of
      an order it does not own, typically one made through `/invoke` before step 1.
      Enforced, that read is refused for good.

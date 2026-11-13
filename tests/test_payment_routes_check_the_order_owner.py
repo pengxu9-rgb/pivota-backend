@@ -227,6 +227,12 @@ SHAPES: Dict[str, Dict[str, Any]] = {
     "paid": dict(payment_status="paid"),
     "expired_quote": dict(quote_expires_at=PAST_QUOTE_EXPIRY),
     "authorization_first": dict(payment_status="pending", psp="paypal", metadata=AUTH_FIRST),
+    # The four states confirm-payment calls terminal: it answers at once, with the order's payment
+    # intent id, and does nothing else.
+    "terminal_payment_failed": dict(payment_status="failed"),
+    "terminal_cancelled": dict(payment_status="canceled"),
+    "terminal_refunded": dict(payment_status="refunded"),
+    "terminal_partially_refunded": dict(payment_status="partial_refund"),
 }
 
 
@@ -295,6 +301,8 @@ def build_harness(monkeypatch, *, service_key_is_internal_trusted: bool = False)
         "reads": [],           # every database read a route made, in order
         "psp_calls": [],       # new payment surfaces asked of the PSP
         "upstream": [],        # what the /invoke proxy sent
+        "governance": [],      # agent ids confirm-payment asked the governance check about
+        "store_reads": [],     # (route module, merchant) of every store lookup
         "authenticated": [],   # agent ids the auth dependency admitted
     }
 
@@ -378,7 +386,18 @@ def build_harness(monkeypatch, *, service_key_is_internal_trusted: bool = False)
             monkeypatch.setattr(shared_database, name, _refuse(name))
 
     async def get_primary_store(merchant_id):
+        state["store_reads"].append(["payments", merchant_id])
         return {"platform": "shopify", "store_id": "store_fixture", "merchant_id": merchant_id}
+
+    async def confirm_get_primary_store(merchant_id):
+        state["store_reads"].append(["confirm", merchant_id])
+        return {"platform": "shopify", "store_id": "store_fixture", "merchant_id": merchant_id}
+
+    real_validate_request_compat = agent_api.validate_request_compat
+
+    async def validate_request_compat(governance, agent_id, *, fail_closed=False):
+        state["governance"].append(agent_id)
+        return await real_validate_request_compat(governance, agent_id, fail_closed=fail_closed)
 
     async def no_runtime_psp(*args, **kwargs):
         return None
@@ -463,7 +482,8 @@ def build_harness(monkeypatch, *, service_key_is_internal_trusted: bool = False)
     monkeypatch.setattr(order_routes, "verify_order_payment_succeeded", verify_order_payment_succeeded)
     monkeypatch.setattr(order_routes, "mark_order_paid", mark_order_paid)
     monkeypatch.setattr(order_routes, "log_order_event", log_order_event)
-    monkeypatch.setattr("services.merchant_store_service.get_primary_store", get_primary_store)
+    monkeypatch.setattr("services.merchant_store_service.get_primary_store", confirm_get_primary_store)
+    monkeypatch.setattr(agent_api, "validate_request_compat", validate_request_compat)
     monkeypatch.setattr("services.pcs_evidence_pack_service.create_order_snapshot_evidence_pack", create_order_snapshot_evidence_pack)
     monkeypatch.setattr("services.agent_webhook_service.emit_agent_webhook_event", emit_agent_webhook_event)
     monkeypatch.setattr(agent_api, "enqueue_merchant_order_create", enqueue_merchant_order_create)
@@ -610,7 +630,7 @@ def run_matrix(h) -> List[Dict[str, Any]]:
     for route in ROUTES:
         for caller in CALLERS:
             for order_id in MATRIX_ORDERS:
-                for key in ("writes", "reads", "psp_calls"):
+                for key in ("writes", "reads", "psp_calls", "governance", "store_reads"):
                     h[key].clear()
                 res = call(h, route, caller, order_id)
                 try:
@@ -621,6 +641,7 @@ def run_matrix(h) -> List[Dict[str, Any]]:
                     "route": route, "caller": caller, "order": order_id, "status": res.status_code, "body": body,
                     "writes": copy.deepcopy(h["writes"]), "reads": copy.deepcopy(h["reads"]),
                     "psp_calls": copy.deepcopy(h["psp_calls"]),
+                    "governance": list(h["governance"]), "store_reads": copy.deepcopy(h["store_reads"]),
                 })
     return records
 
@@ -725,7 +746,7 @@ def assert_carries_nothing_of_the_order(h, res, order_id: str) -> None:
 
 
 def _reset(h) -> None:
-    for key in ("writes", "reads", "psp_calls", "upstream", "authenticated"):
+    for key in ("writes", "reads", "psp_calls", "upstream", "authenticated", "governance", "store_reads"):
         h[key].clear()
 
 
@@ -749,6 +770,10 @@ def test_who_is_served_and_who_is_refused(h, monkeypatch, owner_lines, route, mo
             else:
                 assert (res.status_code, res.json()) == want, (where, res.text)
                 assert h["writes"] == [] and h["psp_calls"] == [], where
+                if route != "payments_create" or want == (403, OWNER_DENIED):
+                    # (Off, a caller outside the scope gets as far as the payment route's store
+                    # lookup only when its scope holds the merchant; refused, nobody does.)
+                    assert h["governance"] == [] and h["store_reads"] == [], where
                 assert_carries_nothing_of_the_order(h, res, order_id)
             lines = [r.getMessage() for r in owner_lines]
             scope = expected_line_scope(route, relation, mode)
@@ -1049,11 +1074,40 @@ CONFIRM_SERVED = {
     "paid": ("success", [], []),
     "fresh": ("success", ["verify"], ["mark_order_paid", "evidence_pack", "log_order_event", "webhook"]),
     "authorization_first": ("success", ["confirm_payment", "capture"], ["finalize_authorized_payment_order"]),
+    "terminal_payment_failed": ("payment_failed", [], []),
+    "terminal_cancelled": ("cancelled", [], []),
+    "terminal_refunded": ("refunded", [], []),
+    "terminal_partially_refunded": ("partially_refunded", [], []),
 }
 
 
 def test_the_confirm_shapes_cover_every_order_shape():
     assert set(CONFIRM_SERVED) == set(SHAPES)
+
+
+def test_the_terminal_shapes_are_the_states_the_confirm_route_calls_terminal():
+    terminal = {status for shape, (status, _, _) in CONFIRM_SERVED.items() if shape.startswith("terminal_")}
+    assert terminal == set(agent_api._TERMINAL_CONFIRM_PAYMENT_STATUSES)
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_a_governance_refusal_of_the_caller_is_only_reached_by_the_owner_once_enforced(h, monkeypatch, mode):
+    """The governance check answers about the CALLER (suspended, blocked). It comes after the owner
+    check: enforced, a caller that is not the owner gets the owner refusal and is never judged there."""
+    async def suspended(agent_id, *, fail_closed=False):
+        return {"agent_id": agent_id, "max_requests_per_minute": 100000, "max_error_rate": 1.0, "status": "suspended"}
+
+    monkeypatch.setattr(governance_module.agent_governance, "_get_policy", suspended)
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    owner = call(h, "payment_confirm", "owner", O_OWNER)
+    assert owner.status_code == 403 and owner.json() != OWNER_DENIED and h["governance"] == [OWNER_AGENT]
+    _reset(h)
+    other = call(h, "payment_confirm", "scoped", O_OWNER)
+    if mode == "enforce":
+        assert (other.status_code, other.json()) == (403, OWNER_DENIED) and h["governance"] == []
+    else:
+        assert (other.status_code, other.json()) == (owner.status_code, owner.json()) and h["governance"] == [SCOPED_AGENT]
+    assert h["store_reads"] == [] and h["psp_calls"] == [] and h["writes"] == []
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -1066,10 +1120,14 @@ def test_enforce_confirm_payment_does_nothing_for_a_caller_that_is_not_the_owner
     owner = h["orders"][order_id]["agent_id"]
     h["orders"][order_id] = _order(order_id, agent_id=owner, **SHAPES[shape])
 
+    caller_agent = CALLER_AGENTS[caller]
+    _reset(h)
     off = call(h, "payment_confirm", caller, order_id)
     assert off.status_code == 200 and off.json()["status"] == status, off.text
     assert [c["psp"] for c in h["psp_calls"]] == psp_steps
     assert [w["write"] for w in h["writes"]] == writes
+    # Off, the route asks governance about this caller and reads the merchant's store for it.
+    assert h["governance"] == [caller_agent] and h["store_reads"] == [["confirm", MERCHANT]]
     if SHAPES[shape].get("with_surface", True):
         assert off.json()["payment_intent_id"] == intent_of(order_id)
 
@@ -1080,9 +1138,12 @@ def test_enforce_confirm_payment_does_nothing_for_a_caller_that_is_not_the_owner
         if mode == "observe":
             assert (res.status_code, res.json()) == (off.status_code, off.json())
             assert [c["psp"] for c in h["psp_calls"]] == psp_steps and [w["write"] for w in h["writes"]] == writes
+            assert h["governance"] == [caller_agent] and h["store_reads"] == [["confirm", MERCHANT]]
             continue
         assert (res.status_code, res.json()) == (403, OWNER_DENIED)
         assert h["psp_calls"] == [] and h["writes"] == [] and h["reads"] == []
+        # Refused before the governance check and before the store is read: nothing ran for this caller.
+        assert h["governance"] == [] and h["store_reads"] == []
         assert_carries_nothing_of_the_order(h, res, order_id)
         assert "pending" not in res.text and "paid" not in res.text
 
@@ -1098,6 +1159,9 @@ def test_the_owner_confirms_its_payment_in_every_mode_in_the_currency_of_the_ord
     res = call(h, "payment_confirm", "owner", O_OWNER)
     assert res.status_code == 200 and res.json()["status"] == status and res.json()["order_id"] == O_OWNER
     assert [c["psp"] for c in h["psp_calls"]] == psp_steps and [w["write"] for w in h["writes"]] == writes
+    assert h["governance"] == [OWNER_AGENT] and h["store_reads"] == [["confirm", MERCHANT]]
+    if shape.startswith("terminal_"):
+        assert res.json()["payment_intent_id"] == intent_of(O_OWNER) and res.json()["payment_status"] == status
     # Every amount the route records or sends on is in the order's own currency.
     for record in h["writes"] + h["psp_calls"]:
         for carried in (record.get("currency"), (record.get("payload") or {}).get("currency")):
