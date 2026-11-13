@@ -772,6 +772,19 @@ def test_the_refresh_update_path_touches_only_image_retries_timeout_and_args(tmp
         assert _values(tokens, flag) == [], f"{flag} must not be on the update path"
 
 
+def test_the_refresh_task_timeout_and_the_verifiers_deadline_come_from_one_value(tmp_path):
+    """be#2814 review N-5: the crawled-code verifier finishes before the job's task timeout. A create sets the env
+    the job reads; an update cannot (the env is hand-set), so the job's own default must equal the script's value."""
+    from jobs import external_referral_refresh as job
+
+    calls = _run(tmp_path, {"EXTERNAL_REFERRAL_REFRESH": "true"})
+    (tokens,) = _refresh_calls(calls)
+    timeout = int(_values(tokens, "--task-timeout")[-1].rstrip("s"))
+    env = dict(kv.split("=", 1) for kv in ",".join(_values(tokens, "--set-env-vars")).split(","))
+    assert int(env["EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS"]) == timeout
+    assert job.TASK_TIMEOUT_SECONDS_DEFAULT == timeout
+
+
 # ── the external-seed destination sweep (be#2641): an UPDATE never rebuilds the job ─────────────────
 SWEEP = "external-seed-destination-sweep"
 

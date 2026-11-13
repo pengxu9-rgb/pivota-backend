@@ -41,9 +41,11 @@ WHAT IS RECORDED, per answer:
                    stops at its expiry anyway) and records the reason;
   - the route refused the request (400, or `invalid`): `unverified` with `route:<reason>`, backed off 7 days, and the
                    run goes on;
-  - the answer was lost (a transport error; the gateway may have built a cart): the same, and the run stops;
-  - 401, 404, 5xx or an unreadable answer: the route's configuration or health, not the row's. Nothing is written,
-                   the slot stays spent, and the run stops.
+  - the answer was lost (a transport error) or cannot be read (a 200 that is not JSON, or an unknown result); the
+                   gateway may have built a cart: the same, and the run stops;
+                   (in both route cases a verified row keeps its verification and records only the reason;)
+  - 401, 404 or 5xx: the route's configuration or health, not the row's. Nothing is written, the slot stays spent,
+                   and the run stops.
   - an applied answer whose cart is not whole and consistent (unit >= subtotal >= unit - code - automatic >= 0) is
                    recorded as not confirmed.
 TIME: no cart is started with less than CART_HEADROOM_SECONDS left before the caller's deadline (the refresh job's
@@ -69,7 +71,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, or_, select
 
 from config.settings import settings
 from db.database import database
@@ -202,6 +204,18 @@ def due(offer: Mapping[str, Any], verifications: Iterable[Mapping[str, Any]], no
     if last_attempt > now - backoff:
         return None
     return 2, last_attempt
+
+
+async def _not_verifiable_market_count(now: datetime) -> int:
+    """Crawl rows the verifier would test (a code of a verifiable kind, not ended) but for their market: none, or one
+    this verifier cannot test (GB, DE, ...). Counted so the summary names them (review N-6); rows it would skip
+    anyway (free shipping, ended) are not counted, so the number is what the market rule alone leaves out."""
+    row = await database.fetch_one(
+        select(func.count()).select_from(o)
+        .where(and_(writer.crawl_rows(), o.c.code.isnot(None), o.c.kind.in_(VERIFIABLE_KINDS),
+                    or_(o.c.ends_at.is_(None), o.c.ends_at > now),
+                    or_(o.c.market.is_(None), o.c.market.notin_(sorted(MARKET_CURRENCY))))))
+    return int(row[0] or 0) if row is not None else 0
 
 
 async def _candidates(now: datetime) -> List[Candidate]:
@@ -381,7 +395,9 @@ async def reserve_cart(host: str, now: datetime) -> bool:
 
 @dataclass(frozen=True)
 class Answer:
-    result: str  # one of _RESULTS, "refused_request" (the route refused this row's request) or "error"
+    # one of _RESULTS; "refused_request" (the route refused this row's request); "unreadable_answer" (a 200 this
+    # verifier cannot read); "transport_error"; or "error"
+    result: str
     reason: str
     body: Dict[str, Any]
 
@@ -395,16 +411,21 @@ def read_answer(status: int, body: Any) -> Answer:
       - a 200 with a known result: that result;
       - a 400, or a 200 answering `invalid`: `refused_request`, the route's reason kept. The request for THIS row is
         what it refused (a host it never contacts, a code it cannot send), so the row backs off (review P2-1);
-      - anything else (401, 404, 5xx, a body that is not JSON, an unknown result): `error`. That is the route's
-        configuration or health, not the row's: the run stops."""
+      - a 200 whose body is not a JSON object, or whose result is unknown (a gateway newer than this verifier):
+        `unreadable_answer`. The gateway answered, so a cart was likely built: the row is recorded and backs off,
+        and the run stops (review N-1);
+      - anything else (401, 404, 5xx): `error`. That is the route's configuration or health, not the row's: nothing
+        is written and the run stops."""
     data = body if isinstance(body, dict) else {}
     if status == 400 or (status == 200 and data.get("result") == "invalid"):
         return Answer("refused_request", _token(data.get("reason")) or "invalid_request", {})
-    if status != 200 or not isinstance(body, dict):
+    if status != 200:
         return Answer("error", f"http_{status}", {})
+    if not isinstance(body, dict):
+        return Answer("unreadable_answer", "unreadable", {})
     result = body.get("result")
     if result not in _RESULTS:
-        return Answer("error", "unknown_result", {})
+        return Answer("unreadable_answer", "unknown_result", {})
     return Answer(result, _token(body.get("reason")), body)
 
 
@@ -502,7 +523,7 @@ async def _write(deal_id: str, variant_id: str, values: dict, now: datetime) -> 
 
 async def record(answer: Answer, c: Candidate, ref: ReferenceVariant, now: datetime) -> str:
     """Write what the store (or the route) said. Returns the count name."""
-    if answer.result in ("refused_request", "transport_error"):
+    if answer.result in ("refused_request", "transport_error", "unreadable_answer"):
         # Not the store's verdict: the row backs off 7 days ("route:" prefix, `due`), and a verified row keeps its
         # verification as on any other no-answer.
         answer = Answer("route", answer.reason, {})
@@ -582,6 +603,9 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
             return counts
         candidates = await _candidates(now)
         bump("due", len(candidates))
+        out_of_market = await _not_verifiable_market_count(now)
+        if out_of_market:
+            bump("skipped_market_not_verifiable", out_of_market)
         per_run = settings.deal_verify_max_carts_per_run
         carts = 0
         hosts_done: set = set()
@@ -631,7 +655,7 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
                     bump("route_" + answer.reason[:48])
                     stopped = True
                     continue
-                if answer.result == "transport_error":
+                if answer.result in ("transport_error", "unreadable_answer"):
                     bump("route_errors")
                     stopped = True  # recorded below (a cart may exist), and then no more calls this run
                 bump(await record(answer, c, ref, now))
