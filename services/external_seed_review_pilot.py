@@ -15,10 +15,12 @@ from services.catalog_identity import validated_source_gtin
 from services.external_seed_model_review import ReviewTarget, build_review_snapshot, review_seed
 from services.shopify_storefront_session import MarketsRefused, ShopifyStorefrontSession, _ua
 
-POLICY_VERSION = "olive-young-us-brand-direct-v3"
+POLICY_VERSION = "olive-young-us-brand-direct-v4"
 REVIEW_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash")
 EVIDENCE_MAX_AGE = timedelta(minutes=10)
 _AMUSE_BARCODE_SOURCE = "https://kiokii.com/en-us/products/amuse-banana-lip-oil-4-5ml.js?country=US"
+AMUSE_SEED_ID = "eps_31f74c1ec20a4d5db0fa977f"
+ROMAND_SEED_ID = "eps_6aa6d3d1e93a424b8c64d6c5"
 SURRATT_SEED_ID = "eps_9f3368aa75d349e09914fbcb"
 
 
@@ -56,23 +58,23 @@ class PilotListing:
 
 
 LISTINGS = {
-    "eps_31f74c1ec20a4d5db0fa977f": PilotListing(
+    AMUSE_SEED_ID: PilotListing(
         "https://amuseseoulmakeup.com/products/banana-lip-oil", "merch_obs_1c4bc54448d534ca", 1500,
         "AMUSE", "Banana Lip Oil",
         "A 4.5 mL tinted lip oil with a glossy finish, a banana scent and a cushioned applicator. "
         "Shade 02 Banana is clear, while 04 Juicy Peach gives a peach tint.",
         (("52547428942138", "8800299133494", "02 BANANA", "8800299133494"),
          ("52547429007674", "8800299133517", "04 JUICY PEACH", "8800299133517")),
-        10117885559098, _AMUSE_BARCODE_SOURCE,
+        10117885559098, _AMUSE_BARCODE_SOURCE, machine_activation_allowed=True,
     ),
-    "eps_6aa6d3d1e93a424b8c64d6c5": PilotListing(
+    ROMAND_SEED_ID: PilotListing(
         "https://romandbeauty.com/products/glasting-melting-balm", "merch_obs_acf4a659be2fb0fb", 1400,
         "rom&nd", "Glasting Melting Balm",
         "A 3.5 g tinted lip balm with a soft, melting texture and buildable, glass-like shine. "
         "Coco Nude is a beige nude and Mauve Whip is a mauve pink.",
         (("41341731438667", "8800258082894", "COCO NUDE", "UGMB01"),
          ("41341731635275", "8800258083112", "MAUVE WHIP", "UGMB07")),
-        7317311291467,
+        7317311291467, machine_activation_allowed=True,
     ),
     SURRATT_SEED_ID: PilotListing(
         "https://www.surrattbeauty.com/products/lipslique", "merch_obs_30f9ce3e44b7fcb4", 3400,
