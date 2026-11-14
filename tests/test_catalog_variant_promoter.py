@@ -101,6 +101,21 @@ def test_extract_seed_returns_empty_for_missing_snapshot() -> None:
     assert _extract_variants_from_seed("garbage") == []
 
 
+@pytest.mark.parametrize(("root", "expected_ids"), [
+    ([], ["snapshot"]),
+    (None, ["snapshot"]),
+    ("malformed", ["snapshot"]),
+    (["malformed"], []),
+])
+def test_mirror_variant_root_fallback(root, expected_ids) -> None:
+    primary = {
+        "source_system": promoter.MIRROR,
+        "seed_data": json.dumps({"variants": root, "snapshot": {"variants": [_tomford_variant("snapshot")]}}),
+        "product_payload": {"variants": [_tomford_variant("payload")]},
+    }
+    assert [variant["variant_id"] for variant in promoter._extract_variants_for_primary(primary)] == expected_ids
+
+
 # ---------------------------------------------------------------------------
 # _extract_variants_from_payload (Path A)
 # ---------------------------------------------------------------------------
@@ -256,6 +271,48 @@ class _FakeTxn:
 
     async def __aexit__(self, *exc):
         return False
+
+
+@pytest.mark.asyncio
+async def test_mirror_promotes_reviewed_employee_variants_with_own_currency(monkeypatch) -> None:
+    reviewed_variants = [
+        {"variant_id": variant_id, "barcode": barcode, "title": title,
+         "price_amount": 15.0, "price_currency": "USD", "availability": "in_stock"}
+        for variant_id, barcode, title in (
+            ("52547428942138", "8800299133494", "02 BANANA"),
+            ("52547429007674", "8800299133517", "04 JUICY PEACH"),
+        )
+    ]
+    primary = {
+        "product_key": "product", "merchant_id": "seller", "platform": "external_seed",
+        "source_product_id": "ext_banana", "source_system": promoter.MIRROR, "catalog_track": "external_referral",
+        "seed_data": {"variants": reviewed_variants, "snapshot": {"variants": [_tomford_variant("stale")]}},
+    }
+    written = []
+
+    class FakeDB:
+        async def fetch_one(self, sql, params):
+            return primary
+
+        async def execute(self, sql, params):
+            written.append(params)
+
+        def transaction(self):
+            return _FakeTxn()
+
+    async def project(product_key):
+        assert product_key == primary["product_key"]
+        return 2, False
+
+    monkeypatch.setattr(promoter, "database", FakeDB())
+    monkeypatch.setattr(promoter, "_project_variant_offers", project)
+    result = await promoter.promote_variants_for_group(group_id="pg_product", apply=True)
+
+    assert result.variants_tier_held == 2
+    assert result.variant_offers_created == 2
+    assert [(row["source_variant_id"], row["barcode"], row["currency"]) for row in written] == [
+        (variant["variant_id"], variant["barcode"], "USD") for variant in reviewed_variants
+    ]
 
 
 def _install_fake_db(monkeypatch, catalog_track=None) -> List[Dict[str, Any]]:

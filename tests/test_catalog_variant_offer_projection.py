@@ -119,6 +119,45 @@ def test_other_seller_or_host_is_refused():
         assert plan_offers(P, V, S, templates, [])[0] == []
 
 
+@pytest.mark.parametrize("destination_host", ["brand.example", "www.brand.example"])
+def test_mirror_www_product_and_bare_offer_template_share_listing(destination_host):
+    product = dict(P, source_domain="www.brand.example")
+    seed = {
+        "seller_ref": "m", "domain": "www.brand.example", "market": "US", "price_currency": "USD",
+        "destination_url": "https://www.brand.example/products/x",
+    }
+    product.update(seed_scope(product, seed))
+    destination = f"https://{destination_host}/products/x"
+    template = dict(T[0], offer_payload={"destination_url": destination})
+
+    rows, skips = plan_offers(product, V, S, [template], [])
+
+    assert len(rows) == 2
+    assert skips == {}
+    assert all(row["source_ref"] == destination for row in rows)
+
+
+@pytest.mark.parametrize("template_host,destination", [
+    ("brand.example", "https://someone.example/products/x"),
+    ("someone.example", "https://brand.example/products/x"),
+    ("brand.example", "https://shop.brand.example/products/x"),
+    ("shop.brand.example", "https://brand.example/products/x"),
+    ("brand.example", "https://www.brand.example/products/other"),
+    ("brand.example", "http://www.brand.example/products/x"),
+    ("brand.example", "https://www.brand.example:444/products/x"),
+    ("brand.example", "https://user:pass@www.brand.example/products/x"),
+])
+def test_www_alias_does_not_relax_listing_scope(template_host, destination):
+    product = dict(P, source_domain="www.brand.example",
+                   seed_listing_identities={("brand.example", "/products/x")}, seed_market="US")
+    template = dict(T[0], source_domain=template_host, offer_payload={"destination_url": destination})
+
+    rows, skips = plan_offers(product, V, S, [template], [])
+
+    assert rows == []
+    assert skips == {"destination_or_seller_mismatch": 2}
+
+
 def test_market_ids_are_distinct_and_ambiguous_template_refused():
     templates = T + [dict(T[0], market="CA")]
     rows, _ = plan_offers(P, V, S, templates, [])
