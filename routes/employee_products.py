@@ -92,6 +92,7 @@ from services.pci_kb_scope_review import (
 from db.reviews_center import employee_audit_logs, product_reviews
 from services.region_pricing import foreign_seed_currencies, seed_storable_currencies
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
+from services.seed_serving import seed_row_market
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
@@ -4814,7 +4815,7 @@ async def get_external_seed_projection(
     async with database.transaction():
         row = await _lock_seed_snapshot(seed_id, review_version)
         projection = await read_external_seed_projection(
-            database, seed_id=seed_id, market=row.get("market"), seller_ref=row.get("seller_ref"),
+            database, seed_id=seed_id, market=seed_row_market(row), seller_ref=row.get("seller_ref"),
             status=_seed_status_of(row), variants=_seed_variants(_ensure_json_obj(row.get("seed_data"))),
             destination_url=row.get("destination_url"),
         )

@@ -30,7 +30,7 @@ async def test_www_storefront_session_accepts_only_its_existing_host_equivalence
                               headers={"set-cookie": "cart_currency=USD"}, json=_brand_response(listing))
     client = SimpleNamespace(request=AsyncMock(return_value=response))
     polite = SimpleNamespace(before_request=AsyncMock(), note_response=lambda *_a, **_kw: None)
-    session = pilot._Session(client, listing.host, polite, {}, "US")
+    session = pilot.ShopifyStorefrontSession(client, listing.host, polite, {}, "US")
     if accepted:
         assert (await session.json_presented(path))[2:] == ("USD", None)
     else:
@@ -61,7 +61,7 @@ async def test_market_evidence_preserves_native_barcode_provenance(seed_id, monk
     sessions = {listing.host: brand, "kiokii.com": corroboration}
     if listing.shipping_source_url:
         sessions[listing.seller_host] = shipping
-    monkeypatch.setattr(pilot, "_Session", lambda _, host, *_args: sessions[host])
+    monkeypatch.setattr(pilot, "ShopifyStorefrontSession", lambda _, host, *_args: sessions[host])
 
     evidence = await pilot.capture_shopify_evidence(listing)
     assert len(evidence["target_sources"]) == 2

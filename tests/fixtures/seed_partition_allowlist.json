@@ -7,6 +7,27 @@
   ],
   "entries": [
     {
+      "file": "routes/employee_products.py",
+      "qualname": "run_external_seed_machine_review",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "Checks for competing active seed rows in the pinned draft storage partition and tool. Storefront evidence separately verifies US reach and USD pricing before approval."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "create_external_seed.<locals>.supersede_live_duplicates",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "Matches the existing same-destination seed storage partition and tool when disabling duplicates inside the publication lock. This is the existing create writer convention."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_write_seed_against_snapshot",
+      "rule": "P",
+      "finding": "OK-partition",
+      "reason": "Uses the stored partition only to serialize same-destination writes with the existing publication lock. It does not label the offer or select a currency."
+    },
+    {
       "file": "jobs/merchant_purchasability_sweep.py",
       "qualname": "_cart_mint_lane",
       "rule": "P",

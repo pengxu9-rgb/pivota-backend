@@ -186,7 +186,7 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
             {"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"rows": rows})}]}},
         ]}
 
-    monkeypatch.setattr(pilot, "_Session", storefront_session)
+    monkeypatch.setattr(pilot, "ShopifyStorefrontSession", storefront_session)
     monkeypatch.setattr(reviewer.vertex_gemini, "vertex_enabled", lambda: True)
     vertex = AsyncMock(side_effect=vertex_post)
     monkeypatch.setattr(reviewer, "_vertex_post", vertex)

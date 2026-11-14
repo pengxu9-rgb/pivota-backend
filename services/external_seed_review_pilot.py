@@ -13,7 +13,7 @@ import httpx
 from services import crawl_politeness, shopify_presentment, storefront_currency
 from services.catalog_identity import validated_source_gtin
 from services.external_seed_model_review import ReviewTarget, build_review_snapshot, review_seed
-from services.retailer_ingest.shopify_markets import MarketsRefused, _Session, _ua
+from services.shopify_storefront_session import MarketsRefused, ShopifyStorefrontSession, _ua
 
 POLICY_VERSION = "olive-young-us-brand-direct-v3"
 REVIEW_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash")
@@ -179,7 +179,7 @@ async def _barcode_corroboration(client, listing: PilotListing, observed: dict) 
     if not required:
         return {}
     url = urlsplit(listing.corroboration_url)
-    session = _Session(client, url.netloc, crawl_politeness, {}, "US")
+    session = ShopifyStorefrontSession(client, url.netloc, crawl_politeness, {}, "US")
     code, detail = await session.json(f"{url.path}?{url.query}")
     variants = detail.get("variants") if code == 200 and isinstance(detail, dict) else None
     if (
@@ -210,7 +210,7 @@ async def _cart_confirmed_product(listing: PilotListing, path: str) -> object | 
     async with httpx.AsyncClient(
         timeout=8.0, follow_redirects=False, headers={"User-Agent": _ua(), "Accept": "application/json"},
     ) as client:
-        session = _Session(client, listing.host, crawl_politeness, {}, "US")
+        session = ShopifyStorefrontSession(client, listing.host, crawl_politeness, {}, "US")
         before = await session.cart_currency()
         if before != "USD":
             return None
@@ -229,10 +229,10 @@ async def capture_shopify_evidence(listing: PilotListing) -> dict:
         async with shopify_presentment.no_cookie_client(
             timeout=8.0, follow_redirects=False, headers={"User-Agent": _ua(), "Accept": "application/json"},
         ) as client:
-            session = _Session(client, listing.host, crawl_politeness, {}, "US")
+            session = ShopifyStorefrontSession(client, listing.host, crawl_politeness, {}, "US")
             shipping_session = (
                 session if shipping.netloc == listing.host
-                else _Session(client, shipping.netloc, crawl_politeness, {}, "US")
+                else ShopifyStorefrontSession(client, shipping.netloc, crawl_politeness, {}, "US")
             )
             meta_response = await shipping_session.request("GET", shipping.path, expect_json=True)
             meta = storefront_currency.parse_meta(meta_response.text) if meta_response.status_code == 200 else None
