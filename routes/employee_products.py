@@ -7,7 +7,7 @@ content-key catalogue endpoints below, whose offers come from
 ``catalog_offers``.
 """
 
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 import asyncio
 import copy
 import csv
@@ -17,6 +17,7 @@ import hashlib
 import logging
 import time
 import math
+import os
 import re
 import unicodedata
 from urllib.parse import urlparse
@@ -24,6 +25,8 @@ from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.security import HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 import uuid
 
@@ -34,7 +37,8 @@ from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
-from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, require_employee_permissions
+from utils import gateway_oidc_auth
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, optional_security, require_employee_permissions
 
 from services import crawl_global_pacer
 from services import external_seed_destination_liveness as destination_liveness
@@ -85,9 +89,10 @@ from services.pci_kb_scope_review import (
     filter_queue_items,
     summarize_filtered_queue,
 )
-from db.reviews_center import product_reviews
+from db.reviews_center import employee_audit_logs, product_reviews
 from services.region_pricing import foreign_seed_currencies, seed_storable_currencies
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
+from services.seed_serving import seed_row_market
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
@@ -2194,6 +2199,7 @@ def _seed_content_fingerprint(row: Dict[str, Any], seed_data: Optional[Dict[str,
         "destination_url": _norm_text(row.get("destination_url")),
         "canonical_url": _norm_text(row.get("canonical_url")),
         "attached_product_key": _norm_text(row.get("attached_product_key")),
+        "attached_variant_id": _norm_text(row.get("attached_variant_id")) or "∅",
         "title": _norm_text(sd.get("title") or row.get("title")),
         "description": _norm_text(sd.get("description")),
         "image_url": _norm_text(sd.get("image_url") or row.get("image_url")),
@@ -2214,6 +2220,47 @@ def _seed_content_fingerprint(row: Dict[str, Any], seed_data: Optional[Dict[str,
 
 
 _SEED_PRICE_FINGERPRINT_KEYS = ("price_amount", "price_currency", "primary_price")
+
+
+def _seed_review_version(row: Dict[str, Any]) -> str:
+    # Use the columns carried by a revision and the raw reviewed payload.
+    columns = (*_SEED_REVISION_COLUMNS, "id", "status", "created_by_employee_id", "updated_at")
+    snapshot = {key: row.get(key) for key in columns}
+    snapshot["seed_data"] = _ensure_json_obj(row.get("seed_data"))
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _require_seed_review_version(row: Dict[str, Any], expected_version: Optional[str]) -> None:
+    if expected_version is not None and _seed_review_version(row) != expected_version:
+        raise HTTPException(status_code=409, detail={"error": "SEED_VERSION_CHANGED", "seed_id": row.get("id")})
+
+
+async def _lock_seed_snapshot(seed_id: str, expected_version: str) -> Dict[str, Any]:
+    row = await database.fetch_one(
+        "SELECT * FROM external_product_seeds WHERE id = :id"
+        + (" FOR UPDATE" if _seed_publish_locks_enabled() else ""),
+        {"id": seed_id},
+    )
+    if not row:
+        raise HTTPException(status_code=409, detail={"error": "SEED_VERSION_CHANGED", "seed_id": seed_id})
+    snapshot = dict(row)
+    _require_seed_review_version(snapshot, expected_version)
+    return snapshot
+
+
+async def _write_seed_against_snapshot(
+    row: Dict[str, Any], update_sql: str, update_values: Dict[str, Any],
+    *, publish_urls: Optional[Iterable[Optional[str]]] = None,
+    after_update: Optional[Callable[[], Awaitable[None]]] = None,
+) -> None:
+    # An editor that read a draft before it was published must reload before writing.
+    async with database.transaction():
+        if publish_urls is not None:
+            await _lock_seed_publish_destination(market=row.get("market"), tool=row.get("tool"), urls=publish_urls)
+        await _lock_seed_snapshot(str(row["id"]), _seed_review_version(row))
+        await _execute_seed_data_stmt(update_sql, update_values)
+        if after_update is not None:
+            await after_update()
 
 
 def _seed_price_changed(
@@ -2348,7 +2395,9 @@ async def _publish_seed(
     update_values: Dict[str, Any],
     actor: Optional[Dict[str, Any]],
     created_by: Any,
+    expected_version: str,
     revision_of: Optional[str] = None,
+    after_update: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> None:
     """THE PUBLISH STEP: a seed that was not served becomes served. Every door that turns a seed `active` runs
     this one function: `PATCH /external-seeds/{id}` with `status=active`, an audit-queue APPROVE of a draft, and a
@@ -2366,6 +2415,7 @@ async def _publish_seed(
     Before any of it, `_authorize_seed_publish`: only a staff role publishes, and never one of the seed's authors
     (its creator or a content editor; 403). A REVISION draft (`revision_of`) also supersedes the live seed it revises,
     by id, wherever that seed points, and that seed is not a conflict for it.
+    The target is locked after the destination lock. The authorization and update both use that verified version.
     A revision publishes only while the seed it revises is still live (`_require_live_revision_base`; 409).
     The caller projects the published seed afterwards (`_project_published_seed`); a projection is a mirror,
     best-effort and post-commit.
@@ -2379,6 +2429,7 @@ async def _publish_seed(
                 market=market, tool=tool,
                 urls=(match_url, destination_url, *((f"revision_of:{revised}",) if revised else ())),
             )
+            await _lock_seed_snapshot(seed_id, expected_version)
             if revised:
                 await _require_live_revision_base(seed_id=seed_id, revision_of=revised)
             holder = await database.fetch_one(
@@ -2439,6 +2490,8 @@ async def _publish_seed(
                 },
             )
             await _execute_seed_data_stmt(update_sql, update_values)
+            if after_update is not None:
+                await after_update()
     except HTTPException:
         raise
     except Exception as exc:
@@ -2489,6 +2542,7 @@ class CreateExternalSeedRequest(BaseModel):
 
 class UpdateExternalSeedRequest(BaseModel):
     status: Optional[str] = None
+    review_version: Optional[str] = Field(default=None, min_length=64, max_length=64)
     notes: Optional[str] = None
     market: Optional[str] = None
     tool: Optional[str] = None
@@ -3600,8 +3654,8 @@ async def _import_external_seeds_csv_text(
                 if existing_row:
                     existing = dict(existing_row)
                     seed_id = str(existing.get("id"))
-                    seed_data = _ensure_json_obj(existing.get("seed_data"))
-                    before_seed_data = copy.deepcopy(seed_data)
+                    before_seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    seed_data = copy.deepcopy(before_seed_data)
                     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
                     seed_data["source"] = seed_data.get("source") or "employee_seed_csv_catalog"
                     if title is not None:
@@ -3679,7 +3733,8 @@ async def _import_external_seeds_csv_text(
                         update_values["created_by_employee_id"] = authors
                         set_clauses.append(_AUTHORS_SET_CLAUSE)
 
-                    await _execute_seed_data_stmt(
+                    await _write_seed_against_snapshot(
+                        existing,
                         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
                         update_values,
                     )
@@ -3870,8 +3925,8 @@ async def _import_external_seeds_csv_text(
                 if existing_row:
                     existing = dict(existing_row)
                     seed_id = str(existing.get("id"))
-                    seed_data = _ensure_json_obj(existing.get("seed_data"))
-                    before_seed_data = copy.deepcopy(seed_data)
+                    before_seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    seed_data = copy.deepcopy(before_seed_data)
                     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
                     seed_data["source"] = seed_data.get("source") or "employee_seed_csv"
 
@@ -3994,11 +4049,12 @@ async def _import_external_seeds_csv_text(
                             actor=current_user,
                             # The authors AFTER this row: an importer who rewrote the seed may not publish it.
                             created_by=authors,
+                            expected_version=_seed_review_version(existing),
                             revision_of=seed_data.get(SEED_REVISION_OF_KEY),
                         )
                         await _project_published_seed(seed_id, price_source=_published_price_source(seed_data))
                     else:
-                        await _execute_seed_data_stmt(update_sql, update_values)
+                        await _write_seed_against_snapshot(existing, update_sql, update_values)
                     updated += 1
                     seed_ids.append(seed_id)
                     continue
@@ -4306,6 +4362,7 @@ async def _fetch_external_seed_rows_for_audit(
           seed_data,
           status, notes, created_by_employee_id,
           attached_product_key, attached_variant_id,
+          seller_ref, seed_kind,
           created_at, updated_at
         FROM external_product_seeds
         WHERE {" AND ".join(where)}
@@ -4330,6 +4387,8 @@ def _build_external_seed_audit_response_item(
     # May THIS viewer approve it (their role, and not their own seed)? The portal hides the approve control if not.
     item["publish_permission"] = _seed_publish_permission(row, current_user)
     item["revision_of"] = _ensure_json_obj(row.get("seed_data")).get(SEED_REVISION_OF_KEY)
+    if _seed_status_of(row) == NEW_EMPLOYEE_SEED_STATUS:
+        item["review_version"] = _seed_review_version(row)
     return item
 
 
@@ -4581,6 +4640,68 @@ async def get_external_seed_audit(
 class ExternalSeedAuditVerdictRequest(BaseModel):
     verdict: Literal["approve", "reject"]
     reason: Optional[str] = Field(default=None, max_length=500)
+    review_version: Optional[str] = Field(default=None, min_length=64, max_length=64)
+
+
+_SEED_REVIEW_TARGET_TYPE = "external_seed"
+_SEED_REVIEW_ACTIONS = {"approve": "external_seed.review.approve", "reject": "external_seed.review.reject"}
+
+
+@router.get("/external-seeds/{seed_id}/review-events")
+async def list_external_seed_review_events(
+    seed_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: dict = Depends(get_current_employee),
+):
+    """Read explicit audit-queue verdicts for this seed, newest first."""
+    log = employee_audit_logs
+    rows = await database.fetch_all(
+        log.select().where(
+            log.c.target_type == _SEED_REVIEW_TARGET_TYPE,
+            log.c.target_id == seed_id,
+            log.c.action.in_(tuple(_SEED_REVIEW_ACTIONS.values())),
+        ).order_by(log.c.created_at.desc(), log.c.id.desc()).limit(limit)
+    )
+    return {
+        "status": "success",
+        "items": [
+            {
+                "id": row["id"],
+                "actor_employee_id": row["actor_employee_id"],
+                "action": row["action"],
+                "reason": row["reason"],
+                "before": _ensure_json_obj(row["before_json"]),
+                "after": _ensure_json_obj(row["after_json"]),
+                "created_at": _to_iso(row["created_at"]),
+            }
+            for row in rows
+        ],
+    }
+
+
+async def _store_seed_review_event(
+    *, before: Dict[str, Any], verdict: str, reason: Optional[str], actor: Dict[str, Any],
+) -> None:
+    """Persist the locked before/after pair in the verdict's transaction."""
+    seed_id = str(before["id"])
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if row is None:
+        raise RuntimeError("seed disappeared during audit verdict")
+    after = dict(row)
+    actor_ids = (_norm_text(actor.get(key)) for key in _ACTOR_ID_KEYS)
+    actor_id = next((value for value in actor_ids if value and "@" not in value), None)
+    await database.execute(
+        employee_audit_logs.insert().values(
+            actor_employee_id=actor_id,
+            actor_email=actor.get("email"),
+            action=_SEED_REVIEW_ACTIONS[verdict],
+            target_type=_SEED_REVIEW_TARGET_TYPE,
+            target_id=seed_id,
+            reason=(reason or "").strip() or None,
+            before_json={"status": _seed_status_of(before), "review_version": _seed_review_version(before)},
+            after_json={"status": _seed_status_of(after), "review_version": _seed_review_version(after)},
+        )
+    )
 
 
 def _audit_verdict_note(verdict: str, *, reviewer: str, reason: Optional[str]) -> str:
@@ -4624,6 +4745,7 @@ async def record_external_seed_audit_verdict(
                 status_code=403,
                 detail={"error": "SEED_PUBLISH_ROLE_FORBIDDEN", "role": role or None, "seed_id": seed_id},
             )
+    _require_seed_review_version(row, body.review_version)
     if verdict == "approve" and current_status == "active":
         return {"status": "success", "verdict": verdict, "seed_status": "active", "published": False, "projected": {}}
     if current_status != NEW_EMPLOYEE_SEED_STATUS:
@@ -4633,11 +4755,17 @@ async def record_external_seed_audit_verdict(
         )
 
     note = _audit_verdict_note(verdict, reviewer=_employee_id_from_user(current_user), reason=body.reason)
+
+    async def record_review() -> None:
+        await _store_seed_review_event(before=row, verdict=verdict, reason=body.reason, actor=current_user)
+
     if verdict == "reject":
-        await database.execute(
+        await _write_seed_against_snapshot(
+            row,
             "UPDATE external_product_seeds SET notes = COALESCE(notes, '') || :note, updated_at = NOW() "
             "WHERE id = :id",
             {"id": seed_id, "note": note},
+            after_update=record_review,
         )
         return {
             "status": "success", "verdict": verdict, "seed_status": current_status, "published": False,
@@ -4664,13 +4792,230 @@ async def record_external_seed_audit_verdict(
         update_values={"id": seed_id, "external_product_id": external_product_id, "note": note},
         actor=current_user,
         created_by=row.get("created_by_employee_id"),
+        expected_version=_seed_review_version(row),
         revision_of=_ensure_json_obj(row.get("seed_data")).get(SEED_REVISION_OF_KEY),
+        after_update=record_review,
     )
     # As a PATCH publish: projected; the price is vouched for only when the draft is a revision that moved it.
     projected = await _project_published_seed(
         seed_id, price_source=_published_price_source(_ensure_json_obj(row.get("seed_data")))
     )
     return {"status": "success", "verdict": verdict, "seed_status": "active", "published": True, "projected": projected}
+
+
+@router.get("/external-seeds/{seed_id}/projection")
+async def get_external_seed_projection(
+    seed_id: str,
+    review_version: str = Query(..., min_length=64, max_length=64),
+    current_user: dict = Depends(get_current_employee),
+):
+    """Read back catalog coverage for the specific version the caller inspected."""
+    from services.external_seed_projection_readback import read_external_seed_projection
+
+    async with database.transaction():
+        row = await _lock_seed_snapshot(seed_id, review_version)
+        projection = await read_external_seed_projection(
+            database, seed_id=seed_id, market=seed_row_market(row), seller_ref=row.get("seller_ref"),
+            status=_seed_status_of(row), variants=_seed_variants(_ensure_json_obj(row.get("seed_data"))),
+            destination_url=row.get("destination_url"),
+        )
+    return {"seed_id": seed_id, "review_version": review_version, "projection": projection}
+
+
+class MachineSeedReviewRequest(BaseModel):
+    request_id: uuid.UUID
+    review_version: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    class Config:
+        extra = "forbid"
+
+
+async def _machine_seed_reviewer(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+) -> str:
+    if os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_ENABLED") != "true" or not _seed_publish_locks_enabled():
+        raise HTTPException(status_code=404, detail="SEED_MACHINE_REVIEW_DISABLED")
+    audience = (os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_AUDIENCE") or "").strip()
+    email = (os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_SERVICE_ACCOUNT") or "").strip().lower()
+    subject = (os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_SERVICE_SUBJECT") or "").strip()
+    if not audience or not email.endswith(".iam.gserviceaccount.com") or not subject.isascii() or not subject.isdigit():
+        raise HTTPException(status_code=503, detail="SEED_MACHINE_REVIEW_UNCONFIGURED")
+    if audience == gateway_oidc_auth.configured_audience() or email in gateway_oidc_auth.configured_service_accounts():
+        raise HTTPException(status_code=503, detail="SEED_MACHINE_REVIEW_UNCONFIGURED")
+    if not credentials:
+        raise HTTPException(status_code=401, detail="SEED_MACHINE_REVIEW_IDENTITY_REQUIRED")
+    try:
+        principal = await asyncio.wait_for(
+            run_in_threadpool(
+                gateway_oidc_auth.verify_google_service_identity, credentials.credentials,
+                audience=audience, allowed={email},
+            ),
+            timeout=gateway_oidc_auth.VERIFY_TIMEOUT_SECONDS,
+        )
+    except (gateway_oidc_auth._Refused, asyncio.TimeoutError):
+        raise HTTPException(status_code=401, detail="SEED_MACHINE_REVIEW_IDENTITY_REQUIRED") from None
+    if principal.get("sub") != subject:
+        raise HTTPException(status_code=401, detail="SEED_MACHINE_REVIEW_IDENTITY_REQUIRED")
+    return f"{email}:{subject}"
+
+
+def _machine_review_replay(
+    receipt: Optional[Dict[str, Any]], *, seed_id: str, review_version: str, reviewer_identity: str,
+) -> Optional[Dict[str, Any]]:
+    if receipt is None:
+        return None
+    if (receipt["seed_id"], receipt["review_version"], receipt["reviewer_identity"]) != (
+        seed_id, review_version, reviewer_identity,
+    ):
+        raise HTTPException(status_code=409, detail="SEED_MACHINE_REVIEW_REQUEST_CONFLICT")
+    return receipt
+
+
+@router.post("/external-seeds/{seed_id}/machine-review")
+async def run_external_seed_machine_review(
+    seed_id: str,
+    body: MachineSeedReviewRequest,
+    reviewer_identity: str = Depends(_machine_seed_reviewer),
+):
+    from services import external_seed_review_pilot as pilot
+    from services.external_seed_machine_review_ledger import load_machine_review, append_machine_review
+
+    listing = pilot.LISTINGS.get(seed_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="SEED_MACHINE_REVIEW_OUT_OF_SCOPE")
+    request_id = str(body.request_id)
+    replay_key = {"seed_id": seed_id, "review_version": body.review_version, "reviewer_identity": reviewer_identity}
+    replay = _machine_review_replay(await load_machine_review(database, request_id), **replay_key)
+    if replay:
+        return replay
+    raw = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not raw:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    row = dict(raw)
+    _require_seed_review_version(row, body.review_version)
+    if row.get("external_product_id") != _stable_external_product_id(listing.url) or not pilot.draft_matches_listing(
+        row, _ensure_json_obj(row.get("seed_data")), listing,
+    ):
+        raise HTTPException(status_code=409, detail="SEED_MACHINE_REVIEW_SCOPE_CHANGED")
+
+    # External calls happen before the write transaction. Receipts are produced on this server.
+    try:
+        evidence = await asyncio.wait_for(pilot.capture_shopify_evidence(listing), timeout=25)
+    except asyncio.TimeoutError:
+        evidence = {"reason": "storefront_read_timeout"}
+    review = await pilot.adjudicate(seed_id, body.review_version, listing, evidence) if evidence.get("sources") else {}
+    decision = {"evidence": evidence, "review": review.get("result"), "receipts": review.get("receipts", {})}
+    evidence_digest = review.get("evidence_digest") or hashlib.sha256(
+        json.dumps(evidence, sort_keys=True).encode(),
+    ).hexdigest()
+    destination_allowed = bool(review.get("eligible")) and await _is_domain_allowed(
+        market="US", destination_url=listing.url,
+    )
+
+    async with database.transaction():
+        await database.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
+            {"lock_key": f"external_seed_machine_review|{request_id}"},
+        )
+        replay = _machine_review_replay(await load_machine_review(database, request_id), **replay_key)
+        if replay:
+            return replay
+        await _lock_seed_publish_destination(market="US", tool="*", urls=listing.listing_urls)
+        row = await _lock_seed_snapshot(seed_id, body.review_version)
+        if not pilot.draft_matches_listing(row, _ensure_json_obj(row.get("seed_data")), listing):
+            raise HTTPException(status_code=409, detail="SEED_MACHINE_REVIEW_SCOPE_CHANGED")
+
+        reason = evidence.get("reason")
+        if not reason and not review.get("eligible"):
+            reason = "model_review_held"
+        if not reason and not (
+            timedelta(0) <= datetime.now(timezone.utc) - datetime.fromisoformat(evidence["captured_at"])
+            <= pilot.EVIDENCE_MAX_AGE
+        ):
+            reason = "storefront_evidence_expired"
+        if not reason and not destination_allowed:
+            reason = "outbound_destination_not_allowed"
+        if not reason:
+            findings = audit_external_seed_row(row)["findings"]
+            blockers = [finding["anomaly_type"] for finding in findings if finding.get("severity") in ("blocker", "review")]
+            if blockers:
+                decision["audit_finding_codes"] = blockers
+                reason = "seed_rule_audit_held"
+        if not reason:
+            seller = await database.fetch_one(
+                """
+                SELECT merchant_id FROM catalog_merchants
+                WHERE merchant_id = :id AND source_ref = :domain AND status = 'observed'
+                FOR SHARE
+                """,
+                {"id": listing.seller_ref, "domain": listing.seller_host},
+            )
+            if seller is None:
+                reason = "observed_seller_changed"
+        if not reason:
+            conflict = await database.fetch_one(
+                """
+                SELECT id FROM external_product_seeds
+                WHERE status = 'active' AND id <> :id AND market = 'US' AND tool = '*'
+                  AND (destination_url = ANY(CAST(:urls AS text[]))
+                    OR canonical_url = ANY(CAST(:urls AS text[]))
+                    OR external_product_id = ANY(CAST(:product_ids AS text[])))
+                LIMIT 1
+                """,
+                {"id": seed_id, "urls": list(listing.listing_urls),
+                 "product_ids": [_stable_external_product_id(url) for url in listing.listing_urls]},
+            )
+            if conflict is not None:
+                reason = "active_seed_conflict"
+        if not reason and (
+            not listing.machine_activation_allowed
+            or os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_ENABLED") != "true"
+        ):
+            reason = "observe_only"
+        if not reason and os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_VERSION") != body.review_version:
+            reason = "activation_version_not_pinned"
+        if not reason:
+            audit = employee_audit_logs
+            prior_rejection = await database.fetch_one(
+                audit.select().with_only_columns(audit.c.id).where(
+                    audit.c.target_type == _SEED_REVIEW_TARGET_TYPE,
+                    audit.c.target_id == seed_id,
+                    audit.c.action == _SEED_REVIEW_ACTIONS["reject"],
+                ).limit(1)
+            )
+            if prior_rejection is not None:
+                reason = "employee_rejection_recorded"
+
+        active_version = None
+        if reason:
+            decision["hold_reason"] = reason
+        else:
+            # The machine scope is one draft. A conflicting live seed is never superseded here.
+            try:
+                activated = await database.fetch_one(
+                    """
+                    UPDATE external_product_seeds
+                    SET status = 'active', updated_at = NOW()
+                    WHERE id = :id AND status = 'draft'
+                    RETURNING *
+                    """,
+                    {"id": seed_id},
+                )
+            except Exception as exc:
+                if _is_active_seed_unique_violation(exc):
+                    raise HTTPException(status_code=409, detail="SEED_ACTIVE_CONFLICT") from exc
+                raise
+            if activated is None:
+                raise HTTPException(status_code=409, detail="SEED_VERSION_CHANGED")
+            active_version = _seed_review_version(dict(activated))
+        receipt = await append_machine_review(
+            database, request_id=request_id, **replay_key, policy_version=listing.policy_version,
+            evidence_digest=evidence_digest, outcome="hold" if reason else "activated",
+            decision=decision, active_review_version=active_version,
+        )
+    if active_version:
+        await _project_published_seed(seed_id, price_source=None)
+    return receipt
 
 
 @router.post("/external-seeds/backfill-storefront")
@@ -5299,7 +5644,7 @@ async def create_external_seed(
         market = market or row.get("market")
         tool = tool or row.get("tool")
 
-        seed_data = dict(existing_seed_data)
+        seed_data = copy.deepcopy(existing_seed_data)
         external_product_id = (
             row.get("external_product_id")
             or seed_data.get("external_product_id")
@@ -5418,14 +5763,39 @@ async def create_external_seed(
                 live_row=row, values=update_values, seed_data=seed_data, created_by=recreate_stamp,
                 price_edited=_seed_price_changed(row, before_seed_data, after_row, seed_data),
             )
+            seed_status = NEW_EMPLOYEE_SEED_STATUS
         else:
+            seed_status = _seed_status_of(row)
             authors_clause = ""
             if content_changed:
                 update_values["created_by_employee_id"] = _merge_seed_authors(
                     row.get("created_by_employee_id"), recreate_stamp
                 )
                 authors_clause = f"\n                    {_AUTHORS_SET_CLAUSE},"
-            await _execute_seed_data_stmt(
+
+            async def supersede_live_duplicates() -> None:
+                await database.execute(
+                    """
+                    UPDATE external_product_seeds
+                    SET status = 'disabled',
+                        notes = COALESCE(notes, '') || :note,
+                        updated_at = NOW()
+                    WHERE id <> :id
+                      AND status = 'active'
+                      AND market = :market
+                      AND tool = :tool
+                      -- Only match this destination, even if a different listing shares a canonical.
+                      AND destination_url IN (:match_url, :dest)
+                    """,
+                    {"id": seed_id, "market": market, "tool": tool, "match_url": match_url,
+                     "dest": dest, "note": f" superseded_by:{seed_id}"},
+                )
+
+            # Superseding peers requires the same destination lock as publication.
+            # Hold it through the snapshot check, update and supersede.
+            supersedes = seed_status == "active"
+            await _write_seed_against_snapshot(
+                row,
                 f"""
                 UPDATE external_product_seeds
                 SET external_product_id = :external_product_id,
@@ -5450,33 +5820,8 @@ async def create_external_seed(
                 WHERE id = :id
                 """,
                 update_values,
-            )
-        seed_status = NEW_EMPLOYEE_SEED_STATUS if revision_of_live else (str(row.get("status") or "").strip() or "active")
-        # Only a LIVE seed supersedes the other live seeds of its destination: a draft is not served,
-        # so it must not take a served seed down before anyone publishes it.
-        if seed_status == "active":
-            await database.execute(
-                """
-                UPDATE external_product_seeds
-                SET status = 'disabled',
-                    notes = COALESCE(notes, '') || :note,
-                    updated_at = NOW()
-                WHERE id <> :id
-                  AND status = 'active'
-                  AND market = :market
-                  AND tool = :tool
-                  -- Only seeds for THIS destination; never one matched through a canonical
-                  -- (a poisoned canonical would disable another shade's seed).
-                  AND destination_url IN (:match_url, :dest)
-                """,
-                {
-                    "id": seed_id,
-                    "market": market,
-                    "tool": tool,
-                    "match_url": match_url,
-                    "dest": dest,
-                    "note": f" superseded_by:{seed_id}",
-                },
+                publish_urls=(match_url, dest) if supersedes else None,
+                after_update=supersede_live_duplicates if supersedes else None,
             )
     else:
         revision_of_live = None
@@ -5766,6 +6111,7 @@ async def get_external_seed(
             },
             # May this viewer publish it? The editor disables `active` when not (their role, or their own seed).
             "publish_permission": _seed_publish_permission(row, current_user),
+            "review_version": _seed_review_version(row),
             # A revision draft names the live seed it replaces once approved.
             "revision_of": seed_data.get(SEED_REVISION_OF_KEY),
         },
@@ -5821,7 +6167,8 @@ async def update_external_seed(
     if not row:
         raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
     row = dict(row)
-    seed_data = _ensure_json_obj(row.get("seed_data"))
+    _require_seed_review_version(row, body.review_version)
+    seed_data = copy.deepcopy(_ensure_json_obj(row.get("seed_data")))
     external_product_id = (
         row.get("external_product_id")
         or seed_data.get("external_product_id")
@@ -6007,10 +6354,11 @@ async def update_external_seed(
             actor=current_user,
             # The authors AFTER this save: an editor who publishes in the same save is refused.
             created_by=authors,
+            expected_version=_seed_review_version(row),
             revision_of=seed_data.get(SEED_REVISION_OF_KEY),
         )
     else:
-        await _execute_seed_data_stmt(update_sql, updates)
+        await _write_seed_against_snapshot(row, update_sql, updates)
 
     # An employee price edit has to reach the BUYER's surfaces, not just the seed.
     # `_refresh_external_seed_by_id` already projects after a re-read; this manual
@@ -8099,7 +8447,8 @@ async def _set_seed_attachment(
             "revision": {"seed_id": revision_id, "seed_status": NEW_EMPLOYEE_SEED_STATUS, "revision_of": seed_id},
         }
     authors = _merge_seed_authors(row.get("created_by_employee_id"), editor_stamp)
-    await database.execute(
+    await _write_seed_against_snapshot(
+        row,
         f"""
         UPDATE external_product_seeds
         SET attached_product_key = :attached_product_key,

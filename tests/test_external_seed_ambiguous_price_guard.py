@@ -11,6 +11,7 @@ listing, whether the PRICING node names this seed's product (its own url, or its
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import asyncio
 import copy
 import json
@@ -438,6 +439,8 @@ def _create(monkeypatch, html: str, mode: str, *, existing: Optional[List[Dict[s
         snapshot.title = snapshot_title
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=None if no_read else snapshot))
     monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=copy.deepcopy(existing or [])))
+    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=copy.deepcopy(existing[0]) if existing else None))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
@@ -930,6 +933,7 @@ def _patch(monkeypatch, row: Dict[str, Any], **body: Any) -> Dict[str, Any]:
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=copy.deepcopy(row)))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_project_refreshed_seed_to_serving_surfaces", AsyncMock(return_value={}))
     asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(**body),

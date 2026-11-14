@@ -11,6 +11,7 @@ and disabled the rest. `_canonical_for_destination` is the one rule all three no
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -412,7 +413,8 @@ def test_a_new_row_keeps_the_id_the_import_always_derived_and_a_reimport_finds_i
 
     async def fetch_one(query, values=None):
         lookups.append(dict(values or {}))
-        if (values or {}).get("external_product_id") == stored["external_product_id"]:
+        if ((values or {}).get("external_product_id") == stored["external_product_id"]
+                or (values or {}).get("id") == stored["id"]):
             return stored
         return None
 
@@ -423,6 +425,7 @@ def test_a_new_row_keeps_the_id_the_import_always_derived_and_a_reimport_finds_i
 
     monkeypatch.setattr(ep.database, "fetch_one", fetch_one)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     asyncio.run(
         ep._import_external_seeds_csv_text(
             text=csv_text, current_user={"employee_id": "emp_test"}, market="US", tool="*", mode="upsert"

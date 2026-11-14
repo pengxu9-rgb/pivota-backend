@@ -56,7 +56,8 @@ class _DB:
         async def fetch_one(query, values=None):
             db.events.append({"op": "fetch_one", "sql": query, **(values or {})})
             if "FROM external_product_seeds WHERE id = :id" in query:
-                return dict(row) if row else None
+                existing = row or csv_existing
+                return dict(existing) if existing else None
             if "status = 'active'" in query and "external_product_id = :external_product_id" in query:
                 return holder
             if "ORDER BY updated_at DESC, created_at DESC" in query:  # the CSV's existing-row lookups
@@ -64,7 +65,7 @@ class _DB:
             return None
 
         async def execute(query, values=None):
-            db.events.append({"op": "execute", "sql": query, **(values or {})})
+            db.events.append({"op": "execute", "sql": str(query), **(values or {})})
 
         async def execute_seed(query, values):
             db.events.append({"op": "execute_seed", "sql": query, **(values or {})})
@@ -101,6 +102,8 @@ class _DB:
                 out.append(e["op"])
             elif "pg_advisory_xact_lock" in sql:
                 out.append("lock")
+            elif sql.startswith("INSERT INTO employee_audit_logs"):
+                out.append("audit")
             elif "superseded_by" in str(e.get("note") or ""):
                 out.append("supersede")
             elif e["op"] == "fetch_one" and "external_product_id = :external_product_id" in sql and "status = 'active'" in sql:
@@ -136,6 +139,7 @@ PREFIX = "/employee/products/external-seeds"
 #: The authenticated reviewer every route call runs as, unless a test changes it.
 _ACTOR: Dict[str, Any] = {"employee_id": "emp_test", "email": "reviewer@example.com", "role": "employee"}
 PUBLISH_ORDER = ["begin", "lock", "conflict_check", "supersede", "update", "commit"]
+AUDITED_PUBLISH_ORDER = PUBLISH_ORDER[:-1] + ["audit", "commit"]
 
 
 # ---------------------------------------------------------------- ED-2: the queue lists drafts
@@ -189,7 +193,7 @@ def test_approve_publishes_a_draft_through_the_shared_publish_step_and_projects(
     res = client.post(f"{PREFIX}/seed_1/audit-verdict", json={"verdict": "approve"})
     assert res.status_code == 200, res.text
     assert res.json()["published"] is True and res.json()["seed_status"] == "active"
-    assert db.ops() == PUBLISH_ORDER
+    assert db.ops() == AUDITED_PUBLISH_ORDER
     (update,) = db.updates()
     assert "status = 'active'" in update["sql"] and update["note"] == " audit_approve:emp_test"
     assert db.projected == [{"seed_id": "seed_1", "price_source": None}], "published, projected, price not vouched"
@@ -201,9 +205,14 @@ def test_approve_and_patch_run_the_same_publish_step(monkeypatch, client):
     assert client.patch(f"{PREFIX}/seed_1", json={"status": "active"}).status_code == 200
     approve_db = _DB(monkeypatch, _row("draft"), locks=True)
     assert client.post(f"{PREFIX}/seed_1/audit-verdict", json={"verdict": "approve"}).status_code == 200
-    assert patch_db.ops() == approve_db.ops() == PUBLISH_ORDER
-    strip = lambda evs: [(e["op"], e.get("sql")) for e in evs if e["op"] != "execute_seed"]  # noqa: E731
-    assert strip(patch_db.events)[1:] == strip(approve_db.events)[1:], "lock, conflict check and supersede SQL agree"
+    assert patch_db.ops() == PUBLISH_ORDER
+    assert approve_db.ops() == AUDITED_PUBLISH_ORDER
+    shared_sql = ("pg_advisory_xact_lock", " FOR UPDATE", "destination_url NOT IN", "superseded_by:")
+    def common_statements(events):
+        return [(e["op"], e.get("sql")) for e in events if any(
+            match in str(e.get("sql", "")) or match in str(e.get("note", "")) for match in shared_sql
+        )]
+    assert common_statements(patch_db.events) == common_statements(approve_db.events)
 
 
 def test_approve_of_a_conflicting_draft_is_a_409_and_writes_nothing(monkeypatch, client):
@@ -223,7 +232,7 @@ def test_reject_keeps_the_draft_a_draft_and_projects_nothing(monkeypatch, client
     (update,) = db.updates()
     assert "status" not in update["sql"].split("SET", 1)[1], "a reject never writes a status"
     assert update["note"] == " audit_reject:emp_test (wrong image)"
-    assert "begin" not in db.ops() and db.locks() == [] and db.projected == []
+    assert db.ops() == ["begin", "update", "audit", "commit"] and db.locks() == [] and db.projected == []
 
 
 @pytest.mark.parametrize("status", ["disabled", "paused", "inactive", "retired"])
@@ -369,7 +378,7 @@ def test_a_csv_active_row_that_conflicts_is_that_rows_error_and_writes_nothing(m
 def test_a_csv_row_that_publishes_nothing_is_a_plain_update(monkeypatch, existing_status, csv_status):
     out, db = _csv(monkeypatch, _row(existing_status), csv_status)
     assert out.errors == [] and out.updated == 1
-    assert db.ops() == ["update"], "no transaction, no lock, no supersede, no projection"
+    assert db.ops() == ["begin", "update", "commit"], "row transaction without a destination lock or supersede"
     assert db.projected == []
 
 

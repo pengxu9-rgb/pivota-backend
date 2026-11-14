@@ -12,6 +12,8 @@ rows, so the market on the written row is the one the route decided, not one a t
 
 from __future__ import annotations
 
+import json
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -274,6 +276,7 @@ def _install_edit(monkeypatch, stored_market: str) -> List[Dict[str, Any]]:
     row = {"id": "eps_1", "market": stored_market, "tool": "*", "canonical_url": f"https://{DOMAIN}/p", "seed_data": {}}
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     return writes
 
@@ -317,7 +320,10 @@ def test_editing_a_seed_into_an_ingest_market_files_it_there(monkeypatch, client
     # filed under the new market.
     (write,) = writes
     assert write["market"] == "SG" and "INSERT INTO external_product_seeds" in write["sql"]
-    assert write["seed_data"]["revision_of"] == "eps_1" and res.json()["revision"]["revision_of"] == "eps_1"
+    seed_data = write["seed_data"]
+    if isinstance(seed_data, str):
+        seed_data = json.loads(seed_data)
+    assert seed_data["revision_of"] == "eps_1" and res.json()["revision"]["revision_of"] == "eps_1"
 
 
 # ----------------------------------------------------------------- CSV import (both sheet shapes)

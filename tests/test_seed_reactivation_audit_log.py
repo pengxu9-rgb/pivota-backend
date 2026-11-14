@@ -11,6 +11,7 @@ The fakes are the ones each tool's own tests use. All names are placeholders.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import re
 import sys
@@ -480,7 +481,7 @@ def test_the_enrichment_upsert_is_unchanged_when_the_audit_fails(monkeypatch, re
 #: `:status`, `EXCLUDED.status`: anything but a literal status that is not live), by file, with what covers it (the
 #: reactivation audit, or the staff publish step) and how many such assignments the file has. A new one fails here.
 _MAY_ACTIVATE_SITES = {
-    "routes/employee_products.py": ("_publish_seed(", 1),  # the approve's publish UPDATE, run by _publish_seed
+    "routes/employee_products.py": ("_publish_seed(", 2),  # staff and the separately checked machine route
     "services/catalog_enrichment_agent/apply.py": ("log_upsert_revivals(", 1),
     "services/identity_resolution.py": ("log_seed_reactivated_outside_approval(", 1),
     _LANE4_REL: ("log_seed_reactivated_outside_approval(", 1),
@@ -547,6 +548,44 @@ def test_every_status_write_that_can_make_a_seed_live_is_logged_or_is_the_publis
     for rel, (helper, statements) in _MAY_ACTIVATE_SITES.items():
         assert len(found[rel]) == statements, (rel, found[rel])
         assert helper in (repo / rel).read_text(), f"{rel} sets a seed live without {helper}"
+
+
+def test_the_extra_employee_activation_is_only_in_the_machine_review_ledger_transaction():
+    source = (Path(__file__).resolve().parents[1] / "routes/employee_products.py").read_text()
+    functions = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.AsyncFunctionDef)}
+    staff = functions["record_external_seed_audit_verdict"]
+    staff_source = ast.get_source_segment(source, staff)
+    assert _may_activate_assignments(staff_source) == ["'active'"]
+    assert "await _publish_seed(" in staff_source
+
+    machine = functions["run_external_seed_machine_review"]
+    assert any(
+        ast.unparse(decorator) == "router.post('/external-seeds/{seed_id}/machine-review')"
+        for decorator in machine.decorator_list
+    )
+    (transaction,) = [
+        node for node in machine.body
+        if isinstance(node, ast.AsyncWith) and ast.unparse(node.items[0].context_expr) == "database.transaction()"
+    ]
+    assert _may_activate_assignments(ast.get_source_segment(source, machine)) == ["'active'"]
+    activation_sql = next(
+        node.value for node in ast.walk(transaction)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and _may_activate_assignments(node.value)
+    )
+    assert "WHERE id = :id AND status = 'draft' RETURNING *" in " ".join(activation_sql.split())
+    (ledger_append,) = [
+        node.value.value for node in transaction.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call) and isinstance(node.value.value.func, ast.Name)
+        and node.value.value.func.id == "append_machine_review"
+    ]
+    assert ledger_append.lineno > next(
+        node.lineno for node in ast.walk(transaction) if isinstance(node, ast.Constant) and node.value == activation_sql
+    )
+    args = {keyword.arg: ast.unparse(keyword.value) for keyword in ledger_append.keywords}
+    assert args["outcome"] == "'hold' if reason else 'activated'"
+    assert args["active_review_version"] == "active_version"
 
 
 def test_every_operator_reactivation_site_calls_the_audit_helper():

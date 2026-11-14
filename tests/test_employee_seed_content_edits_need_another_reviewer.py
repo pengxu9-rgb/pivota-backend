@@ -86,7 +86,7 @@ class _DB:
             return None
 
         async def execute(query, values=None):
-            db.writes.append({"sql": query, **(values or {})})
+            db.writes.append({"sql": str(query), **(values or {})})
 
         async def execute_seed(query, values):
             db.writes.append({"sql": query, **(values or {})})
@@ -228,7 +228,7 @@ def test_the_csv_door_publishes_a_draft_it_does_not_change_for_a_non_author(monk
 def _recreate(monkeypatch, actor, existing, **body):
     import routes.employee_products as ep
 
-    db = _DB(monkeypatch, None, existing_all=[existing])
+    db = _DB(monkeypatch, existing, existing_all=[existing])
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=SimpleNamespace(
         canonical_url=DEST, domain="shop-a.example", title="Placeholder cream", image_url=None, price_amount=24.0,
         price_currency="USD", availability="in_stock", evidence={})))
@@ -323,12 +323,40 @@ def test_a_csv_row_that_changes_a_live_seed_is_a_revision(monkeypatch, csv_text)
     assert out.seedIds == [revision["id"]] and any("revision draft" in w for w in out.warnings)
 
 
+def test_a_simple_csv_row_that_only_changes_the_attached_variant_creates_a_revision(monkeypatch):
+    db = _DB(monkeypatch, _row("active", attached_product_key=PK, attached_variant_id="v1"))
+    out = asyncio.run(db.ep._import_external_seeds_csv_text(
+        text=f"destination_url,market,attached_product_key,attached_variant_id\n{DEST},US,{PK},v2\n",
+        current_user=dict(B), market="US", tool="*", mode="upsert",
+    ))
+    assert out.errors == [] and db.updates_of_seed() == [] and db.projected == []
+    (revision,) = db.inserts()
+    assert revision["status"] == "draft"
+    assert revision["seed_data"]["revision_of"] == "seed_1"
+    assert revision["attached_variant_id"] == "v2"
+    assert revision["created_by_employee_id"] == B_STAMP
+
+
+def test_recreating_a_live_seed_with_a_different_attached_variant_creates_a_revision(monkeypatch):
+    db, out = _recreate(
+        monkeypatch, B, _row("active", attached_product_key=PK, attached_variant_id="v1"),
+        attach_product_key=PK, attach_variant_id="v2",
+    )
+    assert db.updates_of_seed() == [] and db.projected == []
+    (revision,) = db.inserts()
+    assert revision["attached_variant_id"] == "v2"
+    assert revision["created_by_employee_id"] == B_STAMP
+    assert out["seed"]["status"] == "draft"
+
+
 def test_the_publish_step_treats_the_revised_seed_as_superseded_not_a_conflict(monkeypatch):
-    db = _DB(monkeypatch, None)
+    row = _row("draft", id="seed_rev")
+    db = _DB(monkeypatch, row)
     asyncio.run(db.ep._publish_seed(
         seed_id="seed_rev", market="US", tool="*", external_product_id="ext_seed_1", destination_url=ELSEWHERE,
         canonical_url=None, update_sql="UPDATE external_product_seeds SET status = 'active' WHERE id = :id",
         update_values={"id": "seed_rev"}, actor=C, created_by=O_STAMP, revision_of="seed_live",
+        expected_version=db.ep._seed_review_version(row),
     ))
     (supersede,) = db.supersedes()
     assert supersede["revision_of"] == "seed_live" and supersede["external_product_id"] == "ext_seed_1"
@@ -348,6 +376,7 @@ def test_the_fingerprint_reads_what_the_editor_shows():
     assert ep._seed_content_fingerprint(dict(row, title=None), dict(sd)) == base, "the title from seed_data counts"
     assert ep._seed_content_fingerprint(dict(row, disclosure_text=ep.DEFAULT_DISCLOSURE_TEXT), sd) == base
     assert ep._seed_content_fingerprint(dict(row, notes="x", status="active"), sd) == base, "not content"
+    assert ep._seed_content_fingerprint(dict(row, attached_variant_id="∅"), sd) == base
     for change in ({"destination_url": ELSEWHERE}, {"price_amount": 1.0}, {"canonical_url": ELSEWHERE},
                    {"attached_product_key": "pk_other"}, {"market": "SG"}):
         assert ep._seed_content_fingerprint(dict(row, **change), sd) != base, change

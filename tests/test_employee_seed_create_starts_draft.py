@@ -9,6 +9,7 @@ keep their status: a create that lands on a live seed for the same destination u
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -55,6 +56,8 @@ def _run_create(monkeypatch, existing: Optional[List[Dict[str, Any]]] = None):
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=_snapshot()))
     monkeypatch.setattr(ep.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
+    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=existing[0] if existing else None))
     monkeypatch.setattr(ep.database, "execute", execute)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
@@ -86,7 +89,7 @@ def test_a_create_on_a_live_seed_updates_it_and_keeps_it_live(monkeypatch):
     set_clause = update["sql"].split("WHERE")[0]
     assert "status" not in set_clause, "an existing row's status is never rewritten"
     assert out["seed"]["status"] == "active"
-    (supersede,) = supersedes
+    (supersede,) = [write for write in supersedes if "superseded_by" in str(write.get("note") or "")]
     assert "SET status = 'disabled'" in supersede["sql"], "a live re-create still supersedes as before"
 
 

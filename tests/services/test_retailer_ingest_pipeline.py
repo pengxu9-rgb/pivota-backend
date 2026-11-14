@@ -5,6 +5,7 @@ apply, a mislabelled row holds the store, a throttled crawl is retried later (ne
 a capped crawl and a partial apply stop for a human, and an apply re-runs every check first.
 """
 from datetime import datetime, timezone
+from hashlib import sha256
 from types import SimpleNamespace
 
 import json
@@ -18,11 +19,18 @@ from services.retailer_ingest import pipeline
 _REAL_RECORDS_FOR_BRAND = feed.records_for_brand
 
 
+def _shopify_ids(handle):
+    # Keep fixtures stable across hash seeds and in distinct, 13-digit ranges.
+    suffix = int(sha256(handle.encode()).hexdigest()[:12], 16) % 10**12
+    return 10**12 + suffix, 2 * 10**12 + suffix
+
+
 def record(title, ptype, handle, body="<p>A lip colour for soft, velvet lips.</p>", currency="USD"):
+    product_id, variant_id = _shopify_ids(handle)
     return feed.shopify_product_to_record(
-        {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+        {"id": product_id, "vendor": "3CE", "title": title, "handle": handle,
          "product_type": ptype, "body_html": body, "images": [{"src": "https://cdn.example/i.jpg"}],
-         "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True,
+         "variants": [{"id": variant_id, "price": "20.00", "available": True,
                        "sku": handle}]},
         domain="k-touch.us", category_path="beauty", brand_override="3CE", currency=currency,
         source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True,
@@ -1014,10 +1022,11 @@ async def test_a_brand_official_cohort_applies_with_brand_authority(env, monkeyp
     """The brand's own store: offers carry the brand's merchant identity and brand-official INCI
     authority, not a reseller's -- the same records Lane A (onboard_curated_brands.py) writes."""
     def official(title, ptype, handle, body="<p>Ingredients: Water, Glycerin, Dimethicone</p>"):
+        product_id, variant_id = _shopify_ids(handle)
         return feed.shopify_product_to_record(
-            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+            {"id": product_id, "vendor": "3CE", "title": title, "handle": handle,
              "product_type": ptype, "body_html": body, "images": [{"src": "https://cdn.example/i.jpg"}],
-             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True,
+             "variants": [{"id": variant_id, "price": "20.00", "available": True,
                            "sku": handle}]},
             domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
             source_role="brand_official", emit_native_variants=True)
@@ -1088,10 +1097,11 @@ async def test_naming_the_store_as_the_brand_cannot_write_another_brands_rows(en
     """Review round 2: brand="K-Touch" owns k-touch.us, but the records' brand is their vendor (3CE),
     whose canonical keys they would overwrite. Every written brand must own the host."""
     def official(title, ptype, handle):
+        product_id, variant_id = _shopify_ids(handle)
         return feed.shopify_product_to_record(
-            {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+            {"id": product_id, "vendor": "3CE", "title": title, "handle": handle,
              "product_type": ptype, "body_html": "<p>x</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
-             "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True, "sku": handle}]},
+             "variants": [{"id": variant_id, "price": "20.00", "available": True, "sku": handle}]},
             domain="k-touch.us", category_path="beauty", brand_override="K-Touch", currency="USD",
             source_role="brand_official", emit_native_variants=True)
 
@@ -1379,11 +1389,12 @@ async def test_the_readback_reads_each_products_own_row_not_the_shared_index_fla
 # excluded: shoppers look for gift sets, and the harm was the shelf.
 
 def product(title, ptype, handle, price="20.00"):
+    product_id, variant_id = _shopify_ids(handle)
     return feed.shopify_product_to_record(
-        {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+        {"id": product_id, "vendor": "3CE", "title": title, "handle": handle,
          "product_type": ptype, "body_html": "<p>A hydrating cream for the face.</p>",
          "images": [{"src": "https://cdn.example/i.jpg"}],
-         "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": price, "available": True, "sku": handle}]},
+         "variants": [{"id": variant_id, "price": price, "available": True, "sku": handle}]},
         domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
         source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True,
     )

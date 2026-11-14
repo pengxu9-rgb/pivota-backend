@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -405,10 +406,16 @@ def _create(monkeypatch, page, existing_rows: List[Dict[str, Any]], *, variants=
     async def execute_seed(query, values):
         writes.append(values)
 
+    async def fetch_seed(query, values):
+        assert "SELECT * FROM external_product_seeds WHERE id = :id" in str(query)
+        return next((copy.deepcopy(row) for row in existing_rows if row["id"] == values["id"]), None)
+
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=page))
     monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=existing_rows))
+    monkeypatch.setattr(ep.database, "fetch_one", fetch_seed)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
     monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
@@ -512,6 +519,7 @@ def _patch(monkeypatch, variants, *, stored=None, row_currency="USD", **fields):
     row["price_currency"] = row_currency
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep.database, "execute", write)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", write)
     asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(variants=variants, **fields),

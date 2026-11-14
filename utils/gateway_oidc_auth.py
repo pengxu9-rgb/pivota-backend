@@ -517,17 +517,12 @@ def _reset_warn_state_for_test() -> None:
 # Verification
 # ---------------------------------------------------------------------------
 
-def verify_gateway_identity(token: str) -> Dict[str, Any]:
-    """Return the synthesised principal, or raise `_Refused` with a reason code.
-
-    Raises only `_Refused`. Anything the library throws — including a network failure reaching
-    Google — is folded into `verify_failed`, because the CALLER must not be able to tell a
-    forged signature from a certs outage.
-    """
-    audience = configured_audience()
+def verify_google_service_identity(
+    token: str, *, audience: str, allowed: Set[str],
+) -> Dict[str, Any]:
+    """Verify Google OIDC claims for the caller's dedicated audience and service allowlist."""
     if not audience:
         raise _Refused("audience_env_unset")
-    allowed = configured_service_accounts()
     if not allowed:
         raise _Refused("allowlist_env_unset")
 
@@ -571,14 +566,21 @@ def verify_gateway_identity(token: str) -> Dict[str, Any]:
     normalized_email = email.strip().lower()
     if normalized_email not in allowed:
         raise _Refused("email_not_allowlisted")
+    return {"email": normalized_email, "sub": claims.get("sub"), "audience": audience}
 
+
+def verify_gateway_identity(token: str) -> Dict[str, Any]:
+    """Return the synthesised principal, or raise `_Refused` with a reason code."""
+    identity = verify_google_service_identity(
+        token, audience=configured_audience(), allowed=configured_service_accounts(),
+    )
     # No `sub`, no user id: this is a MACHINE, and anything that later wants to attribute an
     # action to a person must fail to find one rather than find a plausible-looking one.
     return {
         "role": GATEWAY_IDENTITY_ROLE,
-        "email": normalized_email,
+        "email": identity["email"],
         "auth_method": "gateway_oidc",
-        "audience": audience,
+        "audience": identity["audience"],
     }
 
 
