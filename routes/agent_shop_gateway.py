@@ -140,6 +140,7 @@ from services import offer_live_verification
 from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
+    SOURCE_CATALOG_SKU,
     canonical_variant_id,
     entry_is_the_sole_variant_read_again,
     handover_coverage_fields,
@@ -6012,6 +6013,17 @@ async def _handle_offers_resolve(
                     )
                 )
 
+                pdp_destination = str(canonical_url or destination_url)
+                if (
+                    _named_without_cart
+                    and variant_match == "exact"
+                    and len(matched_variants) == 1
+                    and str(observed_market_hint or "").upper() == "US"
+                    and row_dict.get("market") == "US"
+                ):
+                    pdp_destination = _named_seed_variant_pdp_url(
+                        pdp_destination, seed_id, redirect_identity.get("seller_ref"), v, sku_id, _handover,
+                    )
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -6028,7 +6040,7 @@ async def _handle_offers_resolve(
                     # the request market, so the click re-check asks the market the mint asked.
                     market_observed=request_market_observed(observed_market_hint),
                     tool=used_tool,
-                    destination_url=str(canonical_url or destination_url),
+                    destination_url=pdp_destination,
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
                     click_id=stable_click_id,
                     ctx={
@@ -6079,10 +6091,7 @@ async def _handle_offers_resolve(
                 )
 
                 composed_spec = compose_attributed_destinations(
-                    # The SAME value the builder above was called with (`canonical_url or
-                    # destination_url`), not the raw column — _seed_domain_from_url reads the
-                    # host off it, so a different input here could disagree with the link.
-                    destination_url=str(canonical_url or destination_url),
+                    destination_url=pdp_destination,
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
                     market=used_market,
                     tool=used_tool,
@@ -6101,11 +6110,7 @@ async def _handle_offers_resolve(
                 # payload. Deriving both from this call makes that impossible by construction.
                 prefilled_claim = _cart_prefilled_claim(
                     cart_url=composed_spec["cart_url"],
-                    # The SAME value compose_attributed_destinations was given
-                    # (`canonical_url or destination_url`), not the raw column —
-                    # _seed_domain_from_url reads the host off it, so a different input here
-                    # could disagree with the link it describes.
-                    destination_url=str(canonical_url or destination_url),
+                    destination_url=pdp_destination,
                     # The link we JUST minted, so the resolve-time rollout bucket is computed
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
@@ -12219,6 +12224,39 @@ def _attached_variant_is_this_offer(
     # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
     # say which one the offer is, so neither may lend it the attached cart.
     return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
+
+
+def _named_seed_variant_pdp_url(
+    family_url: str,
+    seed_id: str,
+    seller_ref: Optional[str],
+    variant: Dict[str, Any],
+    requested_variant_id: Any,
+    handover: Optional[HandoverVariant],
+) -> str:
+    """Keep the selected shade on a reviewed brand-direct referral."""
+    native_id = canonical_variant_id(requested_variant_id)
+    if (
+        not native_id
+        or handover is None
+        or handover.source != SOURCE_CATALOG_SKU
+        or handover.variant_id != native_id
+        or stored_entry_claimed_variant_ids(variant) != {native_id}
+    ):
+        return family_url
+
+    from services.external_seed_review_pilot import LISTINGS
+
+    listing = LISTINGS.get(seed_id)
+    if (
+        listing is None
+        or seller_ref != listing.seller_ref
+        or family_url != listing.url
+        or not any(native_id == variant_id for variant_id, *_ in listing.variants)
+    ):
+        return family_url
+    selected_url = f"{listing.url}?variant={native_id}"
+    return selected_url if variant.get("url") == selected_url else family_url
 
 
 def _cart_pinned_to(cart_url: Any, market: Any) -> bool:
