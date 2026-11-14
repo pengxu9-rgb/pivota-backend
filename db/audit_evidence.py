@@ -1953,7 +1953,7 @@ async def upsert_review_finding(*, audit_run_id: str, merchant_id: str,
     statement = pg_insert(findings).values(
         finding_id=str(uuid.uuid4()), audit_run_id=audit_run_id, merchant_id=merchant_id,
         product_key=product_key, finding_type=finding_type, severity="low",
-        payload_jsonb=payload, created_at=_now_utc(), idempotency_key=f"{finding_type}:{observation_id}",
+        payload_jsonb=_json_safe(payload), created_at=_now_utc(), idempotency_key=f"{finding_type}:{observation_id}",
     )
     statement = statement.on_conflict_do_update(
         index_elements=[findings.c.audit_run_id, findings.c.idempotency_key],
