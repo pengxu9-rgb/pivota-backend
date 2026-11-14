@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -563,7 +564,9 @@ def _create_over(monkeypatch, page, existing_seed_data: Dict[str, Any], **body: 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=page))
     monkeypatch.setattr(ep.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
     monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
@@ -608,6 +611,7 @@ def _patch(monkeypatch, seed_data: Dict[str, Any], **body: Any) -> Dict[str, Any
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_project_refreshed_seed_to_serving_surfaces", AsyncMock(return_value={}))
     asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(**body), current_user={"employee_id": "e"}))

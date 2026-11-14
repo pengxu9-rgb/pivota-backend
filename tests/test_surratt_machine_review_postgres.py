@@ -111,7 +111,7 @@ async def insert_draft(db, seed_id, listing, *, seller_source_ref):
     ("default", "observe_only"), ("unpinned_version", "activation_version_not_pinned"),
     ("wrong_seller", "observed_seller_changed"), ("active_alias", "active_seed_conflict"),
     ("prior_rejection_without_note", "employee_rejection_recorded"),
-    ("other_pilot", "observe_only"), ("activate", None),
+    ("other_pilot", "observe_only"), ("activate", None), ("append_failure", None),
 ])
 async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monkeypatch, case, expected):
     from routes import employee_products as ep
@@ -136,6 +136,10 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         await route_db.execute(
             "INSERT INTO external_product_seeds (id, market, destination_url, status) "
             "VALUES ('existing-active', 'US', :url, 'active')", {"url": listing.listing_urls[1]},
+        )
+    if case == "append_failure":
+        await route_db.execute(
+            "ALTER TABLE external_seed_machine_reviews ADD CONSTRAINT fixture_fail_review_append CHECK (FALSE)"
         )
 
     monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ENABLED", "true")
@@ -197,6 +201,16 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         assert (await client.post(f"{PREFIX}/not-allowlisted/machine-review", json=req, headers=headers)).status_code == 404
         assert (await client.post(endpoint, json=req | {"review_version": "0" * 64}, headers=headers)).status_code == 409
         vertex.assert_not_awaited()
+        if case == "append_failure":
+            from asyncpg import CheckViolationError
+
+            with pytest.raises(CheckViolationError, match="fixture_fail_review_append"):
+                await client.post(endpoint, json=req, headers=headers)
+            stored = await route_db.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+            assert dict(stored) == row
+            assert await load_machine_review(route_db, req["request_id"]) is None
+            project.assert_not_awaited()
+            return
         response = await client.post(endpoint, json=req, headers=headers)
         assert response.status_code == 200, response.text
         receipt = response.json()
@@ -214,6 +228,15 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         assert ep._seed_review_version(after) == version
         project.assert_not_awaited()
     else:
+        from asyncpg import RaiseError
+
         assert after["status"] == "active"
         assert ep._seed_review_version(after) == receipt["active_review_version"]
         project.assert_awaited_once_with(seed_id, price_source=None)
+        with pytest.raises(RaiseError, match="append-only"):
+            async with route_db.transaction():
+                await route_db.execute(
+                    "UPDATE external_seed_machine_reviews SET outcome = outcome WHERE request_id = :request_id",
+                    {"request_id": req["request_id"]},
+                )
+        assert await load_machine_review(route_db, req["request_id"]) == receipt
