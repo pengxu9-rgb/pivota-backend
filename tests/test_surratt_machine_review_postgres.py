@@ -111,13 +111,20 @@ async def insert_draft(db, seed_id, listing, *, seller_source_ref):
     ("default", "observe_only"), ("unpinned_version", "activation_version_not_pinned"),
     ("wrong_seller", "observed_seller_changed"), ("active_alias", "active_seed_conflict"),
     ("prior_rejection_without_note", "employee_rejection_recorded"),
-    ("other_pilot", "observe_only"), ("activate", None), ("append_failure", None),
+    ("other_seed_pinned", "activation_version_not_pinned"),
+    ("amuse_corroboration_changed", "variant_barcode_corroboration_unverified"),
+    ("activate_amuse", None), ("activate_romand", None), ("activate", None), ("append_failure", None),
 ])
 async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monkeypatch, case, expected):
     from routes import employee_products as ep
     from services.external_seed_machine_review_ledger import load_machine_review
 
-    seed_id = next(iter(pilot.LISTINGS)) if case == "other_pilot" else pilot.SURRATT_SEED_ID
+    seed_id = {
+        "activate_amuse": pilot.AMUSE_SEED_ID,
+        "amuse_corroboration_changed": pilot.AMUSE_SEED_ID,
+        "activate_romand": pilot.ROMAND_SEED_ID,
+        "other_seed_pinned": pilot.ROMAND_SEED_ID,
+    }.get(case, pilot.SURRATT_SEED_ID)
     listing = pilot.LISTINGS[seed_id]
     seller_host = listing.host if case == "wrong_seller" else listing.seller_host
     row = await insert_draft(route_db, seed_id, listing, seller_source_ref=seller_host)
@@ -151,7 +158,13 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
     if case != "default":
         monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_ENABLED", "true")
         if case != "unpinned_version":
-            monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_VERSION", version)
+            pinned_version = version
+            if case == "other_seed_pinned":
+                peer = pilot.LISTINGS[pilot.AMUSE_SEED_ID]
+                peer_row = await insert_draft(route_db, pilot.AMUSE_SEED_ID, peer, seller_source_ref=peer.seller_host)
+                pinned_version = ep._seed_review_version(peer_row)
+                assert pinned_version != version
+            monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_VERSION", pinned_version)
 
     def google_identity(token, *, audience, allowed):
         assert (audience, allowed) == ("https://machine-review.test", {MACHINE_EMAIL})
@@ -164,6 +177,16 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
     monkeypatch.setattr(ep, "_project_published_seed", project)
 
     def storefront_session(_client, host, *_args):
+        if listing.corroboration_url and host == urlsplit(listing.corroboration_url).hostname:
+            return SimpleNamespace(json=AsyncMock(return_value=(200, {
+                "id": 10073908707648, "title": "AMUSE Banana Lip Oil 4.5ml",
+                "variants": [
+                    {"id": 51629126123840, "title": "02 Banana", "barcode": (
+                        "8800299133517" if case == "amuse_corroboration_changed" else "8800299133494"
+                    )},
+                    {"id": 51896079974720, "title": "04 Juicy Peach", "barcode": "8800299133517"},
+                ],
+            })))
         if host == listing.seller_host:
             meta = httpx.Response(200, json={"currency": "USD", "ships_to_countries": ["US"],
                                             "myshopify_domain": listing.native_shop_domain})
@@ -171,7 +194,8 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
             assert host == listing.host
             meta = None
         detail = {"id": listing.native_product_id, "variants": [
-            {"id": int(vid), "title": shade, "sku": sku, "barcode": gtin, "available": True,
+            {"id": int(vid), "title": shade, "sku": sku,
+             "barcode": gtin if not listing.corroboration_url else None, "available": True,
              "price": listing.price_minor} for vid, gtin, shade, sku in listing.variants
         ]}
         return SimpleNamespace(request=AsyncMock(return_value=meta),
@@ -181,7 +205,8 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         payload = request["contents"][0]["parts"][0]["text"]
         assert seed_id not in payload and listing.seller_ref not in payload and version not in payload
         rows = [{"variant_id": vid, "scope": "brand_direct", "offer_id": None, "action": "employee_review",
-                 "evidence_refs": [f"shopify_us:{vid}"]} for vid, _, _, _ in listing.variants]
+                 "evidence_refs": [f"shopify_us:{vid}"] + ([f"barcode:{vid}"] if listing.corroboration_url else [])}
+                for vid, _, _, _ in listing.variants]
         return {"modelVersion": model, "responseId": f"fixture-{model.replace('.', '_')}", "candidates": [
             {"finishReason": "STOP", "content": {"parts": [{"text": json.dumps({"rows": rows})}]}},
         ]}
@@ -219,9 +244,10 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         assert receipt["decision"].get("hold_reason") == expected
         assert receipt["outcome"] == ("hold" if expected else "activated")
         assert bool(receipt["active_review_version"]) == (expected is None)
-        assert {r["model_name"] for r in receipt["decision"]["receipts"].values()} == set(pilot.REVIEW_MODELS[:2])
+        model_count = 0 if case == "amuse_corroboration_changed" else 2
+        assert {r["model_name"] for r in receipt["decision"]["receipts"].values()} == set(pilot.REVIEW_MODELS[:model_count])
         assert (await client.post(endpoint, json=req, headers=headers)).json() == receipt
-        assert vertex.await_count == 2
+        assert vertex.await_count == model_count
 
     after = dict(await route_db.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id}))
     if expected:
