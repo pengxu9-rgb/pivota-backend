@@ -6014,7 +6014,13 @@ async def _handle_offers_resolve(
                 )
 
                 pdp_destination = str(canonical_url or destination_url)
-                if _named_without_cart and variant_match == "exact" and len(matched_variants) == 1:
+                if (
+                    _named_without_cart
+                    and variant_match == "exact"
+                    and len(matched_variants) == 1
+                    and str(observed_market_hint or "").upper() == "US"
+                    and row_dict.get("market") == "US"
+                ):
                     pdp_destination = _named_seed_variant_pdp_url(
                         pdp_destination, seed_id, redirect_identity.get("seller_ref"), v, sku_id, _handover,
                     )

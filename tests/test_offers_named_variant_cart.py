@@ -78,6 +78,7 @@ def _sku_row(vid: str) -> Dict[str, Any]:
 def _resolve(
     monkeypatch, client, seeds: List[Dict[str, Any]], *, sku_id: Optional[str] = None,
     sku_rows: Optional[List[Dict[str, Any]]] = None,
+    market_assumed: bool = False,
 ) -> List[Dict[str, Any]]:
     import routes.agent_shop_gateway as gateway
 
@@ -101,7 +102,8 @@ def _resolve(
     res = client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
-              "payload": {"product": product, "limit": 5, "tool": "*", "market": "US"},
+              "payload": {"product": product, "limit": 5, "tool": "*", "market": "US",
+                          "market_assumed": market_assumed},
               "metadata": {"source": "creator-agent-ui"}},
     )
     assert res.status_code == 200, res.text
@@ -203,7 +205,8 @@ def test_named_catalog_variant_keeps_selection_on_referral(
 @pytest.mark.parametrize(
     "case",
     ["other_seller", "other_listing", "other_variant", "ambiguous_query", "subscription",
-     "conflicting_id", "no_catalog_proof", "unnamed", "unreviewed_seed", "wrong_seller_ref"],
+     "conflicting_id", "no_catalog_proof", "unnamed", "unreviewed_seed", "wrong_seller_ref",
+     "assumed_market", "different_listing_market"],
 )
 def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_listing, case):
     from services.external_seed_review_pilot import LISTINGS
@@ -223,11 +226,14 @@ def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_
         monkeypatch.setitem(LISTINGS, seed["id"], referral_listing)
     if case == "wrong_seller_ref":
         seed["seller_ref"] = "merch_obs_other"
+    if case == "different_listing_market":
+        seed["market"] = "CA"
 
     offer = _resolve(
         monkeypatch, client, [seed],
         sku_id=None if case == "unnamed" else NAMED,
         sku_rows=[] if case == "no_catalog_proof" else rows,
+        market_assumed=case == "assumed_market",
     )[0]
 
     _assert_referral(offer)
