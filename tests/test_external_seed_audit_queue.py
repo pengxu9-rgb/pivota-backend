@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from contextlib import nullcontext
 from unittest.mock import AsyncMock
 
 import pytest
@@ -780,6 +781,7 @@ def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
         writes.append({"sql": query, **values})
 
     monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(employee_products_module.database, "transaction", nullcontext)
     monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", record_write)
     monkeypatch.setattr(employee_products_module, "_project_refreshed_seed_to_serving_surfaces", fake_project)
 

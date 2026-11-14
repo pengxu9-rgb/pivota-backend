@@ -15,6 +15,7 @@ routes) is in tests/test_seed_publish_lock_and_audit_verdict_postgres.py. All na
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import asyncio
 import logging
 import re
@@ -72,7 +73,7 @@ class _DB:
             return None
 
         async def execute(query, values=None):
-            db.writes.append({"sql": query, **(values or {})})
+            db.writes.append({"sql": str(query), **(values or {})})
 
         async def execute_seed(query, values):
             db.writes.append({"sql": query, **(values or {})})
@@ -258,6 +259,7 @@ def test_the_check_runs_inside_the_publish_step_so_no_door_can_skip_it():
         asyncio.run(ep._publish_seed(
             seed_id="s", market="US", tool="*", external_product_id="e", destination_url=DEST, canonical_url=None,
             update_sql="UPDATE x", update_values={}, actor=CREATOR, created_by=CREATOR_STAMP,
+            expected_version="unused",
         ))
     assert err.value.status_code == 403
 
@@ -310,6 +312,7 @@ def _capture_writes(monkeypatch, *, existing_one=None, existing_all=None):
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=existing_one))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=list(existing_all or [])))
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
@@ -397,7 +400,7 @@ def test_the_backfill_route_passes_its_actors_stamp(monkeypatch):
 def _editor_create(monkeypatch, existing):
     import routes.employee_products as ep
 
-    writes = _capture_writes(monkeypatch, existing_all=existing)
+    writes = _capture_writes(monkeypatch, existing_one=existing[0] if existing else None, existing_all=existing)
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=SimpleNamespace(
         canonical_url=DEST, domain="shop-a.example", title="Placeholder cream", image_url=None, price_amount=24.0,
         price_currency="USD", availability="in_stock", evidence={})))

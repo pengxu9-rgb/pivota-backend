@@ -385,7 +385,7 @@ class _Session:
         self.polite.note_response(url, resp.status_code, retry_after=resp.headers.get("retry-after"),
                                   headers=resp.headers)
         final = _host(str(getattr(resp, "url", "") or url))
-        if final != self.host:
+        if final != _host(self.host):
             # A geo-router or a sibling regional store: another catalog, another currency.
             refusal = self._refuse("capture_unverifiable", "failed",
                                    f"{path}: the storefront redirected to {final or '(unknown)'}; a regional "

@@ -41,8 +41,11 @@ import asyncio
 import contextvars
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
@@ -115,16 +118,25 @@ class _RouteDB:
         self.rendezvous: Optional[_Rendezvous] = None
         #: Awaited when a publish reaches its supersede (inside its transaction, after its checks).
         self.at_supersede: Optional[Any] = None
+        self.before_destination_lock: Optional[Any] = None
+        self.before_seed_row_lock: Optional[Any] = None
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
     async def execute(self, query, values=None):
+        if self.before_destination_lock is not None and "pg_advisory_xact_lock" in query:
+            await self.before_destination_lock()
         if self.rendezvous is not None and " superseded_by:" in str((values or {}).get("note") or ""):
             await self.rendezvous.arrive()
         if self.at_supersede is not None and " superseded_by:" in str((values or {}).get("note") or ""):
             await self.at_supersede()
         return await self._inner.execute(query, values)
+
+    async def fetch_one(self, query, values=None):
+        if self.before_seed_row_lock is not None and query.endswith("WHERE id = :id FOR UPDATE"):
+            await self.before_seed_row_lock()
+        return await self._inner.fetch_one(query, values)
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +172,12 @@ async def env(monkeypatch):
                 if statement.strip().rstrip(";").upper() in {"BEGIN", "COMMIT"}:
                     continue
                 await scoped.execute(statement)
+        # The shared review-center migration also builds tables that refer to
+        # unrelated identity tables. This fixture only uses its audit table.
+        for statement in split_statements((_MIGRATIONS / "040_reviews_center.sql").read_text()):
+            if "CREATE TABLE IF NOT EXISTS employee_audit_logs" in statement:
+                await scoped.execute(statement)
+                break
 
         route_db = _RouteDB(scoped)
         monkeypatch.setattr(ep, "database", route_db)
@@ -187,7 +205,7 @@ async def env(monkeypatch):
         app.dependency_overrides[get_current_employee] = _employee
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             yield {"db": scoped, "route_db": route_db, "client": client, "ep": ep, "dual_write": dual_write,
-                   "actor": actor}
+                   "actor": actor, "app": app}
     finally:
         await scoped.disconnect()
         await admin.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
@@ -206,6 +224,138 @@ async def _seed(db, seed_id: str, *, status: str, dest: str = DEST, external_pro
         {"id": seed_id, "epid": epid, "dest": dest, "price": price, "status": status, "age": age_hours,
          "sd": json.dumps({"external_product_id": epid, "title": "Placeholder cream"})},
     )
+
+
+@pytest.fixture
+async def machine_pilot(env, monkeypatch):
+    from db.sql_migrations import split_statements
+    from services import external_seed_review_pilot as pilot
+
+    db, ep = env["db"], env["ep"]
+    for statement in split_statements((_MIGRATIONS / "285_external_seed_machine_reviews.sql").read_text()):
+        await db.execute(statement)
+    seed_id = pilot.SURRATT_SEED_ID
+    listing = pilot.LISTINGS[seed_id]
+    variants = [
+        {"variant_id": vid, "barcode": gtin, "title": shade, "sku": sku, "price_currency": "USD",
+         "price_amount": listing.price_minor / 100, "availability": "in_stock", "in_stock": True,
+         "url": f"{listing.url}?variant={vid}"}
+        for vid, gtin, shade, sku in listing.variants
+    ]
+    product_id = ep._stable_external_product_id(listing.url)
+    await _seed(db, seed_id, status="draft", dest=listing.url, external_product_id=product_id,
+                price=listing.price_minor / 100)
+    await db.execute(
+        """
+        UPDATE external_product_seeds
+        SET seller_ref = :seller, seed_kind = 'cross', domain = :host, title = :title,
+            seed_data = CAST(:data AS jsonb)
+        WHERE id = :id
+        """,
+        {"seller": listing.seller_ref, "host": listing.host, "title": listing.title, "id": seed_id,
+         "data": json.dumps({"variants": variants, "title": listing.title, "brand": listing.brand,
+                             "merchant_display_name": listing.brand, "description": listing.description,
+                             "external_product_id": product_id, "product_id": str(listing.native_product_id)})},
+    )
+    await db.execute(
+        "INSERT INTO catalog_merchants (merchant_id, source_ref, status) VALUES (:id, :host, 'observed')",
+        {"id": listing.seller_ref, "host": listing.seller_host},
+    )
+    row = await db.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    version = ep._seed_review_version(dict(row))
+
+    async def reviewer():
+        return "pilot-test@example.com:123"
+
+    env["client"]._transport.app.dependency_overrides[ep._machine_seed_reviewer] = reviewer
+    source = AsyncMock(return_value={"sources": {"public": {}}, "captured_at": datetime.now(timezone.utc).isoformat()})
+    model = AsyncMock(return_value={"eligible": True, "evidence_digest": "a" * 64, "result": {"state": "completed"}})
+    projection = AsyncMock(return_value={})
+    monkeypatch.setattr(pilot, "capture_shopify_evidence", source)
+    monkeypatch.setattr(pilot, "adjudicate", model)
+    monkeypatch.setattr(ep, "audit_external_seed_row", lambda _: {"findings": []})
+    monkeypatch.setattr(ep, "_is_domain_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(ep, "_project_published_seed", projection)
+    monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_ENABLED", "true")
+    monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_VERSION", version)
+    return dict(
+        env, seed_id=seed_id, listing=listing, version=version, projection=projection, source=source, model=model,
+        url=f"{PREFIX}/{seed_id}/machine-review", body={"request_id": str(uuid4()), "review_version": version},
+    )
+
+
+async def test_machine_activation_records_receipt_and_is_idempotent(machine_pilot):
+    pilot = machine_pilot
+    client = pilot["client"]
+    read = await client.get(f'{PREFIX}/{pilot["seed_id"]}/projection', params={"review_version": pilot["version"]})
+    assert read.json()["projection"]["status"] == "not_active"
+    first = await client.post(pilot["url"], json=pilot["body"])
+    assert first.status_code == 200, first.text
+    receipt = first.json()
+    assert receipt["outcome"] == "activated"
+    assert receipt["active_review_version"] != pilot["version"]
+    retry = await client.post(pilot["url"], json=pilot["body"])
+    assert retry.json() == receipt
+    wrong_version = await client.post(pilot["url"], json={**pilot["body"], "review_version": "b" * 64})
+    assert wrong_version.status_code == 409
+    assert pilot["source"].await_count == pilot["model"].await_count == pilot["projection"].await_count == 1
+    row = await pilot["db"].fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": pilot["seed_id"]})
+    assert row["status"] == "active"
+    assert pilot["ep"]._seed_review_version(dict(row)) == receipt["active_review_version"]
+
+
+async def test_machine_hold_never_supersedes_an_active_seed(machine_pilot):
+    pilot = machine_pilot
+    await _seed(pilot["db"], "active-peer", status="active", dest=pilot["listing"].url)
+    response = await pilot["client"].post(pilot["url"], json=pilot["body"])
+    assert response.status_code == 200, response.text
+    assert response.json()["decision"]["hold_reason"] == "active_seed_conflict"
+    assert response.json()["outcome"] == "hold"
+    seeds = await _seeds(pilot["db"])
+    assert seeds[pilot["seed_id"]]["status"] == "draft"
+    assert seeds["active-peer"]["status"] == "active"
+    pilot["projection"].assert_not_awaited()
+
+
+async def test_machine_shadow_review_records_evidence_without_activation(machine_pilot, monkeypatch):
+    pilot = machine_pilot
+    monkeypatch.delenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_ENABLED", raising=False)
+    response = await pilot["client"].post(pilot["url"], json=pilot["body"])
+    assert response.status_code == 200, response.text
+    assert response.json()["decision"]["hold_reason"] == "observe_only"
+    assert response.json()["outcome"] == "hold"
+    assert (await _seeds(pilot["db"]))[pilot["seed_id"]]["status"] == "draft"
+    pilot["projection"].assert_not_awaited()
+
+
+async def test_machine_approval_cannot_publish_if_draft_changes_during_review(machine_pilot):
+    pilot = machine_pilot
+
+    async def changed(*_args):
+        await pilot["db"].execute(
+            "UPDATE external_product_seeds SET notes = 'changed' WHERE id = :id", {"id": pilot["seed_id"]},
+        )
+        return {"eligible": True, "evidence_digest": "a" * 64}
+
+    pilot["model"].side_effect = changed
+    response = await pilot["client"].post(pilot["url"], json=pilot["body"])
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "SEED_VERSION_CHANGED"
+    assert (await _seeds(pilot["db"]))[pilot["seed_id"]]["status"] == "draft"
+    assert await pilot["db"].fetch_one("SELECT request_id FROM external_seed_machine_reviews") is None
+    pilot["projection"].assert_not_awaited()
+
+
+async def test_machine_ledger_failure_rolls_back_activation(machine_pilot, monkeypatch):
+    from services import external_seed_machine_review_ledger
+
+    pilot = machine_pilot
+    monkeypatch.setattr(external_seed_machine_review_ledger, "append_machine_review",
+                        AsyncMock(side_effect=RuntimeError("synthetic ledger failure")))
+    with pytest.raises(RuntimeError, match="synthetic ledger failure"):
+        await pilot["client"].post(pilot["url"], json=pilot["body"])
+    assert (await _seeds(pilot["db"]))[pilot["seed_id"]]["status"] == "draft"
+    pilot["projection"].assert_not_awaited()
 
 
 async def _mirror(db, seed_id: str) -> str:
@@ -269,7 +419,9 @@ async def test_approving_a_draft_publishes_it_and_projects_its_offer(env):
     pk = await _mirror(db, "seed_draft")
     assert await _offers(db, pk) == [], "premise: nothing is projected for the draft"
 
-    res = await _verdict(client, "seed_draft", "approve")
+    queue = await client.get(f"{PREFIX}/audit-queue", params={"status": "draft"})
+    version = queue.json()["items"][0]["review_version"]
+    res = await _verdict(client, "seed_draft", "approve", review_version=version)
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["published"] is True and body["seed_status"] == "active"
@@ -334,6 +486,197 @@ def _publish_call(client, door: str, seed_id: str):
     if door == "patch":
         return client.patch(f"{PREFIX}/{seed_id}", json={"status": "active"})
     return _verdict(client, seed_id, "approve")
+
+
+@pytest.mark.parametrize("door", ["approve", "reject", "patch"])
+async def test_a_review_version_refuses_content_edited_since_the_browser_read_it(env, door):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _seed(db, "seed_draft", status="draft")
+    queue = await client.get(f"{PREFIX}/audit-queue", params={"status": "draft"})
+    version = queue.json()["items"][0]["review_version"]
+    await _as(actor, "emp_editor")
+    edit = await client.patch(f"{PREFIX}/seed_draft", json={"title": "Revised title"})
+    assert edit.status_code == 200, edit.text
+    await _as(actor, "emp_reviewer")
+    if door == "patch":
+        res = await client.patch(f"{PREFIX}/seed_draft", json={"status": "active", "review_version": version})
+    else:
+        res = await _verdict(client, "seed_draft", door, review_version=version)
+    assert res.status_code == 409 and res.json()["detail"]["error"] == "SEED_VERSION_CHANGED", res.text
+    row = await _row(db, "seed_draft")
+    assert row["status"] == "draft" and row["title"] == "Revised title" and row["notes"] is None
+
+
+@pytest.mark.parametrize("mutation", [{"title": "Edited during approval"}, {"status": "disabled"}])
+async def test_a_legacy_verdict_rechecks_the_draft_after_waiting_for_the_destination(env, mutation):
+    db, client, route_db = env["db"], env["client"], env["route_db"]
+    await _seed(db, "seed_draft", status="draft")
+    await _seed(db, "seed_other", status="active")
+
+    async def edit_after_the_approval_read():
+        res = await _in_its_own_request(client.patch(f"{PREFIX}/seed_draft", json=mutation))
+        assert res.status_code == 200, res.text
+
+    route_db.before_destination_lock = edit_after_the_approval_read
+    res = await _verdict(client, "seed_draft", "approve")
+    assert res.status_code == 409 and res.json()["detail"]["error"] == "SEED_VERSION_CHANGED", res.text
+    rows = await _seeds(db)
+    assert rows["seed_draft"]["status"] == mutation.get("status", "draft")
+    assert rows["seed_other"]["status"] == "active" and rows["seed_other"]["notes"] is None
+
+
+async def test_an_edit_that_read_a_draft_does_not_overwrite_it_after_publish(env):
+    db, client, route_db = env["db"], env["client"], env["route_db"]
+    await _seed(db, "seed_draft", status="draft")
+
+    async def approve_after_the_edit_read():
+        route_db.before_seed_row_lock = None
+        res = await _in_its_own_request(_verdict(client, "seed_draft", "approve"))
+        assert res.status_code == 200, res.text
+
+    route_db.before_seed_row_lock = approve_after_the_edit_read
+    res = await client.patch(f"{PREFIX}/seed_draft", json={"title": "Stale draft edit"})
+    assert res.status_code == 409 and res.json()["detail"]["error"] == "SEED_VERSION_CHANGED", res.text
+    row = await _row(db, "seed_draft")
+    assert row["status"] == "active" and row["title"] == "Placeholder cream"
+
+
+async def test_an_active_recreate_cannot_disable_a_concurrent_publish(env, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    db, client, route_db, ep = env["db"], env["client"], env["route_db"], env["ep"]
+    await _seed(db, "seed_old", status="active")
+    await _seed(db, "seed_new", status="draft")
+    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://example.com/redirect"))
+
+    recreate_at_supersede = asyncio.Event()
+    release_recreate = asyncio.Event()
+    publish_at_lock = asyncio.Event()
+
+    async def pause_recreate_before_superseding():
+        route_db.at_supersede = None
+        recreate_at_supersede.set()
+        await release_recreate.wait()
+
+    async def mark_publish_at_destination_lock():
+        route_db.before_destination_lock = None
+        publish_at_lock.set()
+
+    route_db.at_supersede = pause_recreate_before_superseding
+    recreate = asyncio.create_task(
+        _in_its_own_request(client.post(PREFIX, json={"destination_url": DEST, "market": "US"}))
+    )
+    publish = None
+    try:
+        await asyncio.wait_for(recreate_at_supersede.wait(), timeout=5)
+        (lock_key,) = ep._seed_publish_lock_keys(market="US", tool="*", urls=(DEST,))
+        lock_is_free = await db.fetch_val(
+            "SELECT pg_try_advisory_xact_lock(hashtext(:lock_key))", {"lock_key": lock_key}
+        )
+        route_db.before_destination_lock = mark_publish_at_destination_lock
+        publish = asyncio.create_task(_in_its_own_request(_verdict(client, "seed_new", "approve")))
+        await asyncio.wait_for(publish_at_lock.wait(), timeout=5)
+        if lock_is_free:
+            # Reproduce the race without the fix: commit the replacement before
+            # the old request resumes its stale supersede.
+            await asyncio.wait_for(asyncio.shield(publish), timeout=5)
+    finally:
+        release_recreate.set()
+        recreated = await asyncio.wait_for(recreate, timeout=5)
+        if publish is not None:
+            published = await asyncio.wait_for(publish, timeout=5)
+
+    assert recreated.status_code == 200 and recreated.json()["seed"]["id"] == "seed_old", recreated.text
+    assert published.status_code == 200 and published.json()["published"] is True, published.text
+    rows = await _seeds(db)
+    assert rows["seed_new"]["status"] == "active", rows
+    assert rows["seed_new"]["notes"].strip() == "audit_approve:emp_test"
+    assert rows["seed_old"]["status"] == "disabled"
+
+
+async def test_an_active_recreate_that_read_before_publish_requires_reload(env, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    db, client, route_db, ep = env["db"], env["client"], env["route_db"], env["ep"]
+    await _seed(db, "seed_old", status="active")
+    await _seed(db, "seed_new", status="draft")
+    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://example.com/redirect"))
+
+    async def publish_after_recreate_read():
+        route_db.before_destination_lock = None
+        published = await asyncio.wait_for(_in_its_own_request(_verdict(client, "seed_new", "approve")), timeout=5)
+        assert published.status_code == 200 and published.json()["published"] is True, published.text
+
+    route_db.before_destination_lock = publish_after_recreate_read
+    recreated = await client.post(PREFIX, json={"destination_url": DEST, "market": "US"})
+    assert recreated.status_code == 409 and recreated.json()["detail"]["error"] == "SEED_VERSION_CHANGED", recreated.text
+    rows = await _seeds(db)
+    assert rows["seed_new"]["status"] == "active" and rows["seed_old"]["status"] == "disabled"
+
+
+async def test_review_events_persist_verdict_actor_reason_and_exact_versions(env):
+    from utils.auth import get_current_employee
+
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _seed(db, "seed_reviewed", status="draft")
+    await _seed(db, "seed_unrelated", status="draft", dest=OTHER_DEST)
+    path = f"{PREFIX}/seed_reviewed"
+    audit = await client.get(f"{path}/audit")
+    draft_version = audit.json()["item"]["review_version"]
+    actor.clear()
+    actor.update(email="fixture_reviewer@example.test", sub="fixture_reviewer@example.test", role="outsourced")
+    rejected = await _verdict(client, "seed_reviewed", "reject", review_version=draft_version, reason="Check shade")
+    assert rejected.status_code == 200, rejected.text
+    await _as(actor, "emp_test")
+    actor.pop("sub")
+    audit = await client.get(f"{path}/audit")
+    updated_version = audit.json()["item"]["review_version"]
+    assert updated_version != draft_version
+
+    approved = await _verdict(client, "seed_reviewed", "approve", review_version=updated_version, reason="Shade verified")
+    assert approved.status_code == 200, approved.text
+    await _verdict(client, "seed_unrelated", "reject", reason="Unrelated")
+    active_row = await db.fetch_one("SELECT * FROM external_product_seeds WHERE id = 'seed_reviewed'")
+    active_version = env["ep"]._seed_review_version(dict(active_row))
+    no_op = await _verdict(client, "seed_reviewed", "approve")
+    assert no_op.status_code == 200 and no_op.json()["published"] is False
+
+    response = await client.get(f"{path}/review-events")
+    assert response.status_code == 200, response.text
+    approval, rejection = response.json()["items"]
+    assert approval["action"] == "external_seed.review.approve" and approval["reason"] == "Shade verified"
+    assert rejection["action"] == "external_seed.review.reject" and rejection["reason"] == "Check shade"
+    assert rejection["before"] == {"status": "draft", "review_version": draft_version}
+    assert rejection["after"] == approval["before"] == {"status": "draft", "review_version": updated_version}
+    assert approval["after"] == {"status": "active", "review_version": active_version}
+    assert approval["actor_employee_id"] == "emp_test"
+    assert rejection["actor_employee_id"] is None
+    for event in (approval, rejection):
+        assert event["created_at"] and "actor_email" not in event
+    app = env["app"]
+    employee_override = app.dependency_overrides.pop(get_current_employee)
+    try:
+        anonymous = await client.get(f"{path}/review-events")
+        assert anonymous.status_code in (401, 403)
+    finally:
+        app.dependency_overrides[get_current_employee] = employee_override
+
+
+@pytest.mark.parametrize("verdict", ["approve", "reject"])
+async def test_a_failed_audit_event_insert_rolls_back_the_verdict(env, verdict):
+    from asyncpg import CheckViolationError
+
+    db, client = env["db"], env["client"]
+    await _seed(db, "seed_draft", status="draft")
+    await _seed(db, "seed_active", status="active")
+    before = await _seeds(db)
+    await db.execute("ALTER TABLE employee_audit_logs ADD CONSTRAINT fixture_fail_audit_insert CHECK (FALSE)")
+    with pytest.raises(CheckViolationError):
+        await _verdict(client, "seed_draft", verdict)
+    assert await _seeds(db) == before
+    assert await db.fetch_val("SELECT COUNT(*) FROM employee_audit_logs") == 0
 
 
 async def _in_its_own_request(coro):
@@ -488,7 +831,7 @@ async def _as(actor, employee_id, role="employee"):
 
 async def _row(db, seed_id):
     return dict(await db.fetch_one(
-        "SELECT status, destination_url, price_amount, created_by_employee_id, seed_data, notes"
+        "SELECT status, destination_url, title, price_amount, created_by_employee_id, seed_data, notes"
         " FROM external_product_seeds WHERE id = :id", {"id": seed_id}))
 
 
@@ -728,7 +1071,8 @@ async def test_a_takedown_racing_the_approval_never_lands_between_its_check_and_
     takedown = await race["task"]
 
     assert race["landed_inside_the_publish"] is False, "the takedown waited for the approval's commit"
-    assert approval.status_code == 200 and takedown.status_code == 200, (approval.text, takedown.text)
+    assert approval.status_code == 200 and takedown.status_code == 409, (approval.text, takedown.text)
+    assert takedown.json()["detail"]["error"] == "SEED_VERSION_CHANGED"
     seeds = await _seeds(db)
     assert seeds[seed_id]["status"] == "disabled"
     assert f"superseded_by:{revision_id}" in seeds[seed_id]["notes"], "the approval superseded a base that was live"
