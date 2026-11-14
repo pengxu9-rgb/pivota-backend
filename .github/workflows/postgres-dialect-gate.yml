@@ -135,6 +135,9 @@ on:
       # touching only one of these would otherwise skip the gate that runs them on Postgres.
       - "tests/reap_cart_link_cases.py"
       - "tests/test_reap_cart_link.py"
+      # Same reason again, for order create: every case of its Postgres gate lives in this shared,
+      # non-`test_` module, collected by tests/test_order_create_one_order_per_quote_postgres.py.
+      - "tests/order_create_one_per_quote_cases.py"
       - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making

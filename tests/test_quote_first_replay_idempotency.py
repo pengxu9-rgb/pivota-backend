@@ -41,6 +41,13 @@ def _shopify_store_policy_context(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_api_module, "get_primary_store", fake_get_primary_store)
     monkeypatch.setattr(payment_module, "get_primary_store", fake_get_primary_store)
 
+    # This file has no `orders` table. The replay lookup used to fail on that and be read as "no
+    # order"; an unreadable lookup is now a 503, so the lookup here reads an empty table instead.
+    async def no_order_yet(**_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_api_module, "find_replayable_order_for_create", no_order_yet)
+
 
 def test_agent_order_payment_instructions_do_not_claim_client_secret_when_missing() -> None:
     import routes.agent_api as agent_api_module

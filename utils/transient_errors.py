@@ -101,6 +101,30 @@ def is_asyncpg_busy_error(err: BaseException) -> bool:
     return False
 
 
+# Why an order create was refused with a retriable 503 although no statement of the create itself
+# failed: it could not be told whether the order already exists. The `error` stays
+# TEMPORARY_UNAVAILABLE (what every caller already retries on); `reason` names the cause.
+ORDER_REPLAY_LOOKUP_UNAVAILABLE = "ORDER_REPLAY_LOOKUP_UNAVAILABLE"
+ORDER_QUOTE_GUARD_UNAVAILABLE = "ORDER_QUOTE_GUARD_UNAVAILABLE"
+
+
+def order_existence_unknown_http_exception_fields(reason: str, *, retry_after_seconds: int = 1) -> dict:
+    """status / headers / detail of the 503 an order create answers when it cannot tell whether
+    the order already exists. A dict, so an HTTPException subclass can be built from it."""
+    return {
+        "status_code": 503,
+        "headers": {"Retry-After": str(max(1, int(retry_after_seconds)))},
+        "detail": {
+            "error": "TEMPORARY_UNAVAILABLE",
+            "reason": reason,
+            "message": (
+                "Could not tell whether this order already exists. "
+                "Retry shortly with the same idempotency key."
+            ),
+        },
+    }
+
+
 def db_busy_http_exception(*, retry_after_seconds: int = 1) -> HTTPException:
     return HTTPException(
         status_code=503,

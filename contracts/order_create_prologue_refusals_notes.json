@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "about": "contracts/order_create_prologue_refusals.json: the nine [status, code] pairs POST /agent/v2/orders answers ONLY from the request's prologue, before the first call of the order write step, so no order row can exist because of this request when one is answered. That file is byte-identical to the agent gateway's copy (both sides pin its sha256). This file is this repository's own notes on how to read such an answer; tests/test_order_create_prologue_refusals_contract.py pins every statement in it.",
+  "envelope": {
+    "code": "error.details.error",
+    "reason": "error.details.reason",
+    "note": "The route's own code is error.details.error. error.code is derived from the HTTP status alone and is never a listed code. error.message equals error.details.error when the route named a code, and is otherwise a sentence."
+  },
+  "PARTNER_ASSERTION_REJECTED": {
+    "reasons": ["bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "replay", "resource", "stale", "subject"],
+    "decided_before_the_nonce_is_claimed": ["bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "resource", "stale", "subject"],
+    "can_follow_an_accepted_earlier_copy": ["replay", "stale", "subject"],
+    "can_follow_an_accepted_earlier_copy_note": "The same bytes delivered again after a copy was accepted, which may have created the order. `replay`: the nonce was already claimed. `stale`: the same, after the timestamp window closed. `subject`: the partner's agent record could not be read this time (a failed read counts as no agent) or the agent is no longer active; it is decided before the nonce is looked at, so it wins over `replay`. The nonce is kept longer than the window stays open, so an accepted request is never accepted twice by the store that claimed it. A caller holding a guard for the order should keep it on these three reasons.",
+    "only_across_a_change_of_the_signing_secret": ["bad_mac", "no_secret"],
+    "only_across_a_change_of_the_signing_secret_note": "There is one signing secret and no previous-secret slot. A copy accepted under the old value and delivered again after the value changed (or was removed) is told `bad_mac` (or `no_secret`), not `replay`.",
+    "subject_has_a_second_site": "`subject` is also answered after the nonce was claimed, when the partner's agent record cannot be read at adoption. That is still before the route body."
+  },
+  "QUOTE_NOT_FOUND": "Listed at 404 only (the caller does not own the quote, or it does not exist). The same code at 409 is the write step's own re-check of the quote, which can follow a written order, and at 400 is the pre-flight's; neither is listed.",
+  "not_listed_on_purpose": {
+    "503 TEMPORARY_UNAVAILABLE": "The database was busy, or it could not be told whether the order already exists (error.details.reason is then ORDER_REPLAY_LOOKUP_UNAVAILABLE or ORDER_QUOTE_GUARD_UNAVAILABLE). An order may exist.",
+    "409 QUOTE_CONSUMED": "The quote already has its order."
+  }
+}

@@ -105,6 +105,13 @@ def _stub_order_create_deep_seams(monkeypatch, created_orders):
 
     monkeypatch.setattr(agent_api_module, "get_primary_store", fake_get_primary_store)
 
+    # No `orders` table here. The replay lookup used to fail on that and be read as "no order";
+    # an unreadable lookup is now a 503, so the lookup reads an empty table instead.
+    async def no_order_yet(**_):
+        return None
+
+    monkeypatch.setattr(agent_api_module, "find_replayable_order_for_create", no_order_yet)
+
     from mvp.idempotency import InMemoryIdempotencyStore
 
     shared_store = InMemoryIdempotencyStore()
