@@ -20,6 +20,7 @@ Each refusal has a twin that still writes, so the guard cannot pass by refusing 
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
@@ -39,10 +40,16 @@ def _create(monkeypatch, page, existing_rows: List[Dict[str, Any]], **body: Any)
     async def execute_seed(query, values):
         writes.append(values)
 
+    async def fetch_seed(query, values):
+        assert "SELECT * FROM external_product_seeds WHERE id = :id" in str(query)
+        return next((row for row in existing_rows if row["id"] == values["id"]), None)
+
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=page))
     monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=existing_rows))
+    monkeypatch.setattr(ep.database, "fetch_one", fetch_seed)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "transaction", nullcontext)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
     monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
