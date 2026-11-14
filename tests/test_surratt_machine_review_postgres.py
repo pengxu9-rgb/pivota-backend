@@ -60,8 +60,10 @@ def test_surratt_draft_matches_only_the_pinned_seller_listing_and_variants():
 async def route_db(monkeypatch):
     url = os.getenv("PIVOTA_PG_TEST_URL") or os.getenv("DATABASE_URL", "")
     endpoint = urlsplit(url)
+    database_name = endpoint.path.removeprefix("/")
     if (endpoint.scheme not in ("postgres", "postgresql", "postgresql+asyncpg")
-            or endpoint.hostname not in ("localhost", "127.0.0.1", "::1") or "test" not in endpoint.path):
+            or endpoint.hostname not in ("localhost", "127.0.0.1", "::1")
+            or (database_name != "pivota_dialect_check" and not database_name.endswith("_test"))):
         pytest.skip("requires a named local PostgreSQL test database")
 
     from databases import Database
