@@ -92,6 +92,7 @@ from db.database import database
 from services.catalog_enrichment_agent.ingestion import (
     SOURCE_VARIANT_ID_MAX as _SOURCE_VARIANT_ID_MAX,
 )
+from services.catalog_variant_offer_projection import MIRROR, variants_from_seed
 from services.variant_identity import variant_id_provenance
 
 logger = logging.getLogger(__name__)
@@ -428,6 +429,9 @@ def build_variant_row(
         product_id=primary.get("source_product_id"),
         product_key=primary.get("product_key"),
     )
+    currency = variant.get("currency")
+    if primary.get("source_system") == MIRROR:
+        currency = str(variant.get("price_currency") or currency or "").strip().upper()
     return VariantRow(
         sku_key=sku_key,
         product_key=primary["product_key"],
@@ -438,7 +442,7 @@ def build_variant_row(
         sku=variant.get("sku") or None,
         barcode=variant.get("barcode") or None,
         title=str(variant.get("title") or "").strip() or "(untitled variant)",
-        currency=variant.get("currency") or None,
+        currency=currency or None,
         image_url=variant.get("image_url") or None,
         visible_option_labels=_visible_option_labels(options),
         visible_attributes=_visible_attributes(options),
@@ -657,15 +661,21 @@ def _is_unique_violation(exc: BaseException) -> bool:
 
 
 def _extract_variants_for_primary(primary: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Try Path B (seed_data.snapshot.variants) first, then Path A
-    (product_payload.variants). Returns whichever was non-empty.
-    Path B preferred because external_seed scrapes have richer
-    options metadata (axis_kind, structured shade/size labels)."""
-    seed_variants = _extract_variants_from_seed(primary.get("seed_data"))
-    if seed_variants:
-        return seed_variants
-    payload_variants = _extract_variants_from_payload(primary.get("product_payload"))
-    return payload_variants
+    """Use the attached seed before the serialized Shopify product payload.
+
+    A mirror uses the same root-first variants as its offer projector. A
+    nonempty root array is authoritative, even if all entries are malformed.
+    """
+    seed_data = primary.get("seed_data")
+    if primary.get("source_system") == MIRROR:
+        seed = _coerce_jsonb(seed_data)
+        seed_variants = variants_from_seed(seed)
+        root_variants = seed.get("variants") if isinstance(seed, dict) else None
+        if isinstance(root_variants, list) and root_variants:
+            return seed_variants
+    else:
+        seed_variants = _extract_variants_from_seed(seed_data)
+    return seed_variants or _extract_variants_from_payload(primary.get("product_payload"))
 
 
 async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import AsyncMock
 
@@ -42,6 +43,8 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
 
         async def fake_fetch_one(_query: str, values: Optional[Dict[str, Any]] = None):
             v = values or {}
+            if "id" in v:
+                return store_by_id.get(v["id"])
             market = str(v.get("market") or "")
             tool = str(v.get("tool") or "")
             external_product_id = str(v.get("external_product_id") or "")
@@ -77,6 +80,7 @@ def test_employee_external_seeds_import_csv_upsert_is_idempotent(monkeypatch) ->
 
         monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
         monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
+        monkeypatch.setattr(employee_products_module.database, "transaction", nullcontext)
         monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
 
         client = TestClient(app)
@@ -125,15 +129,27 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
     # from the models rather than stubbing the reads and writes.
     _ensure_real_tables()
 
-    app = FastAPI()
+    database = employee_products_module.database
+    real_fetch_one = database.fetch_one
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async with database:
+            yield
+
+    app = FastAPI(lifespan=lifespan)
     app.include_router(employee_products_module.router)
     app.dependency_overrides[get_current_employee] = override_employee
-    try:
+    with TestClient(app) as client:
         store_by_id: Dict[str, Dict[str, Any]] = {}
         store_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
         async def fake_fetch_one(_query: str, values: Optional[Dict[str, Any]] = None):
+            if "external_product_seeds" not in str(_query).lower():
+                return await real_fetch_one(_query, values)
             v = values or {}
+            if "id" in v:
+                return store_by_id.get(v["id"])
             market = str(v.get("market") or "")
             tool = str(v.get("tool") or "")
             external_product_id = str(v.get("external_product_id") or "")
@@ -171,7 +187,6 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
         monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
 
-        client = TestClient(app)
         csv_text = (
             "Brand,Product Title,Product URL,Variant ID,SKU,Option Name,Option Value,Price,Currency,Availability,Variant Image URL,Variant Label Image URL,AI Merged Description,AI Marketing Copy,Deep Link\n"
             'Tom Ford Beauty,"Oud Wood Eau de Parfum",https://example.com/p/oud,111,T6K601,Size,30 ml,75.00,USD,In Stock,https://example.com/img1.jpg,https://example.com/swatch1.png,"Desc",,"https://example.com/p/oud?variant=111&utm_source=pivota"\n'
@@ -185,7 +200,7 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         )
         assert res1.status_code == 200, res1.text
         payload1 = res1.json()
-        assert payload1["created"] == 1
+        assert payload1["created"] == 1, payload1
         assert payload1["updated"] == 0
         assert len(payload1.get("seedIds") or []) == 1
 
@@ -225,5 +240,3 @@ def test_employee_external_seeds_import_csv_catalog_groups_variants(monkeypatch)
         assert payload2["updated"] == 1
         assert len(payload2.get("seedIds") or []) == 1
         assert len(store_by_id) == 1
-    finally:
-        app.dependency_overrides.pop(get_current_employee, None)

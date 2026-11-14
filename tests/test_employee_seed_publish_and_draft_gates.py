@@ -157,7 +157,10 @@ def test_a_live_seed_holding_the_same_id_is_a_409_and_nothing_is_written(monkeyp
         h.patch(status="active")
     assert err.value.status_code == 409
     assert err.value.detail == {"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": "seed_live_other"}
-    assert h.statements == [] and h.projected == []
+    assert h.projected == []
+    assert all(s["sql"].lstrip().startswith("SELECT pg_advisory_xact_lock(") for s in h.statements)
+    if h.ep._seed_publish_locks_enabled():
+        assert len(h.statements) == 1
 
 
 def test_a_unique_index_race_is_a_409_not_a_500(monkeypatch):
