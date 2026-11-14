@@ -151,6 +151,7 @@ def selection_measurement(observations):
         "execution_conditions": [{"provider":provider,"contract":contract,"observations":count} for (provider,contract),count in sorted(conditions.items())],
         "mixed_execution_providers": sorted(mixed),
         "answers": [{"observation_id": r["observation_id"], "query": r.get("query"),
+                     "product_key": r.get("product_key"), "tier": r.get("tier"), "status": r.get("status"),
                      "provider": r.get("provider"), "prompt_contract": r.get("prompt_contract"), "brand_mentioned": r.get("brand_mentioned"),
                      "unknown_reason": r.get("answer_unknown_reason"),
                      "evidence": r.get("answer_evidence"), "cited_sources": r.get("cited_sources") or []}

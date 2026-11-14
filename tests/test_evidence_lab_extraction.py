@@ -1,8 +1,6 @@
 """Phase 2b lab-report extraction: PDF/JSON parsing, the disease/drug safety
 screen, and the LLM-backed candidate extractor (mocked LLM). The candidates are
-PROPOSALS — they come back unverified; substantiation happens only when the
-merchant confirms one against the stored artifact, so the value here is that the
-parse + screen are honest and deterministic."""
+PROPOSALS — they come back unverified; confirmation submits them for review."""
 from __future__ import annotations
 
 import json

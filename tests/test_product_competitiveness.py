@@ -217,10 +217,7 @@ def test_discovery_appearance_splits_endorsement_from_own_listing():
     assert d["appeared_recommended"] == 1
 
 
-def test_evidence_play_recommends_supplying_proof_to_commerce_index():
-    """Build C: the Pivota-moat lever. A product making efficacy/cert claims with
-    no supplied evidence (and AI-flagged unsupported answers) gets a 'supply lab
-    reports/certifications -> Pivota publishes them as grounded claims' action."""
+def test_evidence_play_recommends_submitting_exact_product_proof_for_review():
     from services.agent_center_bd_report_service import build_evidence_play
     product = {
         "title": "Anuko Bond & Repair Hair Oil",
@@ -230,7 +227,8 @@ def test_evidence_play_recommends_supplying_proof_to_commerce_index():
     assert ep["present"] is True
     assert ep["already_substantiated"] is False
     assert "repair" in ep["claims_to_substantiate"] and "vegan" in ep["claims_to_substantiate"]
-    assert any("Pivota publishes" in m for m in ep["moves"])
+    assert any("exact product and claims" in m for m in ep["moves"])
+    assert "reviews whether each source supports the claim" in ep["pivota_value"]
     # verify gap -> evidence action (factual-only copy: names wrong facts)
     assert any("wrong facts" in m and "3" in m for m in ep["moves"])
 

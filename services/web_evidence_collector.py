@@ -5,12 +5,8 @@ same client the audit uses for grounded web retrieval) to DISCOVER press / revie
 citations for a product, and record them as REVIEWABLE evidence candidates in the
 cross-vertical product_evidence store (Phase 2a/2b).
 
-Trust spine: web-discovered claims enter UNVERIFIED — they surface to the merchant
-for confirmation in the evidence panel, exactly like lab-report candidates, and are
-NEVER auto-served to agents. The merchant confirms one (POST /evidence with the
-matching source_type + source_ref=url) → it grades substantiated → the serve gate
-publishes it. This is the "crawl accelerates head merchants" path; long-tail
-merchants still rely on direct intake.
+Web-discovered claims enter unverified. Merchants can submit a candidate for
+independent review; neither discovery nor submission publishes the candidate.
 
 Reuses, never rebuilds:
   - services.social_search_client.search_web (SerpAPI; honesty contract: no key /
@@ -153,7 +149,7 @@ def build_web_evidence_candidates(
             "source_ref": url,
             "source_type": source_type,
             "evidence_grade": grade,
-            # UNVERIFIED until the merchant confirms — never auto-served.
+            # Independent review is required before publication.
             "substantiation_status": "unverified",
             "discovered_via": "web_crawl",
         }
@@ -180,50 +176,50 @@ async def _merge_candidates_into_evidence(
     """Append new web candidates to the product's existing evidence WITHOUT
     clobbering merchant-entered claims (upsert REPLACES the array, so we
     read-merge-write). Dedupe by source_ref and claim_text. Returns count added."""
-    from db.product_evidence import fetch_product_evidence_row, upsert_product_evidence
-
-    existing = await fetch_product_evidence_row(product_key, geo_code=geo_code, db=db)
-    existing_claims = list((existing or {}).get("claims") or [])
-    review_state = (existing or {}).get("review_state") or "observed"
-    # upsert_product_evidence does a FULL-ROW upsert (merchant_id / required_disclaimers
-    # = EXCLUDED.*), so we must carry the existing row's values forward or a crawl/job
-    # that doesn't know the merchant (merchant_id=None — the headline use case) would
-    # null out the stored merchant_id (the indexed scoping column) + disclaimers.
-    # Prefer the existing non-null merchant_id over the (possibly None) argument.
-    existing_merchant_id = (existing or {}).get("merchant_id")
-    effective_merchant_id = existing_merchant_id or merchant_id
-    existing_disclaimers = (existing or {}).get("required_disclaimers")
-    seen_refs = {
-        str(c.get("source_ref") or "").strip().lower()
-        for c in existing_claims
-        if isinstance(c, dict) and c.get("source_ref")
-    }
-    seen_texts = {
-        str(c.get("claim_text") or "").strip().lower()
-        for c in existing_claims
-        if isinstance(c, dict)
-    }
-    added: List[Dict[str, Any]] = []
-    for cand in candidates:
-        ref = str(cand.get("source_ref") or "").strip().lower()
-        txt = str(cand.get("claim_text") or "").strip().lower()
-        if (ref and ref in seen_refs) or (txt and txt in seen_texts):
-            continue
-        seen_refs.add(ref)
-        seen_texts.add(txt)
-        added.append(cand)
-    if not added:
-        return 0
-    await upsert_product_evidence(
-        product_key,
-        merchant_id=effective_merchant_id,
-        claims=existing_claims + added,
-        geo_code=geo_code,
-        review_state=review_state,
-        required_disclaimers=existing_disclaimers,
-        db=db,
+    from db.product_evidence import (
+        MAX_PRODUCT_EVIDENCE_CLAIMS,
+        fetch_product_evidence_row,
+        product_evidence_transaction,
+        upsert_product_evidence,
     )
-    return len(added)
+
+    async with product_evidence_transaction(product_key, geo_code=geo_code, db=db) as write_db:
+        existing = await fetch_product_evidence_row(
+            product_key, geo_code=geo_code, db=write_db, strict=True
+        ) or {}
+        existing_claims = list(existing.get("claims") or [])
+        seen_refs = {
+            str(c.get("source_ref") or "").strip().lower()
+            for c in existing_claims
+            if isinstance(c, dict) and c.get("source_ref")
+        }
+        seen_texts = {
+            str(c.get("claim_text") or "").strip().lower()
+            for c in existing_claims
+            if isinstance(c, dict)
+        }
+        added: List[Dict[str, Any]] = []
+        for cand in candidates:
+            if len(existing_claims) + len(added) >= MAX_PRODUCT_EVIDENCE_CLAIMS:
+                break
+            ref = str(cand.get("source_ref") or "").strip().lower()
+            txt = str(cand.get("claim_text") or "").strip().lower()
+            if (ref and ref in seen_refs) or (txt and txt in seen_texts):
+                continue
+            seen_refs.add(ref)
+            seen_texts.add(txt)
+            added.append(cand)
+        if added:
+            await upsert_product_evidence(
+                product_key,
+                merchant_id=existing.get("merchant_id") or merchant_id,
+                claims=existing_claims + added,
+                geo_code=geo_code,
+                review_state=existing.get("review_state") or "observed",
+                required_disclaimers=existing.get("required_disclaimers"),
+                db=write_db,
+            )
+        return len(added)
 
 
 async def collect_web_evidence_for_product(

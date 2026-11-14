@@ -1,10 +1,11 @@
 """Phase 2c web-evidence collector: domain classification + candidate building are
 pure; the merge/collect paths read-merge-write so they never clobber merchant
-claims, and discovered claims stay UNVERIFIED (merchant confirms → served)."""
+claims, and discovered claims stay unverified pending independent review."""
 from __future__ import annotations
 
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -78,6 +79,10 @@ class _FakeDB:
 
     async def execute(self, sql, values):
         self.executed.append((sql, values))
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
 
 
 async def _noop_ensure() -> None:

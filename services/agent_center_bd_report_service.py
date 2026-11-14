@@ -5022,6 +5022,8 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
     substantiated_evidence_count = 0
     third_party_evidence_sources = 0
     try:
+        from services.claim_safety import substantiated_product_claims
+
         evidence_row = await _fetch_one_dict(
             """
             SELECT claims
@@ -5037,14 +5039,10 @@ async def load_sku_context(sku_key: str, merchant_id: str) -> Dict[str, Any]:
             "editorial_press", "third_party_review", "third_party_test", "certification",
         }
         third_party_refs = set()
-        for claim in _json_list((evidence_row or {}).get("claims")):
-            if not isinstance(claim, dict):
-                continue
-            if str(claim.get("substantiation_status") or "").lower() != "substantiated":
-                continue
+        for claim in substantiated_product_claims((evidence_row or {}).get("claims")):
             substantiated_evidence_count += 1
-            if str(claim.get("source_type") or "").lower() in third_party_types:
-                ref = str(claim.get("source_ref") or "").strip().lower()
+            if (claim.source_type or "").lower() in third_party_types:
+                ref = (claim.source_ref or "").strip().lower()
                 if ref:
                     third_party_refs.add(ref)
         has_substantiated_evidence = substantiated_evidence_count > 0
@@ -5696,12 +5694,7 @@ def build_evidence_play(
     sku_ctx: Optional[Mapping[str, Any]],
     verify_summary: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """The Pivota-moat action: supply lab reports / clinical evidence /
-    certifications so Pivota can publish them as GROUNDED, CITABLE claims on the
-    merchant's canonical PDP / commerce index. Fires when the product makes
-    substantiation-worthy claims (or AI flagged unsupported answers about it) but
-    the merchant hasn't supplied evidence yet — the one lever no retailer,
-    marketplace, or publisher can offer the brand. Deterministic; no probes."""
+    """Show evidence worth submitting for review when the audit finds a gap."""
     prod = product if isinstance(product, Mapping) else {}
     ctx = sku_ctx if isinstance(sku_ctx, Mapping) else {}
     already = _has_substantiation(dict(prod), dict(ctx))
@@ -5718,30 +5711,24 @@ def build_evidence_play(
     if present:
         if efficacy:
             moves.append(
-                "Supply third-party proof (lab test, clinical study, or "
-                f"ingredient data) for your efficacy claims ({', '.join(efficacy[:4])}) "
-                "— Pivota publishes them as grounded, citable claims on your "
-                "canonical PDP so AI cites the evidence, not just marketing copy."
+                f"Submit a lab test or study for the exact product and claims ({', '.join(efficacy[:4])}). "
+                "Include the test conditions and measured results."
             )
         if certs:
             moves.append(
-                f"Upload your certifications ({', '.join(certs[:4])}) for Pivota to "
-                "publish as verifiable claims AI engines can cite."
+                f"Submit certifications ({', '.join(certs[:4])}) with an issuer, scope and certificate reference."
             )
         if flagged:
             # Flags are factual-only now — say what was actually found (wrong
             # facts in AI answers), not "unsupported" (the retired editorial
             # framing), and pitch evidence as the correction channel.
             moves.append(
-                f"AI stated wrong facts about your product in {flagged} "
-                "checked answer(s) — publishing your evidenced facts on the "
-                "canonical page gives AI a source to correct against."
+                f"AI stated wrong facts about your product in {flagged} checked answer(s). "
+                "Submit a source that documents the correct information."
             )
         if not moves:
             moves.append(
-                "Supply product evidence (specs, sourcing, test results, "
-                "certifications) for Pivota to publish as grounded claims on your "
-                "canonical PDP."
+                "Submit product specs, sourcing, test results or certifications for review."
             )
     # Per-claim proof checklist: 'what point should I prove, with what?'
     all_claims = list(dict.fromkeys(specs + efficacy + certs))
@@ -5775,9 +5762,8 @@ def build_evidence_play(
         "unsubstantiated_in_ai": flagged,
         "moves": moves,
         "pivota_value": (
-            "Pivota's commerce index turns merchant-supplied evidence into "
-            "grounded, citable claims — a trust signal AI engines reward and that "
-            "retailers, marketplaces, and publishers can't provide for the brand."
+            "Pivota reviews whether each source supports the claim for this product. "
+            "Verified claims can be published on the product page."
         ),
     }
 
