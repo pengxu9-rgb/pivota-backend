@@ -21,6 +21,7 @@ Driven through the REAL route and the REAL redirect minter; only the DB reads ar
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import json
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -132,6 +133,105 @@ def _assert_referral(offer: Dict[str, Any]) -> None:
     assert "/cart/" not in _payload(offer)["dest"]
     assert spec["pdp_url"], "a decline removes the cart, never the product page"
     assert offer["affiliate_url"], "and never the offer"
+
+
+@pytest.fixture
+def referral_listing():
+    from services.external_seed_review_pilot import LISTINGS, SURRATT_SEED_ID
+
+    return replace(
+        LISTINGS[SURRATT_SEED_ID],
+        url=f"https://{HOST}/products/soft-pinch-liquid-blush",
+        seller_ref="merch_obs_rare",
+        variants=((ATTACHED, "001", "Bliss", "RB-0"), (NAMED, "002", "Adore", "RB-2")),
+    )
+
+
+def _seed_with_referral_landing(referral_listing, landing_url: str, *, conflicting_id: bool = False):
+    seed = _seed()
+    product_key = SHOPIFY_PK.replace("::shopify::", "::external_seed::")
+    seed["attached_product_key"] = product_key
+    seed["seller_ref"] = referral_listing.seller_ref
+    seed["seed_data"]["snapshot"].pop("storefront_platform")
+    seed["seed_data"]["snapshot"].pop("variants")
+    variants = seed["seed_data"]["variants"]
+    for variant in variants:
+        variant["url"] = f'{seed["canonical_url"]}?variant={variant["variant_id"]}'
+    variants[2]["url"] = landing_url
+    if conflicting_id:
+        variants[2]["shopify_variant_id"] = ATTACHED
+    sku_rows = [_sku_row(variant["variant_id"]) for variant in variants]
+    for row in sku_rows:
+        row["product_key"] = product_key
+        row["sku_key"] = f'{product_key}::v:{row["source_variant_id"]}'
+    return seed, sku_rows
+
+
+@pytest.mark.parametrize("named", [ATTACHED, NAMED])
+def test_named_catalog_variant_keeps_selection_on_referral(
+    monkeypatch, client, warm_lane, referral_listing, named,
+):
+    from routes import outbound_links
+    from services.external_seed_review_pilot import LISTINGS
+
+    family = referral_listing.url
+    seed, rows = _seed_with_referral_landing(referral_listing, f"{family}?variant={NAMED}")
+    monkeypatch.setitem(LISTINGS, seed["id"], referral_listing)
+    warm_resolve = AsyncMock()
+    monkeypatch.setattr(outbound_links, "resolve_warm_handoff", warm_resolve)
+    monkeypatch.setattr(outbound_links, "log_outbound_click", AsyncMock())
+
+    offer = _resolve(monkeypatch, client, [seed], sku_id=named, sku_rows=rows)[0]
+
+    _assert_referral(offer)
+    assert offer["cart_prefilled"] is False
+    assert offer["source"]["variant_match"] == "exact"
+    spec = offer["execution_spec"]
+    token = _payload(offer)
+    assert token["dest"] == spec["pdp_url"]
+    assert token["ctx"]["variant_declined"] == "not_the_named_variant"
+    parsed = urlparse(token["dest"])
+    assert parsed.hostname == HOST
+    assert parsed.path == "/products/soft-pinch-liquid-blush"
+    assert parse_qs(parsed.query)["variant"] == [named]
+    redirect = client.get("/r", params={"token": _token(offer)}, follow_redirects=False)
+    assert redirect.status_code == 302
+    assert redirect.headers["location"] == spec["pdp_url"]
+    warm_resolve.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["other_seller", "other_listing", "other_variant", "ambiguous_query", "subscription",
+     "conflicting_id", "no_catalog_proof", "unnamed", "unreviewed_seed", "wrong_seller_ref"],
+)
+def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_listing, case):
+    from services.external_seed_review_pilot import LISTINGS
+
+    family = referral_listing.url
+    landing = {
+        "other_seller": f"https://other.example/products/soft-pinch-liquid-blush?variant={NAMED}",
+        "other_listing": f"https://{HOST}/products/other-blush?variant={NAMED}",
+        "other_variant": f"{family}?variant={ATTACHED}",
+        "ambiguous_query": f"{family}?variant={NAMED}&variant={ATTACHED}",
+        "subscription": f"{family}?variant={NAMED}&selling_plan=321",
+    }.get(case, f"{family}?variant={NAMED}")
+    seed, rows = _seed_with_referral_landing(
+        referral_listing, landing, conflicting_id=case == "conflicting_id",
+    )
+    if case != "unreviewed_seed":
+        monkeypatch.setitem(LISTINGS, seed["id"], referral_listing)
+    if case == "wrong_seller_ref":
+        seed["seller_ref"] = "merch_obs_other"
+
+    offer = _resolve(
+        monkeypatch, client, [seed],
+        sku_id=None if case == "unnamed" else NAMED,
+        sku_rows=[] if case == "no_catalog_proof" else rows,
+    )[0]
+
+    _assert_referral(offer)
+    assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
 
 
 # ------------------------------------------------------------------ the reviewer's case and kin
