@@ -1196,13 +1196,29 @@ def test_only_the_missing_claims_table_turns_the_guard_off() -> None:
 
     missing = orders_module._is_missing_quote_claims_table
     # PostgreSQL: the class or the SQLSTATE of an undefined TABLE, whatever the text says.
-    assert missing(UndefinedTableError('relation "order_quote_claims" does not exist', sqlstate="42P01"))
-    assert missing(UndefinedTableError("anything"))
-    assert missing(_PgError("anything", sqlstate="42P01"))
-    assert missing(_PgError("anything", pgcode="42P01"))
+    claims_missing = 'relation "order_quote_claims" does not exist'
+    assert missing(UndefinedTableError(claims_missing, sqlstate="42P01"))
+    assert missing(UndefinedTableError(claims_missing))
+    assert missing(_PgError(claims_missing, sqlstate="42P01"))
+    assert missing(_PgError(claims_missing, pgcode="42P01"))
     wrapped = RuntimeError("wrapped")
-    wrapped.__cause__ = UndefinedTableError('relation "order_quote_claims" does not exist', sqlstate="42P01")
+    wrapped.__cause__ = UndefinedTableError(claims_missing, sqlstate="42P01")
     assert missing(wrapped)
+    # psycopg2's error wrapped by SQLAlchemy: the driver error is on `.orig`, and only there.
+    via_orig = RuntimeError("(psycopg2.errors.UndefinedTable) wrapped")
+    via_orig.orig = _PgError(claims_missing, pgcode="42P01")
+    assert missing(via_orig)
+    # ...and `.orig` is walked for what is NOT the table too.
+    via_orig_column = RuntimeError("wrapped")
+    via_orig_column.orig = _PgError('column "order_id" of relation "order_quote_claims" does not exist', pgcode="42703")
+    assert not missing(via_orig_column)
+
+    # An undefined table that is not THIS one (a trigger, a rule or a view the statement reaches):
+    # the class or SQLSTATE says "undefined table", but the guard's table is not the one missing.
+    assert not missing(UndefinedTableError('relation "order_quote_claim_audit" does not exist', sqlstate="42P01"))
+    assert not missing(_PgError('relation "orders_archive" does not exist', pgcode="42P01"))
+    assert not missing(UndefinedTableError("anything"))
+    assert not missing(_PgError("anything", sqlstate="42P01"))
     # SQLite: the one exact message of an OperationalError.
     assert missing(OperationalError("no such table: order_quote_claims"))
 
@@ -1215,6 +1231,9 @@ def test_only_the_missing_claims_table_turns_the_guard_off() -> None:
     assert not missing(OperationalError("no such table: orders"))
     assert not missing(OperationalError("table order_quote_claims has no column named order_id"))
     assert not missing(OperationalError("no such table: order_quote_claims_old"))
+    # A lookalike SQLite message that is not the exact one (nothing here depends on time or order).
+    assert not missing(OperationalError("no such table: main.order_quote_claims"))
+    assert not missing(OperationalError("no such table: order_quote_claims; while preparing"))
     assert not missing(_PgError('function order_quote_claims() does not exist', sqlstate="42883"))
     assert not missing(_PgError('schema "order_quote_claims" does not exist', sqlstate="3F000"))
     assert not missing(RuntimeError(BUSY))
@@ -1569,12 +1588,34 @@ async def test_the_replay_lookup_widens_only_for_internal_keys(world: World) -> 
 
     for by in ({"idempotency_key": "key-shared"}, {"quote_id": quote}):
         assert await found(TRUSTED_A, **by) == made[TRUSTED_A]
-        assert await found(TRUSTED_B, **by) == made[TRUSTED_A]
         assert await found(AGENT_A, **by) == made[AGENT_A]
         assert await found(lookalike, **by) == made[lookalike]
         assert await found(AGENT_B, **by) is None
         assert await found("agent_internal_trusted", **by) is None  # not the prefix: an ordinary id
+        # The prefix is case-sensitive: an upper-case lookalike is an ordinary id of its own.
+        assert await found("AGENT_INTERNAL_TRUSTED_" + TRUSTED_B[len("agent_internal_trusted_"):], **by) is None
+    # Only the QUOTE lookup treats internal keys as one caller: another internal key finds the order
+    # made for the quote, but not an order by the first key's idempotency key, which stays its own.
+    assert await found(TRUSTED_B, quote_id=quote) == made[TRUSTED_A]
+    assert await found(TRUSTED_B, idempotency_key="key-shared") is None
     assert len(await w.claims_for(quote)) == 3
+
+
+async def test_an_internal_key_replays_by_session_only_its_own_orders(world: World) -> None:
+    """The session lookup matches the raw agent id, as orders are owned: another internal key does
+    not find the first one's order by its session, though it does by the quote."""
+    w = world
+    find = w.orders_module.find_replayable_order_for_create
+    quote = _quote_id()
+    data = _order_data(quote, TRUSTED_A)
+    data["agent_session_id"] = "sess-shared-0001"
+    made = await w.orders_module.create_order(data)
+    by_session = await find(merchant_id=MERCHANT, agent_id=TRUSTED_B, agent_session_id="sess-shared-0001")
+    assert by_session is None
+    own = await find(merchant_id=MERCHANT, agent_id=TRUSTED_A, agent_session_id="sess-shared-0001")
+    assert own and own["order_id"] == made
+    by_quote = await find(merchant_id=MERCHANT, agent_id=TRUSTED_B, quote_id=quote)
+    assert by_quote and by_quote["order_id"] == made
 
 
 async def test_a_quote_the_caller_does_not_own_is_refused_before_anything_is_read(world: World) -> None:

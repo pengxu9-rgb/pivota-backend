@@ -195,7 +195,9 @@ def _is_missing_quote_claims_table(exc: BaseException) -> bool:
     unwrapped); psycopg2, the sync driver, carries the same code as `pgcode`. The text is NOT
     read, because "does not exist" is also how PostgreSQL words a missing COLUMN of this table
     (42703), a missing function, a missing schema: none of those is an absent table, and each
-    must refuse the order (the caller turns every other error into "cannot tell").
+    must refuse the order (the caller turns every other error into "cannot tell"). The undefined
+    table must also be named as this one (`relation "order_quote_claims" does not exist`): an
+    undefined table elsewhere in the statement's reach is not the guard's table missing.
 
     SQLite has no error codes for this, so there it is the one exact message of an
     `OperationalError`: "no such table: order_quote_claims".
@@ -206,9 +208,14 @@ def _is_missing_quote_claims_table(exc: BaseException) -> bool:
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        if getattr(current, "sqlstate", None) == "42P01" or getattr(current, "pgcode", None) == "42P01":
-            return True
-        if type(current).__name__ == "UndefinedTableError":
+        undefined_table = (
+            getattr(current, "sqlstate", None) == "42P01"
+            or getattr(current, "pgcode", None) == "42P01"
+            or type(current).__name__ == "UndefinedTableError"
+        )
+        # The undefined table must be THIS one: a statement can reach another table (a trigger, a
+        # rule, a view added later), and an absent table there is not the guard's table missing.
+        if undefined_table and f'"{ORDER_QUOTE_CLAIMS_TABLE}"' in str(current):
             return True
         if type(current).__name__ == "OperationalError" and str(current).strip().lower() == _SQLITE_NO_CLAIMS_TABLE:
             return True
@@ -540,10 +547,13 @@ async def find_replayable_order_for_create(
     agent there is nothing to scope by, so nothing replays. `intent_id` (a checkout token's session)
     narrows it further to the orders created under that token.
 
-    "The calling agent" is the caller it acts as (`caller_identity`), the rule quote ownership and
-    the quote claim use: an internal trusted key finds an order ANY internal trusted key made,
-    because they are one caller (the service's own credential, across a key rotation). Every
-    other agent matches its own id exactly, as before.
+    The QUOTE lookup alone matches "the calling agent" as the caller it acts as (`caller_identity`),
+    the rule quote ownership and the quote claim use: an internal trusted key finds an order ANY
+    internal trusted key made for that quote, because they are one caller for a quote (the
+    service's own credential, across a key rotation), and the claim already makes that order the
+    quote's only one. The idempotency-key and session lookups match the raw agent id, as orders
+    are owned: an internal key replays only its own orders by key or session. Every other agent
+    matches its own id exactly in all three, as before.
     """
     merchant_id = str(merchant_id or "").strip()
     if not merchant_id:
@@ -555,11 +565,12 @@ async def find_replayable_order_for_create(
     intent_clause = "\n                  AND metadata ->> 'intent_id' = :intent_id" if intent_id else ""
     # An exact match, or for the shared internal identity a match on its literal prefix (substr,
     # not LIKE: the prefix contains `_`, which LIKE reads as "any character").
-    agent_values: Dict[str, Any] = {"agent_id": agent_id}
-    agent_clause = "agent_id = :agent_id"
+    exact_values: Dict[str, Any] = {"agent_id": agent_id}
+    exact_clause = "agent_id = :agent_id"
+    quote_values, quote_clause = exact_values, exact_clause
     if is_internal_trusted_identity(caller_identity(agent_id)):
-        agent_values = {"agent_id": INTERNAL_TRUSTED_AGENT_PREFIX, "agent_prefix_len": len(INTERNAL_TRUSTED_AGENT_PREFIX)}
-        agent_clause = "substr(agent_id, 1, :agent_prefix_len) = :agent_id"
+        quote_values = {"agent_id": INTERNAL_TRUSTED_AGENT_PREFIX, "agent_prefix_len": len(INTERNAL_TRUSTED_AGENT_PREFIX)}
+        quote_clause = "substr(agent_id, 1, :agent_prefix_len) = :agent_id"
 
     def _normalize_preferred_psp(value: Optional[str]) -> Optional[str]:
         normalized = str(value or "").strip().lower()
@@ -588,7 +599,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND {agent_clause}
+                  AND {exact_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND metadata ->> 'idempotency_key' = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -596,6 +607,7 @@ async def find_replayable_order_for_create(
                 """,
                 str(idempotency_key).strip(),
                 "idempotency_key",
+                exact_values,
             )
         )
     if quote_id:
@@ -605,7 +617,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND {agent_clause}
+                  AND {quote_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -613,6 +625,7 @@ async def find_replayable_order_for_create(
                 """,
                 str(quote_id).strip(),
                 "quote_id",
+                quote_values,
             )
         )
     if agent_session_id:
@@ -622,7 +635,7 @@ async def find_replayable_order_for_create(
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
-                  AND {agent_clause}
+                  AND {exact_clause}
                   AND COALESCE(is_deleted, FALSE) = FALSE
                   AND agent_session_id = :match_value{intent_clause}
                 ORDER BY created_at DESC
@@ -630,10 +643,11 @@ async def find_replayable_order_for_create(
                 """,
                 str(agent_session_id).strip(),
                 "agent_session_id",
+                exact_values,
             )
         )
 
-    for query, match_value, replay_scope in candidate_queries:
+    for query, match_value, replay_scope, agent_values in candidate_queries:
         if not match_value:
             continue
         values = {"merchant_id": merchant_id, **agent_values, "match_value": match_value}
