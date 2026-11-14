@@ -203,6 +203,7 @@ def own_availability(variant):
 def plan_offers(product, variants, skus, templates, existing):
     """Own-price projection. Ambiguous IDs or seller/market templates are refused."""
     counts = collections.Counter()
+    product_host = normalize_host(product.get("source_domain"))
     by_id = collections.defaultdict(list)
     for variant in variants:
         vid = str(variant.get("variant_id") or variant.get("id") or "").strip()
@@ -273,25 +274,17 @@ def plan_offers(product, variants, skus, templates, existing):
                 counts["destination_or_seller_mismatch"] += 1
                 continue
             destination = payload.get("destination_url") or payload.get("canonical_url")
-            try:
-                url = urlsplit(destination or "")
-                valid = (
-                    url.scheme == "https"
-                    and url.hostname == product.get("source_domain")
-                    and not url.username
-                    and not url.password
-                    and url.port in (None, 443)
-                    and bool(url.path)
-                )
-            except (ValueError, TypeError):
-                valid = False
+            destination_identity = listing_identity(destination)
+            # The mirror product keeps the page's `www.` spelling, legacy offer
+            # templates can store the bare host. Keep the exact HTTPS listing URL.
             if (
-                not valid
-                or template.get("source_domain") != product.get("source_domain")
+                not destination_identity
+                or destination_identity[0] != product_host
+                or normalize_host(template.get("source_domain")) != product_host
                 or ("seed_market" in product and market != product["seed_market"])
                 or (
                     "seed_listing_identities" in product
-                    and listing_identity(destination) not in product["seed_listing_identities"]
+                    and destination_identity not in product["seed_listing_identities"]
                 )
             ):
                 counts["destination_or_seller_mismatch"] += 1
