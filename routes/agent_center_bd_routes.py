@@ -36,18 +36,20 @@ from __future__ import annotations
 
 from typing import List
 import logging
+import os
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, validator
 
-from db.merchant_audit_runs import recent_runs_for_merchant
+from db.merchant_audit_runs import fetch_audit_run_by_id, recent_runs_for_merchant
 from services.agent_center_bd_report_service import (
     build_structured_report,
     run_bd_probes,
     run_brand_report,
 )
-from utils.auth import get_current_employee
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee
 
 router = APIRouter(prefix="/api/agent-center/bd", tags=["agent-center", "bd"])
 logger = logging.getLogger(__name__)
@@ -55,6 +57,79 @@ logger = logging.getLogger(__name__)
 
 _HARD_MAX_RUNS = 8
 _TASK_SCOPE_RECENT_RUN_LIMIT = 20
+
+
+class ConsumerRecommendationReview(BaseModel):
+    answer_sha256: str = Field(min_length=64, max_length=64)
+    verdict: str = Field(max_length=20)
+    exact_product_and_fit_checked: bool
+    excerpt: Optional[str] = Field(default=None, max_length=700)
+    citation_url: Optional[str] = Field(default=None, max_length=2000)
+
+
+async def _recommendation_review_run(run_id: UUID, current_user: Dict[str, Any]):
+    if os.getenv("PIVOTA_RECOMMENDATION_AUDIT_PILOT") != "true":
+        raise HTTPException(status_code=404, detail="Recommendation audit pilot is disabled.")
+    reviewer = current_user.get("employee_id") or current_user.get("employeeId") or current_user.get("user_id")
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES or not reviewer:
+        raise HTTPException(status_code=403, detail="Staff identity required.")
+    run = await fetch_audit_run_by_id(run_id=str(run_id))
+    if not run or not run.get("merchant_id"):
+        raise HTTPException(status_code=404, detail="Audit run not found.")
+    if run.get("stage") != "completed" or not isinstance(run.get("report_jsonb"), dict):
+        raise HTTPException(status_code=409, detail="A completed audit with retained answers is required.")
+    return run, str(reviewer)
+
+
+@router.get("/audit/{run_id}/recommendation-review")
+async def list_consumer_recommendation_reviews(
+    run_id: UUID, current_user: Dict[str, Any] = Depends(get_current_employee),
+):
+    from db.audit_evidence import list_review_findings
+    from db._jsonb_safe import coerce_jsonb_to_dict
+    from services.recommendation_observation import pilot_observations
+
+    run, _ = await _recommendation_review_run(run_id, current_user)
+    findings = await list_review_findings(audit_run_id=str(run_id), merchant_id=run["merchant_id"])
+    reviews = {}
+    for finding in findings:
+        payload = coerce_jsonb_to_dict(finding.get("payload_jsonb")) or {}
+        if payload.get("observation_id"):
+            reviews[payload["observation_id"]] = payload
+    return {"observations": [
+        {**row, "review": reviews.get(observation_id)}
+        for observation_id, row in pilot_observations(run["report_jsonb"]).items()
+    ]}
+
+
+@router.put("/audit/{run_id}/recommendation-review/{observation_id}")
+async def review_consumer_recommendation(
+    run_id: UUID, observation_id: str, body: ConsumerRecommendationReview,
+    current_user: Dict[str, Any] = Depends(get_current_employee),
+):
+    from db.audit_evidence import upsert_review_finding
+    from services.recommendation_observation import (
+        RECOMMENDATION_BASIS, pilot_observations, validate_review,
+    )
+
+    run, reviewer = await _recommendation_review_run(run_id, current_user)
+    observation = pilot_observations(run["report_jsonb"]).get(observation_id)
+    if observation is None:
+        raise HTTPException(status_code=404, detail="Pilot observation not found in this run.")
+    if not body.exact_product_and_fit_checked:
+        raise HTTPException(status_code=422, detail="Review the exact product, shopper constraints and cited source before submitting.")
+    try:
+        review = validate_review(observation, answer_sha256=body.answer_sha256, verdict=body.verdict,
+                                 excerpt=body.excerpt, citation_url=body.citation_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finding_id = await upsert_review_finding(
+        audit_run_id=str(run_id), merchant_id=run["merchant_id"],
+        product_key=observation["product_key"], observation_id=observation_id,
+        payload={**review, "basis": RECOMMENDATION_BASIS, "observation_id": observation_id,
+                 "product_key": observation["product_key"], "reviewed_by": reviewer},
+    )
+    return {"finding_id": finding_id, "verdict": body.verdict}
 
 
 async def _latest_completed_audit_run_id_for_tasks(

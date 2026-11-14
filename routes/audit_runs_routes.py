@@ -1553,9 +1553,19 @@ async def get_audit_run(
         # a second copy of a paywall is how the two drift apart.
         from routes.merchant_audit_routes import _apply_actions_paywall
 
+        projected_payload = _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+        if audience == "revenue_recovery" and isinstance(projected_payload, str):
+            from db._jsonb_safe import coerce_jsonb_to_dict
+
+            projected_payload = _strip_brand_facing_internal_money(coerce_jsonb_to_dict(projected_payload))
+        if audience == "revenue_recovery" and isinstance(projected_payload, dict):
+            from services.recommendation_observation import enrich_revenue_recovery
+
+            await enrich_revenue_recovery(projected_payload, row)
+
         return await _apply_actions_paywall(
             sanitize_report_for_merchant(
-                _strip_brand_facing_internal_money(proj.get("payload_jsonb"))
+                projected_payload
             ),
             str(row.get("merchant_id") or ""),
             row,

@@ -64,6 +64,18 @@ def test_substantiated_drops_unverified_flagged_rejected() -> None:
     assert substantiated_claims(_profile("unverified", "flagged", "rejected")) == []
 
 
+def test_preexisting_materialized_product_evidence_needs_claim_level_verification() -> None:
+    legacy = {"claim_text": "Hydration for 12 hours", "source_type": "merchant_lab_report",
+              "source_ref": "art_1", "evidence_grade": "a", "substantiation_status": "substantiated"}
+    ingredient = _profile("substantiated")["claims"][0]
+    row = {"title": "Essence", "evidence_profile": {
+        "review_state": "reviewed",  # prior merchant API accepted this label
+        "claims": [legacy, ingredient],
+    }}
+    assert [c["claim_text"] for c in _row_as_product(row)["evidence_claims"]] == ["claim-0"]
+    assert [c["claim_text"] for c in _shape_product_for_pdp(row)["evidence_claims"]] == ["claim-0"]
+
+
 # --- public canonical PDP shaper ---------------------------------------------
 
 def test_canonical_shaper_emits_substantiated_only_plus_disclaimers() -> None:

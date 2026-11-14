@@ -42,6 +42,27 @@ def test_merge_none_and_empty_returns_none() -> None:
     assert pe.merge_evidence_profiles() is None
 
 
+async def test_pending_claim_does_not_shadow_verified_claim_after_pdp_assembly(monkeypatch) -> None:
+    from services.claim_safety import substantiated_claims
+
+    pending = {"claim_text": "Hydrates", "source_ref": "https://lab.example/test",
+               "source_type": "merchant_lab_report", "substantiation_status": "unverified"}
+    reviewed = {**pending, "source_type": "third_party_test", "substantiation_status": "substantiated",
+                "review_status": "verified", "reviewed_by": "staff", "evidence_grade": "a",
+                "review_source_type": "third_party_test", "review_source_url": pending["source_ref"]}
+
+    async def general(keys, *, db=None):
+        return {"evidence_profile": {"claims": [reviewed]}}
+
+    monkeypatch.setattr(pe, "fetch_product_evidence_for_keys", general)
+    row = {"evidence_profile": {"claims": [pending]}, "required_disclaimers": None}
+    assembled = await asm.fetch_evidence_for_keys(["pk"], db=_FakeDB(one=row))
+    assert substantiated_claims(assembled["evidence_profile"]) == [{
+        "claim_text": "Hydrates", "source_ref": pending["source_ref"],
+        "source_type": "third_party_test", "evidence_grade": "a",
+    }]
+
+
 def test_merge_tolerates_json_string_input() -> None:
     s = json.dumps({"claims": [{"claim_text": "Z", "source_ref": "s"}], "review_state": "observed"})
     m = pe.merge_evidence_profiles(s)
@@ -134,3 +155,24 @@ async def test_readiness_includes_evidence_tier(monkeypatch) -> None:
 
     r = await mar.assess_merchant_audit_readiness("m1")
     assert r["evidence"]["products_with_substantiated_claims"] == 7
+
+
+async def test_readiness_counts_verified_claims_per_product_and_ignores_legacy_self_grades(monkeypatch) -> None:
+    from db.database import database
+
+    raw = {"claim_text": "Hydration", "source_type": "third_party_test", "source_ref": "fake",
+           "substantiation_status": "substantiated", "evidence_grade": "a"}
+    verified = {**raw, "review_status": "verified", "review_source_type": "third_party_test",
+                "review_source_url": "https://lab.example/report", "reviewed_by": "staff"}
+
+    async def fetch_all(sql, values):
+        assert "merchant_id = :mid" in sql
+        assert values["mid"] == "m1"
+        return [
+            {"product_key": "legacy-only", "claims": [raw]},
+            {"product_key": "actually-verified", "claims": json.dumps([verified])},
+            {"product_key": "actually-verified", "claims": [verified]},
+        ]
+
+    monkeypatch.setattr(database, "fetch_all", fetch_all)
+    assert await mar._count_substantiated_evidence("m1") == 1

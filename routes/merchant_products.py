@@ -16,11 +16,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from db.canonical_commerce import canonical_products
 from db.database import database
 from db.products import products_cache, get_cached_products
+from db.product_evidence import MAX_EVIDENCE_CLAIM_LENGTH, MAX_EVIDENCE_SUBMISSION_CLAIMS, MAX_PRODUCT_EVIDENCE_CLAIMS
 from db.product_enrichment import (
     get_enrichment,
     get_enrichments_for_products,
@@ -1995,18 +1996,18 @@ async def run_product_enrichment(
 # --- Phase 2b: merchant evidence intake --------------------------------------
 
 class EvidenceClaimIn(BaseModel):
-    claim_text: str
+    claim_text: str = Field(max_length=MAX_EVIDENCE_CLAIM_LENGTH)
     # merchant_positioning | merchant_lab_report | third_party_test | certification
     # | third_party_review | editorial_press. Defaults to positioning (unverified).
-    source_type: Optional[str] = None
-    # Artifact id / citation url. Required for a substantiated source_type — without
-    # it the claim is honestly stored as unverified positioning.
-    source_ref: Optional[str] = None
+    source_type: Optional[str] = Field(default=None, max_length=40)
+    # Public URL or an uploaded lab-report extraction id. An extraction needs
+    # a separate public source because file contents are not kept after extraction.
+    source_ref: Optional[str] = Field(default=None, max_length=2000)
+    public_source_url: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ProductEvidenceBody(BaseModel):
-    claims: List[EvidenceClaimIn] = []
-    review_state: Optional[str] = "observed"
+    claims: List[EvidenceClaimIn] = Field(default_factory=list, max_length=MAX_EVIDENCE_SUBMISSION_CLAIMS)
 
 
 async def _resolve_evidence_product(merchant_id: str, platform: str, platform_product_id: str):
@@ -2033,12 +2034,7 @@ async def upsert_product_evidence_endpoint(
     body: ProductEvidenceBody,
     current_user: dict = Depends(get_current_user),
 ):
-    """Phase 2b: merchant evidence intake. Writes provenance-graded claims to
-    product_evidence and refreshes agent_pdp_view so they are served via the
-    agent-PDP read surfaces. Optional / never required. Positioning is stored as
-    `unverified` (improves PDP copy) until a lab/cert/third-party source
-    substantiates it — only substantiated claims are ever served to agents (the
-    serve gate is single-sourced downstream)."""
+    """Add merchant evidence for review. Merchants can submit sources and positioning."""
     if current_user.get("role") != "merchant":
         raise HTTPException(status_code=403, detail="Only merchants can author evidence")
     merchant_id = current_user.get("merchant_id")
@@ -2059,7 +2055,7 @@ async def upsert_product_evidence_endpoint(
     if not owns and platform != PLATFORM_URL_AUDIT:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    product_key, content_key = await _resolve_evidence_product(
+    product_key, _ = await _resolve_evidence_product(
         merchant_id, platform, platform_product_id
     )
     if not product_key:
@@ -2068,32 +2064,55 @@ async def upsert_product_evidence_endpoint(
             detail="Product not in the canonical catalog yet — sync your catalog first.",
         )
 
-    from db.product_evidence import normalize_intake_claims, upsert_product_evidence
+    from db.product_evidence import (
+        fetch_product_evidence_row,
+        lab_candidate_belongs_to_artifact,
+        merge_merchant_claims,
+        normalize_intake_claims,
+        product_evidence_transaction,
+        upsert_product_evidence,
+    )
+    from services.claim_safety import review_source_url
 
     claims = normalize_intake_claims([c.model_dump() for c in body.claims])
-    await upsert_product_evidence(
-        product_key,
-        merchant_id=merchant_id,
-        claims=claims,
-        review_state=(body.review_state or "observed"),
-    )
+    if claims:
+        async with product_evidence_transaction(product_key) as db:
+            row = await fetch_product_evidence_row(product_key, db=db, strict=True) or {}
+            if row.get("merchant_id") not in (None, merchant_id):
+                raise HTTPException(status_code=404, detail="Product not found")
+            existing = row.get("claims") or []
+            for claim in claims:
+                if claim.get("review_status") != "submitted":
+                    continue
+                ref = claim["source_ref"]
+                if claim["source_type"] == "merchant_lab_report" and ref.startswith("art_"):
+                    if not claim.get("public_source_url"):
+                        raise HTTPException(status_code=422, detail="Add a public HTTPS link so staff can inspect the lab report.")
+                    if not await lab_candidate_belongs_to_artifact(
+                        artifact_id=ref, merchant_id=merchant_id, product_key=product_key,
+                        claim_text=claim["claim_text"], db=db,
+                    ):
+                        raise HTTPException(status_code=422, detail="The claim does not match an extracted report for this product.")
+                elif not review_source_url(ref):
+                    raise HTTPException(status_code=422, detail="Add a public HTTPS source that supports this claim.")
+            merged = merge_merchant_claims(existing, claims)
+            if len(merged) > max(MAX_PRODUCT_EVIDENCE_CLAIMS, len(existing)):
+                raise HTTPException(status_code=409, detail="This product has reached its evidence submission limit.")
+            if merged != existing:
+                await upsert_product_evidence(
+                    product_key,
+                    merchant_id=merchant_id,
+                    claims=merged,
+                    review_state=row.get("review_state") or "observed",
+                    required_disclaimers=row.get("required_disclaimers"),
+                    db=db,
+                )
 
-    refreshed = False
-    if content_key:
-        try:
-            from services.agent_pdp_view_assembler import refresh_agent_pdp_view_for_content_key
-            refreshed = await refresh_agent_pdp_view_for_content_key(
-                content_key, refresh_source="merchant_evidence_intake"
-            )
-        except Exception:
-            refreshed = False  # best-effort: stored now, served on the next assembly
-
-    substantiated = sum(1 for c in claims if c.get("substantiation_status") == "substantiated")
     return {
         "product_key": product_key,
         "claims_written": len(claims),
-        "substantiated": substantiated,
-        "served_refresh": refreshed,
+        "substantiated": 0,
+        "served_refresh": False,
     }
 
 
@@ -2114,13 +2133,17 @@ async def get_product_evidence_endpoint(
     if not product_key:
         return {"claims": [], "review_state": None}
 
-    from db.product_evidence import fetch_product_evidence_row
+    from db.product_evidence import fetch_product_evidence_row, merchant_visible_claim
     row = await fetch_product_evidence_row(product_key)
-    if not row:
+    if not row or row.get("merchant_id") not in (None, merchant_id):
         return {"claims": [], "review_state": None}
     updated = row.get("updated_at")
     return {
-        "claims": row.get("claims") or [],
+        "claims": [
+            {key: value for key, value in merchant_visible_claim(claim).items()
+             if key != "reviewed_by"}
+            for claim in row.get("claims") or [] if isinstance(claim, dict)
+        ],
         "review_state": row.get("review_state"),
         "required_disclaimers": row.get("required_disclaimers"),
         "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else updated,
@@ -2158,12 +2181,7 @@ async def extract_lab_report_evidence_endpoint(
     paste its text, and get back CANDIDATE claims an LLM extracted from it plus a
     stable `artifact_id`.
 
-    Nothing is published here. The candidates come back unverified for the merchant
-    to review; confirming one via POST `/evidence` with
-    source_type='merchant_lab_report' and source_ref=<artifact_id> is what grades
-    it 'a' / substantiated and serves it to agents. Optional, never required — a
-    suggestion to get more out of Pivota for products whose value isn't yet in the
-    catalog copy."""
+    The merchant can submit unverified candidates to POST `/evidence` for review."""
     if current_user.get("role") != "merchant":
         raise HTTPException(status_code=403, detail="Only merchants can submit lab reports")
     merchant_id = current_user.get("merchant_id")
@@ -2244,13 +2262,10 @@ async def extract_lab_report_evidence_endpoint(
             kind="lab_report",
             source="merchant_upload",
             url_or_blob_ref=filename,
-            extracted_claim_keys=[c["claim_text"] for c in candidates],
+            extracted_claim_keys=[c["claim_text"].strip() for c in candidates],
         )
     except Exception:
-        # Artifact persistence is best-effort; the candidates are still returned so
-        # the merchant can review. (Confirming a claim requires the artifact_id, so
-        # a transient store failure just means re-uploading.)
-        pass
+        raise HTTPException(status_code=503, detail="Unable to save the report reference. Please retry.")
 
     return {
         "artifact_id": artifact_id,
@@ -2259,12 +2274,11 @@ async def extract_lab_report_evidence_endpoint(
         "candidate_count": len(candidates),
         "next_step": {
             "instructions": (
-                "Review each candidate. To publish one as a substantiated, citable "
-                "claim, POST it to this product's /evidence endpoint with "
-                "source_type='merchant_lab_report' and source_ref set to this artifact_id. "
-                "Nothing is published until you confirm."
+                "The uploaded file or pasted text is used to extract draft claims. "
+                "Submit a candidate with this artifact ID and a public HTTPS source for staff to inspect."
             ),
             "source_type": "merchant_lab_report",
             "source_ref": artifact_id,
+            "public_source_url_required": True,
         },
     }

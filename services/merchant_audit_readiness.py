@@ -140,11 +140,12 @@ async def _count_substantiated_evidence(merchant_id: str) -> int:
     non-Postgres; never blocks the verdict. Drives the portal's informational
     'evidence tier' (how much citable evidence the merchant has)."""
     from db.database import database
+    from services.claim_safety import substantiated_product_claims
 
     try:
-        row = await database.fetch_one(
+        rows = await database.fetch_all(
             """
-            SELECT COUNT(DISTINCT product_key) AS n
+            SELECT product_key, claims
             FROM product_evidence
             WHERE merchant_id = :mid
               AND claims @> '[{"substantiation_status": "substantiated"}]'
@@ -153,7 +154,9 @@ async def _count_substantiated_evidence(merchant_id: str) -> int:
         )
     except Exception:
         return 0
-    return int((dict(row).get("n") if row else 0) or 0)
+    return len({
+        row["product_key"] for row in rows if substantiated_product_claims(row["claims"])
+    })
 
 
 async def assess_merchant_audit_readiness(

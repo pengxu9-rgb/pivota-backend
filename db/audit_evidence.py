@@ -40,7 +40,7 @@ from sqlalchemy import (
     UniqueConstraint, and_, func, or_,
     select as sa_select,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID, insert as pg_insert
 from sqlalchemy.sql import expression
 
 from db._ddl_guard import apply_ddl_statements
@@ -108,6 +108,7 @@ FINDING_FIRST_PARTY_INDEXING_GAP = "first_party_pdp_indexing_gap"
 FINDING_NO_KOL_ENDORSEMENTS = "no_kol_endorsements_detected"
 FINDING_CORPORATE_OWNERSHIP_KNOWN = "corporate_ownership_known"
 FINDING_BASELINE_REFERENCE_AVAILABLE = "baseline_reference_available"
+FINDING_CONSUMER_RECOMMENDATION_REVIEW = "consumer_recommendation_review"
 
 # Free-form finding types are accepted; the taxonomy above documents
 # the ones with synthesis-layer handlers. Other types still insert
@@ -1916,7 +1917,10 @@ async def list_findings_for_run(
     try:
         rows = await database.fetch_all(
             readiness_findings.select()
-            .where(readiness_findings.c.audit_run_id == audit_run_id)
+            .where(
+                readiness_findings.c.audit_run_id == audit_run_id,
+                readiness_findings.c.finding_type != FINDING_CONSUMER_RECOMMENDATION_REVIEW,
+            )
             .order_by(readiness_findings.c.created_at)
         )
     except Exception as exc:  # noqa: BLE001
@@ -1926,6 +1930,42 @@ async def list_findings_for_run(
         )
         return []
     return [dict(r) for r in (rows or [])]
+
+
+async def list_review_findings(*, audit_run_id: str, merchant_id: str) -> List[Dict[str, Any]]:
+    """Read run-scoped staff reviews without exposing other findings."""
+    await ensure_audit_evidence_tables()
+    findings = readiness_findings
+    rows = await database.fetch_all(findings.select().where(
+        findings.c.audit_run_id == audit_run_id,
+        findings.c.merchant_id == merchant_id,
+        findings.c.finding_type == FINDING_CONSUMER_RECOMMENDATION_REVIEW,
+    ))
+    return [dict(row) for row in rows]
+
+
+async def upsert_review_finding(*, audit_run_id: str, merchant_id: str,
+                                product_key: str, observation_id: str, payload: Dict[str, Any]) -> str:
+    """Allow staff corrections without rewriting the underlying audit or duplicating a review."""
+    await ensure_audit_evidence_tables()
+    findings = readiness_findings
+    finding_type = FINDING_CONSUMER_RECOMMENDATION_REVIEW
+    statement = pg_insert(findings).values(
+        finding_id=str(uuid.uuid4()), audit_run_id=audit_run_id, merchant_id=merchant_id,
+        product_key=product_key, finding_type=finding_type, severity="low",
+        payload_jsonb=payload, created_at=_now_utc(), idempotency_key=f"{finding_type}:{observation_id}",
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[findings.c.audit_run_id, findings.c.idempotency_key],
+        index_where=findings.c.idempotency_key.isnot(None),
+        set_={"payload_jsonb": statement.excluded.payload_jsonb},
+        where=(findings.c.merchant_id == merchant_id) & (findings.c.finding_type == finding_type)
+              & (findings.c.product_key == product_key),
+    ).returning(findings.c.finding_id)
+    row = await database.fetch_one(statement)
+    if row is None:
+        raise ValueError("Existing review identity conflicts with the audit observation.")
+    return str(row["finding_id"])
 
 
 async def list_actions_for_run(

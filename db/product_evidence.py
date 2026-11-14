@@ -21,6 +21,7 @@ db.product_quality_backfill_jobs).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -30,8 +31,17 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import func
 
 from db.database import IS_POSTGRES, database, metadata
+from services.claim_safety import (
+    MERCHANT_EVIDENCE_SOURCE_TYPES,
+    has_verified_merchant_evidence,
+    review_source_url,
+    substantiated_product_claims,
+)
 
 logger = logging.getLogger(__name__)
+MAX_PRODUCT_EVIDENCE_CLAIMS = 100
+MAX_EVIDENCE_SUBMISSION_CLAIMS = 10
+MAX_EVIDENCE_CLAIM_LENGTH = 2000
 
 
 product_evidence = Table(
@@ -169,11 +179,11 @@ def merge_evidence_profiles(*profiles: Any) -> Optional[Dict[str, Any]]:
     or JSON string, None-tolerant) into one — claims concatenated and deduped by
     (claim_text, source_ref). Returns None when nothing usable. Pure.
 
-    Order matters only for `review_state` (first non-empty wins) and dedupe
-    precedence (the first profile's claim survives), so callers pass the
-    higher-precedence profile first (e.g. brand-official beauty before general)."""
+    For duplicate claims eligible for publication, the first profile wins.
+    A pending or legacy self-graded claim cannot hide a publishable claim.
+    The first non-empty `review_state` still describes the combined profile."""
     merged_claims: List[Dict[str, Any]] = []
-    seen = set()
+    positions = {}
     review_state: Optional[str] = None
     for raw in profiles:
         prof = _coerce_json(raw)
@@ -187,9 +197,12 @@ def merge_evidence_profiles(*profiles: Any) -> Optional[Dict[str, Any]]:
             if not text:
                 continue
             key = (text.lower(), str(claim.get("source_ref") or "").strip().lower())
-            if key in seen:
+            if key in positions:
+                index = positions[key]
+                if not substantiated_product_claims([merged_claims[index]]) and substantiated_product_claims([claim]):
+                    merged_claims[index] = claim
                 continue
-            seen.add(key)
+            positions[key] = len(merged_claims)
             merged_claims.append(claim)
         rs = prof.get("review_state")
         if rs and not review_state:
@@ -264,28 +277,8 @@ async def fetch_product_evidence_for_keys(
 
 # --- merchant intake (Phase 2b) ----------------------------------------------
 
-# Map a merchant intake source_type -> (evidence_grade, substantiation_status).
-# Converges on the SERVING gate's letter grades (PIVOTA-Agent
-# pivotaInsightsQuality PUBLIC_SAFE_CLAIM_GRADES = {a,b,c}) so a substantiated
-# merchant claim publishes with NO serving-gate change. Positioning stays
-# `unverified` (improves PDP copy; never served as a grounded claim until a lab /
-# cert / third-party source substantiates it).
-_INTAKE_SOURCE_GRADE: Dict[str, tuple] = {
-    "merchant_lab_report": ("a", "substantiated"),
-    "third_party_test": ("a", "substantiated"),
-    "certification": ("a", "substantiated"),
-    "third_party_review": ("b", "substantiated"),
-    "editorial_press": ("b", "substantiated"),
-    "merchant_positioning": (None, "unverified"),
-}
-
-
 def normalize_intake_claims(raw_claims: Any) -> List[Dict[str, Any]]:
-    """Map merchant-supplied intake claims to ProductClaim dicts with a serving-
-    compatible evidence_grade + an HONEST substantiation_status. A substantiated
-    source_type (lab/cert/third-party) requires a `source_ref` (the artifact id or
-    citation url) — without one it is honestly downgraded to unverified positioning,
-    so a merchant can't self-substantiate by just picking a label."""
+    """Store source-backed submissions for review. Ignore client grades and status."""
     if not isinstance(raw_claims, list):
         return []
     out: List[Dict[str, Any]] = []
@@ -297,20 +290,77 @@ def normalize_intake_claims(raw_claims: Any) -> List[Dict[str, Any]]:
             continue
         source_type = str(raw.get("source_type") or "merchant_positioning").strip().lower()
         source_ref = (str(raw.get("source_ref")).strip() or None) if raw.get("source_ref") else None
-        grade, status = _INTAKE_SOURCE_GRADE.get(source_type, (None, "unverified"))
-        if status == "substantiated" and not source_ref:
-            grade, status, source_type = None, "unverified", "merchant_positioning"
+        if source_type not in MERCHANT_EVIDENCE_SOURCE_TYPES or not source_ref:
+            source_type = "merchant_positioning"
         claim: Dict[str, Any] = {
             "claim_text": text,
             "source_type": source_type,
-            "substantiation_status": status,
+            "substantiation_status": "unverified",
         }
-        if grade:
-            claim["evidence_grade"] = grade
+        if source_type != "merchant_positioning":
+            claim["review_status"] = "submitted"
         if source_ref:
             claim["source_ref"] = source_ref
+        public_source_url = review_source_url(raw.get("public_source_url"))
+        if source_type == "merchant_lab_report" and public_source_url:
+            claim["public_source_url"] = public_source_url
         out.append(claim)
     return out
+
+
+def claim_identity(claim: Dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(claim.get("claim_text") or "").strip(),
+        str(claim.get("source_type") or "").strip().lower(),
+        str(claim.get("source_ref") or "").strip(),
+    )
+
+
+def merchant_visible_claim(claim: Dict[str, Any]) -> Dict[str, Any]:
+    """Unwind legacy self-grades in the merchant view while retaining the submission."""
+    if (str(claim.get("source_type") or "").strip().lower() in MERCHANT_EVIDENCE_SOURCE_TYPES
+            and str(claim.get("substantiation_status") or "").strip().lower() == "substantiated"
+            and not has_verified_merchant_evidence(claim)):
+        claim = {**claim, "substantiation_status": "unverified", "review_status": "submitted"}
+        claim.pop("evidence_grade", None)
+    return claim
+
+
+def merge_merchant_claims(existing: List[Dict[str, Any]], submitted: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add claims idempotently without overwriting previously reviewed evidence."""
+    merged = list(existing)
+    positions = {}
+    for index, claim in enumerate(merged):
+        if isinstance(claim, dict):
+            positions.setdefault(claim_identity(claim), index)
+    for claim in submitted:
+        identity = claim_identity(claim)
+        index = positions.get(identity)
+        if index is None:
+            positions[identity] = len(merged)
+            merged.append(claim)
+        elif (claim.get("public_source_url") and not merged[index].get("public_source_url")
+              and not has_verified_merchant_evidence(merged[index])):
+            merged[index] = {**merged[index], "public_source_url": claim["public_source_url"]}
+        elif (claim.get("review_status") == "submitted"
+              and merged[index].get("discovered_via") == "web_crawl"
+              and not merchant_visible_claim(merged[index]).get("review_status")):
+            merged[index] = {**claim, "discovered_via": "web_crawl"}
+    return merged
+
+
+@asynccontextmanager
+async def product_evidence_transaction(product_key: str, *, geo_code: str = "default", db: Any = None):
+    """Serialize the merchant, web collection and staff read/modify/write paths."""
+    await ensure_product_evidence_tables()
+    write_db = db or database
+    async with write_db.transaction():
+        if IS_POSTGRES:
+            await write_db.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(CAST(:key AS text), 0))",
+                {"key": f"product_evidence:{geo_code}:{product_key}"},
+            )
+        yield write_db
 
 
 async def upsert_product_evidence(
@@ -368,8 +418,8 @@ async def insert_evidence_artifact(
     """Record one source document the merchant evidence intake references (a lab
     PDF, cert, review…). Idempotent on artifact_id (re-uploading the same file
     re-points to the same row, preserving captured_at). Returns the artifact_id —
-    a confirmed claim's `source_ref` points here, which is what grades it. Pure
-    write; never auto-creates claims (the merchant confirms candidates separately)."""
+    a submitted claim's `source_ref` points here. The merchant confirms
+    candidates separately for review."""
     await ensure_product_evidence_tables()
     write_db = db or database
     keys_json = json.dumps(extracted_claim_keys) if extracted_claim_keys else None
@@ -401,11 +451,27 @@ async def insert_evidence_artifact(
     return artifact_id
 
 
+async def lab_candidate_belongs_to_artifact(
+    *, artifact_id: str, merchant_id: str, product_key: str, claim_text: str, db: Any,
+) -> bool:
+    row = await db.fetch_one(
+        """
+        SELECT extracted_claim_keys FROM evidence_artifact
+        WHERE artifact_id = :aid AND product_key = :pk AND merchant_id = :mid
+          AND kind = 'lab_report' AND source = 'merchant_upload'
+        """,
+        {"aid": artifact_id, "pk": product_key, "mid": merchant_id},
+    )
+    keys = _coerce_json(row["extracted_claim_keys"]) if row else None
+    return isinstance(keys, list) and claim_text in keys
+
+
 async def fetch_product_evidence_row(
     product_key: str,
     *,
     geo_code: str = "default",
     db: Any = None,
+    strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """One product's stored evidence (for the merchant read endpoint). None when
     absent; best-effort."""
@@ -421,6 +487,8 @@ async def fetch_product_evidence_row(
             {"pk": product_key, "geo": geo_code},
         )
     except Exception:
+        if strict:
+            raise
         return None
     if not row:
         return None

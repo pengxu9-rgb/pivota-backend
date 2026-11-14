@@ -23,7 +23,10 @@ authoring writer, the read path, and PR4's serving gate.
 from __future__ import annotations
 
 import json
+from ipaddress import ip_address
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlsplit
 
 from models.catalog import ProductClaim, RequiredDisclaimer
 
@@ -45,6 +48,50 @@ SUBSTANTIATION_STATUSES = frozenset(
 REVIEW_OBSERVED = "observed"
 REVIEW_REVIEWED = "reviewed"
 REVIEW_FLAGGED = "flagged"
+
+# These source labels can be supplied through the merchant evidence endpoint.
+# Only a claim-level review from a trusted writer can authorize publication.
+# Legacy rows may have both a grade and a merchant-supplied profile review_state.
+MERCHANT_EVIDENCE_SOURCE_TYPES = frozenset({
+    "merchant_lab_report", "third_party_test", "certification",
+    "third_party_review", "editorial_press", "merchant_positioning",
+})
+REVIEWED_MERCHANT_EVIDENCE_SOURCE_TYPES = (
+    MERCHANT_EVIDENCE_SOURCE_TYPES - {"merchant_positioning"}
+) | {"brand_statement", "retailer_listing"}
+_PRIVATE_CITATION_QUERY = re.compile(r"token|password|secret|authorization|api.?key", re.IGNORECASE)
+
+
+def review_source_url(value: Any) -> Optional[str]:
+    """A reviewer-provided web citation, excluding credentials and non-web refs."""
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if len(url) > 2000 or "\\" in url or any(char.isspace() or ord(char) < 32 for char in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").rstrip(".")
+        if (parsed.scheme == "https" and "." in host
+                and not host.endswith((".local", ".internal", ".localhost"))
+                and parsed.username is None and parsed.password is None and not parsed.fragment
+                and not any(_PRIVATE_CITATION_QUERY.search(name)
+                            for name, _ in parse_qsl(parsed.query, keep_blank_values=True))):
+            try:
+                return url if ip_address(host).is_global else None
+            except ValueError:
+                return url
+    except ValueError:
+        pass
+    return None
+
+
+def has_verified_merchant_evidence(claim: Dict[str, Any]) -> bool:
+    return (claim.get("review_status") == "verified"
+            and bool(str(claim.get("reviewed_by") or "").strip())
+            and claim.get("evidence_grade") in ("a", "b", "c")
+            and str(claim.get("review_source_type") or "") in REVIEWED_MERCHANT_EVIDENCE_SOURCE_TYPES
+            and review_source_url(claim.get("review_source_url")) is not None)
 
 # Category kinds the contract recognizes.
 CATEGORY_SKINCARE = "skincare"
@@ -134,11 +181,22 @@ def _coerce_claim(raw: Any) -> Optional[ProductClaim]:
         status = str(raw.get("substantiation_status") or "").strip().lower()
         if status not in SUBSTANTIATION_STATUSES:
             status = SUBSTANTIATION_UNVERIFIED
+        source_type = str(raw.get("source_type") or "").strip()
+        source_ref = str(raw.get("source_ref") or "").strip() or None
+        grade = str(raw.get("evidence_grade") or "").strip() or None
+        if status == SUBSTANTIATION_SUBSTANTIATED and source_type.lower() in MERCHANT_EVIDENCE_SOURCE_TYPES:
+            # This normalized object is a public projection. Keep the original
+            # submission and the reviewer identity only in the evidence store.
+            if has_verified_merchant_evidence(raw):
+                source_ref = raw["review_source_url"].strip()
+                source_type = raw["review_source_type"]
+            else:
+                status, grade = SUBSTANTIATION_UNVERIFIED, None
         return ProductClaim(
             claim_text=text,
-            source_ref=(str(raw.get("source_ref")).strip() or None) if raw.get("source_ref") else None,
-            source_type=(str(raw.get("source_type")).strip() or None) if raw.get("source_type") else None,
-            evidence_grade=(str(raw.get("evidence_grade")).strip() or None) if raw.get("evidence_grade") else None,
+            source_ref=source_ref,
+            source_type=source_type or None,
+            evidence_grade=grade,
             substantiation_status=status,
         )
     return None
