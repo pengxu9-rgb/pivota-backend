@@ -34,7 +34,7 @@ def test_production_observation_uses_stock_projection_and_distinct_native_facts(
 
     now = datetime.now(timezone.utc)
     record = refresh.storefront_record(listing, payload(listing), now)
-    shaped = scope_reviewed_plan(ingest_validated_jsonl([record], market="US"))
+    shaped = scope_reviewed_plan(ingest_validated_jsonl([record], market="US", include_reviewed_surratt=True))
     offers = [json.loads(row["offer_payload"])[PROOF_KEY] for row in shaped["offers"]]
     assert {row["merchant_id"] for row in shaped["offers"]} == {listing.merchant_id}
     assert {(row["price_minor"], row["availability"]) for row in offers} == {
@@ -73,7 +73,25 @@ def test_wrong_or_missing_stock_cannot_replace_existing_observation():
 async def test_stock_writer_cannot_publish_family_offer_or_active_seed_for_scope():
     listing = next(iter(RETAILERS.values()))
     held = refresh.storefront_record(listing, payload(listing), datetime.now(timezone.utc))
-    generic = ingest_validated_jsonl([held], market="US")
+    generic = ingest_validated_jsonl([held], market="US", include_reviewed_surratt=True)
     assert generic["seeds"]
     with pytest.raises(ValueError, match="require the scoped retailer writer"):
         await apply_ingest_plan(generic, batch_label="unreviewed-refresh", db=object(), market="US")
+
+
+def test_mixed_generic_plan_holds_only_reviewed_listing():
+    import json
+
+    listing = next(iter(RETAILERS.values()))
+    held = refresh.storefront_record(listing, payload(listing), datetime.now(timezone.utc))
+    raw = {**payload(listing), "handle": "another-lipstick", "id": 123456789}
+    from services.curated_brand_feed import shopify_product_to_record
+
+    sibling = shopify_product_to_record(
+        raw, domain=listing.host, source_role="retailer", retailer_name="Bluemercury",
+        category_path="beauty/makeup/lip/lipstick", currency="USD",
+    )
+    plan = ingest_validated_jsonl([held, sibling], market="US")
+    assert len(plan["pdps"]) == 1 and plan["pdps"][0]["canonical_url"].endswith("/another-lipstick")
+    assert plan["seeds"] and all(row["attached_product_key"] == plan["pdps"][0]["product_key"] for row in plan["seeds"])
+    assert all(json.loads(row["offer_payload"])["destination_url"].endswith("/another-lipstick") for row in plan["offers"])

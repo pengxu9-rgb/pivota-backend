@@ -20,7 +20,8 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
     """Reuse the stock writer only after stage confirms identity and ownership."""
     plan = scope_reviewed_plan(
         await enrichment.plan_with_current_listings(
-            [record], db=db, market="US", source_jsonl="surratt_exact_retailer_review_v1"
+            [record], db=db, market="US", source_jsonl="surratt_exact_retailer_review_v1",
+            include_reviewed_surratt=True,
         )
     )
     if plan["listing_spellings"]["status"] != "read":

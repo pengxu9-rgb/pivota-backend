@@ -3136,7 +3136,8 @@ def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
 
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
-                                     allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
+                                     allow_moves: Any = (), planner: Any = None,
+                                     include_reviewed_surratt: bool = False) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
     `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
@@ -3149,6 +3150,8 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     planner = planner or ingest_validated_jsonl
     records = list(records)
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
+    if include_reviewed_surratt:
+        given["include_reviewed_surratt"] = True
     first = planner(records, **given)
     content, retailer = content_keys_of(first), retailer_keys_of(first)
     if not content and not retailer:

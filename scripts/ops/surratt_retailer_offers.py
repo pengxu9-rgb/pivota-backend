@@ -15,6 +15,7 @@ from services import crawl_politeness, shopify_edge_pacer
 from services.catalog_enrichment_agent.surratt_retailer_apply import apply_reviewed_retailer
 from services.catalog_identity import validated_source_gtin
 from services.curated_brand_feed import _note_response, shopify_product_to_record
+from services.exact_retailer_shades import read_offers
 from services.outbound_links_service import is_destination_domain_allowed
 from services.shopify_presentment import presentment_currency
 from services.surratt_retailer_pilot import RETAILERS
@@ -146,6 +147,19 @@ async def apply_cohort(db, records, *, mode):
         applied = [await apply_reviewed_retailer(db, record, write=True) for record in records]
         if planned != applied:
             raise ValueError("production write differs from its preflight")
+        canonical_ids = {canonical for listing in RETAILERS.values() for canonical, _ in listing.variants.values()}
+        for canonical in sorted(canonical_ids):
+            expected = {
+                (row["seller_ref"], offer_id, proof["retailer_landing_url"], proof["price_minor"])
+                for row in applied for offer_id, proof in row["offers"].items()
+                if proof["canonical_native_variant_id"] == canonical and proof["availability"] == "in_stock"
+            }
+            actual = {
+                (row["merchant_id"], row["offer_id"], row["destination_url"], round(row["price_amount"] * 100))
+                for row in await read_offers(db, canonical, timeout=5)
+            }
+            if actual != expected:
+                raise ValueError("production exact retailer reader does not match the verified cohort")
         return applied
 
 
