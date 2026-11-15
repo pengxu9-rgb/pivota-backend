@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.surratt_retailer_pilot import (
-    EXACT_RETAILER_LISTINGS,
+    KIOKII_PROTECTED_LISTING_KEYS,
     KIOKII_RETAILER_COHORT,
     PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY,
     SURRATT_RETAILER_COHORT,
@@ -5433,10 +5433,9 @@ async def _handle_offers_resolve(
     async def _append_external_offers_from_seed_rows(
         seed_rows: List[Any], *, sibling: bool = False, deadline: Optional[float] = None,
     ) -> None:
-        if exact_retailer_cohort:
-            seed_rows = [r for r in seed_rows if not exact_retailer_shades.is_pilot_retailer_seed(
-                _row_to_dict(r), exact_retailer_cohort,
-            )]
+        seed_rows = [r for r in seed_rows if not exact_retailer_shades.is_pilot_retailer_seed(
+            _row_to_dict(r), exact_retailer_cohort,
+        )]
         # ONE statement for every product key this batch is about to hand over, BEFORE the
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
@@ -10585,7 +10584,8 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
-    pilot_listing_keys = ", ".join(f"'{key}'" for key in EXACT_RETAILER_LISTINGS)
+    pilot_listing_keys = ", ".join(f"'{key}'" for key in SURRATT_RETAILER_COHORT.listings)
+    kiokii_listing_keys = ", ".join(f"'{key}'" for key in sorted(KIOKII_PROTECTED_LISTING_KEYS))
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10687,6 +10687,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND o.offer_type = 'retailer'
                        AND o.offer_mode = 'redirect'
                        AND o.suppressed_at IS NULL
+                       AND p.product_key NOT IN ({kiokii_listing_keys})
                        -- A reviewed listing only serves through the exact pilot reader once marked.
                        AND (p.product_key NOT IN ({pilot_listing_keys}) OR NOT EXISTS (
                            SELECT 1 FROM catalog_offers pilot

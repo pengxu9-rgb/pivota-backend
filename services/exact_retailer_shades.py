@@ -12,11 +12,14 @@ from services.catalog_identity import validated_source_gtin
 from services.handover_variant_identity import candidate_from_row, canonical_variant_id
 from services.seed_served_url import same_destination
 from services.surratt_retailer_pilot import (
-    KIOKII_RETAILER_COHORT, PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT, ExactRetailerCohort,
+    KIOKII_PROTECTED_FAMILY_URLS, KIOKII_PROTECTED_LISTING_KEYS, KIOKII_RETAILER_COHORT,
+    PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT, ExactRetailerCohort,
 )
 
 
 RETAILER_HOSTS = frozenset(listing.host for listing in RETAILERS.values())
+_KIOKII_PROTECTED_LOCATIONS = frozenset((urlsplit(url).hostname, urlsplit(url).path)
+                                       for url in KIOKII_PROTECTED_FAMILY_URLS)
 _KIOKII_CANONICAL_VARIANTS = frozenset(
     canonical_id for listing in KIOKII_RETAILER_COHORT.listings.values()
     for canonical_id, _ in listing.variants.values()
@@ -91,8 +94,9 @@ def matching_cohort(product_id, sku_id, observed_market, merchant_scope):
     return None
 
 
-def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
-    if row.get("attached_product_key") in cohort.listings:
+def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = SURRATT_RETAILER_COHORT):
+    attached_key = row.get("attached_product_key")
+    if attached_key in KIOKII_PROTECTED_LISTING_KEYS or (cohort is SURRATT_RETAILER_COHORT and attached_key in RETAILERS):
         return True
     for field in ("domain", "destination_url", "canonical_url"):
         value = str(row.get(field) or "")
@@ -103,8 +107,7 @@ def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort = SURRATT_RETAILER_C
         host = (address.hostname or "").lower().removeprefix("www.")
         if cohort is SURRATT_RETAILER_COHORT and host in RETAILER_HOSTS:
             return True
-        if any(host == listing.host and address.path.rstrip("/") == listing.product_path
-               for listing in cohort.listings.values()):
+        if (host, address.path.rstrip("/")) in _KIOKII_PROTECTED_LOCATIONS:
             return True
     return False
 

@@ -13,7 +13,8 @@ from main import app
 from routes import agent_shop_gateway as gateway, outbound_links
 from services import exact_retailer_shades as shades
 from services.surratt_retailer_pilot import (
-    KIOKII_FLAG, KIOKII_RETAILER_COHORT, PILOT_FLAG, PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT,
+    KIOKII_FLAG, KIOKII_PROTECTED_FAMILY_URLS, KIOKII_RETAILER_COHORT, PILOT_FLAG, PROOF_KEY, RETAILERS,
+    SURRATT_RETAILER_COHORT,
 )
 from tests.test_offers_one_per_seller_buyer_currency import _seed, _shade
 
@@ -233,6 +234,21 @@ def test_kiokii_exact_offer_is_gated_and_requires_a_signature(monkeypatch, http)
     offers = _invoke(client, sku_id=canonical, cohort=cohort)
     assert not any(offer["source"]["type"] == "catalog_offer" for offer in offers)
     assert calls == ["legacy"] * 7 + ["exact"]
+
+
+@pytest.mark.parametrize("family_url", KIOKII_PROTECTED_FAMILY_URLS)
+def test_kiokii_same_family_seeds_cannot_bypass_the_disabled_feature(monkeypatch, http, family_url):
+    client, _ = http
+    canonical = "52547429007674"
+    monkeypatch.delenv(KIOKII_FLAG, raising=False)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["kiokii.com", "amuseseoulmakeup.com"]))
+    calls = _wire_sources(monkeypatch, canonical, [], brand="amuseseoulmakeup.com", retailer="kiokii.com",
+                          retailer_family=f"{family_url}?variant=51896079974720")
+    offers = _invoke(client, sku_id=canonical, cohort=KIOKII_RETAILER_COHORT)
+    assert [offer["source"].get("seed_id") for offer in offers] == ["seed-official"]
+    assert calls == ["legacy"]
+    assert not shades.is_pilot_retailer_seed({"destination_url": "https://kiokii.com/products/other-product"}, None)
 
 
 @pytest.mark.asyncio

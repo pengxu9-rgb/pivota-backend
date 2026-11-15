@@ -2048,7 +2048,9 @@ def ingest_validated_jsonl(
     (services/retailer_ingest/detectors.listing_collision_flags). An `ext:retailer:` row is keyed
     by its listing URL, so it never meets another listing under its key.
     """
-    from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT, RETAILERS as SURRATT_LISTINGS
+    from services.surratt_retailer_pilot import (
+        KIOKII_BARE_LISTING_KEY, KIOKII_PROTECTED_LISTING_KEYS, RETAILERS as SURRATT_LISTINGS,
+    )
 
     pdp_rows: List[Dict[str, Any]] = []
     sku_rows: List[Dict[str, Any]] = []
@@ -2078,7 +2080,7 @@ def ingest_validated_jsonl(
             reason = "reviewed_surratt_retailer_scope"
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
-        if key in KIOKII_RETAILER_COHORT.listings and key not in reviewed_retailer_keys:
+        if key in KIOKII_PROTECTED_LISTING_KEYS and (key == KIOKII_BARE_LISTING_KEY or key not in reviewed_retailer_keys):
             skipped += 1
             reason = "reviewed_kiokii_retailer_scope"
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1

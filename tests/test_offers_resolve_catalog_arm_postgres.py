@@ -185,23 +185,24 @@ def test_the_arm_matches_by_content_key_and_product_key_too(pg_engine):
         assert (res.get("offers") or []), f"{ident} must resolve through the same arm"
 
 
-@pytest.mark.parametrize("cohort_name", ["surratt", "kiokii"])
+@pytest.mark.parametrize("cohort_name", ["surratt", "kiokii", "kiokii_bare"])
 def test_a_marked_exact_listing_cannot_fall_back_to_any_generic_offer(pg_engine, monkeypatch, cohort_name):
     from sqlalchemy import text
 
-    from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT, PROOF_KEY, SURRATT_RETAILER_COHORT
+    from services.surratt_retailer_pilot import KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT, PROOF_KEY, SURRATT_RETAILER_COHORT
 
-    cohort = KIOKII_RETAILER_COHORT if cohort_name == "kiokii" else SURRATT_RETAILER_COHORT
+    cohort = SURRATT_RETAILER_COHORT if cohort_name == "surratt" else KIOKII_RETAILER_COHORT
     monkeypatch.delenv(cohort.flag, raising=False)
     _seed(pg_engine)
-    key = next(iter(cohort.listings))
+    key = KIOKII_BARE_LISTING_KEY if cohort_name == "kiokii_bare" else next(iter(cohort.listings))
     with pg_engine.begin() as conn:
         for table in ("catalog_offers", "catalog_skus", "catalog_products"):
             conn.execute(text(f"UPDATE {table} SET product_key=:new WHERE product_key=:old"), {"new": key, "old": _PK})
-        conn.execute(text(
-            "UPDATE catalog_offers SET offer_payload=offer_payload || jsonb_build_object(CAST(:proof_key AS text), 'null'::jsonb), "
-            "suppressed_at=NOW() WHERE offer_id='of_retailer_cheap'"
-        ), {"proof_key": PROOF_KEY})
+        if cohort_name == "surratt":
+            conn.execute(text(
+                "UPDATE catalog_offers SET offer_payload=offer_payload || jsonb_build_object(CAST(:proof_key AS text), 'null'::jsonb), "
+                "suppressed_at=NOW() WHERE offer_id='of_retailer_cheap'"
+            ), {"proof_key": PROOF_KEY})
     assert _resolve(_SIG)["offers"] == []
 
 

@@ -87,6 +87,15 @@ KIOKII_RETAILER_COHORT = ExactRetailerCohort(
 )
 
 EXACT_RETAILER_LISTINGS = {**RETAILERS, **KIOKII_RETAILER_COHORT.listings}
+# The ordinary Shopify mapper constructs an unlocalized /products path for this family.
+# Reserve that URL's identity without admitting it to the US reviewed writer.
+KIOKII_BARE_FAMILY_URL = "https://kiokii.com/products/amuse-banana-lip-oil-4-5ml"
+KIOKII_BARE_LISTING_KEY = "ext:retailer:581319a8b5513cdd0a9ff47ac6a6e027"
+KIOKII_PROTECTED_LISTING_KEYS = frozenset((*KIOKII_RETAILER_COHORT.listings, KIOKII_BARE_LISTING_KEY))
+KIOKII_PROTECTED_FAMILY_URLS = tuple(
+    listing.family_url for listing in KIOKII_RETAILER_COHORT.listings.values()
+) + (KIOKII_BARE_FAMILY_URL,)
+PROTECTED_RETAILER_LISTING_KEYS = frozenset(RETAILERS) | KIOKII_PROTECTED_LISTING_KEYS
 
 
 def pilot_enabled() -> bool:

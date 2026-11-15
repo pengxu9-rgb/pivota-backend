@@ -322,26 +322,31 @@ def test_two_stores_are_two_sellers_and_multi_merchant(schema_engine, monkeypatc
     assert _scope(payload) == "multi_merchant_canonical"
 
 
-@pytest.mark.parametrize("is_kiokii", [False, True], ids=["surratt", "kiokii"])
-def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monkeypatch, is_kiokii):
+@pytest.mark.parametrize("scope", ["surratt", "kiokii", "kiokii_bare"])
+def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monkeypatch, scope):
+    from dataclasses import replace
     from sqlalchemy import text
 
     from services import agent_pdp_view_assembler as assembler
     from services.surratt_retailer_pilot import (
-        KIOKII_RETAILER_COHORT, PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT,
+        KIOKII_BARE_FAMILY_URL, KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT, PROOF_KEY, RETAILERS,
+        SURRATT_RETAILER_COHORT,
     )
 
     _seed(schema_engine)
     _set_column(schema_engine, True)
-    exact = KIOKII_RETAILER_COHORT if is_kiokii else SURRATT_RETAILER_COHORT
+    exact = SURRATT_RETAILER_COHORT if scope == "surratt" else KIOKII_RETAILER_COHORT
     cohort = {"ck": exact.canonical_content_key, "group": exact.canonical_group_id}
     hidden = next(iter(exact.listings.items()))
+    if scope == "kiokii_bare":
+        hidden = (KIOKII_BARE_LISTING_KEY,
+                  replace(hidden[1], product_path=KIOKII_BARE_FAMILY_URL.removeprefix("https://kiokii.com")))
     ordinary = list(RETAILERS.items())[1]
     hidden_key, hidden_listing = hidden
     _, ordinary_listing = ordinary
-    seed_prefix = f"exact-{hidden_listing.host}"
-    brand_url = ("https://amuseseoulmakeup.com/products/banana-lip-oil" if is_kiokii
-                 else "https://www.surrattbeauty.com/products/lipslique")
+    seed_prefix = f"exact-{scope}"
+    brand_url = ("https://www.surrattbeauty.com/products/lipslique" if scope == "surratt"
+                 else "https://amuseseoulmakeup.com/products/banana-lip-oil")
     brand_image = f"{brand_url}.jpg"
     retailer_image = f"https://{hidden_listing.host}/lipslique.jpg"
     with schema_engine.begin() as conn:
@@ -392,11 +397,35 @@ def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monk
         conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload - CAST(:marker AS text) "
                           "WHERE product_key=:pk"), {"marker": PROOF_KEY, "pk": hidden_key})
     generic = _run(monkeypatch, build)
+    explicit_seed = _run(monkeypatch, build_from_retailer_seed)
+    if scope != "surratt":
+        assert {offer["merchant_id"] for offer in generic["offers"]} == {
+            exact.canonical_merchant_id, ordinary_listing.merchant_id,
+        }
+        assert (float(generic["price_min"]), generic["seller_count"]) == (34.0, 2)
+        assert explicit_seed["image_url"] == brand_image
+        assert explicit_seed["refreshed_by_proposal_id"] is None
+        wrong_seed_id = f"{seed_prefix}-attached-to-brand"
+        with schema_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO external_product_seeds (id, market, destination_url, attached_product_key, image_url, created_at)"
+                " VALUES (:id, 'US', :url, :product_key, :image, NOW() + INTERVAL '1 minute')"
+            ), {"id": wrong_seed_id, "url": f"{hidden_listing.family_url}?variant={second_native}",
+                "product_key": exact.canonical_product_key, "image": retailer_image})
+        assert _run(monkeypatch, build)["image_url"] == brand_image
+
+        async def build_from_wrong_seed(db):
+            return await assembler.build_agent_pdp_view_row(
+                exact.canonical_content_key, refresh_source="test", db=db,
+                external_seed_id=wrong_seed_id, refreshed_by_proposal_id=27,
+            )
+
+        assert _run(monkeypatch, build_from_wrong_seed)["image_url"] == brand_image
+        return
     assert {offer["merchant_id"] for offer in generic["offers"]} == {
         exact.canonical_merchant_id, ordinary_listing.merchant_id, hidden_listing.merchant_id,
     }
     assert (float(generic["price_min"]), generic["seller_count"]) == (1.0, 3)
-    explicit_seed = _run(monkeypatch, build_from_retailer_seed)
     assert explicit_seed["image_url"] == retailer_image
     assert explicit_seed["refreshed_by_proposal_id"] == 27
 

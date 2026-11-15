@@ -2121,7 +2121,9 @@ def planned_retailer_listings(plan: Dict[str, Any]) -> Dict[str, str]:
     return listings
 
 
-async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: Any) -> List[Dict[str, Any]]:
+async def find_legacy_retailer_listing_owners(
+    plan: Dict[str, Any], database: Any, *, listing_aliases: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """Every existing row the apply guard would refuse on, in the order it would meet them.
 
     SELECT-only: the only call made on `database` is one `fetch_all`. Each finding is
@@ -2135,6 +2137,7 @@ async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: An
     from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
 
     listings = planned_retailer_listings(plan)
+    listings.update(listing_aliases or {})
     if not listings:
         return []
     rows = await database.fetch_all(
@@ -2608,10 +2611,12 @@ async def apply_ingest_plan(
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
-    from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT, SURRATT_RETAILER_COHORT
+    from services.surratt_retailer_pilot import KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT, SURRATT_RETAILER_COHORT
 
     planned_keys = {row.get("product_key") for section in ("pdps", "skus", "offers") for row in plan.get(section) or []}
     planned_keys.update(row.get("attached_product_key") for row in plan.get("seeds") or [])
+    if KIOKII_BARE_LISTING_KEY in planned_keys:
+        raise ValueError("the unlocalized Kiokii listing is reserved for the observed US product")
     for scope in (SURRATT_RETAILER_COHORT, KIOKII_RETAILER_COHORT):
         if planned_keys.intersection(scope.listings) and plan.get("reviewed_secondary_group") != scope.canonical_group_id:
             raise ValueError("reviewed listings require the scoped retailer writer")

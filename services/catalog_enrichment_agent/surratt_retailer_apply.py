@@ -6,7 +6,10 @@ from datetime import datetime
 from services.catalog_enrichment_agent import apply as enrichment
 from services.catalog_enrichment_agent.surratt_retailer_offers import scope_reviewed_plan
 from services.catalog_identity import validated_source_gtin
-from services.surratt_retailer_pilot import PROOF_KEY, SURRATT_RETAILER_COHORT
+from services.surratt_retailer_pilot import (
+    KIOKII_BARE_FAMILY_URL, KIOKII_PROTECTED_FAMILY_URLS, KIOKII_PROTECTED_LISTING_KEYS,
+    KIOKII_RETAILER_COHORT, PROOF_KEY, SURRATT_RETAILER_COHORT,
+)
 
 
 async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RETAILER_COHORT):
@@ -56,18 +59,23 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     ):
         raise ValueError("retailer has a verified domain claim")
     canonical = await canonical_witness(db, retailer, cohort=cohort)
-    if any(row["kind"] != "retired_owner" for row in await enrichment.find_legacy_retailer_listing_owners(plan, db)):
+    is_kiokii = cohort is KIOKII_RETAILER_COHORT
+    aliases = {KIOKII_BARE_FAMILY_URL.removeprefix("https://"): key} if is_kiokii else None
+    conflicts = await enrichment.find_legacy_retailer_listing_owners(plan, db, listing_aliases=aliases)
+    if any(row["kind"] != "retired_owner" for row in conflicts):
         raise ValueError("a competing active listing already owns the retailer URL")
+    protected_urls = KIOKII_PROTECTED_FAMILY_URLS if is_kiokii else (retailer.family_url,)
+    protected_keys = sorted(KIOKII_PROTECTED_LISTING_KEYS) if is_kiokii else [key]
     if await db.fetch_val(
         """
         SELECT EXISTS (SELECT 1 FROM external_product_seeds
          WHERE coalesce(nullif(lower(trim(status)),''),'active')='active'
-           AND (attached_product_key=:key
+           AND (attached_product_key=ANY(:keys)
              OR lower(rtrim(regexp_replace(split_part(split_part(canonical_url,'?',1),'#',1),
-                                           '^https?://(www[.])?', '', 'i'),'/'))=:listing
+                                           '^https?://(www[.])?', '', 'i'),'/'))=ANY(:listings)
              OR lower(rtrim(regexp_replace(split_part(split_part(destination_url,'?',1),'#',1),
-                                           '^https?://(www[.])?', '', 'i'),'/'))=:listing))
-        """, {"key": key, "listing": retailer.family_url.removeprefix("https://")}
+                                           '^https?://(www[.])?', '', 'i'),'/'))=ANY(:listings)))
+        """, {"keys": protected_keys, "listings": [url.removeprefix("https://") for url in protected_urls]}
     ):
         raise ValueError("an active retailer source seed already owns the listing")
     listing = await db.fetch_one(

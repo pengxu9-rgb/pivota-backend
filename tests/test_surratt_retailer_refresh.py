@@ -97,3 +97,27 @@ def test_mixed_generic_plan_holds_only_reviewed_listing():
     assert len(plan["pdps"]) == 1 and plan["pdps"][0]["canonical_url"].endswith("/another-lipstick")
     assert plan["seeds"] and all(row["attached_product_key"] == plan["pdps"][0]["product_key"] for row in plan["seeds"])
     assert all(json.loads(row["offer_payload"])["destination_url"].endswith("/another-lipstick") for row in plan["offers"])
+
+
+@pytest.mark.asyncio
+async def test_kiokii_bare_listing_cannot_enter_the_generic_or_reviewed_writer():
+    from services.catalog_enrichment_agent.ingestion import retailer_product_key
+    from services.curated_brand_feed import shopify_product_to_record
+    from services.surratt_retailer_pilot import KIOKII_BARE_FAMILY_URL, KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT
+
+    raw = {
+        "id": 10073908707648, "handle": "amuse-banana-lip-oil-4-5ml", "title": "AMUSE Banana Lip Oil",
+        "vendor": "AMUSE", "product_type": "Makeup", "images": [{"src": "https://cdn.example/lip.jpg"}],
+        "variants": [{"id": 51629126123840, "barcode": "8800299133494", "price": "18.99", "available": True}],
+    }
+    record = shopify_product_to_record(raw, domain="kiokii.com", source_role="retailer", retailer_name="Kiokii",
+                                       category_path="beauty/makeup/lip/lip_oil", currency="USD")
+    assert record["offers"][0]["destination_url"] == KIOKII_BARE_FAMILY_URL
+    assert retailer_product_key("kiokii.com", KIOKII_BARE_FAMILY_URL) == KIOKII_BARE_LISTING_KEY
+    plan = ingest_validated_jsonl([record], market="US", reviewed_retailer_keys=(KIOKII_BARE_LISTING_KEY,))
+    assert plan["skipped_reasons"] == {"reviewed_kiokii_retailer_scope": 1}
+    assert not plan["pdps"] and not plan["seeds"]
+    with pytest.raises(ValueError, match="unlocalized Kiokii listing is reserved"):
+        await apply_ingest_plan({"pdps": [{"product_key": KIOKII_BARE_LISTING_KEY}],
+                                 "reviewed_secondary_group": KIOKII_RETAILER_COHORT.canonical_group_id},
+                                batch_label="unlocalized-test", db=object(), market="US")
