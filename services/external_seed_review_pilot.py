@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import os
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -90,6 +92,30 @@ LISTINGS = {
         machine_activation_allowed=True,
     ),
 }
+
+
+AUTOMATIQUE_LISTING = PilotListing(
+    "https://www.surrattbeauty.com/products/automatique-lip-crayon", "merch_obs_30f9ce3e44b7fcb4", 3400,
+    "Surratt Beauty", "Automatique Lip Crayon",
+    "Automatique Lip Crayon is a twist-up lipstick with a slim applicator, creamy texture and a matte finish. "
+    "Savoir Faire is the dusty rose shade currently sold by Surratt Beauty in the US.",
+    (("43054723465283", "609015652428", "SAVOIR FAIRE - DUSTY ROSE", "SB002-13"),),
+    7619240132675, seller_source_ref="surrattbeauty.com",
+    shipping_source_url="https://surrattbeauty.com/meta.json", native_shop_domain="surrattbeauty.myshopify.com",
+    policy_version="surratt-automatique-us-brand-direct-v1", machine_activation_allowed=True,
+)
+AUTOMATIQUE_EXTERNAL_PRODUCT_ID = "ext_5cb339225f03d6bbbf8d25dc"
+
+
+def machine_review_listing(seed_id: str) -> PilotListing | None:
+    """The isolated job may pin one new draft ID without widening the existing pilot."""
+    listing = LISTINGS.get(seed_id)
+    if listing is not None:
+        return listing
+    pinned = os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_AUTOMATIQUE_SEED_ID")
+    if seed_id == pinned and re.fullmatch(r"eps_[0-9a-f]{24}", seed_id):
+        return AUTOMATIQUE_LISTING
+    return None
 
 
 def _usd_minor(value) -> int | None:
