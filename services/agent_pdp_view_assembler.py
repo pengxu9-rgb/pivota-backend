@@ -34,6 +34,7 @@ from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
 )
+from services.surratt_retailer_pilot import PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY, RETAILERS as SURRATT_RETAILERS
 from services.title_normalization import normalize_display_title
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,15 @@ _SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
     row_source_system_expr="cp.source_system",
     row_source_ref_expr="cp.source_ref",
 )
+_SURRATT_RETAILER_KEYS = ", ".join(f"'{key}'" for key in SURRATT_RETAILERS)
+
+
+def _has_surratt_retailer_shade_marker(product_key_ref: str) -> str:
+    return f"""({product_key_ref} IN ({_SURRATT_RETAILER_KEYS}) AND EXISTS (
+        SELECT 1 FROM catalog_offers pilot
+        WHERE pilot.product_key = {product_key_ref}
+          AND pilot.offer_payload->'{SURRATT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
+    ))"""
 
 
 # ---------------------------------------------------------------------
@@ -136,6 +146,9 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
          AND pgm.platform_product_id = cp.source_product_id
         WHERE cp.content_key = :ck
         {_SOURCE_QUARANTINE_ANTI_JOIN}
+          -- Reviewed Surratt children are resolved at shade grain by offers.resolve.
+          -- Exclude the entire marked listing before gathering generic prices and variants.
+          AND NOT {_has_surratt_retailer_shade_marker('cp.product_key')}
         """,
         {"ck": content_key},
     )
@@ -236,10 +249,11 @@ async def fetch_external_seed_by_id(
     """
     read_db = db or database
     row = await read_db.fetch_one(
-        """
+        f"""
         SELECT id, attached_product_key, title, image_url, seed_data,
-               canonical_url, destination_url
-        FROM external_product_seeds
+               canonical_url, destination_url,
+               {_has_surratt_retailer_shade_marker('seed.attached_product_key')} AS exact_retailer_shade_listing
+        FROM external_product_seeds seed
         WHERE id = :seed_id
         """,
         {"seed_id": seed_id},
@@ -2469,11 +2483,13 @@ async def build_agent_pdp_view_row(
     product_keys = [p["product_key"] for p in products if p.get("product_key")]
     skus = await fetch_skus_for_keys(product_keys, db=read_db)
     offers = await fetch_offers_for_keys(product_keys, db=read_db)
-    external_seed = (
-        await fetch_external_seed_by_id(external_seed_id, db=read_db)
-        if external_seed_id
-        else await fetch_external_seed_for_keys(product_keys, db=read_db)
-    )
+    if external_seed_id:
+        external_seed = await fetch_external_seed_by_id(external_seed_id, db=read_db)
+        if external_seed and external_seed.get("exact_retailer_shade_listing"):
+            external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
+            refreshed_by_proposal_id = None
+    else:
+        external_seed = await fetch_external_seed_for_keys(product_keys, db=read_db)
     # Each row's OWN seed, for compose_brand_section_description. Best-effort: without it the
     # description is served exactly as before.
     try:
