@@ -39,8 +39,10 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.surratt_retailer_pilot import (
-    PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY,
-    RETAILERS as SURRATT_RETAILER_LISTINGS,
+    EXACT_RETAILER_LISTINGS,
+    KIOKII_RETAILER_COHORT,
+    PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY,
+    SURRATT_RETAILER_COHORT,
 )
 from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
@@ -4967,7 +4969,8 @@ async def _handle_offers_resolve(
         payload=payload,
         request_metadata=request_metadata,
     )
-    exact_retailer_pilot = exact_retailer_shades.applies(product_id, sku_id, observed_market_hint, merchant_scope)
+    exact_retailer_cohort = exact_retailer_shades.matching_cohort(product_id, sku_id, observed_market_hint, merchant_scope)
+    surratt_exact_referrals = exact_retailer_cohort is SURRATT_RETAILER_COHORT
     commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
         payload_surface=payload.commerce_surface,
         request_metadata=request_metadata,
@@ -5430,8 +5433,10 @@ async def _handle_offers_resolve(
     async def _append_external_offers_from_seed_rows(
         seed_rows: List[Any], *, sibling: bool = False, deadline: Optional[float] = None,
     ) -> None:
-        if exact_retailer_pilot:
-            seed_rows = [r for r in seed_rows if not exact_retailer_shades.is_pilot_retailer_seed(_row_to_dict(r))]
+        if exact_retailer_cohort:
+            seed_rows = [r for r in seed_rows if not exact_retailer_shades.is_pilot_retailer_seed(
+                _row_to_dict(r), exact_retailer_cohort,
+            )]
         # ONE statement for every product key this batch is about to hand over, BEFORE the
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
@@ -7322,6 +7327,7 @@ async def _handle_offers_resolve(
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         catalog_rows = []
+        kiokii_offer_ids = set()
         # FRESH PRICE FIRST, in a merged group only (see `_catalog_price_freshness_sql`): empty
         # fragments and no extra bind otherwise, so every other statement is the one main sends.
         _price_select, _price_order, _price_params = (
@@ -7330,10 +7336,11 @@ async def _handle_offers_resolve(
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
-        if exact_retailer_pilot:
+        if surratt_exact_referrals:
             # The product-grain statement can rank another shade before the caller's limit.
             catalog_rows = await exact_retailer_shades.read_offers(
                 database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+                cohort=exact_retailer_cohort,
             )
         elif ident_aliases:
             catalog_rows = await asyncio.wait_for(
@@ -7351,6 +7358,17 @@ async def _handle_offers_resolve(
             )
             if _group_flag == "shadow":
                 _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
+        if exact_retailer_cohort is KIOKII_RETAILER_COHORT:
+            try:
+                exact_rows = await exact_retailer_shades.read_offers(
+                    database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+                    cohort=KIOKII_RETAILER_COHORT,
+                )
+            except Exception:
+                logger.warning("Kiokii exact retailer offer lookup failed", exc_info=True)
+            else:
+                kiokii_offer_ids = {row["offer_id"] for row in exact_rows}
+                catalog_rows = [*exact_rows, *(catalog_rows or [])]
 
         # Hosts the seed lane already claimed. Read from `source`, which carries the raw
         # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
@@ -7376,6 +7394,8 @@ async def _handle_offers_resolve(
         deduped = 0
         for row in catalog_rows or []:
             r = dict(row)
+            kiokii_exact_referral = r.get("offer_id") in kiokii_offer_ids
+            exact_referral = surratt_exact_referrals or kiokii_exact_referral
             destination = str(r.get("destination_url") or "").strip()
             if not destination.startswith(("http://", "https://")):
                 continue
@@ -7404,7 +7424,10 @@ async def _handle_offers_resolve(
                     "source": "offers.resolve.catalog_offer",
                     "offerId": str(r.get("offer_id") or ""),
                     **({"productId": product_id} if product_id else {}),
-                    **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if exact_retailer_pilot else {}),
+                    **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if exact_referral else {}),
+                    **({
+                        "canonicalNativeVariantId": r["variant_id"], "retailerNativeVariantId": r["retailer_variant_id"],
+                    } if kiokii_exact_referral else {}),
                 },
                 merchant_id=offer_merchant,
                 product_id=str(r.get("product_key") or "") or None,
@@ -7419,14 +7442,17 @@ async def _handle_offers_resolve(
             )
             if not redirect_url:
                 unattributed += 1
+                if kiokii_exact_referral:
+                    continue
 
             if _group_mode:
                 _catalog_sku_keys[f"of:catalog_offer:{r.get('offer_id')}"] = r.get("sku_key")
             if _group_mode and not str(r.get("currency") or "").strip():
                 # The row states no currency, so none ships below: no best price on it.
                 _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
-            offer = _catalog_offer_entry(r, group_mode=_group_mode or exact_retailer_pilot, redirect_url=redirect_url)
-            if exact_retailer_pilot:
+            offer = _catalog_offer_entry(r, group_mode=_group_mode or exact_referral,
+                                         redirect_url=redirect_url)
+            if exact_referral:
                 offer["confidence"] = 1.0
                 offer["cart_prefilled"] = False
                 offer["source"].update(
@@ -10559,7 +10585,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
-    pilot_listing_keys = ", ".join(f"'{key}'" for key in SURRATT_RETAILER_LISTINGS)
+    pilot_listing_keys = ", ".join(f"'{key}'" for key in EXACT_RETAILER_LISTINGS)
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10665,7 +10691,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND (p.product_key NOT IN ({pilot_listing_keys}) OR NOT EXISTS (
                            SELECT 1 FROM catalog_offers pilot
                            WHERE pilot.product_key = p.product_key
-                             AND pilot.offer_payload->'{SURRATT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
+                             AND pilot.offer_payload->'{EXACT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
                        ))
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0

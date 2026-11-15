@@ -34,7 +34,7 @@ from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
 )
-from services.surratt_retailer_pilot import PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY, RETAILERS as SURRATT_RETAILERS
+from services.surratt_retailer_pilot import EXACT_RETAILER_LISTINGS, PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY
 from services.title_normalization import normalize_display_title
 
 logger = logging.getLogger(__name__)
@@ -76,11 +76,11 @@ _SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
     row_source_system_expr="cp.source_system",
     row_source_ref_expr="cp.source_ref",
 )
-_SURRATT_RETAILER_KEYS = ", ".join(f"'{key}'" for key in SURRATT_RETAILERS)
+_REVIEWED_RETAILER_KEYS = ", ".join(f"'{key}'" for key in EXACT_RETAILER_LISTINGS)
 
 
 def _has_surratt_retailer_shade_marker(product_key_ref: str) -> str:
-    return f"""({product_key_ref} IN ({_SURRATT_RETAILER_KEYS}) AND EXISTS (
+    return f"""({product_key_ref} IN ({_REVIEWED_RETAILER_KEYS}) AND EXISTS (
         SELECT 1 FROM catalog_offers pilot
         WHERE pilot.product_key = {product_key_ref}
           AND pilot.offer_payload->'{SURRATT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL

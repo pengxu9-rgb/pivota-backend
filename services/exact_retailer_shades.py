@@ -1,4 +1,4 @@
-"""Read reviewed exact retailer shades for the Surratt US pilot."""
+"""Read reviewed exact retailer shades for allowlisted US listings."""
 
 import asyncio
 import json
@@ -12,12 +12,15 @@ from services.catalog_identity import validated_source_gtin
 from services.handover_variant_identity import candidate_from_row, canonical_variant_id
 from services.seed_served_url import same_destination
 from services.surratt_retailer_pilot import (
-    CANONICAL_CONTENT_KEY, CANONICAL_GROUP_ID, CANONICAL_MERCHANT_ID, CANONICAL_PRODUCT_KEY,
-    PROOF_KEY, RETAILERS, pilot_enabled,
+    KIOKII_RETAILER_COHORT, PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT, ExactRetailerCohort,
 )
 
 
 RETAILER_HOSTS = frozenset(listing.host for listing in RETAILERS.values())
+_KIOKII_CANONICAL_VARIANTS = frozenset(
+    canonical_id for listing in KIOKII_RETAILER_COHORT.listings.values()
+    for canonical_id, _ in listing.variants.values()
+)
 _ROW_LIMIT = 121
 
 _SELECT = """
@@ -52,35 +55,56 @@ _SELECT = """
 """
 
 
-@lru_cache(maxsize=1)
-def canonical_signature():
+@lru_cache(maxsize=2)
+def _canonical_signature(merchant_id, product_key):
     from services.catalog_sync_service import make_pivota_signature_id
 
     return make_pivota_signature_id(
-        CANONICAL_MERCHANT_ID, "external_seed", CANONICAL_PRODUCT_KEY.rsplit("::", 1)[-1],
+        merchant_id, "external_seed", product_key.rsplit("::", 1)[-1],
     )
+
+
+def canonical_signature(cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
+    return _canonical_signature(cohort.canonical_merchant_id, cohort.canonical_product_key)
+
+
+def _named_us_request(sku_id, observed_market, merchant_scope):
+    return bool(sku_id) and not merchant_scope and str(observed_market or "").upper() == "US"
+
+
+def _matches_product(product_id, cohort):
+    return product_id in {cohort.canonical_product_key, canonical_signature(cohort)}
 
 
 def applies(product_id, sku_id, observed_market, merchant_scope):
-    return (
-        pilot_enabled()
-        and not merchant_scope
-        and str(observed_market or "").upper() == "US"
-        and bool(sku_id)
-        and product_id in {CANONICAL_PRODUCT_KEY, canonical_signature()}
-    )
+    return (SURRATT_RETAILER_COHORT.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
+            and _matches_product(product_id, SURRATT_RETAILER_COHORT))
 
 
-def is_pilot_retailer_seed(row):
-    if row.get("attached_product_key") in RETAILERS:
+def matching_cohort(product_id, sku_id, observed_market, merchant_scope):
+    if applies(product_id, sku_id, observed_market, merchant_scope):
+        return SURRATT_RETAILER_COHORT
+    if (KIOKII_RETAILER_COHORT.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
+            and _native_id(sku_id) in _KIOKII_CANONICAL_VARIANTS
+            and _matches_product(product_id, KIOKII_RETAILER_COHORT)):
+        return KIOKII_RETAILER_COHORT
+    return None
+
+
+def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
+    if row.get("attached_product_key") in cohort.listings:
         return True
     for field in ("domain", "destination_url", "canonical_url"):
         value = str(row.get(field) or "")
         try:
-            host = urlsplit(value if "://" in value else f"https://{value}").hostname
+            address = urlsplit(value if "://" in value else f"https://{value}")
         except ValueError:
             continue
-        if (host or "").lower().removeprefix("www.") in RETAILER_HOSTS:
+        host = (address.hostname or "").lower().removeprefix("www.")
+        if cohort is SURRATT_RETAILER_COHORT and host in RETAILER_HOSTS:
+            return True
+        if any(host == listing.host and address.path.rstrip("/") == listing.product_path
+               for listing in cohort.listings.values()):
             return True
     return False
 
@@ -110,7 +134,7 @@ def _fresh_observation(value, now):
     return observed_at.utcoffset() is not None and timedelta(minutes=-2) <= now - observed_at <= timedelta(hours=4)
 
 
-def _offer(row, *, listing, canonical_id, gtin, now):
+def _offer(row, *, listing, canonical_product_key, canonical_id, gtin, now):
     retailer_id = _variant(row)
     if (listing.variants.get(retailer_id) != (canonical_id, gtin)
             or row.get("seller_kind") != "retailer" or row.get("seller_domain") != listing.host
@@ -131,7 +155,7 @@ def _offer(row, *, listing, canonical_id, gtin, now):
     price = Decimal(str(row["price_amount"])) if row.get("price_amount") is not None else None
     price_minor = proof.get("price_minor")
     if (
-        proof.get("canonical_product_key") != CANONICAL_PRODUCT_KEY
+        proof.get("canonical_product_key") != canonical_product_key
         or proof.get("canonical_native_variant_id") != canonical_id
         or proof.get("retailer_native_variant_id") != retailer_id
         or proof.get("gtin14") != gtin
@@ -146,20 +170,21 @@ def _offer(row, *, listing, canonical_id, gtin, now):
             "variant_id": canonical_id, "retailer_variant_id": retailer_id}
 
 
-async def read_offers(db, sku_id, *, timeout):
+async def read_offers(db, sku_id, *, timeout, cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
     """Accept only a unique, currently live paired variant with persisted review evidence."""
     numeric = _native_id(sku_id)
     if not numeric:
         return []
     records = await asyncio.wait_for(db.fetch_all(_SELECT, {
-        "content_key": CANONICAL_CONTENT_KEY, "group_id": CANONICAL_GROUP_ID, "canonical_key": CANONICAL_PRODUCT_KEY,
-        "canonical_merchant": CANONICAL_MERCHANT_ID, "canonical_signature": canonical_signature(),
-        "retailer_keys": sorted(RETAILERS), "limit": _ROW_LIMIT, "proof_key": PROOF_KEY,
+        "content_key": cohort.canonical_content_key, "group_id": cohort.canonical_group_id,
+        "canonical_key": cohort.canonical_product_key, "canonical_merchant": cohort.canonical_merchant_id,
+        "canonical_signature": canonical_signature(cohort), "retailer_keys": sorted(cohort.listings),
+        "limit": _ROW_LIMIT, "proof_key": PROOF_KEY,
     }), timeout=timeout)
     if len(records) >= _ROW_LIMIT:
         return []
     rows = [dict(row) for row in records]
-    anchor_rows = [row for row in rows if row["product_key"] == CANONICAL_PRODUCT_KEY]
+    anchor_rows = [row for row in rows if row["product_key"] == cohort.canonical_product_key]
     anchor = [row for row in anchor_rows if _variant(row) == numeric]
     if len(anchor) != 1:
         return []
@@ -169,7 +194,7 @@ async def read_offers(db, sku_id, *, timeout):
 
     offers = []
     now = datetime.now(timezone.utc)
-    for product_key, listing in RETAILERS.items():
+    for product_key, listing in cohort.listings.items():
         retailer_rows = [row for row in rows if row["product_key"] == product_key and row["merchant_id"] == listing.merchant_id]
         selected = _selected_skus(retailer_rows, gtin)
         if len(selected) != 1:
@@ -177,7 +202,8 @@ async def read_offers(db, sku_id, *, timeout):
         candidates = [row for row in retailer_rows if row["sku_key"] in selected and row["offer_id"]]
         if len(candidates) != 1:
             continue
-        offer = _offer(candidates[0], listing=listing, canonical_id=numeric, gtin=gtin, now=now)
+        offer = _offer(candidates[0], listing=listing, canonical_product_key=cohort.canonical_product_key,
+                       canonical_id=numeric, gtin=gtin, now=now)
         if offer:
             offers.append(offer)
     return offers

@@ -2608,12 +2608,13 @@ async def apply_ingest_plan(
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
-    from services.surratt_retailer_pilot import CANONICAL_GROUP_ID as SURRATT_GROUP, RETAILERS as SURRATT_LISTINGS
+    from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT, SURRATT_RETAILER_COHORT
 
     planned_keys = {row.get("product_key") for section in ("pdps", "skus", "offers") for row in plan.get(section) or []}
     planned_keys.update(row.get("attached_product_key") for row in plan.get("seeds") or [])
-    if planned_keys.intersection(SURRATT_LISTINGS) and plan.get("reviewed_secondary_group") != SURRATT_GROUP:
-        raise ValueError("reviewed Surratt listings require the scoped retailer writer")
+    for scope in (SURRATT_RETAILER_COHORT, KIOKII_RETAILER_COHORT):
+        if planned_keys.intersection(scope.listings) and plan.get("reviewed_secondary_group") != scope.canonical_group_id:
+            raise ValueError("reviewed listings require the scoped retailer writer")
 
     preflight = require_primary_plan(plan) if primary_readiness else None
     counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
@@ -3137,7 +3138,8 @@ def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
                                      allow_moves: Any = (), planner: Any = None,
-                                     include_reviewed_surratt: bool = False) -> Dict[str, Any]:
+                                     include_reviewed_surratt: bool = False,
+                                     reviewed_retailer_keys: tuple[str, ...] = ()) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
     `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
@@ -3152,6 +3154,8 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
     if include_reviewed_surratt:
         given["include_reviewed_surratt"] = True
+    if reviewed_retailer_keys:
+        given["reviewed_retailer_keys"] = reviewed_retailer_keys
     first = planner(records, **given)
     content, retailer = content_keys_of(first), retailer_keys_of(first)
     if not content and not retailer:

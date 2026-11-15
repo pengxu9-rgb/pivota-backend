@@ -5,18 +5,18 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from services.catalog_identity import validated_source_gtin
-from services.surratt_retailer_pilot import CANONICAL_GROUP_ID, CANONICAL_PRODUCT_KEY, PROOF_KEY, RETAILERS
+from services.surratt_retailer_pilot import PROOF_KEY, SURRATT_RETAILER_COHORT
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 
-def scope_reviewed_plan(plan: dict) -> dict:
+def scope_reviewed_plan(plan: dict, *, cohort=SURRATT_RETAILER_COHORT) -> dict:
     """Retain catalog lineage and the refresh anchor without creating a routed seed."""
     pdps = plan.get("pdps") or []
-    if len(pdps) != 1 or pdps[0].get("product_key") not in RETAILERS:
+    if len(pdps) != 1 or pdps[0].get("product_key") not in cohort.listings:
         raise ValueError("expected one reviewed retailer listing")
     product = pdps[0]
     key = product["product_key"]
-    retailer = RETAILERS[key]
+    retailer = cohort.listings[key]
     if (
         product["merchant_id"] != retailer.merchant_id
         or product["canonical_url"] != retailer.family_url
@@ -80,7 +80,7 @@ def scope_reviewed_plan(plan: dict) -> dict:
         canonical_variant, gtin = retailer.variants[variant]
         payload[PROOF_KEY] = {
             "version": 1,
-            "canonical_product_key": CANONICAL_PRODUCT_KEY,
+            "canonical_product_key": cohort.canonical_product_key,
             "canonical_native_variant_id": canonical_variant,
             "retailer_native_variant_id": variant,
             "gtin14": gtin,
@@ -99,5 +99,6 @@ def scope_reviewed_plan(plan: dict) -> dict:
     child = {**product, "pivota_signature_id": None, "pivota_canonical_url": None, "pivota_signature_minted_at": None}
     return {
         **plan, "pdps": [child], "skus": [sku for sku in plan["skus"] if sku["sku_key"] in seen],
-        "offers": offers, "merchants": [], "seeds": [], "incis": [], "reviewed_secondary_group": CANONICAL_GROUP_ID,
+        "offers": offers, "merchants": [], "seeds": [], "incis": [],
+        "reviewed_secondary_group": cohort.canonical_group_id,
     }

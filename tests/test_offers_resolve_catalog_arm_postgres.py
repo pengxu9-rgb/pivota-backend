@@ -185,14 +185,16 @@ def test_the_arm_matches_by_content_key_and_product_key_too(pg_engine):
         assert (res.get("offers") or []), f"{ident} must resolve through the same arm"
 
 
-def test_a_marked_surratt_listing_cannot_fall_back_to_any_generic_offer(pg_engine, monkeypatch):
+@pytest.mark.parametrize("cohort_name", ["surratt", "kiokii"])
+def test_a_marked_exact_listing_cannot_fall_back_to_any_generic_offer(pg_engine, monkeypatch, cohort_name):
     from sqlalchemy import text
 
-    from services.surratt_retailer_pilot import PILOT_FLAG, PROOF_KEY, RETAILERS
+    from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT, PROOF_KEY, SURRATT_RETAILER_COHORT
 
-    monkeypatch.delenv(PILOT_FLAG, raising=False)
+    cohort = KIOKII_RETAILER_COHORT if cohort_name == "kiokii" else SURRATT_RETAILER_COHORT
+    monkeypatch.delenv(cohort.flag, raising=False)
     _seed(pg_engine)
-    key = next(iter(RETAILERS))
+    key = next(iter(cohort.listings))
     with pg_engine.begin() as conn:
         for table in ("catalog_offers", "catalog_skus", "catalog_products"):
             conn.execute(text(f"UPDATE {table} SET product_key=:new WHERE product_key=:old"), {"new": key, "old": _PK})

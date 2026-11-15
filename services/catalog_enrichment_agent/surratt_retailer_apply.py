@@ -6,23 +6,19 @@ from datetime import datetime
 from services.catalog_enrichment_agent import apply as enrichment
 from services.catalog_enrichment_agent.surratt_retailer_offers import scope_reviewed_plan
 from services.catalog_identity import validated_source_gtin
-from services.surratt_retailer_pilot import (
-    CANONICAL_CONTENT_KEY,
-    CANONICAL_GROUP_ID,
-    CANONICAL_MERCHANT_ID,
-    CANONICAL_PRODUCT_KEY,
-    PROOF_KEY,
-    RETAILERS,
-)
+from services.surratt_retailer_pilot import PROOF_KEY, SURRATT_RETAILER_COHORT
 
 
-async def apply_reviewed_retailer(db, record, *, write: bool):
+async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RETAILER_COHORT):
     """Reuse the stock writer only after stage confirms identity and ownership."""
+    surratt = cohort is SURRATT_RETAILER_COHORT
+    label = "surratt_exact_retailer_review_v1" if surratt else "meitu_us_kiokii_retailer_review_v1"
+    scope = {"include_reviewed_surratt": True} if surratt else {"reviewed_retailer_keys": tuple(cohort.listings)}
     plan = scope_reviewed_plan(
         await enrichment.plan_with_current_listings(
-            [record], db=db, market="US", source_jsonl="surratt_exact_retailer_review_v1",
-            include_reviewed_surratt=True,
-        )
+            [record], db=db, market="US", source_jsonl=label, **scope,
+        ),
+        cohort=cohort,
     )
     if plan["listing_spellings"]["status"] != "read":
         raise ValueError("stored retailer listing spellings were not verified")
@@ -36,7 +32,7 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
         raise ValueError("existing exact identity gate is disabled")
     product = plan["pdps"][0]
     key = product["product_key"]
-    retailer = RETAILERS[key]
+    retailer = cohort.listings[key]
     params = {"key": key, "seller": retailer.merchant_id, "host": retailer.host, "url": retailer.family_url}
     lock = " FOR UPDATE" if write else ""
     observed = await db.fetch_one(
@@ -59,7 +55,7 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
         """, {"host": retailer.host}
     ):
         raise ValueError("retailer has a verified domain claim")
-    canonical = await canonical_witness(db, retailer)
+    canonical = await canonical_witness(db, retailer, cohort=cohort)
     if any(row["kind"] != "retired_owner" for row in await enrichment.find_legacy_retailer_listing_owners(plan, db)):
         raise ValueError("a competing active listing already owns the retailer URL")
     if await db.fetch_val(
@@ -82,7 +78,7 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
     )
     if listing and dict(listing) != {
         "merchant_id": retailer.merchant_id, "canonical_url": retailer.family_url,
-        "content_key": CANONICAL_CONTENT_KEY, "suppressed_at": None, "suppression_reason": None,
+        "content_key": cohort.canonical_content_key, "suppressed_at": None, "suppression_reason": None,
         "pivota_signature_id": None,
     }:
         raise ValueError("retailer product key is already occupied by another identity")
@@ -97,12 +93,12 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
         raise ValueError("reviewed retailer offers have different capture times")
     replay = False
     if before:
-        stored = require_retailer_rows(before, expected, params, compare_snapshot=False)
+        stored = require_retailer_rows(before, expected, params, compare_snapshot=False, cohort=cohort)
         if len(stored) != 1 or min(incoming) < max(stored):
             raise ValueError("retailer capture predates the persisted observation")
         replay = incoming == stored
         if replay:
-            require_retailer_rows(before, expected, params)
+            require_retailer_rows(before, expected, params, cohort=cohort)
             require_offer_snapshot(before, expected_money)
     receipt = {"product_key": key, "seller_ref": retailer.merchant_id, "offers": expected,
                "existing": len(before), "replayed": replay}
@@ -110,16 +106,16 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
         return receipt
 
     counts = await enrichment.apply_ingest_plan(
-        plan, batch_label="surratt_exact_retailer_review_v1", db=db, market="US", price_read=True,
+        plan, batch_label=label, db=db, market="US", price_read=True,
     )
     if {k: counts.get(k) for k in ("pdps", "skus", "offers", "seeds")} != {
-        "pdps": 1, "skus": 2, "offers": 2, "seeds": 0,
+        "pdps": 1, "skus": len(retailer.variants), "offers": len(retailer.variants), "seeds": 0,
     } or any(counts.get(k) for k in ("product_groups_failed", "offers_skipped", "skus_identity_conflict")):
         raise ValueError("retailer write was incomplete")
     after = await retailer_witness(db, params)
-    require_retailer_rows(after, expected, params)
+    require_retailer_rows(after, expected, params, cohort=cohort)
     require_offer_snapshot(after, expected_money)
-    if await canonical_witness(db, retailer) != canonical:
+    if await canonical_witness(db, retailer, cohort=cohort) != canonical:
         raise ValueError("reviewed canonical product or index changed during retailer apply")
     if await db.fetch_val(
         "SELECT to_jsonb(m)::text FROM catalog_merchants m WHERE m.merchant_id=:seller",
@@ -129,7 +125,7 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
     return receipt
 
 
-async def canonical_witness(db, retailer):
+async def canonical_witness(db, retailer, *, cohort=SURRATT_RETAILER_COHORT):
     rows = await db.fetch_all(
         """
         SELECT to_jsonb(p)::text AS product_row, to_jsonb(i)::text AS index_row,
@@ -148,12 +144,13 @@ async def canonical_witness(db, retailer):
           AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
           AND s.source_variant_id=ANY(:variants)
         ORDER BY s.source_variant_id
-        """, {"key": CANONICAL_PRODUCT_KEY, "seller": CANONICAL_MERCHANT_ID, "content": CANONICAL_CONTENT_KEY,
-              "group_id": CANONICAL_GROUP_ID, "variants": sorted(v[0] for v in retailer.variants.values())}
+        """, {"key": cohort.canonical_product_key, "seller": cohort.canonical_merchant_id,
+              "content": cohort.canonical_content_key, "group_id": cohort.canonical_group_id,
+              "variants": sorted(v[0] for v in retailer.variants.values())}
     )
     observed = {(row["source_variant_id"], validated_source_gtin(row["barcode"])) for row in rows}
     if len(rows) != len(retailer.variants) or observed != set(retailer.variants.values()):
-        raise ValueError("canonical Surratt product, index or exact UPC identities are missing")
+        raise ValueError("canonical product, index or exact UPC identities are missing")
     return [dict(row) for row in rows]
 
 
@@ -184,7 +181,7 @@ def require_offer_snapshot(rows, expected_money):
         raise ValueError("retailer availability or price differs from the observed snapshot")
 
 
-def require_retailer_rows(rows, expected, params, *, compare_snapshot=True):
+def require_retailer_rows(rows, expected, params, *, compare_snapshot=True, cohort=SURRATT_RETAILER_COHORT):
     if len(rows) != len(expected) or {row["offer_id"] for row in rows} != expected.keys():
         raise ValueError("retailer offer IDs are incomplete or collide with an earlier writer")
     observed_times = set()
@@ -207,7 +204,8 @@ def require_retailer_rows(rows, expected, params, *, compare_snapshot=True):
             or (row["merchant_id"], row["sku_seller"], row["product_seller"]) != (params["seller"],) * 3
             or (row["source_ref"], row["market"], row["currency"], row["offer_type"], row["offer_mode"])
             != (params["url"], "US", "USD", "retailer", "redirect")
-            or (row["content_key"], row["product_group_id"]) != (CANONICAL_CONTENT_KEY, CANONICAL_GROUP_ID)
+            or (row["content_key"], row["product_group_id"])
+            != (cohort.canonical_content_key, cohort.canonical_group_id)
             or row["pivota_signature_id"] is not None
             or row["suppression_reason"] is not None or row["suppressed_at"] is not None
             or row["source_variant_id"] != wanted["retailer_native_variant_id"]
