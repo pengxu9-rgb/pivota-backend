@@ -205,9 +205,70 @@ case "$SERVICE" in
 esac
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/$IMAGE_NAME:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
+
+# Compare actual default traffic by revision, including an existing split.
+# A tag can have no percent on its own entry while its revision serves on another entry.
+candidate_routing() {
+  "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format='json(status.traffic,status.latestReadyRevisionName,status.latestCreatedRevisionName)' \
+    | python3 -c '
+import json
+import re
+import sys
+
+try:
+    status = json.load(sys.stdin)["status"]
+    traffic = status["traffic"]
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+
+def revision(target):
+    return target.get("revisionName") or (
+        status.get("latestReadyRevisionName") if target.get("latestRevision") is True else None
+    )
+
+serving = {}
+for target in traffic or []:
+    percent = target.get("percent", 0)
+    if type(percent) is not int or not 0 <= percent <= 100:
+        sys.exit(1)
+    if percent:
+        name = revision(target)
+        if not name:
+            sys.exit(1)
+        serving[name] = serving.get(name, 0) + percent
+if sum(serving.values()) != 100:
+    sys.exit(1)
+
+tag = sys.argv[1]
+if tag:
+    matches = [target for target in traffic if target.get("tag") == tag]
+    if len(matches) != 1:
+        sys.exit(1)
+    name = revision(matches[0])
+    url = matches[0].get("url", "")
+    if (
+        not name or name != status.get("latestCreatedRevisionName") or name in serving
+        or not re.fullmatch(r"https://[A-Za-z0-9.-]+", url)
+    ):
+        sys.exit(1)
+
+print(json.dumps(serving, sort_keys=True, separators=(",", ":")))
+if tag:
+    print(name)
+    print(url)
+' "${1:-}"
+}
+
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
 # an existing service. A brand-new service has no previous revision to protect anyway.
-if "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+if [ "$PROMOTE" = 0 ]; then
+  SERVING_BEFORE="$(candidate_routing)" || {
+    echo "could not read existing default traffic for $SERVICE — refusing a candidate deploy." >&2
+    exit 2
+  }
+  NO_TRAFFIC="--tag $CANDIDATE_TAG --no-traffic"; FIRST_DEPLOY=0
+elif "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
   NO_TRAFFIC="--tag $CANDIDATE_TAG --no-traffic"; FIRST_DEPLOY=0
 else
   NO_TRAFFIC=""; FIRST_DEPLOY=1; echo "note: $SERVICE does not exist yet - first revision takes traffic immediately"
@@ -551,14 +612,49 @@ r=urllib.request.urlopen(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STAT
 # Verify the candidate revision on its own tagged URL BEFORE it takes traffic: `gcloud run deploy`
 # reports success as soon as the container passes its startup probe, which a revision that boots
 # but cannot serve still does.
-CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
-  --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1 || true)
-# ^ `|| true` is load-bearing. Under `set -o pipefail` a grep that matches nothing makes the whole
-# pipeline exit 1, `VAR=$(...)` adopts that status, and `set -e` kills the script - silently, right
-# after a successful `run deploy`. That is exactly the FIRST_DEPLOY case the next two lines were
-# written to handle, so they could never run.
-[ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
-CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
+if [ "$PROMOTE" = 0 ]; then
+  CANDIDATE_ROUTING="$(candidate_routing "$CANDIDATE_TAG")" || {
+    echo "could not verify the new tagged candidate at 0% default traffic." >&2
+    exit 1
+  }
+  {
+    IFS= read -r SERVING_AFTER
+    IFS= read -r CANDIDATE_REVISION
+    IFS= read -r CAND_URL
+  } <<< "$CANDIDATE_ROUTING"
+  [ "$SERVING_AFTER" = "$SERVING_BEFORE" ] || {
+    echo "default traffic changed during candidate deployment." >&2
+    exit 1
+  }
+  CANDIDATE_IDENTITY="$("$GCLOUD" run revisions describe "$CANDIDATE_REVISION" --project "$PROJECT" --region "$REGION" \
+    --format='json(spec.containers[0].env,spec.containers[0].image,status.imageDigest,status.containerStatuses)' | python3 -c '
+import json
+import re
+import sys
+
+revision = json.load(sys.stdin)
+container = revision["spec"]["containers"][0]
+status = revision.get("status", {})
+container_statuses = status.get("containerStatuses") or [{}]
+refs = (status.get("imageDigest"), container_statuses[0].get("imageDigest"), container.get("image"))
+digests = {ref.split("@")[-1] for ref in refs if ref and re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", ref)}
+matches = [entry.get("value") for entry in container.get("env", []) if entry.get("name") == "PIVOTA_COMMIT_SHA"]
+if len(matches) != 1 or not matches[0] or len(digests) != 1:
+    sys.exit(1)
+print(matches[0])
+print(digests.pop())
+')" || { echo "could not verify the tagged candidate commit and image digest." >&2; exit 1; }
+  {
+    IFS= read -r CANDIDATE_SHA
+    IFS= read -r CANDIDATE_IMAGE_DIGEST
+  } <<< "$CANDIDATE_IDENTITY"
+  [ "$CANDIDATE_SHA" = "$TAG" ] || { echo "tagged candidate is not commit $TAG." >&2; exit 1; }
+else
+  CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1 || true)
+  [ "$FIRST_DEPLOY" = 1 ] && CAND_URL=""
+  CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')}"
+fi
 # macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
 # `set -u` — which is exactly the public (PUBLIC=1) case. Use the ${arr[@]+"${arr[@]}"} guard.
 AUTH=()
@@ -610,10 +706,20 @@ print(",".join(t["tag"] for t in d.get("status",{}).get("traffic",[])
 }
 
 if [ "$PROMOTE" = 0 ]; then
-  # The candidate answered 200 on its own tagged URL and is sitting at 0%. Leaving the tag in place
-  # is the point - it is what makes the revision reachable for a second look. The next promoted
-  # deploy sweeps it.
-  echo "candidate $CANDIDATE_TAG verified and left at 0% traffic (PROMOTE=0). Previous revision still serving."
+  FINAL_ROUTING="$(candidate_routing "$CANDIDATE_TAG")" || {
+    echo "could not recheck candidate and default traffic after the health probe." >&2
+    exit 1
+  }
+  [ "$FINAL_ROUTING" = "$CANDIDATE_ROUTING" ] || {
+    echo "candidate or default traffic changed during the health probe." >&2
+    exit 1
+  }
+  echo "candidate $CANDIDATE_TAG ($CANDIDATE_REVISION), commit $CANDIDATE_SHA, image $CANDIDATE_IMAGE_DIGEST verified at 0% default traffic."
+  echo "Serving revisions: $SERVING_BEFORE"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf 'Web revision `%s` passed health at 0%% default traffic.\n\nCommit `%s`\n\nImage `%s`\n' \
+      "$CANDIDATE_REVISION" "$CANDIDATE_SHA" "$CANDIDATE_IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+  fi
   exit 0
 fi
 

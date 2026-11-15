@@ -56,6 +56,7 @@ def _gcloud_shim(tmp_path: Path, pool_max: str, max_scale: str) -> Path:
             if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
               for a in "$@"; do
                 case "$a" in
+                  *status.latestCreatedRevisionName*) echo '{{"status":{{"traffic":[{{"revisionName":"web-fixture","percent":100}}]}}}}'; exit 0 ;;
                   *maxScale*) echo "{max_scale}"; exit 0 ;;
                   *containers*env*) echo "{env_repr}"; exit 0 ;;
                 esac

@@ -76,6 +76,7 @@ def _shim(tmp_path: Path) -> Path:
             if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
               for a in "$@"; do
                 case "$a" in
+                  *status.latestCreatedRevisionName*) echo '{"status":{"traffic":[{"revisionName":"web-fixture","percent":100}]}}'; exit 0 ;;
                   *maxScale*) echo "10"; exit 0 ;;
                   *containers*env*) echo "{'name': 'PIVOTA_ENV', 'value': 'production'};{'name': 'DB_POOL_MAX_SIZE', 'value': '12'};{'name': 'DB_POOL_MIN_SIZE', 'value': '2'}"; exit 0 ;;
                 esac
