@@ -1,10 +1,11 @@
-"""Reviewed US listing and native shade identities for the Surratt retailer pilot."""
+"""Reviewed US retailer listings and their native shade identities."""
 
 from dataclasses import dataclass
 import os
 
 
 PILOT_FLAG = "SURRATT_EXACT_RETAILER_SHADES_ENABLED"
+KIOKII_FLAG = "MEITU_US_KIOKII_EXACT_ENABLED"
 PROOF_KEY = "exact_retailer_shade_v1"
 CANONICAL_MERCHANT_ID = "merch_obs_30f9ce3e44b7fcb4"
 CANONICAL_PRODUCT_KEY = "::".join(
@@ -20,10 +21,24 @@ class RetailerListing:
     host: str
     native_product_id: str
     variants: dict[str, tuple[str, str]]
+    product_path: str = "/products/surratt-lipslique"
 
     @property
     def family_url(self) -> str:
-        return f"https://{self.host}/products/surratt-lipslique"
+        return f"https://{self.host}{self.product_path}"
+
+
+@dataclass(frozen=True)
+class ExactRetailerCohort:
+    flag: str
+    canonical_product_key: str
+    canonical_merchant_id: str
+    canonical_group_id: str
+    canonical_content_key: str
+    listings: dict[str, RetailerListing]
+
+    def enabled(self) -> bool:
+        return os.getenv(self.flag) == "1"
 
 
 RETAILERS = {
@@ -47,6 +62,43 @@ RETAILERS = {
     ),
 }
 
+SURRATT_RETAILER_COHORT = ExactRetailerCohort(
+    PILOT_FLAG, CANONICAL_PRODUCT_KEY, CANONICAL_MERCHANT_ID, CANONICAL_GROUP_ID, CANONICAL_CONTENT_KEY, RETAILERS,
+)
+
+KIOKII_RETAILER_COHORT = ExactRetailerCohort(
+    flag=KIOKII_FLAG,
+    canonical_product_key="::".join(
+        ("prod", "merch_obs_1c4bc54448d534ca", "external_seed", "ext_51577f22556c1f3aeb091391")
+    ),
+    canonical_merchant_id="merch_obs_1c4bc54448d534ca",
+    canonical_group_id="pg_d6608eb0dcd14006495d2676df6972d8",
+    canonical_content_key="ck_d6608eb0dcd14006495d2676df6972d8",
+    listings={
+        "ext:retailer:e18722a4e9371490caee4b67526d208b": RetailerListing(
+            "merch_obs_9e4d0e3a645af39b",
+            "kiokii.com",
+            "10073908707648",
+            {
+                "51629126123840": ("52547428942138", "08800299133494"),
+                "51896079974720": ("52547429007674", "08800299133517"),
+            },
+            product_path="/en-us/products/amuse-banana-lip-oil-4-5ml",
+        ),
+    },
+)
+
+EXACT_RETAILER_LISTINGS = {**RETAILERS, **KIOKII_RETAILER_COHORT.listings}
+# The ordinary Shopify mapper constructs an unlocalized /products path for this family.
+# Reserve that URL's identity without admitting it to the US reviewed writer.
+KIOKII_BARE_FAMILY_URL = "https://kiokii.com/products/amuse-banana-lip-oil-4-5ml"
+KIOKII_BARE_LISTING_KEY = "ext:retailer:581319a8b5513cdd0a9ff47ac6a6e027"
+KIOKII_PROTECTED_LISTING_KEYS = frozenset((*KIOKII_RETAILER_COHORT.listings, KIOKII_BARE_LISTING_KEY))
+KIOKII_PROTECTED_FAMILY_URLS = tuple(
+    listing.family_url for listing in KIOKII_RETAILER_COHORT.listings.values()
+) + (KIOKII_BARE_FAMILY_URL,)
+PROTECTED_RETAILER_LISTING_KEYS = frozenset(RETAILERS) | KIOKII_PROTECTED_LISTING_KEYS
+
 
 def pilot_enabled() -> bool:
-    return os.getenv(PILOT_FLAG) == "1"
+    return SURRATT_RETAILER_COHORT.enabled()

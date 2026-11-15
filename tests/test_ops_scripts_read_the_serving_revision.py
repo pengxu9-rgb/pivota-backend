@@ -377,7 +377,8 @@ def test_scripts_asking_what_the_next_deploy_inherits_keep_the_template(
         f"{script} no longer performs `{expected_read}` in its code (only, perhaps, in a "
         f"comment). {why}"
     )
-    assert "serving_revision" not in body and "serving_image" not in body, (
+    calls = "\n".join(line for line in body.splitlines() if "_serving_revision.sh" not in line)
+    assert "serving_revision" not in calls and "serving_image" not in calls, (
         f"{script} switched to the serving revision. {why}"
     )
     assert "_serving_revision.sh" in (GCP / script).read_text(), (

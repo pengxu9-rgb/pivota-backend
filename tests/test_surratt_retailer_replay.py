@@ -36,7 +36,7 @@ async def test_same_observation_replay_requires_exact_persisted_proof(monkeypatc
     monkeypatch.setattr(intake_identity, "intake_identity_enabled", lambda _: True)
     monkeypatch.setattr(intake_identity, "variant_barcode_match_enabled", lambda: True)
     monkeypatch.setattr(replay.enrichment, "plan_with_current_listings", AsyncMock(return_value=plan))
-    monkeypatch.setattr(replay, "scope_reviewed_plan", lambda value: value)
+    monkeypatch.setattr(replay, "scope_reviewed_plan", lambda value, *, cohort: value)
     monkeypatch.setattr(replay.enrichment, "find_legacy_retailer_listing_owners", AsyncMock(return_value=[]))
     write = AsyncMock()
     monkeypatch.setattr(replay.enrichment, "apply_ingest_plan", write)

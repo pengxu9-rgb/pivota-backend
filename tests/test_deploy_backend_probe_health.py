@@ -142,7 +142,7 @@ def _probe_payload(tmp_path: Path, url: str) -> str:
     payload = args.read_text(encoding="utf-8")
     assert payload.startswith("^|^-c|"), payload[:40]
     payload = payload[len("^|^-c|"):]
-    assert "urlopen" in payload and "sys.exit" in payload and url in payload
+    assert "opener.open" in payload and "sys.exit" in payload and url in payload
     return payload
 
 
@@ -247,8 +247,11 @@ def test_the_probe_payload_exits_zero_only_for_an_exact_200(tmp_path, status, sh
     import sys
     import threading
 
+    visited = []
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            visited.append(self.path)
             # A LIVE 200 behind the redirect, deliberately. Pointing it at a dead port would make
             # the row pass because the target was unreachable, proving nothing about 3xx — and
             # urlopen FOLLOWS redirects and reports the final status, so before the geturl()
@@ -278,6 +281,7 @@ def test_the_probe_payload_exits_zero_only_for_an_exact_200(tmp_path, status, sh
             [sys.executable, "-c", payload],
             capture_output=True, timeout=60, env=_no_proxy_env(),
         ).returncode
+        assert visited == ["/health"]
     finally:
         server.shutdown()
     assert (rc == 0) is should_promote, f"HTTP {status} -> exit {rc}"

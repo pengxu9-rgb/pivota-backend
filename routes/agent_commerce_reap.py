@@ -1938,9 +1938,9 @@ async def _load_cart_link_item(
     `priced_sku`, when given, is filled with the `sku_key` of the sku this load PRICED (on success
     only): the one a no-key load chose, which `/purchases/prepare` names in its witness.
     """
-    from services.surratt_retailer_pilot import RETAILERS
+    from services.surratt_retailer_pilot import PROTECTED_RETAILER_LISTING_KEYS
 
-    if product_key in RETAILERS:
+    if product_key in PROTECTED_RETAILER_LISTING_KEYS:
         raise svc.PurchaseRefused("row_not_shopify", "reviewed retailer listing is referral-only")
     if svc.is_cart_link_enrichment_enabled():
         enrichment = await database.fetch_one(
