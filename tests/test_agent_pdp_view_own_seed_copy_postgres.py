@@ -74,6 +74,7 @@ async def scoped():
               status text NOT NULL,
               domain text,
               canonical_url text,
+              destination_url text NOT NULL,
               title text,
               seed_data jsonb,
               updated_at timestamptz NOT NULL
@@ -88,13 +89,14 @@ async def scoped():
 
 
 async def _seed(db, seed_id, key, *, status="active", updated="2026-09-01", seed_data=None, domain="brand.example",
-                title="Product", url=None):
+                title="Product", url=None, destination_url=None):
+    canonical_url = url or f"https://{domain}/products/{seed_id}"
     await db.execute(
-        "INSERT INTO external_product_seeds (id, attached_product_key, status, domain, canonical_url, title, "
+        "INSERT INTO external_product_seeds (id, attached_product_key, status, domain, canonical_url, destination_url, title, "
         "seed_data, updated_at) "
-        "VALUES (:id, :key, :status, :domain, :url, :title, CAST(:seed_data AS jsonb), :updated)",
+        "VALUES (:id, :key, :status, :domain, :url, :destination_url, :title, CAST(:seed_data AS jsonb), :updated)",
         {"id": seed_id, "key": key, "status": status, "domain": domain, "title": title,
-         "url": url or f"https://{domain}/products/{seed_id}", "seed_data": json.dumps(seed_data or {}),
+         "url": canonical_url, "destination_url": destination_url or canonical_url, "seed_data": json.dumps(seed_data or {}),
          "updated": datetime.fromisoformat(updated).replace(tzinfo=timezone.utc)},
     )
 
@@ -120,6 +122,20 @@ async def test_each_product_gets_its_own_newest_active_seed(scoped):
     assert (json.loads(sections) if isinstance(sections, str) else sections) == SECTIONS
     assert got["pk_b"]["description_origin"] == "pdp_product_description"
     assert got["pk_b"]["details_sections"] is None
+
+
+async def test_kiokii_destination_alias_cannot_supply_the_brands_seed_copy(scoped):
+    from services.agent_pdp_view_assembler import fetch_own_seed_copy_for_keys
+    from services.surratt_retailer_pilot import KIOKII_BARE_FAMILY_URL, KIOKII_RETAILER_COHORT
+
+    key = KIOKII_RETAILER_COHORT.canonical_product_key
+    await _seed(scoped, "eps_official", key, seed_data={"seed_description_origin": "pdp_product_description"})
+    await _seed(scoped, "eps_kiokii", key, updated="2026-09-20",
+                destination_url=f"{KIOKII_BARE_FAMILY_URL}?variant=51896079974720",
+                seed_data={"seed_description_origin": "retailer_copy"})
+
+    [seed] = (await fetch_own_seed_copy_for_keys([key], db=scoped)).values()
+    assert seed["description_origin"] == "pdp_product_description"
 
 
 async def test_the_origin_falls_back_to_the_snapshot_then_to_empty(scoped):
@@ -252,8 +268,8 @@ async def test_the_statement_timeout_bounds_the_check(scoped, monkeypatch):
 
     await scoped.execute(
         """
-        INSERT INTO external_product_seeds (id, attached_product_key, status, domain, title, seed_data, updated_at)
-        SELECT 'eps_t' || g, 'pk_t' || g, 'active', 'brand.example', 'Product ' || g,
+        INSERT INTO external_product_seeds (id, attached_product_key, status, domain, destination_url, title, seed_data, updated_at)
+        SELECT 'eps_t' || g, 'pk_t' || g, 'active', 'brand.example', 'https://brand.example/products/eps_t' || g, 'Product ' || g,
                jsonb_build_object('pdp_details_sections', (
                  SELECT jsonb_agg(jsonb_build_object('heading', 'Details', 'body', repeat('filler text ', 200)))
                  FROM generate_series(1, 8))),
