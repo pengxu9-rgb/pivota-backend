@@ -436,6 +436,7 @@ from routes.ap2_trusted_issuers_admin import router as ap2_trusted_issuers_admin
 from routes.external_offers import router as external_offers_router
 from routes.prometheus_metrics import router as prometheus_metrics_router
 from routes.employee_reviews import router as employee_reviews_router
+from routes.employee_shopify_orders import router as employee_shopify_orders_router
 from routes.readiness_internal import router as readiness_internal_router
 from routes.buyer_reviews import router as buyer_reviews_router
 from routes.questions_api import router as questions_router
@@ -1361,6 +1362,7 @@ app.include_router(
     include_in_schema=False,
 )
 app.include_router(employee_reviews_router)  # Employee Reviews Center (imports/governance)
+app.include_router(employee_shopify_orders_router)
 app.include_router(buyer_reviews_router)  # Buyer Reviews (submission; default disabled)
 app.include_router(questions_router)  # Buyer Questions (UGC)
 app.include_router(reviews_invitation_issuer_router)  # Internal: mint invitation_token from paid orders
