@@ -7,8 +7,8 @@ import os
 PILOT_FLAG = "SURRATT_EXACT_RETAILER_SHADES_ENABLED"
 PROOF_KEY = "exact_retailer_shade_v1"
 CANONICAL_MERCHANT_ID = "merch_obs_30f9ce3e44b7fcb4"
-CANONICAL_PRODUCT_KEY = (
-    f"prod::{CANONICAL_MERCHANT_ID}::external_seed::ext_2ef8d743c054c55cef2cf95e"
+CANONICAL_PRODUCT_KEY = "::".join(
+    ("prod", CANONICAL_MERCHANT_ID, "external_seed", "ext_2ef8d743c054c55cef2cf95e")
 )
 CANONICAL_GROUP_ID = "pg_ceb91ba4d550214bae12c9c91645c593"
 CANONICAL_CONTENT_KEY = "ck_ceb91ba4d550214bae12c9c91645c593"
