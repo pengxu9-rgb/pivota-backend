@@ -144,7 +144,7 @@ async def capture_retailer_targets(evidence, record):
         targets.append(target)
         evidence["target_sources"].append({
             "variant_id": native, "scope": target.scope, "offer_id": offer_id,
-            "evidence_refs": [ref, f"shopify_us:{native}", f"barcode:{native}"],
+            "evidence_refs": [ref],
         })
         quotes[offer_id] = quote
     if {target.variant_id for target in targets} != EXPANDED_VARIANTS.keys() - INITIAL_VARIANTS.keys():
@@ -152,9 +152,11 @@ async def capture_retailer_targets(evidence, record):
     return tuple(targets), quotes
 
 
-async def prepare_review(record):
+async def prepare_review(record, *, review_existing=False):
     row = await load_seed()
-    seed_variants(row)
+    _, variants = seed_variants(row)
+    if not review_existing and variants.keys() == EXPANDED_VARIANTS.keys():
+        return None
     version = _seed_review_version(row)
     evidence = await capture_shopify_evidence(REVIEW_LISTING)
     if not evidence.get("sources"):
@@ -241,14 +243,14 @@ async def apply_anchors(review):
     row = await load_seed(lock=True)
     data, initial = seed_variants(row)
     await assert_unique_additions()
+    if initial.keys() == EXPANDED_VARIANTS.keys():
+        return {"existing": 6, "replayed": True, "rows": projection_summary(verify_projection(
+            await canonical_rows(), EXPANDED_VARIANTS,
+        ))}
     if (review is None or _seed_review_version(row) != review.version
             or not 0 <= (datetime.now(timezone.utc) - review.captured_at).total_seconds()
             <= EVIDENCE_MAX_AGE.total_seconds()):
         raise ValueError("AMUSE seed version changed or machine evidence expired")
-    if initial.keys() == EXPANDED_VARIANTS.keys():
-        return {"existing": 6, "replayed": True, "rows": projection_summary(verify_projection(
-            await canonical_rows(), EXPANDED_VARIANTS,
-        ).values())}
     before = verify_projection(await canonical_rows(), INITIAL_VARIANTS)
     full_set = list(data["variants"]) + list(review.variants)
     result = await upsert_seed_data(

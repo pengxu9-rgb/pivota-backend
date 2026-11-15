@@ -95,7 +95,7 @@ async def run(mode, sha):
     try:
         await verify_database(host, catalog)
         record = await fetch_storefront(cohort=COHORT)
-        review = await prepare_review(record)
+        review = await prepare_review(record, review_existing=mode == "plan")
         key, listing = next(iter(COHORT.listings.items()))
         await require_domains(listing.family_url)
         async with database.transaction(force_rollback=mode == "plan"):
@@ -104,24 +104,35 @@ async def run(mode, sha):
             await database.execute("SELECT pg_advisory_xact_lock(1160308171, 2)")
             await require_domains(listing.family_url)
             anchor = await apply_anchors(review)
-            options = {"write": True, "cohort": COHORT, "expand_kiokii": True}
-            first = await apply_reviewed_retailer(database, record, **options)
-            replay = await apply_reviewed_retailer(database, record, **options)
-            if (first["product_key"], first["seller_ref"], len(first["offers"])) != (key, listing.merchant_id, 6):
+            options = {"cohort": COHORT, "expand_kiokii": True}
+            planned = await apply_reviewed_retailer(database, record, write=False, **options)
+            if planned["existing"] != anchor["existing"]:
+                raise ValueError("AMUSE canonical and Kiokii offer counts must expand together")
+            if (planned["product_key"], planned["seller_ref"], len(planned["offers"])) != (key, listing.merchant_id, 6):
                 raise ValueError("exact combined Kiokii expansion landed outside its reviewed identity")
-            if not first["replayed"] and {offer_id: first["offers"].get(offer_id)
-                                          for offer_id in review.retailer_quotes} != review.retailer_quotes:
+            if not planned["replayed"] and (review is None or {
+                offer_id: planned["offers"].get(offer_id) for offer_id in review.retailer_quotes
+            } != review.retailer_quotes):
                 raise ValueError("new Kiokii offers differ from the scoped machine review")
-            if replay["existing"] != 6 or not replay["replayed"] or first["offers"].keys() != replay["offers"].keys():
+            if not planned["replayed"] and await apply_reviewed_retailer(
+                database, record, write=True, **options,
+            ) != planned:
+                raise ValueError("the Kiokii write differs from the reviewed plan")
+            replay = await apply_reviewed_retailer(database, record, write=True, **options)
+            if replay["existing"] != 6 or not replay["replayed"] or planned["offers"] != replay["offers"]:
                 raise ValueError("exact combined Kiokii expansion is not replay-safe")
-            observed_offer_ids = await verify_retailer_offers(first["offers"], listing.merchant_id)
+            observed_offer_ids = await verify_retailer_offers(planned["offers"], listing.merchant_id)
         return {
             "scope": "amuse_us_six_expansion", "schema_version": 1, "market": "US", "mode": mode,
-            "environment": environment, "release_sha": sha, "database": catalog, "committed": mode == "apply",
-            "same_capture_replayed": True, "canonical": anchor, "listing": first,
-            "offer_readback_ids": observed_offer_ids, "evidence_digest": review.evidence_digest,
-            "review_models": {stage: {"model": receipt["model_name"], "response_id": receipt["run_id"]}
-                              for stage, receipt in review.model_receipts.items() if receipt},
+            "environment": environment, "release_sha": sha, "database": catalog,
+            "committed": mode == "apply" and not planned["replayed"],
+            "same_capture_replayed": True, "canonical": anchor, "listing": planned,
+            "offer_readback_ids": observed_offer_ids, "current_review": {
+                "evidence_digest": review.evidence_digest,
+                "quotes_bound_to_write": not planned["replayed"],
+                "models": {stage: {"model": receipt["model_name"], "response_id": receipt["run_id"]}
+                           for stage, receipt in review.model_receipts.items() if receipt},
+            } if review is not None else None,
         }
     finally:
         await database.disconnect()
