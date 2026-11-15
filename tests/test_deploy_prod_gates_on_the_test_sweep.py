@@ -195,16 +195,86 @@ def test_the_other_services_wait_for_web(job):
 
 
 @pytest.mark.parametrize("job", [j for j in DEPLOY_JOBS if j != "deploy"])
-def test_a_candidate_dispatch_does_not_deploy_the_other_services(job):
-    """A dispatch with promote unchecked means "build and health-check without putting
-    anything in front of users". Neither service has such a state — the worker takes no
-    traffic at all, so there is no 0% to hold it at, and it drains queues from its app
-    lifespan the moment it boots. Deploying them there makes "candidate" mean "fully live".
-    Nothing asserted this until a mutation audit removed the `if:` and the suite stayed green."""
-    condition = str(_jobs()[job].get("if") or "")
-    assert "inputs.promote" in condition and "push" in condition, (
-        f"`{job}` carries `if: {condition}` — it no longer skips on a candidate dispatch."
+def test_a_candidate_does_not_deploy_the_other_services(job):
+    assert _jobs()[job]["if"] == "${{ needs.test-gate.outputs.promote == '1' }}"
+
+
+def test_web_uses_the_same_resolved_mode_to_deploy_and_verify():
+    jobs = _jobs()
+    assert jobs[GATE_JOB]["outputs"]["promote"] == "${{ steps.release-mode.outputs.promote }}"
+    deploy = jobs[DEPLOY_JOB]
+    assert deploy["env"]["PROMOTE_FLAG"] == "${{ needs.test-gate.outputs.promote }}"
+    steps = {step.get("name"): step for step in deploy["steps"]}
+    assert 'PROMOTE="$PROMOTE_FLAG"' in steps["Deploy web"]["run"]
+    assert steps["Confirm production is serving the new commit"]["if"] == "${{ needs.test-gate.outputs.promote == '1' }}"
+    assert steps["Candidate summary"]["if"] == "${{ needs.test-gate.outputs.promote == '0' }}"
+    assert _triggers()["workflow_dispatch"]["inputs"]["promote"]["default"] is False
+
+
+@pytest.mark.parametrize(
+    ("event", "push_mode", "manual", "promote"),
+    [
+        ("push", "", "false", "1"),
+        ("push", "promote", "false", "1"),
+        ("push", "candidate", "false", "0"),
+        ("push", "candidate", "true", "0"),
+        ("push", "CANDIDATE", "false", None),
+        ("push", "candidate ", "false", None),
+        ("push", "true", "false", None),
+        ("workflow_dispatch", "candidate", "true", "1"),
+        ("workflow_dispatch", "promote", "false", "0"),
+        ("workflow_dispatch", "invalid", "false", "0"),
+        ("workflow_dispatch", "candidate", "", None),
+        ("pull_request", "candidate", "false", None),
+    ],
+)
+def test_release_mode_executes_the_workflow_resolution(tmp_path, event, push_mode, manual, promote):
+    step = next(step for step in _jobs()[GATE_JOB]["steps"] if step.get("id") == "release-mode")
+    assert step["env"]["PUSH_MODE"] == "${{ vars.PRODUCTION_PUSH_MODE }}"
+    output = tmp_path / "output"
+    summary = tmp_path / "summary"
+    env = {
+        **os.environ,
+        "GITHUB_EVENT_NAME": event,
+        "PUSH_MODE": push_mode,
+        "MANUAL_PROMOTE": manual,
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=15)
+    if promote is None:
+        assert result.returncode != 0
+        assert not output.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert output.read_text() == f"promote={promote}\n"
+        assert ("candidate" if promote == "0" else "promote") in summary.read_text()
+
+
+@pytest.mark.parametrize("value", ("", "invalid"))
+def test_an_unresolved_mode_blocks_deploy_before_gcloud(value):
+    first = _jobs()[DEPLOY_JOB]["steps"][0]
+    result = subprocess.run(
+        ["bash", "-c", first["run"]],
+        env={**os.environ, "PROMOTE_FLAG": value}, capture_output=True, timeout=15,
     )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(("promote", "minimum"), [("0", "0"), ("1", "2")])
+def test_only_workflow_candidates_override_the_revision_minimum(tmp_path, promote, minimum):
+    step = next(step for step in _jobs()[DEPLOY_JOB]["steps"] if step.get("name") == "Deploy web")
+    script = tmp_path / "infra/gcp/deploy_backend.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text('#!/bin/bash\nprintf "%s %s %s\\n" "$CONFIG" "$PROMOTE" "$MIN_INSTANCES"\n')
+    script.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path,
+        env={**os.environ, "PROMOTE_FLAG": promote, "MIN_INSTANCES": "2", "SHA": "fixture-sha"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"preserve {promote} {minimum}\n"
 
 
 @pytest.mark.parametrize("job", DEPLOY_JOBS)
