@@ -158,7 +158,7 @@ NON_PARTNER_ROUTES: Dict[str, Tuple[str, ...]] = {
         "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
         "employee_kb_monitoring.py", "employee_missing_endpoints.py", "employee_payouts.py",
         "employee_pdp_governance.py", "employee_reviews.py", "employee_routing_dashboard.py",
-        "employee_settlement_rules.py", "employee_store_psp_fixes.py", "employees_security.py",
+        "employee_settlement_rules.py", "employee_shopify_orders.py", "employee_store_psp_fixes.py", "employees_security.py",
         "channel_graph_routes.py", "questions_api.py", "routing_governance.py",
     ),
     "merchant portal and dashboard, behind a merchant or dashboard-user login: a merchant looking "

@@ -4946,7 +4946,7 @@ async def _handle_offers_resolve(
     explicit commerce_surface tightens internal-offer servability (strict mode), not sourcing.
     """
     from db.database import database
-    from services import exact_retailer_shades
+    from services import exact_retailer_shades, external_seed_review_pilot
 
     started = time.perf_counter()
 
@@ -5504,6 +5504,16 @@ async def _handle_offers_resolve(
                 )
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             variants = _seed_variants(seed_data)
+            automatique = external_seed_review_pilot.AUTOMATIQUE_LISTING
+            scoped_automatique = row_dict.get("destination_url") == automatique.url
+            if scoped_automatique and not (
+                str(observed_market_hint or "").upper() == row_dict.get("market") == "US"
+                and row_dict.get("seller_ref") == automatique.seller_ref
+                and row_dict.get("external_product_id") == external_seed_review_pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID
+                and str(seed_data.get("product_id") or "") == str(automatique.native_product_id)
+                and canonical_variant_id(sku_id) == automatique.variants[0][0]
+            ):
+                continue
 
             matched_variants: List[Dict[str, Any]] = []
             if sku_id:
@@ -5829,6 +5839,20 @@ async def _handle_offers_resolve(
                             )
                         ):
                             redirect_identity = _live_identity
+                selected_pdp = None
+                if scoped_automatique:
+                    selected_pdp = _named_seed_variant_pdp_url(
+                        str(canonical_url or destination_url), seed_id, redirect_identity.get("seller_ref"),
+                        v, sku_id, _handover, listing=automatique,
+                    )
+                    if (
+                        selected_pdp == str(canonical_url or destination_url)
+                        or v.get("barcode") != automatique.variants[0][1]
+                        or v.get("sku") != automatique.variants[0][3]
+                    ):
+                        continue
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                    _handover_id = None
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -6021,8 +6045,8 @@ async def _handle_offers_resolve(
                     )
                 )
 
-                pdp_destination = str(canonical_url or destination_url)
-                if (
+                pdp_destination = selected_pdp or str(canonical_url or destination_url)
+                if not scoped_automatique and (
                     _named_without_cart
                     and variant_match == "exact"
                     and len(matched_variants) == 1
@@ -12261,6 +12285,8 @@ def _named_seed_variant_pdp_url(
     variant: Dict[str, Any],
     requested_variant_id: Any,
     handover: Optional[HandoverVariant],
+    *,
+    listing=None,
 ) -> str:
     """Keep the selected shade on a reviewed brand-direct referral."""
     native_id = canonical_variant_id(requested_variant_id)
@@ -12275,7 +12301,7 @@ def _named_seed_variant_pdp_url(
 
     from services.external_seed_review_pilot import LISTINGS
 
-    listing = LISTINGS.get(seed_id)
+    listing = listing or LISTINGS.get(seed_id)
     if (
         listing is None
         or seller_ref != listing.seller_ref

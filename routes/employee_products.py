@@ -4880,7 +4880,7 @@ async def run_external_seed_machine_review(
     from services import external_seed_review_pilot as pilot
     from services.external_seed_machine_review_ledger import load_machine_review, append_machine_review
 
-    listing = pilot.LISTINGS.get(seed_id)
+    listing = pilot.machine_review_listing(seed_id)
     if not listing:
         raise HTTPException(status_code=404, detail="SEED_MACHINE_REVIEW_OUT_OF_SCOPE")
     request_id = str(body.request_id)
@@ -4967,6 +4967,22 @@ async def run_external_seed_machine_review(
             )
             if conflict is not None:
                 reason = "active_seed_conflict"
+        if not reason and listing is pilot.AUTOMATIQUE_LISTING:
+            native_id, gtin, *_ = listing.variants[0]
+            duplicate = await database.fetch_val(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM catalog_skus s JOIN catalog_products p USING (product_key)
+                    WHERE s.suppressed_at IS NULL AND p.suppressed_at IS NULL
+                      AND (s.barcode = ANY(CAST(:barcodes AS text[]))
+                        OR (s.merchant_id = :seller AND s.source_variant_id = :variant))
+                )
+                """,
+                {"barcodes": [gtin.zfill(n) for n in (12, 13, 14)],
+                 "seller": listing.seller_ref, "variant": native_id},
+            )
+            if duplicate:
+                reason = "existing_catalog_variant_conflict"
         if not reason and (
             not listing.machine_activation_allowed
             or os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_ENABLED") != "true"

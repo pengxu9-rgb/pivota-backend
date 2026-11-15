@@ -1403,7 +1403,7 @@ def _source_domain_for_row(row_dict: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-async def _apply(limit: int) -> Dict[str, Any]:
+async def _apply(limit: int, *, seed_id: Optional[str] = None) -> Dict[str, Any]:
     """Returns ``{"inserted": int, "vertical_guard": dict}``.
 
     (Was annotated ``-> int`` while returning this dict — every caller already
@@ -1422,7 +1422,11 @@ async def _apply(limit: int) -> Dict[str, Any]:
     rows_unresolved_vertical = 0
 
     limit_clause = ""
+    seed_clause = ""
     values: Dict[str, Any] = {}
+    if seed_id is not None:
+        seed_clause = "WHERE id = :seed_id"
+        values["seed_id"] = seed_id
     if limit > 0:
         limit_clause = "LIMIT :limit"
         values["limit"] = limit
@@ -1453,6 +1457,7 @@ async def _apply(limit: int) -> Dict[str, Any]:
           mirrored_product_type,
           mirrored_category
         FROM missing
+        {seed_clause}
         ORDER BY updated_at DESC NULLS LAST, id ASC
         {limit_clause}
         """,
