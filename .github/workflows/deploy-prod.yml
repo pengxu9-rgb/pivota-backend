@@ -509,7 +509,19 @@ jobs:
           fi
           # Build from ./src (the target commit), using that commit's own build config - for a
           # rollback, the image should be what that commit produced, not what main builds today.
-          gcloud builds submit --config src/infra/gcp/cloudbuild.backend.yaml \
+          BUILD_CONFIG=src/infra/gcp/cloudbuild.backend.yaml
+          if [ "$PROMOTE_FLAG" = 0 ]; then
+            # Other production jobs pull backend:latest. Only publish the SHA tag during a hold.
+            # The Docker build still produces both local tags, with the original steps and options.
+            CANDIDATE_CONFIG="$RUNNER_TEMP/backend-candidate.json"
+            export COMMIT_IMAGE_TEMPLATE='${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'
+            yq -o=json '.images |= map(select(. == strenv(COMMIT_IMAGE_TEMPLATE)))' "$BUILD_CONFIG" \
+              > "$CANDIDATE_CONFIG"
+            jq -e --arg image "$COMMIT_IMAGE_TEMPLATE" '.images == [$image]' "$CANDIDATE_CONFIG" >/dev/null \
+              || { echo "::error::Could not identify the commit-only candidate image"; exit 1; }
+            BUILD_CONFIG="$CANDIDATE_CONFIG"
+          fi
+          gcloud builds submit --config "$BUILD_CONFIG" \
             --project "$PROJECT_SHARED" --substitutions=COMMIT_SHA="$SHA" src
 
       - name: Deploy web

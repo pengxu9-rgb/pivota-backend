@@ -73,6 +73,14 @@ def _shim(tmp_path: Path) -> Path:
         textwrap.dedent(
             """\
             #!/usr/bin/env bash
+            if [[ "$*" == "artifacts docker images describe "* ]]; then
+              printf 'sha256:%064d\\n' 0
+              exit 0
+            fi
+            if [[ "$*" == "run services get-iam-policy "* ]]; then
+              echo '{"bindings":[{"role":"roles/run.invoker","members":["allUsers"]}]}'
+              exit 0
+            fi
             if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
               for a in "$@"; do
                 case "$a" in

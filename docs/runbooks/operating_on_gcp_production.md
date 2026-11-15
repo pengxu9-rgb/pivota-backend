@@ -93,8 +93,10 @@ Set the GitHub Actions **repository** variable `PRODUCTION_PUSH_MODE` to `candid
 before queuing the first merge to hold. Check existing production deploy runs before
 the hold begins. A run that already resolved its release mode keeps that decision.
 Each push still waits for both test gates on its exact SHA and deploys only a tagged
-`web` revision. The deploy checks the candidate's commit and health and verifies
-that the existing default traffic split is unchanged. Worker and proof-issuer do
+`web` revision. Candidate builds publish only the commit image tag, preserving the
+shared `backend:latest` alias. The deploy pins the image digest, checks the commit
+reported by `/health` and verifies that the existing default traffic split is unchanged.
+It preserves service ingress, labels and IAM policy. Worker and proof-issuer do
 not roll in candidate mode. The candidate revision has a zero instance minimum
 so tags from successive pushes do not keep warm instances. The run summary records
 the revision, commit and image digest. Candidate mode keeps its per-SHA tag

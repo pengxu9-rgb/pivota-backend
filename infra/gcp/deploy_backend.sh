@@ -64,7 +64,8 @@ case "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" in true|false) ;; *) echo "ST
 # WHAT `preserve` DOES NOT PRESERVE, said out loud so the name does not overpromise. It keeps env
 # vars, secret mounts and the entrypoint. It still reasserts the SHAPE of the service from the
 # constants at the top of this file: --cpu, --memory, --min/--max-instances, --concurrency,
-# --timeout, --ingress, --vpc-egress, --labels, --service-account. An operator who widened
+# --timeout, --ingress, --vpc-egress, --labels, --service-account. Production candidates preserve
+# the service's ingress, labels and IAM policy. An operator who widened
 # --max-instances by hand during an incident will have it pulled back silently by the next CI
 # deploy. (The sentence here used to add "those match live prod today so nothing drifts"; that is
 # no longer true by design — 2026-08-29 deliberately changed --concurrency and --max-instances, so
@@ -142,6 +143,23 @@ if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ];
   fi
 fi
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
+SERVICE_ARGS=(--ingress "$INGRESS" "$PUBLIC_FLAG" --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp")
+VPC_PROBE_ONLY=0
+CANDIDATE_HEALTH_SHA=""
+if [ "$ENV" = prod ] && [ "$CONFIG" = preserve ] && [ "$PROMOTE" = 0 ]; then
+  # Ingress, invoker IAM and labels apply to the whole service. Read the IAM
+  # policy for probe authentication and leave these settings as they are.
+  SERVICE_ARGS=()
+  if [ "$SERVICE" = web ]; then
+    CANDIDATE_HEALTH_SHA="$TAG"
+  fi
+  PUBLIC="$(preserved_public_invoker)"
+  case "$PUBLIC" in
+    1) ;;
+    0) VPC_PROBE_ONLY=1 ;;
+    *) echo "could not read $SERVICE's IAM policy in $PROJECT — refusing a candidate deploy." >&2; exit 2 ;;
+  esac
+fi
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
   echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
   exit 2
@@ -203,70 +221,30 @@ case "$SERVICE" in
   web) [ -z "$ENV_PREFIX" ] || { echo "SERVICE=web must not set ENV_PREFIX (got '$ENV_PREFIX')" >&2; exit 2; } ;;
   *)   [ -n "$ENV_PREFIX" ] || { echo "SERVICE=$SERVICE requires ENV_PREFIX (else it deploys with the BACKEND's config)" >&2; exit 2; } ;;
 esac
-IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/$IMAGE_NAME:$TAG"
+IMAGE_REPOSITORY="$REGION-docker.pkg.dev/pivota-shared/pivota/$IMAGE_NAME"
+IMAGE="$IMAGE_REPOSITORY:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
-
-# Compare actual default traffic by revision, including an existing split.
-# A tag can have no percent on its own entry while its revision serves on another entry.
-candidate_routing() {
-  "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
-    --format='json(status.traffic,status.latestReadyRevisionName,status.latestCreatedRevisionName)' \
-    | python3 -c '
-import json
-import re
-import sys
-
-try:
-    status = json.load(sys.stdin)["status"]
-    traffic = status["traffic"]
-except (KeyError, TypeError, ValueError):
-    sys.exit(1)
-
-def revision(target):
-    return target.get("revisionName") or (
-        status.get("latestReadyRevisionName") if target.get("latestRevision") is True else None
-    )
-
-serving = {}
-for target in traffic or []:
-    percent = target.get("percent", 0)
-    if type(percent) is not int or not 0 <= percent <= 100:
-        sys.exit(1)
-    if percent:
-        name = revision(target)
-        if not name:
-            sys.exit(1)
-        serving[name] = serving.get(name, 0) + percent
-if sum(serving.values()) != 100:
-    sys.exit(1)
-
-tag = sys.argv[1]
-if tag:
-    matches = [target for target in traffic if target.get("tag") == tag]
-    if len(matches) != 1:
-        sys.exit(1)
-    name = revision(matches[0])
-    url = matches[0].get("url", "")
-    if (
-        not name or name != status.get("latestCreatedRevisionName") or name in serving
-        or not re.fullmatch(r"https://[A-Za-z0-9.-]+", url)
-    ):
-        sys.exit(1)
-
-print(json.dumps(serving, sort_keys=True, separators=(",", ":")))
-if tag:
-    print(name)
-    print(url)
-' "${1:-}"
-}
 
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
 # an existing service. A brand-new service has no previous revision to protect anyway.
 if [ "$PROMOTE" = 0 ]; then
-  SERVING_BEFORE="$(candidate_routing)" || {
+  # shellcheck source=infra/gcp/_serving_revision.sh
+  . "$HERE/_serving_revision.sh"
+  SERVING_BEFORE="$(candidate_routing_snapshot "$SERVICE")" || {
     echo "could not read existing default traffic for $SERVICE — refusing a candidate deploy." >&2
     exit 2
   }
+  # Pin the SHA-tagged build before deploying so a retag cannot change what Cloud Run imports.
+  EXPECTED_CANDIDATE_DIGEST="$("$GCLOUD" artifacts docker images describe "$IMAGE" \
+    --format='value(image_summary.digest)')" || {
+    echo "could not resolve the image digest for candidate commit $TAG." >&2
+    exit 2
+  }
+  [[ "$EXPECTED_CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "invalid image digest for candidate commit $TAG." >&2
+    exit 2
+  }
+  IMAGE="$IMAGE_REPOSITORY@$EXPECTED_CANDIDATE_DIGEST"
   NO_TRAFFIC="--tag $CANDIDATE_TAG --no-traffic"; FIRST_DEPLOY=0
 elif "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
   NO_TRAFFIC="--tag $CANDIDATE_TAG --no-traffic"; FIRST_DEPLOY=0
@@ -481,22 +459,33 @@ fi
 #
 # So: try directly, and if the answer is an ingress/IAM rejection rather than the app, re-probe from
 # INSIDE the VPC with a one-shot Cloud Run job. Only a real 200 from the application passes.
-probe_health(){ # url -> echoes the status code
-  local url="$1" code
-  # curl emits the -w template even when the transfer FAILS - "000", no trailing newline - and
-  # only then exits non-zero. The old `|| echo 000` therefore appended a second one and produced
-  # "000000", which matches no arm of the case below except the catch-all, so the function returned
-  # early and the in-VPC re-probe underneath - the entire reason this function exists - was dead
-  # code for every timeout and connection reset. Only a real HTTP status ever reached it.
-  code=$(curl -sS -o /tmp/pivota-health.$$ -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null) || true
-  code="${code:-000}"
-  case "$code" in
-    200) rm -f /tmp/pivota-health.$$; echo 200; return 0 ;;
-    403|404|000) : ;;                     # possibly ingress/IAM, not the app - fall through
-    *) rm -f /tmp/pivota-health.$$; echo "$code"; return 0 ;;
-  esac
-  rm -f /tmp/pivota-health.$$
-  echo "   direct probe got $code (ingress-blocked from here); re-probing from inside the VPC" >&2
+probe_health(){ # url [expected commit] -> echoes the status code
+  local url="$1" expected_sha="${2:-}" code body
+  if [ "${VPC_PROBE_ONLY:-0}" = 1 ]; then
+    echo "   probing the private candidate from inside the VPC" >&2
+  else
+    body=$(mktemp) || { echo 000; return 0; }
+    # A transfer can fail after curl has received a 200 response header.
+    code=$(curl -sS -o "$body" -w '%{http_code}' -m 30 ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$url" 2>/dev/null) || code=000
+    code="${code:-000}"
+    if [ "$code" = 200 ] && [ -n "$expected_sha" ] && ! python3 -c '
+import json
+import sys
+
+version = json.load(sys.stdin).get("version") or {}
+sys.exit(0 if version.get("full_sha") == sys.argv[1] else 1)
+' "$expected_sha" < "$body" 2>/dev/null; then
+      echo "   candidate /health did not report commit $expected_sha" >&2
+      rm -f "$body"
+      echo 000
+      return 0
+    fi
+    rm -f "$body"
+    case "$code" in
+      403|404|000) echo "   direct probe got $code. Re-probing from inside the VPC." >&2 ;;
+      *) echo "$code"; return 0 ;;
+    esac
+  fi
   # A PRIVATE SERVICE NEEDS A TOKEN HERE TOO. Being inside the VPC satisfies INGRESS; it does not
   # satisfy IAM. On 2026-09-29 a staging deploy (PUBLIC=0) of a revision that was Ready and serving
   # (web-00025-tut, "Application startup complete") was refused: this job called /health with no
@@ -521,7 +510,20 @@ t.add_header('Metadata-Flavor','Google')
 q.add_header('Authorization','Bearer '+urllib.request.urlopen(t,timeout=10).read().decode())"
   fi
   py="$py
-r=urllib.request.urlopen(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STATUS='+str(s)+' FINAL_URL='+u);sys.exit(0 if s==200 and u=='$url' else 1)"
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+opener=urllib.request.build_opener(NoRedirect())
+r=opener.open(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STATUS='+str(s)+' FINAL_URL='+u)
+if s!=200 or u!='$url': sys.exit(1)"
+  if [ -n "$expected_sha" ]; then
+    local expected_sha_json
+    expected_sha_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$expected_sha") || { echo 000; return 0; }
+    py="$py
+import json
+version=json.load(r).get('version') or {}
+sys.exit(0 if version.get('full_sha')==$expected_sha_json else 1)"
+  fi
   # ^|^ delimiter: gcloud splits --args on COMMAS, and this probe is Python that contains commas
   # (`,timeout=25`), which would otherwise be shredded into separate argv entries. That makes `|`
   # the one character the program may not contain - refuse rather than run a shredded probe.
@@ -603,9 +605,7 @@ r=urllib.request.urlopen(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STAT
   --min-instances "${MIN_INSTANCES:-$MIN}" --max-instances "${MAX_INSTANCES:-$MAX}" \
   --no-cpu-throttling --cpu-boost \
   --execution-environment gen2 \
-  --ingress "$INGRESS" \
-  $PUBLIC_FLAG \
-  --labels "env=$ENV,service=$SERVICE,managed-by=infra-gcp" \
+  ${SERVICE_ARGS[@]+"${SERVICE_ARGS[@]}"} \
   $NO_TRAFFIC \
   --quiet
 
@@ -613,7 +613,7 @@ r=urllib.request.urlopen(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STAT
 # reports success as soon as the container passes its startup probe, which a revision that boots
 # but cannot serve still does.
 if [ "$PROMOTE" = 0 ]; then
-  CANDIDATE_ROUTING="$(candidate_routing "$CANDIDATE_TAG")" || {
+  CANDIDATE_ROUTING="$(candidate_routing_snapshot "$SERVICE" "$CANDIDATE_TAG")" || {
     echo "could not verify the new tagged candidate at 0% default traffic." >&2
     exit 1
   }
@@ -627,7 +627,7 @@ if [ "$PROMOTE" = 0 ]; then
     exit 1
   }
   CANDIDATE_IDENTITY="$("$GCLOUD" run revisions describe "$CANDIDATE_REVISION" --project "$PROJECT" --region "$REGION" \
-    --format='json(spec.containers[0].env,spec.containers[0].image,status.imageDigest,status.containerStatuses)' | python3 -c '
+    --format='json(spec.containers[0].env,status.imageDigest,status.containerStatuses)' | python3 -c '
 import json
 import re
 import sys
@@ -636,7 +636,7 @@ revision = json.load(sys.stdin)
 container = revision["spec"]["containers"][0]
 status = revision.get("status", {})
 container_statuses = status.get("containerStatuses") or [{}]
-refs = (status.get("imageDigest"), container_statuses[0].get("imageDigest"), container.get("image"))
+refs = (status.get("imageDigest"), container_statuses[0].get("imageDigest"))
 digests = {ref.split("@")[-1] for ref in refs if ref and re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", ref)}
 matches = [entry.get("value") for entry in container.get("env", []) if entry.get("name") == "PIVOTA_COMMIT_SHA"]
 if len(matches) != 1 or not matches[0] or len(digests) != 1:
@@ -649,6 +649,10 @@ print(digests.pop())
     IFS= read -r CANDIDATE_IMAGE_DIGEST
   } <<< "$CANDIDATE_IDENTITY"
   [ "$CANDIDATE_SHA" = "$TAG" ] || { echo "tagged candidate is not commit $TAG." >&2; exit 1; }
+  [ "$CANDIDATE_IMAGE_DIGEST" = "$EXPECTED_CANDIDATE_DIGEST" ] || {
+    echo "tagged candidate image $CANDIDATE_IMAGE_DIGEST differs from expected $EXPECTED_CANDIDATE_DIGEST." >&2
+    exit 1
+  }
 else
   CAND_URL=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --format="value(status.traffic.extract(\"url\").flatten())" | tr ',;' '\n\n' | grep -F "$CANDIDATE_TAG" | head -1 || true)
@@ -658,7 +662,9 @@ fi
 # macOS ships bash 3.2, where "${AUTH[@]}" on an EMPTY array is an unbound-variable error under
 # `set -u` — which is exactly the public (PUBLIC=1) case. Use the ${arr[@]+"${arr[@]}"} guard.
 AUTH=()
-[ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
+if [ "$PUBLIC" != 1 ] && [ "$VPC_PROBE_ONLY" = 0 ]; then
+  AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
+fi
 AUTH_ARGS=(${AUTH[@]+"${AUTH[@]}"})
 # The in-VPC re-probe's token audience (see probe_health): the SERVICE URL even though the probe
 # calls the candidate's TAG URL - a token scoped to the tag URL is rejected 401. Empty when public.
@@ -668,7 +674,7 @@ if [ "$PUBLIC" != 1 ]; then
   [ -n "$PROBE_AUDIENCE" ] || { echo "could not read $SERVICE's URL, so the in-VPC probe cannot authenticate - NOT shifting traffic." >&2; exit 1; }
 fi
 echo "verifying candidate at $CAND_URL"
-CODE=$(probe_health "$CAND_URL/health")
+CODE=$(probe_health "$CAND_URL/health" "$CANDIDATE_HEALTH_SHA")
 [ "$CODE" = 200 ] || { echo "candidate health check returned $CODE — NOT shifting traffic. Previous revision still serving." >&2; exit 1; }
 
 # Retire stale candidate tags, and say what was retired.
@@ -706,7 +712,7 @@ print(",".join(t["tag"] for t in d.get("status",{}).get("traffic",[])
 }
 
 if [ "$PROMOTE" = 0 ]; then
-  FINAL_ROUTING="$(candidate_routing "$CANDIDATE_TAG")" || {
+  FINAL_ROUTING="$(candidate_routing_snapshot "$SERVICE" "$CANDIDATE_TAG")" || {
     echo "could not recheck candidate and default traffic after the health probe." >&2
     exit 1
   }
