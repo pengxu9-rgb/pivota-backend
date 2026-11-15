@@ -68,7 +68,9 @@ SURRATT_RETAILER_COHORT = ExactRetailerCohort(
 
 KIOKII_RETAILER_COHORT = ExactRetailerCohort(
     flag=KIOKII_FLAG,
-    canonical_product_key="prod::merch_obs_1c4bc54448d534ca::external_seed::ext_51577f22556c1f3aeb091391",
+    canonical_product_key="::".join(
+        ("prod", "merch_obs_1c4bc54448d534ca", "external_seed", "ext_51577f22556c1f3aeb091391")
+    ),
     canonical_merchant_id="merch_obs_1c4bc54448d534ca",
     canonical_group_id="pg_d6608eb0dcd14006495d2676df6972d8",
     canonical_content_key="ck_d6608eb0dcd14006495d2676df6972d8",
