@@ -94,7 +94,10 @@ def scope_reviewed_plan(plan: dict) -> dict:
         raise ValueError("exact retailer offer missing")
     # The existing observed row is the FK target. Do not upsert aliases or
     # introduce an active seed that the old purchase routes could select.
+    # The retailer listing has its own storefront URL but shares the existing
+    # brand PDP. Keeping it unsigned also keeps it out of sitemap elections.
+    child = {**product, "pivota_signature_id": None, "pivota_canonical_url": None, "pivota_signature_minted_at": None}
     return {
-        **plan, "skus": [sku for sku in plan["skus"] if sku["sku_key"] in seen],
+        **plan, "pdps": [child], "skus": [sku for sku in plan["skus"] if sku["sku_key"] in seen],
         "offers": offers, "merchants": [], "seeds": [], "incis": [], "reviewed_secondary_group": CANONICAL_GROUP_ID,
     }

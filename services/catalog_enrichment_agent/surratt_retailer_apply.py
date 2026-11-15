@@ -76,13 +76,15 @@ async def apply_reviewed_retailer(db, record, *, write: bool):
         raise ValueError("an active retailer source seed already owns the listing")
     listing = await db.fetch_one(
         """
-        SELECT merchant_id, canonical_url, content_key, suppressed_at, suppression_reason
+        SELECT merchant_id, canonical_url, content_key, suppressed_at, suppression_reason, pivota_signature_id
         FROM catalog_products WHERE product_key=:key
         """ + lock, {"key": key}
     )
-    if listing and tuple(dict(listing).values()) != (
-        retailer.merchant_id, retailer.family_url, CANONICAL_CONTENT_KEY, None, None
-    ):
+    if listing and dict(listing) != {
+        "merchant_id": retailer.merchant_id, "canonical_url": retailer.family_url,
+        "content_key": CANONICAL_CONTENT_KEY, "suppressed_at": None, "suppression_reason": None,
+        "pivota_signature_id": None,
+    }:
         raise ValueError("retailer product key is already occupied by another identity")
 
     expected = {offer["offer_id"]: json.loads(offer["offer_payload"])[PROOF_KEY] for offer in plan["offers"]}
@@ -162,7 +164,7 @@ async def retailer_witness(db, params):
           o.suppressed_at, o.suppression_reason, o.availability, o.list_price,
           o.offer_payload->'exact_retailer_shade_v1' AS proof,
           s.merchant_id AS sku_seller, s.source_variant_id, s.barcode, p.merchant_id AS product_seller,
-          p.content_key, g.product_group_id
+          p.content_key, g.product_group_id, p.pivota_signature_id
         FROM catalog_offers o
         LEFT JOIN catalog_skus s ON s.sku_key=o.sku_key AND s.product_key=o.product_key
           AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
@@ -206,6 +208,7 @@ def require_retailer_rows(rows, expected, params, *, compare_snapshot=True):
             or (row["source_ref"], row["market"], row["currency"], row["offer_type"], row["offer_mode"])
             != (params["url"], "US", "USD", "retailer", "redirect")
             or (row["content_key"], row["product_group_id"]) != (CANONICAL_CONTENT_KEY, CANONICAL_GROUP_ID)
+            or row["pivota_signature_id"] is not None
             or row["suppression_reason"] is not None or row["suppressed_at"] is not None
             or row["source_variant_id"] != wanted["retailer_native_variant_id"]
             or validated_source_gtin(row["barcode"]) != wanted["gtin14"]

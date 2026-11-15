@@ -35,6 +35,8 @@ def test_production_observation_uses_stock_projection_and_distinct_native_facts(
     now = datetime.now(timezone.utc)
     record = refresh.storefront_record(listing, payload(listing), now)
     shaped = scope_reviewed_plan(ingest_validated_jsonl([record], market="US", include_reviewed_surratt=True))
+    assert shaped["pdps"][0]["pivota_signature_id"] is None
+    assert shaped["pdps"][0]["pivota_canonical_url"] is None
     offers = [json.loads(row["offer_payload"])[PROOF_KEY] for row in shaped["offers"]]
     assert {row["merchant_id"] for row in shaped["offers"]} == {listing.merchant_id}
     assert {(row["price_minor"], row["availability"]) for row in offers} == {

@@ -28,6 +28,7 @@ async def test_same_observation_replay_requires_exact_persisted_proof(monkeypatc
                      "source_ref": retailer.family_url, "market": "US", "currency": "USD",
                      "offer_type": "retailer", "offer_mode": "redirect", "content_key": CANONICAL_CONTENT_KEY,
                      "product_group_id": CANONICAL_GROUP_ID, "suppressed_at": None, "suppression_reason": None,
+                     "pivota_signature_id": None,
                      "source_variant_id": native, "barcode": gtin, "availability": "in_stock", "list_price": 34.0})
     if tamper:
         rows[0]["proof"].update(tamper)
@@ -46,6 +47,7 @@ async def test_same_observation_replay_requires_exact_persisted_proof(monkeypatc
         fetch_one = AsyncMock(side_effect=[{"row_json": "{}"}, {
             "merchant_id": retailer.merchant_id, "canonical_url": retailer.family_url,
             "content_key": CANONICAL_CONTENT_KEY, "suppressed_at": None, "suppression_reason": None,
+            "pivota_signature_id": None,
         }])
         fetch_val = AsyncMock(return_value=False)
 
