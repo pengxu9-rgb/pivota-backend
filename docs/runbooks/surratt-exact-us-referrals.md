@@ -1,0 +1,16 @@
+# Surratt US exact retailer referrals
+
+The pilot adds the two reviewed Surratt Lipslique shades from Bluemercury and Frends Beauty to the existing Surratt product group. The application flag `SURRATT_EXACT_RETAILER_SHADES_ENABLED` defaults to off. The pilot offers named US shades through `get_offers` with signed links to the retailer PDP.
+
+## Deploy and canary
+
+1. Deploy the merged backend through the normal production workflow with the pilot flag off. Check the actual web and worker revisions. Check the image used by any job that can rebuild these PDPs or write retailer listings. The current [job image tool](../../infra/gcp/reimage_jobs.sh) can plan and verify named job updates.
+2. On the deployed image, run `python -m scripts.ops.surratt_retailer_offers plan` from a dedicated US crawl-subnet Cloud Run job named `meitu-surratt-retailer-*`. Use the production Cloud SQL secret, `PIVOTA_ENV=production`, `GOOGLE_CLOUD_PROJECT=pivota-prod`, and `SURRATT_RELEASE_COMMIT` set to the image commit. Set the current enrichment identity and variant-barcode flags for the job. Confirm the existing canonical group and the two observed seller identities, the signed-link domain policy, and exactly two native variants per seller.
+3. Run the same job with `apply` and `SURRATT_RETAILER_WRITE_ENABLED=1`. Save the output with the four offer IDs. Replay against the same scope and verify the keys, seller ownership, native shade and currency. A fresh out-of-stock observation may remove that offer from results. The job preserves the existing brand product and checks its original SKU, offer, index, and PDP snapshots around each write.
+4. Enable the pilot flag on the reviewed backend web revision for the four rows. Call the existing production MCP `get_offers` for each canonical shade with `market=US`. Compare offer results and signed redirects against fresh Shopify source reads. Exercise an unnamed shade, a non-US request, and an unrelated listing. Verify that a standard PDP refresh preserves the brand page and that the named retailer offers remain referral-only.
+
+## Refresh and rollback
+
+Run `refresh` using the same reviewed image, job identity, network and write switch after the canary apply. It requires all four existing offer keys. Each refresh checks the storefront product, native variant, UPC, explicit US currency, observed stock and price. Unconfirmed observations leave stored facts alone. The reader serves a proof for at most four hours from the storefront read. Run the scoped job hourly and monitor its completion and the age of the oldest of the four stored proofs.
+
+Disable the web pilot flag and pause the dedicated refresh trigger to withdraw the pilot. The ordinary catalog, PDP assembler and cart reader exclude reviewed retailer offers independently of the serving flag. Existing signed links still point to their particular retailer shade.

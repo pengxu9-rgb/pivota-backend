@@ -322,6 +322,78 @@ def test_two_stores_are_two_sellers_and_multi_merchant(schema_engine, monkeypatc
     assert _scope(payload) == "multi_merchant_canonical"
 
 
+def test_marked_surratt_children_stay_out_of_stock_pdp_rebuild(schema_engine, monkeypatch):
+    from sqlalchemy import text
+
+    from services import agent_pdp_view_assembler as assembler
+    from services.surratt_retailer_pilot import (
+        CANONICAL_CONTENT_KEY, CANONICAL_GROUP_ID, CANONICAL_MERCHANT_ID, CANONICAL_PRODUCT_KEY, PROOF_KEY, RETAILERS,
+    )
+
+    _seed(schema_engine)
+    _set_column(schema_engine, True)
+    cohort = {"ck": CANONICAL_CONTENT_KEY, "group": CANONICAL_GROUP_ID}
+    hidden, ordinary = list(RETAILERS.items())
+    hidden_key, hidden_listing = hidden
+    ordinary_key, ordinary_listing = ordinary
+    brand_image = "https://www.surrattbeauty.com/lipslique.jpg"
+    retailer_image = f"https://{hidden_listing.host}/lipslique.jpg"
+    with schema_engine.begin() as conn:
+        _insert_product(conn, pk=CANONICAL_PRODUCT_KEY, merchant=CANONICAL_MERCHANT_ID,
+                        url="https://www.surrattbeauty.com/products/lipslique", title="Lipslique", primary=True, **cohort)
+        _insert_offer(conn, offer_id="surratt-brand", sku=f"{CANONICAL_PRODUCT_KEY}::v:31365263163459",
+                      pk=CANONICAL_PRODUCT_KEY, merchant=CANONICAL_MERCHANT_ID, price=34,
+                      url="https://www.surrattbeauty.com/products/lipslique")
+        for key, listing in (ordinary, hidden):
+            _insert_product(conn, pk=key, merchant=listing.merchant_id, url=listing.family_url,
+                            title="Retail Lipslique", **cohort)
+            native_id = next(iter(listing.variants))
+            _insert_offer(conn, offer_id=f"surratt-{listing.host}", sku=f"{key}::v:{native_id}", pk=key,
+                          merchant=listing.merchant_id, price=19 if key == hidden_key else 40, url=listing.family_url)
+        _insert_offer(conn, offer_id="surratt-unrelated-offer-on-marked-listing", sku=f"{hidden_key}::v:32360830533707",
+                      pk=hidden_key, merchant=hidden_listing.merchant_id, price=1, url=hidden_listing.family_url)
+        conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload || CAST(:marker AS jsonb), suppressed_at=NOW() "
+                          "WHERE offer_id=:offer_id"), {"marker": json.dumps({PROOF_KEY: {"observed_at": "2020-01-01T00:00:00Z"}}),
+                                                      "offer_id": f"surratt-{hidden_listing.host}"})
+        for seed_id, product_key, url, image in (
+            ("surratt-brand-seed", CANONICAL_PRODUCT_KEY, "https://www.surrattbeauty.com/products/lipslique", brand_image),
+            ("surratt-pilot-seed", hidden_key, hidden_listing.family_url, retailer_image),
+        ):
+            conn.execute(text(
+                "INSERT INTO external_product_seeds (id, market, destination_url, attached_product_key, image_url)"
+                " VALUES (:id, 'US', :url, :product_key, :image)"
+            ), {"id": seed_id, "url": url, "product_key": product_key, "image": image})
+
+    async def build(db):
+        return await _rebuild(db, CANONICAL_CONTENT_KEY)
+
+    async def build_from_retailer_seed(db):
+        return await assembler.build_agent_pdp_view_row(
+            CANONICAL_CONTENT_KEY, refresh_source="test", db=db,
+            external_seed_id="surratt-pilot-seed", refreshed_by_proposal_id=27,
+        )
+
+    row = _run(monkeypatch, build)
+    assert {offer["merchant_id"] for offer in row["offers"]} == {CANONICAL_MERCHANT_ID, ordinary_listing.merchant_id}
+    assert (float(row["price_min"]), float(row["price_max"]), row["seller_count"]) == (34.0, 40.0, 2)
+    assert {str(v["variant_id"]) for v in row["variants"]} & set(hidden_listing.variants) == set()
+    explicit_seed = _run(monkeypatch, build_from_retailer_seed)
+    assert explicit_seed["image_url"] == row["image_url"] == brand_image
+    assert explicit_seed["refreshed_by_proposal_id"] is None
+
+    with schema_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload - CAST(:marker AS text) "
+                          "WHERE product_key=:pk"), {"marker": PROOF_KEY, "pk": hidden_key})
+    generic = _run(monkeypatch, build)
+    assert {offer["merchant_id"] for offer in generic["offers"]} == {
+        CANONICAL_MERCHANT_ID, ordinary_listing.merchant_id, hidden_listing.merchant_id,
+    }
+    assert (float(generic["price_min"]), generic["seller_count"]) == (1.0, 3)
+    explicit_seed = _run(monkeypatch, build_from_retailer_seed)
+    assert explicit_seed["image_url"] == retailer_image
+    assert explicit_seed["refreshed_by_proposal_id"] == 27
+
+
 def test_another_retailers_placeholder_on_the_row_is_its_offer_not_a_twin(schema_engine, monkeypatch):
     _seed(schema_engine)
     _set_column(schema_engine, True)

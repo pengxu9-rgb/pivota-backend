@@ -185,6 +185,24 @@ def test_the_arm_matches_by_content_key_and_product_key_too(pg_engine):
         assert (res.get("offers") or []), f"{ident} must resolve through the same arm"
 
 
+def test_a_marked_surratt_listing_cannot_fall_back_to_any_generic_offer(pg_engine, monkeypatch):
+    from sqlalchemy import text
+
+    from services.surratt_retailer_pilot import PILOT_FLAG, PROOF_KEY, RETAILERS
+
+    monkeypatch.delenv(PILOT_FLAG, raising=False)
+    _seed(pg_engine)
+    key = next(iter(RETAILERS))
+    with pg_engine.begin() as conn:
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            conn.execute(text(f"UPDATE {table} SET product_key=:new WHERE product_key=:old"), {"new": key, "old": _PK})
+        conn.execute(text(
+            "UPDATE catalog_offers SET offer_payload=offer_payload || jsonb_build_object(CAST(:proof_key AS text), 'null'::jsonb), "
+            "suppressed_at=NOW() WHERE offer_id='of_retailer_cheap'"
+        ), {"proof_key": PROOF_KEY})
+    assert _resolve(_SIG)["offers"] == []
+
+
 def test_an_unknown_identity_returns_no_offers_and_says_so(pg_engine):
     _seed(pg_engine)
     res = _resolve("sig_does_not_exist")

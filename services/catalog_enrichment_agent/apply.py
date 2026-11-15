@@ -407,6 +407,10 @@ _OFFER_UPSERT_SQL = """
                              || jsonb_build_object('price_read_source', catalog_offers.offer_payload->'price_read_source')
                         ELSE EXCLUDED.offer_payload END,
                       updated_at = NOW()
+                    -- Reviewed native shade rows require a new reviewed storefront
+                    -- observation. A generic re-ingest cannot replace their money or proof.
+                    WHERE catalog_offers.offer_payload->'exact_retailer_shade_v1' IS NULL
+                       OR EXCLUDED.offer_payload->'exact_retailer_shade_v1' IS NOT NULL
                     """
 
 #: The final suppression reason of an offer the retailer-ingest shade fold RETIRED: an offer of this lane that
@@ -1075,6 +1079,7 @@ async def _ensure_singleton_pg(pdp: Dict[str, Any]) -> None:
 async def _ensure_primary_retailer_group(
     pdp: Dict[str, Any], *, database: Any, target: Optional[str] = None,
     refusals: Optional[Dict[str, Dict[str, Any]]] = None,
+    member_is_primary: bool = True,
 ) -> bool:
     """Persist primary retailer group evidence on the writer's own DB, or refuse.
 
@@ -1093,9 +1098,12 @@ async def _ensure_primary_retailer_group(
             "platform": str(pdp.get("platform") or ""),
             "platform_product_id": str(pdp.get("source_product_id") or ""),
         }
-        await database.execute(_UPSERT_SINGLETON_MEMBER_SQL, params)
+        statement = _UPSERT_SINGLETON_MEMBER_SQL
+        if not member_is_primary:
+            statement = statement.replace("TRUE, NOW()", "FALSE, NOW()")
+        await database.execute(statement, params)
         stored = await database.fetch_one(
-            """SELECT product_group_id FROM product_group_members
+            """SELECT product_group_id, is_primary FROM product_group_members
                WHERE merchant_id=:merchant_id AND platform=:platform
                  AND platform_product_id=:platform_product_id""",
             {k: v for k, v in params.items() if k != "product_group_id"},
@@ -1103,6 +1111,8 @@ async def _ensure_primary_retailer_group(
         actual = str(dict(stored).get("product_group_id") or "").strip() if stored else ""
         if not actual or (target and actual != target):
             raise ValueError("primary group membership missing or disagrees with resolved identity")
+        if not member_is_primary and stored["is_primary"]:
+            raise ValueError("retailer cannot replace the canonical group primary")
         return True
     except Exception as exc:  # noqa: BLE001 — counted refusal, never a success substitute
         logger.error("primary retailer group persistence failed for product_key=%s: %s",
@@ -2598,6 +2608,12 @@ async def apply_ingest_plan(
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
+    from services.surratt_retailer_pilot import CANONICAL_GROUP_ID as SURRATT_GROUP, RETAILERS as SURRATT_LISTINGS
+
+    planned_keys = {row.get("product_key") for section in ("pdps", "skus", "offers") for row in plan.get(section) or []}
+    planned_keys.update(row.get("attached_product_key") for row in plan.get("seeds") or [])
+    if planned_keys.intersection(SURRATT_LISTINGS) and plan.get("reviewed_secondary_group") != SURRATT_GROUP:
+        raise ValueError("reviewed Surratt listings require the scoped retailer writer")
 
     preflight = require_primary_plan(plan) if primary_readiness else None
     counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
@@ -2673,6 +2689,8 @@ async def _apply_ingest_plan(
     owner_counts = {**owner_counts, **stage_counts, **label_counts}
 
     if batch:
+        if plan.get("reviewed_secondary_group"):
+            raise ValueError("reviewed secondary retailer apply requires the transactional writer")
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
                                                   verified_storefront=verified_storefront, price_read=price_read)
         counts.update(owner_counts)
@@ -2730,8 +2748,13 @@ async def _apply_ingest_plan(
             _note_pdp_refusal(refusals, pdp, "insert_failed", **_exc_detail(exc))
 
         if str(pdp.get("product_key") or "").startswith("ext:retailer:"):
+            target = group_targets.get(pdp["product_key"])
+            secondary_group = plan.get("reviewed_secondary_group")
+            if secondary_group and (target != secondary_group or not identity_gate_on):
+                raise ValueError("reviewed retailer no longer resolves to the approved canonical group")
             if not await _ensure_primary_retailer_group(
-                pdp, database=database, target=group_targets.get(pdp["product_key"]), refusals=refusals,
+                pdp, database=database, target=target, refusals=refusals,
+                member_is_primary=not secondary_group,
             ):
                 counts["product_groups_failed"] += 1
                 skipped_product_keys.add(pdp.get("product_key"))
@@ -3113,7 +3136,8 @@ def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
 
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
-                                     allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
+                                     allow_moves: Any = (), planner: Any = None,
+                                     include_reviewed_surratt: bool = False) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
     `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
@@ -3126,6 +3150,8 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     planner = planner or ingest_validated_jsonl
     records = list(records)
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
+    if include_reviewed_surratt:
+        given["include_reviewed_surratt"] = True
     first = planner(records, **given)
     content, retailer = content_keys_of(first), retailer_keys_of(first)
     if not content and not retailer:

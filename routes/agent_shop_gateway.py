@@ -38,6 +38,10 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.surratt_retailer_pilot import (
+    PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY,
+    RETAILERS as SURRATT_RETAILER_LISTINGS,
+)
 from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
@@ -4942,6 +4946,7 @@ async def _handle_offers_resolve(
     explicit commerce_surface tightens internal-offer servability (strict mode), not sourcing.
     """
     from db.database import database
+    from services import exact_retailer_shades
 
     started = time.perf_counter()
 
@@ -4962,6 +4967,7 @@ async def _handle_offers_resolve(
         payload=payload,
         request_metadata=request_metadata,
     )
+    exact_retailer_pilot = exact_retailer_shades.applies(product_id, sku_id, observed_market_hint, merchant_scope)
     commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
         payload_surface=payload.commerce_surface,
         request_metadata=request_metadata,
@@ -5424,6 +5430,8 @@ async def _handle_offers_resolve(
     async def _append_external_offers_from_seed_rows(
         seed_rows: List[Any], *, sibling: bool = False, deadline: Optional[float] = None,
     ) -> None:
+        if exact_retailer_pilot:
+            seed_rows = [r for r in seed_rows if not exact_retailer_shades.is_pilot_retailer_seed(_row_to_dict(r))]
         # ONE statement for every product key this batch is about to hand over, BEFORE the
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
@@ -7298,7 +7306,12 @@ async def _handle_offers_resolve(
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
-        if ident_aliases:
+        if exact_retailer_pilot:
+            # The product-grain statement can rank another shade before the caller's limit.
+            catalog_rows = await exact_retailer_shades.read_offers(
+                database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+            )
+        elif ident_aliases:
             catalog_rows = await asyncio.wait_for(
                 database.fetch_all(
                     # The statement text is built by `_catalog_offers_statement`, which the group
@@ -7367,6 +7380,7 @@ async def _handle_offers_resolve(
                     "source": "offers.resolve.catalog_offer",
                     "offerId": str(r.get("offer_id") or ""),
                     **({"productId": product_id} if product_id else {}),
+                    **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if exact_retailer_pilot else {}),
                 },
                 merchant_id=offer_merchant,
                 product_id=str(r.get("product_key") or "") or None,
@@ -7387,7 +7401,14 @@ async def _handle_offers_resolve(
             if _group_mode and not str(r.get("currency") or "").strip():
                 # The row states no currency, so none ships below: no best price on it.
                 _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
-            external_offers.append(_catalog_offer_entry(r, group_mode=_group_mode, redirect_url=redirect_url))
+            offer = _catalog_offer_entry(r, group_mode=_group_mode or exact_retailer_pilot, redirect_url=redirect_url)
+            if exact_retailer_pilot:
+                offer["confidence"] = 1.0
+                offer["cart_prefilled"] = False
+                offer["source"].update(
+                    variant_match="exact", variant_id=r["variant_id"], retailer_variant_id=r["retailer_variant_id"],
+                )
+            external_offers.append(offer)
             if catalog_rows:
                 mapping_candidates.append(
                     _conf(
@@ -10514,6 +10535,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
+    pilot_listing_keys = ", ".join(f"'{key}'" for key in SURRATT_RETAILER_LISTINGS)
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10615,6 +10637,12 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND o.offer_type = 'retailer'
                        AND o.offer_mode = 'redirect'
                        AND o.suppressed_at IS NULL
+                       -- A reviewed listing only serves through the exact pilot reader once marked.
+                       AND (p.product_key NOT IN ({pilot_listing_keys}) OR NOT EXISTS (
+                           SELECT 1 FROM catalog_offers pilot
+                           WHERE pilot.product_key = p.product_key
+                             AND pilot.offer_payload->'{SURRATT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
+                       ))
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0
                        -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
