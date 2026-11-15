@@ -1,0 +1,30 @@
+-- HAND-APPLIED ONLY. Publish this versioned file with its SHA-256 and apply it
+-- in one transaction before enabling EMPLOYEE_SHOPIFY_ORDERS_ENABLED.
+-- Fast production boot skips migrations. The disabled feature needs no table.
+
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '30s';
+
+CREATE TABLE IF NOT EXISTS employee_shopify_orders (
+    merchant_id varchar(50) NOT NULL,
+    store_id varchar(50) NOT NULL,
+    domain text NOT NULL,
+    shopify_order_id varchar(20) NOT NULL CHECK (shopify_order_id ~ '^[1-9][0-9]{0,19}$'),
+    name text NOT NULL,
+    test boolean NOT NULL,
+    payment_status text,
+    fulfillment_status text NOT NULL,
+    currency varchar(3) NOT NULL,
+    subtotal numeric NOT NULL,
+    shipping numeric NOT NULL,
+    total numeric NOT NULL,
+    line_items jsonb NOT NULL CHECK (jsonb_typeof(line_items) = 'array'),
+    shopify_created_at timestamptz NOT NULL,
+    shopify_updated_at timestamptz NOT NULL,
+    synced_at timestamptz NOT NULL DEFAULT now(),
+    synced_by_employee_id text NOT NULL,
+    PRIMARY KEY (merchant_id, store_id, domain, shopify_order_id)
+);
+
+CREATE INDEX IF NOT EXISTS employee_shopify_orders_store_order
+    ON employee_shopify_orders (merchant_id, store_id, domain, synced_at DESC, shopify_order_id DESC);
