@@ -24,6 +24,7 @@ one answers 200", not "the text contains the word Bearer".
 from __future__ import annotations
 
 import http.server
+import json
 import os
 import shutil
 import subprocess
@@ -40,13 +41,24 @@ SCRIPTS = {
 }
 SHA = "74e29e99f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5"
 CANDIDATE_TAG = "c-" + SHA[-12:]
+DIGEST = "sha256:" + "a" * 64
 METADATA = "http://metadata.google.internal"
 
 GCLOUD_STUB = r"""#!/bin/sh
 case "$1 $2" in
+  "artifacts docker")
+    [ "$3 $4" = "images describe" ] || exit 1
+    printf '%s\n' "$STUB_DIGEST"; exit 0 ;;
   "run services")
     [ "$3" = describe ] || exit 0
     case "$*" in
+      *"status.latestCreatedRevisionName"*)
+        if [ -f "$STUB_DEPLOYED" ]; then
+          printf '%s\n' "$STUB_ROUTING_AFTER"
+        else
+          printf '%s\n' "$STUB_ROUTING_BEFORE"
+        fi
+        exit 0 ;;
       *"--format=json"*)       printf '%s' '{"status":{"traffic":[]}}'; exit 0 ;;
       *"traffic.extract"*)     printf '%s\n' "$STUB_CAND_URL"; exit 0 ;;
       *"value(status.url)"*)   printf '%s\n' "$STUB_SERVICE_URL"; exit 0 ;;
@@ -54,6 +66,10 @@ case "$1 $2" in
       *containers*env*)        echo "{'name': 'DB_POOL_MAX_SIZE', 'value': '8'}"; exit 0 ;;
       *)                       exit 0 ;;
     esac ;;
+  "run deploy") touch "$STUB_DEPLOYED"; exit 0 ;;
+  "run revisions")
+    [ "$3" = describe ] && [ "$4" = "$STUB_CAND_REVISION" ] || exit 1
+    printf '%s\n' "$STUB_REVISION"; exit 0 ;;
   "run jobs")
     case "$3" in
       create)
@@ -81,6 +97,7 @@ def _deploy(tmp_path: Path, service: str, public: str, *, service_url: str | Non
     shutil.copy2(SCRIPTS[service], script)
     # deploy_gateway.sh sources its gateway-image resolver from its own directory.
     shutil.copy2(SCRIPTS[service].parent / "_gateway_image.sh", here / "_gateway_image.sh")
+    shutil.copy2(SCRIPTS[service].parent / "_serving_revision.sh", here / "_serving_revision.sh")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "gcloud").write_text(GCLOUD_STUB)
@@ -92,13 +109,39 @@ def _deploy(tmp_path: Path, service: str, public: str, *, service_url: str | Non
     args_file = tmp_path / "probe_args"
     deletes = tmp_path / "deletes"
     deletes.touch()
+    candidate_url = f"https://{CANDIDATE_TAG}---{service}-abc-uw.a.run.app"
+    live_revision = f"{service}-live"
+    candidate_revision = f"{service}-candidate"
+    live_traffic = {"percent": 100, "revisionName": live_revision}
+    candidate_traffic = {
+        "tag": CANDIDATE_TAG,
+        "url": candidate_url,
+        "percent": 0,
+        "revisionName": candidate_revision,
+    }
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "GCLOUD": str(bin_dir / "gcloud"),
         "CONFIG": "preserve", "PROMOTE": "0", "PUBLIC": public,
-        "STUB_CAND_URL": f"https://{CANDIDATE_TAG}---{service}-abc-uw.a.run.app",
+        "STUB_CAND_URL": candidate_url,
         "STUB_SERVICE_URL": f"https://{service}-abc-uw.a.run.app" if service_url is None else service_url,
+        "STUB_DEPLOYED": str(tmp_path / "deployed"),
+        "STUB_DIGEST": DIGEST,
+        "STUB_ROUTING_BEFORE": json.dumps({"status": {
+            "latestReadyRevisionName": live_revision,
+            "traffic": [live_traffic],
+        }}),
+        "STUB_ROUTING_AFTER": json.dumps({"status": {
+            "latestCreatedRevisionName": candidate_revision,
+            "latestReadyRevisionName": candidate_revision,
+            "traffic": [live_traffic, candidate_traffic],
+        }}),
+        "STUB_CAND_REVISION": candidate_revision,
+        "STUB_REVISION": json.dumps({
+            "spec": {"containers": [{"env": [{"name": "PIVOTA_COMMIT_SHA", "value": SHA}]}]},
+            "status": {"imageDigest": DIGEST},
+        }),
         "STUB_ARGS_FILE": str(args_file), "STUB_DELETES": str(deletes),
         "STUB_EXECUTE_RC": str(execute_rc),
     }

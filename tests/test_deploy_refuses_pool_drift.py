@@ -37,7 +37,7 @@ SCRIPT = REPO / "infra" / "gcp" / "deploy_backend.sh"
 
 
 def _gcloud_shim(tmp_path: Path, pool_max: str, max_scale: str) -> Path:
-    """A gcloud that answers `services describe` and records nothing else.
+    """A gcloud that answers candidate reads and logs other calls.
 
     Emits the same `[{'name': ..., 'value': ...}]` shape gcloud's
     `--format='value(...env)'` produces, so the parser under test is exercised
@@ -53,9 +53,18 @@ def _gcloud_shim(tmp_path: Path, pool_max: str, max_scale: str) -> Path:
         textwrap.dedent(
             f"""\
             #!/usr/bin/env bash
+            if [[ "$*" == "artifacts docker images describe "* ]]; then
+              printf 'sha256:%064d\\n' 0
+              exit 0
+            fi
+            if [[ "$*" == "run services get-iam-policy "* ]]; then
+              echo '{{"bindings":[{{"role":"roles/run.invoker","members":["allUsers"]}}]}}'
+              exit 0
+            fi
             if [ "$1" = run ] && [ "$2" = services ] && [ "$3" = describe ]; then
               for a in "$@"; do
                 case "$a" in
+                  *status.latestCreatedRevisionName*) echo '{{"status":{{"traffic":[{{"revisionName":"web-fixture","percent":100}}]}}}}'; exit 0 ;;
                   *maxScale*) echo "{max_scale}"; exit 0 ;;
                   *containers*env*) echo "{env_repr}"; exit 0 ;;
                 esac

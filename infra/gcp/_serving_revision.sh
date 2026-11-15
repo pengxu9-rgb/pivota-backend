@@ -112,3 +112,59 @@ for e in (c.get("env") or []):
         print(e.get("value", "")); sys.exit(0)
 sys.exit(1)' 2>/dev/null
 }
+
+# Compare actual default traffic by revision, including an existing split.
+# A tag can have no percent on its own entry while its revision serves on another entry.
+candidate_routing_snapshot(){ # <service> [candidate-tag]
+  local svc="$1"
+  local proj=(); [ -n "${PROJECT:-}" ] && proj=(--project "$PROJECT")
+  "$GCLOUD" run services describe "$svc" ${proj[@]+"${proj[@]}"} --region "$REGION" \
+    --format='json(status.traffic,status.latestReadyRevisionName,status.latestCreatedRevisionName)' \
+    | python3 -c '
+import json
+import re
+import sys
+
+try:
+    status = json.load(sys.stdin)["status"]
+    traffic = status["traffic"]
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+
+def revision(target):
+    return target.get("revisionName") or (
+        status.get("latestReadyRevisionName") if target.get("latestRevision") is True else None
+    )
+
+serving = {}
+for target in traffic or []:
+    percent = target.get("percent", 0)
+    if type(percent) is not int or not 0 <= percent <= 100:
+        sys.exit(1)
+    if percent:
+        name = revision(target)
+        if not name:
+            sys.exit(1)
+        serving[name] = serving.get(name, 0) + percent
+if sum(serving.values()) != 100:
+    sys.exit(1)
+
+tag = sys.argv[1]
+if tag:
+    matches = [target for target in traffic if target.get("tag") == tag]
+    if len(matches) != 1:
+        sys.exit(1)
+    name = revision(matches[0])
+    url = matches[0].get("url", "")
+    if (
+        not name or name != status.get("latestCreatedRevisionName") or name in serving
+        or not re.fullmatch(r"https://[A-Za-z0-9.-]+", url)
+    ):
+        sys.exit(1)
+
+print(json.dumps(serving, sort_keys=True, separators=(",", ":")))
+if tag:
+    print(name)
+    print(url)
+' "${2:-}"
+}

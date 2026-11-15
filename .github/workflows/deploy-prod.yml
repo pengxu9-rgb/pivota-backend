@@ -13,6 +13,9 @@
 # merge; after merge, an undeployed main IS the hazard the 08-22 cutover already demonstrated
 # (#1812). The dispatch trigger stays for rollbacks (any merged SHA) and 0%-traffic candidates,
 # and the drift alarm stays as the independent check on this pipeline itself.
+# A repository variable, PRODUCTION_PUSH_MODE, can hold subsequent pushes at 0% default
+# traffic. Set it to candidate before queuing the first push to hold. Unset or promote
+# retains automatic promotion. Manual dispatch takes its explicit promote input.
 #
 # ── SCOPE: web, worker AND proof-issuer, as of 2026-09-05 ──────────────────────────────────────
 # This file used to say "`web` only", on the argument that rolling `worker` "has queue semantics
@@ -74,7 +77,7 @@ on:
         description: 'Shift 100% traffic to the new revision. Uncheck to build and health-check a candidate at 0%.'
         required: true
         type: boolean
-        default: true
+        default: false
       reason:
         # `required: true` is the UI's half of this. It is NOT enforcement: Actions accepts an
         # EMPTY string for a required string input from `gh workflow run` and from the API, so the
@@ -139,6 +142,8 @@ jobs:
     runs-on: ubuntu-latest
     # Above the DEADLINE below, so the script's own diagnostic prints before GitHub kills the job.
     timeout-minutes: 55
+    outputs:
+      promote: ${{ steps.release-mode.outputs.promote }}
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -150,6 +155,32 @@ jobs:
       REASON: ${{ inputs.reason }}
       BYPASS: ${{ (github.event_name == 'workflow_dispatch' && inputs.bypass_test_gate) && '1' || '0' }}
     steps:
+      - name: Resolve production release mode
+        id: release-mode
+        shell: bash
+        env:
+          PUSH_MODE: ${{ vars.PRODUCTION_PUSH_MODE }}
+          MANUAL_PROMOTE: ${{ inputs.promote && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              case "$PUSH_MODE" in
+                ''|promote) mode=promote; promote=1 ;;
+                candidate) mode=candidate; promote=0 ;;
+                *) echo '::error::Set PRODUCTION_PUSH_MODE to candidate or promote, or unset it.'; exit 1 ;;
+              esac ;;
+            workflow_dispatch)
+              case "$MANUAL_PROMOTE" in
+                true) mode=promote; promote=1 ;;
+                false) mode=candidate; promote=0 ;;
+                *) echo '::error::Manual promote must be a boolean.'; exit 1 ;;
+              esac ;;
+            *) echo '::error::Unsupported production deployment trigger.'; exit 1 ;;
+          esac
+          printf 'promote=%s\n' "$promote" >> "$GITHUB_OUTPUT"
+          printf 'Production release mode is **%s**.\n' "$mode" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Record why this deploy was run by hand
         if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
@@ -380,13 +411,21 @@ jobs:
     # reject it - the validation would be running on a string that had already had its way.
     # An `env:` block is an expression context: the value is passed, never pasted.
     env:
-      # push: the pushed merge commit, always promoted. dispatch: the operator's choice of both.
+      # The source SHA stays tied to the test gate. Its release mode is resolved once there.
       SHA: ${{ github.event_name == 'push' && github.sha || inputs.sha }}
-      PROMOTE_FLAG: ${{ (github.event_name == 'push' || inputs.promote) && 1 || 0 }}
+      PROMOTE_FLAG: ${{ needs.test-gate.outputs.promote }}
       REASON: ${{ inputs.reason }}
       ACTOR: ${{ github.actor }}
       BYPASSED: ${{ (github.event_name == 'workflow_dispatch' && inputs.bypass_test_gate) && 'yes' || 'no' }}
     steps:
+      - name: Require a resolved production release mode
+        shell: bash
+        run: |
+          case "$PROMOTE_FLAG" in
+            0|1) ;;
+            *) echo '::error::Production release mode is missing or invalid.'; exit 1 ;;
+          esac
+
       # The reason belongs in THIS job's log, not only the gate's. Whoever is reading a deploy log
       # after an incident is reading this job; a note in a sibling job's summary is a click away
       # and therefore not there.
@@ -470,12 +509,29 @@ jobs:
           fi
           # Build from ./src (the target commit), using that commit's own build config - for a
           # rollback, the image should be what that commit produced, not what main builds today.
-          gcloud builds submit --config src/infra/gcp/cloudbuild.backend.yaml \
+          BUILD_CONFIG=src/infra/gcp/cloudbuild.backend.yaml
+          if [ "$PROMOTE_FLAG" = 0 ]; then
+            # Other production jobs pull backend:latest. Only publish the SHA tag during a hold.
+            # The Docker build still produces both local tags, with the original steps and options.
+            CANDIDATE_CONFIG="$RUNNER_TEMP/backend-candidate.json"
+            export COMMIT_IMAGE_TEMPLATE='${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'
+            yq -o=json '.images |= map(select(. == strenv(COMMIT_IMAGE_TEMPLATE)))' "$BUILD_CONFIG" \
+              > "$CANDIDATE_CONFIG"
+            jq -e --arg image "$COMMIT_IMAGE_TEMPLATE" '.images == [$image]' "$CANDIDATE_CONFIG" >/dev/null \
+              || { echo "::error::Could not identify the commit-only candidate image"; exit 1; }
+            BUILD_CONFIG="$CANDIDATE_CONFIG"
+          fi
+          gcloud builds submit --config "$BUILD_CONFIG" \
             --project "$PROJECT_SHARED" --substitutions=COMMIT_SHA="$SHA" src
 
       - name: Deploy web
         run: |
           set -euo pipefail
+          # A tagged revision with a revision-level minimum keeps instances warm
+          # at 0% traffic. Only the candidate revision gets a zero minimum.
+          if [ "$PROMOTE_FLAG" = 0 ]; then
+            export MIN_INSTANCES=0
+          fi
           # CONFIG=preserve: roll the image forward and leave the service's 188 env vars and 54
           # secret mounts exactly as they are. The ported env files this script otherwise needs are
           # git-ignored and generated from `railway variables`, which will not outlive Railway.
@@ -484,7 +540,7 @@ jobs:
             infra/gcp/deploy_backend.sh prod "$SHA"
 
       - name: Confirm production is serving the new commit
-        if: ${{ github.event_name == 'push' || inputs.promote }}
+        if: ${{ needs.test-gate.outputs.promote == '1' }}
         run: |
           set -euo pipefail
           # Cloud Run reports the traffic split as updated before every instance has rolled, so a
@@ -500,10 +556,10 @@ jobs:
           exit 1
 
       - name: Candidate summary
-        if: ${{ github.event_name != 'push' && !inputs.promote }}
+        if: ${{ needs.test-gate.outputs.promote == '0' }}
         run: |
-          echo "::notice::Candidate for $SHA passed its health check and is at 0% traffic."
-          echo "Re-run with promote checked to shift traffic."
+          echo "::notice::Web candidate for $SHA is healthy at 0% default traffic. Serving revisions and percentages are unchanged."
+          echo "Dispatch this exact SHA with promote checked when ready to shift traffic."
 
   # ── THE OTHER TWO SERVICES ─────────────────────────────────────────────────────────────────────
   # Both `needs: [test-gate, deploy]`, and the second half of that is deliberate.
@@ -521,12 +577,12 @@ jobs:
 
   deploy-worker:
     needs: [test-gate, deploy]
-    # A candidate deploy (dispatch with promote unchecked) is defined as "build and health-check
+    # Candidate mode is defined as "build and health-check
     # without putting anything in front of users". The worker has no such state to be in: it takes
     # no traffic, so there is no 0% to hold it at, and a worker instance drains queues from its app
     # lifespan whether or not any request ever reaches it. Deploying it under PROMOTE=0 would mean
     # a "candidate" that is fully live. Skip instead, and say so.
-    if: ${{ github.event_name == 'push' || inputs.promote }}
+    if: ${{ needs.test-gate.outputs.promote == '1' }}
     runs-on: ubuntu-latest
     environment: gcp-prod
     env:
@@ -566,7 +622,7 @@ jobs:
 
   deploy-proof-issuer:
     needs: [test-gate, deploy]
-    if: ${{ github.event_name == 'push' || inputs.promote }}
+    if: ${{ needs.test-gate.outputs.promote == '1' }}
     runs-on: ubuntu-latest
     environment: gcp-prod
     env:
