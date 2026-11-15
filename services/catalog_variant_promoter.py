@@ -722,7 +722,7 @@ async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
 
 
 async def promote_variants_for_group(
-    *, group_id: str, apply: bool = False
+    *, group_id: str, apply: bool = False, variant_ids: frozenset[str] | None = None,
 ) -> GroupOutcome:
     """Process one product_group. Idempotent — repeat calls upsert.
     Wraps the per-group upserts in a transaction so partial failure
@@ -741,6 +741,11 @@ async def promote_variants_for_group(
 
     primary = dict(primary_row)
     raw_variants = _extract_variants_for_primary(primary)
+    if variant_ids is not None:
+        raw_variants = [
+            variant for variant in raw_variants
+            if str(variant.get("variant_id") or variant.get("id") or "").strip() in variant_ids
+        ]
     real_variants = filter_real_variants(raw_variants)
 
     if not real_variants:

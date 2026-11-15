@@ -16,6 +16,7 @@ from services import crawl_politeness, shopify_presentment, storefront_currency
 from services.catalog_identity import validated_source_gtin
 from services.external_seed_model_review import ReviewTarget, build_review_snapshot, review_seed
 from services.shopify_storefront_session import MarketsRefused, ShopifyStorefrontSession, _ua
+from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT
 
 POLICY_VERSION = "olive-young-us-brand-direct-v4"
 REVIEW_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash")
@@ -215,19 +216,21 @@ async def _barcode_corroboration(client, listing: PilotListing, observed: dict) 
         or str(detail.get("title") or "").strip().casefold() != "amuse banana lip oil 4.5ml"
     ):
         return None
-    expected_ids = {"52547428942138": "51629126123840", "52547429007674": "51896079974720"}
+    (retailer,) = KIOKII_RETAILER_COHORT.listings.values()
+    expected_ids = {canonical: native for native, (canonical, _) in retailer.variants.items()}
     matched = {}
     for variant_id, brand in required.items():
+        retailer_shade = "03 Manuka Honey" if variant_id == "52547428974906" else brand["shade"]
         matches = [
             item for item in variants if isinstance(item, dict)
-            and str(item.get("id") or "") == expected_ids[variant_id]
-            and str(item.get("title") or "").strip().casefold() == brand["shade"].casefold()
+            and str(item.get("id") or "") == expected_ids.get(variant_id)
+            and str(item.get("title") or "").strip().casefold() == retailer_shade.casefold()
             and validated_source_gtin(item.get("barcode")) == validated_source_gtin(brand["gtin"])
         ]
         if len(matches) != 1:
             return None
         matched[variant_id] = {
-            "source_url": listing.corroboration_url, "variant_id": expected_ids[variant_id],
+            "source_url": listing.corroboration_url, "variant_id": str(matches[0]["id"]),
             "shade": brand["shade"], "native_barcode": brand["gtin"], "gtin_provenance": "identity_only",
         }
     return matched
@@ -310,13 +313,17 @@ async def capture_shopify_evidence(listing: PilotListing) -> dict:
     }
 
 
-async def adjudicate(seed_id: str, review_version: str, listing: PilotListing, evidence: dict) -> dict:
+async def adjudicate(
+    seed_id: str, review_version: str, listing: PilotListing, evidence: dict,
+    *, exact_retailer_targets: tuple[ReviewTarget, ...] = (),
+) -> dict:
     from services.external_seed_gemini_reviewer import run_gemini_review
 
     snapshot = build_review_snapshot(
         seed_id=seed_id, seed_snapshot={"review_version": review_version, "policy_version": listing.policy_version},
         evidence_packet=evidence,
-        expected_targets=[ReviewTarget(variant[0], "brand_direct") for variant in listing.variants],
+        expected_targets=[ReviewTarget(variant[0], "brand_direct") for variant in listing.variants]
+        + list(exact_retailer_targets),
     )
     primary, secondary = await asyncio.gather(
         run_gemini_review(snapshot, evidence, stage="primary", model_name=REVIEW_MODELS[0],

@@ -376,6 +376,7 @@ async def upsert_seed_data(
     proposer: str,
     source: Optional[str] = None,
     notes: Optional[str] = None,
+    project_after_merge: bool = True,
 ) -> WriteResult:
     """Single canonical write path for external_product_seeds.seed_data.
 
@@ -390,7 +391,8 @@ async def upsert_seed_data(
          proposal 'merged'.
       6. If no merge: mark the proposal 'rejected'.
 
-    Returns a WriteResult with per-field decisions so callers can
+    A transactional caller that performs a scoped projection itself can defer
+    the default post-merge projections. Returns a WriteResult with per-field decisions so callers can
     surface what actually changed."""
     if not isinstance(proposed_seed_data, dict):
         raise TypeError("proposed_seed_data must be a dict")
@@ -495,21 +497,23 @@ async def upsert_seed_data(
             merged_seed_data=merged_seed_data,
             updated_lock=updated_lock,
             proposal_id=proposal_id,
+            refresh_pdp=project_after_merge,
         )
         final_status = "merged"
         # Convergence P1.6: keep the persisted catalog_offers mirror fresh for
         # this seed. Post-commit, best-effort, flag-gated, and a no-op if the
         # seed has no mirror product yet (the 15-min job creates the chain) —
         # it must never fail the authorized seed write.
-        try:
-            from services.external_offer_dual_write import sync_offer_for_seed
+        if project_after_merge:
+            try:
+                from services.external_offer_dual_write import sync_offer_for_seed
 
-            await sync_offer_for_seed(seed_id)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "seed_data_writer: catalog_offers dual-write failed for seed_id=%r",
-                seed_id, exc_info=True,
-            )
+                await sync_offer_for_seed(seed_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "seed_data_writer: catalog_offers dual-write failed for seed_id=%r",
+                    seed_id, exc_info=True,
+                )
     else:
         final_status = proposal_status  # 'rejected' or 'no_change'
 
@@ -616,6 +620,7 @@ async def _apply_merge(
     merged_seed_data: Dict[str, Any],
     updated_lock: Dict[str, Any],
     proposal_id: Optional[int],
+    refresh_pdp: bool = True,
 ) -> None:
     """Apply the merged seed_data + content_lock under an authorized
     transaction. The trigger respects pivota.seed_write_token=authorized
@@ -651,6 +656,8 @@ async def _apply_merge(
                 {"proposal_id": proposal_id},
             )
 
+    if not refresh_pdp:
+        return
     try:
         await refresh_agent_pdp_view_for_seed(
             seed_id=seed_id,

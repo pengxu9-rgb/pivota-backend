@@ -176,8 +176,14 @@ def test_exact_selection_precedes_price_ranking_and_limit(monkeypatch, http):
     assert retailer[0]["source"]["variant_id"] == FIRST
 
 
-@pytest.mark.parametrize(("canonical", "native"), [("52547428942138", "51629126123840"),
-                                                  ("52547429007674", "51896079974720")])
+@pytest.mark.parametrize(("canonical", "native"), [
+    ("52547428909370", "51629126189376"),
+    ("52547428942138", "51629126123840"),
+    ("52547428974906", "51629126222144"),
+    ("52547429007674", "51896079974720"),
+    ("52547429040442", "51629126156608"),
+    ("52547429073210", "51896079876416"),
+])
 def test_kiokii_uses_own_native_shade_in_signed_referral(monkeypatch, http, canonical, native):
     client, warm = http
     cohort = KIOKII_RETAILER_COHORT
