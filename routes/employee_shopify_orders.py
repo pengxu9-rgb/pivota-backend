@@ -19,6 +19,7 @@ from services.employee_shopify_orders import (
     resolve_store_order_credentials,
     sync_employee_shopify_order,
 )
+from services.shopify_domain import MYSHOPIFY_HOST
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, has_permission
 from utils.tenant_scope import assert_merchant_scope, is_scope_staff
 
@@ -31,6 +32,9 @@ _SYNC_PERMISSION = "mcp.orders.sync"
 class OrderSyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     shopify_order_id: Annotated[str, StringConstraints(strict=True, pattern=NATIVE_ORDER_ID_PATTERN)]
+    expected_domain: Annotated[str, StringConstraints(
+        strict=True, max_length=77, pattern=f"^{MYSHOPIFY_HOST.pattern}$",
+    )]
 
 
 async def _employee_staff(
@@ -122,7 +126,10 @@ async def employee_sync_shopify_order(
     employee_id = _employee_id(actor)
     if not has_permission(actor, _SYNC_PERMISSION):
         raise HTTPException(status_code=403, detail="SHOPIFY_ORDER_SYNC_PERMISSION_REQUIRED")
-    return await _run(sync_employee_shopify_order, merchant_id, store_id, body.shopify_order_id, employee_id, credential_resolver)
+    return await _run(
+        sync_employee_shopify_order, merchant_id, store_id, body.expected_domain,
+        body.shopify_order_id, employee_id, credential_resolver,
+    )
 
 
 @router.get(_ORDER_PATH + "/{shopify_order_id}")

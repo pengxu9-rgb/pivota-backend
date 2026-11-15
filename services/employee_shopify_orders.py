@@ -327,6 +327,7 @@ async def list_employee_shopify_orders(merchant_id: str, store_id: str, offset: 
 async def sync_employee_shopify_order(
     merchant_id: str,
     store_id: str,
+    expected_domain: str,
     order_id: str,
     actor_employee_id: str,
     credential_resolver: ShopifyOrderCredentialResolver,
@@ -334,6 +335,8 @@ async def sync_employee_shopify_order(
     if not _enabled("EMPLOYEE_SHOPIFY_ORDER_SYNC_ENABLED"):
         raise ShopifyOrderError("SHOPIFY_ORDER_SYNC_DISABLED", 409)
     store, domain = await _shopify_store(merchant_id, store_id)
+    if domain != expected_domain:
+        raise ShopifyOrderError("SHOPIFY_STORE_CHANGED", 409)
     if not _sync_allowed(merchant_id, store_id, domain):
         raise ShopifyOrderError("SHOPIFY_ORDER_SYNC_STORE_UNAVAILABLE", 409)
     raw_credentials = await credential_resolver(store)

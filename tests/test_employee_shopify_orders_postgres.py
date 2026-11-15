@@ -163,7 +163,8 @@ async def _exercise_employee_orders(database, monkeypatch):
     )
 
     primary, secondary = _store_path(PRIMARY), _store_path(SECONDARY)
-    body = {"shopify_order_id": ORDER_ID}
+    body = {"shopify_order_id": ORDER_ID, "expected_domain": SECONDARY_DOMAIN}
+    primary_body = {**body, "expected_domain": PRIMARY_DOMAIN}
     async with async_client(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
         monkeypatch.delenv("EMPLOYEE_SHOPIFY_ORDERS_ENABLED", raising=False)
         monkeypatch.delenv("EMPLOYEE_SHOPIFY_ORDER_SYNC_ENABLED", raising=False)
@@ -218,11 +219,29 @@ async def _exercise_employee_orders(database, monkeypatch):
         permissions = ["mcp.orders.sync"]
         assert (await client.get(secondary)).json()["can_sync"] is True
         assert (await client.get(primary)).json()["can_sync"] is False
-        assert (await client.post(f"{primary}/sync", json=body)).json() == {"detail": "SHOPIFY_ORDER_SYNC_STORE_UNAVAILABLE"}
-        assert (await client.post(f"{secondary}/sync", json={"shopify_order_id": 18996744552814})).status_code == 422
-        assert (await client.post(f"{secondary}/sync", json={"shopify_order_id": "#1001"})).status_code == 422
+        assert (await client.post(f"{primary}/sync", json=primary_body)).json() == {"detail": "SHOPIFY_ORDER_SYNC_STORE_UNAVAILABLE"}
+        assert (await client.post(f"{secondary}/sync", json={**body, "shopify_order_id": 18996744552814})).status_code == 422
+        assert (await client.post(f"{secondary}/sync", json={**body, "shopify_order_id": "#1001"})).status_code == 422
+        assert (await client.post(f"{secondary}/sync", json={"shopify_order_id": ORDER_ID})).status_code == 422
+        assert (await client.post(f"{secondary}/sync", json={**body, "expected_domain": f"https://{SECONDARY_DOMAIN}"})).status_code == 422
         assert (await client.get(f"{_store_path(SECONDARY, 'other')}/{ORDER_ID}")).status_code == 404
         assert not upstream_calls and not credential_calls
+
+        # Both bindings are authorized, but the employee selected the previous domain.
+        monkeypatch.setenv(ALLOWLIST, json.dumps([_binding(SECONDARY, SECONDARY_DOMAIN), _binding(SECONDARY, PRIMARY_DOMAIN)]))
+        await database.execute(
+            "UPDATE merchant_stores SET domain = :domain WHERE store_id = :store",
+            {"domain": PRIMARY_DOMAIN, "store": SECONDARY},
+        )
+        changed = await client.post(f"{secondary}/sync", json=body)
+        assert changed.status_code == 409 and changed.json() == {"detail": "SHOPIFY_STORE_CHANGED"}
+        assert not upstream_calls and not credential_calls
+        assert await database.fetch_val("SELECT count(*) FROM employee_shopify_orders") == 0
+        await database.execute(
+            "UPDATE merchant_stores SET domain = :domain WHERE store_id = :store",
+            {"domain": SECONDARY_DOMAIN, "store": SECONDARY},
+        )
+        monkeypatch.setenv(ALLOWLIST, json.dumps([_binding(SECONDARY, SECONDARY_DOMAIN)]))
 
         for mode, status, detail in (
             ("redirect", 502, "SHOPIFY_ORDER_PROVIDER_UNAVAILABLE"),
@@ -262,7 +281,7 @@ async def _exercise_employee_orders(database, monkeypatch):
         assert stale.status_code == 200 and stale.json()["order"]["shopify_updated_at"] == order["shopify_updated_at"]
 
         monkeypatch.setenv(ALLOWLIST, json.dumps([_binding(PRIMARY, PRIMARY_DOMAIN), _binding(SECONDARY, SECONDARY_DOMAIN)]))
-        assert (await client.post(f"{primary}/sync", json=body)).status_code == 200
+        assert (await client.post(f"{primary}/sync", json=primary_body)).status_code == 200
         primary_order = (await client.get(f"{primary}/{ORDER_ID}")).json()["order"]
         assert primary_order["domain"] == PRIMARY_DOMAIN and primary_order["line_items"][0]["title"] == "Primary line"
         assert (await client.get(f"{secondary}/{ORDER_ID}")).json()["order"]["line_items"][0]["title"] == "Demo 2 line"
