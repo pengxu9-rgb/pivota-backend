@@ -1,11 +1,12 @@
 """Reviewed US retailer listings and their native shade identities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 
 
 PILOT_FLAG = "SURRATT_EXACT_RETAILER_SHADES_ENABLED"
 KIOKII_FLAG = "MEITU_US_KIOKII_EXACT_ENABLED"
+KIOKII_EXPANSION_FLAG = "KIOKII_US_RETAILER_EXPANSION_ENABLED"
 PROOF_KEY = "exact_retailer_shade_v1"
 CANONICAL_MERCHANT_ID = "merch_obs_30f9ce3e44b7fcb4"
 CANONICAL_PRODUCT_KEY = "::".join(
@@ -66,6 +67,15 @@ SURRATT_RETAILER_COHORT = ExactRetailerCohort(
     PILOT_FLAG, CANONICAL_PRODUCT_KEY, CANONICAL_MERCHANT_ID, CANONICAL_GROUP_ID, CANONICAL_CONTENT_KEY, RETAILERS,
 )
 
+_KIOKII_INITIAL_VARIANTS = {
+    "51629126123840": ("52547428942138", "08800299133494"),
+    "51896079974720": ("52547429007674", "08800299133517"),
+}
+KIOKII_INITIAL_OFFER_IDS = frozenset({
+    "offer:catalog_enrichment_agent_v1:fc5ef310e498e089",
+    "offer:catalog_enrichment_agent_v1:ef54321432063313",
+})
+
 KIOKII_RETAILER_COHORT = ExactRetailerCohort(
     flag=KIOKII_FLAG,
     canonical_product_key="::".join(
@@ -80,12 +90,19 @@ KIOKII_RETAILER_COHORT = ExactRetailerCohort(
             "kiokii.com",
             "10073908707648",
             {
-                "51629126123840": ("52547428942138", "08800299133494"),
-                "51896079974720": ("52547429007674", "08800299133517"),
+                **_KIOKII_INITIAL_VARIANTS,
+                "51629126189376": ("52547428909370", "08800299133487"),
+                "51629126222144": ("52547428974906", "08800299133500"),
+                "51629126156608": ("52547429040442", "08800299133524"),
+                "51896079876416": ("52547429073210", "08800299133531"),
             },
             product_path="/en-us/products/amuse-banana-lip-oil-4-5ml",
         ),
     },
+)
+_kiokii_key, _kiokii_listing = next(iter(KIOKII_RETAILER_COHORT.listings.items()))
+KIOKII_INITIAL_RETAILER_COHORT = replace(
+    KIOKII_RETAILER_COHORT, listings={_kiokii_key: replace(_kiokii_listing, variants=_KIOKII_INITIAL_VARIANTS)},
 )
 
 EXACT_RETAILER_LISTINGS = {**RETAILERS, **KIOKII_RETAILER_COHORT.listings}
