@@ -30,14 +30,17 @@ Keep completed review directories under the same history root across runs. For a
 ```sh
 python -m scripts.ops.meitu_discovery.review_input "$run/queries.jsonl" \
   --run-dir "$review_run" --history-root "$review_runs"
-python -m scripts.ops.meitu_discovery.review_cloud launch "$review_run"
-python -m scripts.ops.meitu_discovery.review_cloud collect "$review_run"
+jq -r '.runs[]' "$review_run/review-plan.json"
 ```
 
-Each sample binds one Meitu relationship, one merchant listing, and up to four exact native variant quotes. Price, stock, title, GTIN, SKU, merchant, market evidence, or relationship changes produce a fresh sample. Completed results are reused only after the planner revalidates their Cloud execution, input digest, submitted sample, and completed model rounds. A pre-policy archive or an expired log contributes no reuse evidence. Two independently successful model rounds are required, with arbitration only when they disagree. A zero-count review input means the planner found no further eligible samples for that receipt.
+For each listed path, run `python -m scripts.ops.meitu_discovery.review_cloud launch PATH` and then `collect PATH` once the execution finishes. The planner splits large inputs within the worker and Cloud Run argument limits. A plan with zero pending samples needs no execution.
+
+Each sample binds one Meitu relationship, one merchant listing, and up to four exact native variant quotes. Price, stock, title, GTIN, SKU, merchant, market evidence, or relationship changes produce a fresh sample. Completed results are reused only after the planner revalidates their Cloud execution, input digest, submitted sample, and completed model rounds. An authenticated hold is counted in `held_samples`. The same evidence remains held, while incomplete samples can go into a new plan. A pre-policy archive or an expired log contributes no reuse evidence. Two independently successful model rounds are required, with arbitration only when they disagree.
+
+To retry byte-identical input after a confirmed failed execution or a run whose model reviews are all incomplete, put that input in a new run directory and use `review_cloud launch NEW_RUN --retry-from PRIOR_RUN`. The retry reuses one execution per confirmed predecessor. Pending or ambiguous execution responses remain pending until Cloud Run supplies an authoritative result.
 
 ## Reconcile discovery and the handoff
 
 Build a fresh retailer source manifest and optional intake ledger with `python -m scripts.ops.meitu_discovery.sources --evidence-dir DIRECTORY --output MANIFEST --intake-ledger LEDGER`. The directory contains the existing tracker, original research, expansion, retailer, Olive Young and baseline files consumed by the builder. Keep original, alternative, dupe, historical and channel associations as evidence.
 
-Use `python -m scripts.ops.meitu_discovery.coverage --help` to reconcile the new intake, official query receipts, and older capture manifest with its bound receipts. Use `python -m scripts.ops.meitu_discovery.handoff --coverage --audit AUDIT --cohort COHORT` to account for all audited quote keys against an already prepared cohort. The next-page suggestion is a read-only review queue. The original cohort file remains the input for any separately reviewed apply.
+Use `python -m scripts.ops.meitu_discovery.coverage --help` to reconcile the new intake, official query receipts, and older capture manifest with its bound receipts. Use `python -m scripts.ops.meitu_discovery.handoff --coverage --audit AUDIT --cohort COHORT` to account for all audited quote keys against an already prepared cohort. An optional `--conflicts` file records separately reviewed reasons as a JSON list of `{"quote_key":["https://seller.example/products/item","1234"],"review_required":"distinct_native_gtin"}`. The next-page suggestion is a read-only review queue. The original cohort file remains the input for any separately reviewed apply.

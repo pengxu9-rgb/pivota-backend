@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from uuid import uuid4
 import zlib
 
 from . import model_worker as worker
@@ -24,6 +25,7 @@ DIGEST_NAME = "review-input.sha256"
 EXECUTION_NAME = "review-execution.json"
 SUMMARY_NAME = "review-summary.json"
 INTENT_NAME = ".review-launch-intent.json"
+OWNER_LABEL = "meitu-review-owner"
 
 
 class ReviewPending(RuntimeError):
@@ -34,37 +36,48 @@ class UnsupportedReviewWorker(RuntimeError):
     """The preserved execution used a different source review worker."""
 
 
-def _gcloud(*args, regional=True, missing_job=None):
+class ReviewFailed(ValueError):
+    """The exact review execution is authenticated and terminally failed."""
+
+
+def _missing_resource(stderr, name):
+    detail = stderr.casefold()
+    return (name in detail
+            and not re.search(r"\b403\b|permission|unauthenticated|access denied", detail)
+            and bool(re.search(r"not[_ ]found|cannot find (?:the )?(?:job|execution)|does not exist|could not find", detail)))
+
+
+def _gcloud(*args, regional=True, missing_resource=None, expect_json=True):
     flags = [f"--project={worker.PROJECT}", "--format=json"]
     if regional:
         flags.append(f"--region={REGION}")
     run = subprocess.run(["gcloud", *args, *flags], capture_output=True, text=True, timeout=90, check=False)
     if run.returncode:
-        detail = run.stderr.casefold()
-        if (missing_job and missing_job in detail and
-                re.search(r"not found|cannot find (?:the )?job|does not exist|could not find", detail)):
+        if missing_resource and _missing_resource(run.stderr, missing_resource):
             return None
         raise RuntimeError(f"gcloud {' '.join(args[:3])} failed with exit code {run.returncode}")
-    return json.loads(run.stdout)
+    return json.loads(run.stdout) if expect_json else None
 
 
 def _packed(data):
     return b64encode(zlib.compress(data, level=9)).decode("ascii")
 
 
-def _render_program(source, payload):
+def _render_program(source, payload, previous=None):
+    predecessor = f"PREVIOUS={previous!r};" if previous else ""
     return (
         "import base64,zlib;"
         f"SOURCE={source!r};"
         f"INPUT={payload!r};"
+        f"{predecessor}"
         "scope={'__name__':'review_model_worker'};"
         "exec(compile(zlib.decompress(base64.b64decode(SOURCE)),'review_model_worker.py','exec'),scope);"
         "scope['run_cloud'](zlib.decompress(base64.b64decode(INPUT)))"
     )
 
 
-def _program(raw):
-    program = _render_program(_packed(Path(worker.__file__).read_bytes()), _packed(raw))
+def _program(raw, previous=None):
+    program = _render_program(_packed(Path(worker.__file__).read_bytes()), _packed(raw), previous)
     worker.require(len(program) < 30_000, "review input exceeds the inline job limit; split the input")
     return program
 
@@ -111,22 +124,25 @@ def _unpack(data, limit):
 
 
 def _embedded_input(program, input_sha256):
-    match = re.match(r"import base64,zlib;SOURCE='([A-Za-z0-9+/=]+)';INPUT='([A-Za-z0-9+/=]+)';", program)
+    match = re.match(r"import base64,zlib;SOURCE='([A-Za-z0-9+/=]+)';INPUT='([A-Za-z0-9+/=]+)';"
+                     r"(?:PREVIOUS='([a-z0-9-]+)';)?", program)
     if match is None:
         raise UnsupportedReviewWorker("unrecognized review executable")
     worker.require(len(program) < 30_000, "review executable exceeds its limit")
-    source, payload = match.groups()
+    source, payload, previous = match.groups()
+    if previous:
+        _check_names(previous.rsplit("-", 1)[0], previous)
     expected_worker = Path(worker.__file__).read_bytes()
     raw = _unpack(payload, worker.MAX_INPUT_BYTES)
     worker.require(sha256(raw).hexdigest() == input_sha256, "review executable input differs from the pinned digest")
     if _unpack(source, 100_000) != expected_worker:
         raise UnsupportedReviewWorker("review executable used a different worker revision")
-    worker.require(_render_program(source, payload) == program, "unexpected commands in the review executable")
+    worker.require(_render_program(source, payload, previous) == program, "unexpected commands in the review executable")
     return raw
 
 
 def _check_execution(detail, job, execution):
-    worker.require(detail.get("kind") == "Execution", "expected a Cloud Run execution")
+    worker.require(isinstance(detail, dict) and detail.get("kind") == "Execution", "expected a Cloud Run execution")
     metadata = detail["metadata"]
     _check_metadata(metadata, execution)
     worker.require(metadata["labels"].get("run.googleapis.com/job") == job, "execution belongs to another job")
@@ -136,22 +152,25 @@ def _check_execution(detail, job, execution):
     return program
 
 
-def _check_completed(detail, job, execution, input_sha256):
-    program = _check_execution(detail, job, execution)
+def _check_succeeded(detail, execution):
     status = detail.get("status", {})
     condition = [entry["status"] for entry in status.get("conditions", []) if entry.get("type") == "Completed"]
     if condition in ([], ["Unknown"]):
         raise ReviewPending(f"review execution {execution} is still running")
+    if condition == ["False"] and not status.get("runningCount") and not status.get("succeededCount") and (
+        status.get("failedCount") == 1 or status.get("cancelledCount") == 1
+    ):
+        raise ReviewFailed(f"review execution {execution} terminally failed")
     worker.require(condition == ["True"] and status.get("succeededCount") == 1
                    and not status.get("failedCount") and not status.get("cancelledCount"),
                    "review Cloud Run execution did not succeed")
-    return _embedded_input(program, input_sha256)
 
 
 def _check_receipt(payload, raw, input_sha256):
     packets = worker.review_packets(raw)
     worker.require(
-        (payload.get("scope"), payload.get("market"), payload.get("review_policy"), payload.get("review_input_sha256"))
+        isinstance(payload, dict)
+        and (payload.get("scope"), payload.get("market"), payload.get("review_policy"), payload.get("review_input_sha256"))
         == (worker.SCOPE, "US", worker.REVIEW_POLICY, input_sha256)
         and type(payload.get("candidate_count")) is int and payload["candidate_count"] == len(packets)
         and all(type(payload.get(key)) is int and payload[key] == 0 for key in worker.ZERO_WRITES),
@@ -163,14 +182,18 @@ def _check_receipt(payload, raw, input_sha256):
     reviews = payload.get("reviews")
     worker.require(isinstance(reviews, list) and len(reviews) == len(expected), "review receipt has incomplete results")
     for row in reviews:
+        worker.require(isinstance(row, dict) and isinstance(row.get("candidate_id"), str),
+                       "invalid review candidate receipt")
         item = row["candidate_id"]
         worker.require(item not in observed, "review receipt repeats a candidate")
         observed[item] = (row.get("url"), row.get("model_sample_variant_ids"))
         models = row.get("models")
         worker.require(isinstance(models, list) and len(models) <= len(worker.STAGES), "invalid model receipt count")
         for model in models:
+            worker.require(isinstance(model, dict), "invalid model receipt")
             stage = model.get("stage")
-            worker.require(stage in worker.STAGES and model.get("model") == worker.STAGES[stage][0]
+            worker.require(isinstance(stage, str) and stage in worker.STAGES
+                           and model.get("model") == worker.STAGES[stage][0]
                            and model.get("decision") in worker.DECISIONS
                            and worker._clean_text(model.get("response_id"), 256), "wrong review model or response")
         worker.require(row.get("disposition") == worker.disposition(models), "review disposition does not match decisions")
@@ -181,11 +204,18 @@ def read_completed_review(job: str, execution: str, input_sha256: str) -> dict |
     """Revalidate the exact successful Cloud execution without trusting a local receipt."""
     _check_names(job, execution)
     worker.require(worker._identifier(input_sha256, r"[a-f0-9]{64}"), "invalid review input digest")
-    detail = _gcloud("run", "jobs", "executions", "describe", execution)
+    detail = _gcloud("run", "jobs", "executions", "describe", execution, missing_resource=execution)
+    if detail is None:
+        return None
     try:
-        raw = _check_completed(detail, job, execution, input_sha256)
+        raw = _embedded_input(_check_execution(detail, job, execution), input_sha256)
+        _check_succeeded(detail, execution)
     except (ReviewPending, UnsupportedReviewWorker):
         return None
+    return _read_authoritative_log(job, execution, input_sha256, raw)
+
+
+def _read_authoritative_log(job, execution, input_sha256, raw):
     log_filter = (
         f'resource.type="cloud_run_job" AND resource.labels.project_id="{worker.PROJECT}" '
         f'AND resource.labels.location="{REGION}" AND resource.labels.job_name="{job}" '
@@ -197,7 +227,7 @@ def read_completed_review(job: str, execution: str, input_sha256: str) -> dict |
         return None
     worker.require(isinstance(logs, list) and len(logs) == 1, "expected a single authoritative review log")
     record = logs[0]
-    worker.require(record.get("logName") == LOG_NAME and record.get("resource") == {
+    worker.require(isinstance(record, dict) and record.get("logName") == LOG_NAME and record.get("resource") == {
         "type": "cloud_run_job", "labels": {"project_id": worker.PROJECT, "location": REGION, "job_name": job},
     } and all(record.get("labels", {}).get(f"run.googleapis.com/{key}") == value for key, value in (
         ("execution_name", execution), ("task_index", "0"), ("task_attempt", "0"),
@@ -221,13 +251,18 @@ def _json_bytes(data):
 
 def _read_input(run_dir):
     raw = (run_dir / INPUT_NAME).read_bytes()
-    return raw, sha256(raw).hexdigest(), len(worker.review_packets(raw))
+    digest = sha256(raw).hexdigest()
+    marker = run_dir / DIGEST_NAME
+    if marker.exists():
+        worker.require(marker.read_text().strip() == digest, "review input was modified after launch")
+    return raw, digest, len(worker.review_packets(raw))
 
 
 def _read_launch(run_dir, input_sha256):
     worker.require((run_dir / DIGEST_NAME).read_text().strip() == input_sha256, "review input was modified after launch")
     launch = json.loads((run_dir / EXECUTION_NAME).read_bytes())
-    worker.require(launch.get("review_input_sha256") == input_sha256, "launch belongs to another review input")
+    worker.require(isinstance(launch, dict) and launch.get("review_input_sha256") == input_sha256,
+                   "launch belongs to another review input")
     _check_names(launch["job"], launch["execution"])
     return launch
 
@@ -244,17 +279,36 @@ def _existing_execution(job, digest):
     return execution
 
 
-def _write_intent(path, job, digest, state):
+def _write_intent(path, job, digest, owner, state):
     temp = path.with_name(path.name + ".tmp")
-    temp.write_bytes(_json_bytes({"job": job, "review_input_sha256": digest, "state": state}))
+    temp.write_bytes(_json_bytes({"job": job, "review_input_sha256": digest, "owner": owner, "state": state}))
     temp.replace(path)
 
 
-def launch(run_dir):
+def _retry_predecessor(run_dir, retry_from, digest):
+    worker.require(run_dir.resolve() != retry_from.resolve(), "retry needs a new review run directory")
+    archive = _read_launch(retry_from, digest)
+    job, execution = archive["job"], archive["execution"]
+    detail = _gcloud("run", "jobs", "executions", "describe", execution)
+    raw = _embedded_input(_check_execution(detail, job, execution), digest)
+    try:
+        _check_succeeded(detail, execution)
+    except ReviewFailed:
+        return execution
+    summary = _read_authoritative_log(job, execution, digest, raw)
+    if summary is None:
+        raise ReviewPending(f"verified review receipt for {execution} is unavailable")
+    worker.require(all(row["disposition"] == worker.INCOMPLETE for row in summary["reviews"]),
+                   "exact-input retry requires every model decision to be incomplete")
+    return execution
+
+
+def launch(run_dir, retry_from=None):
     raw, digest, count = _read_input(run_dir)
     if not count:
         return {"candidate_count": 0, "review_input_sha256": digest}
-    program = _program(raw)
+    previous = _retry_predecessor(run_dir, retry_from, digest) if retry_from is not None else None
+    program = _program(raw, previous)
     job = _job_name(program)
     if (run_dir / EXECUTION_NAME).exists():
         archive = _read_launch(run_dir, digest)
@@ -273,30 +327,39 @@ def launch(run_dir):
         _archive_once(run_dir / DIGEST_NAME, (digest + "\n").encode())
         intent_path = run_dir / INTENT_NAME
         intent = json.loads(intent_path.read_bytes()) if intent_path.exists() else None
-        if intent:
-            worker.require(intent.get("job") == job and intent.get("review_input_sha256") == digest
-                           and intent.get("state") in {"ready_to_submit", "submission_pending"},
+        if intent is not None:
+            worker.require(isinstance(intent, dict) and intent.get("job") == job and intent.get("review_input_sha256") == digest
+                           and worker._identifier(intent.get("owner"), r"[a-f0-9]{32}")
+                           and intent.get("state") in {"creating_job", "submission_pending"},
                            "launch intent belongs to another immutable review")
-        resource = _gcloud("run", "jobs", "describe", job, missing_job=job)
+        resource = _gcloud("run", "jobs", "describe", job, missing_resource=job)
         if resource is None:
-            worker.require(intent is None, "review job disappeared after launch intent")
-            _gcloud("run", "jobs", "create", job, f"--image={IMAGE}",
-                    f"--service-account={worker.ACCOUNT}", "--tasks=1", "--parallelism=1",
-                    f"--task-timeout={RUN_TIMEOUT}s", "--max-retries=0", "--command=python",
-                    f"--args=^|^-c|{program}", "--quiet")
-            _write_intent(intent_path, job, digest, "ready_to_submit")
-            intent = {"state": "ready_to_submit"}
-            resource = _gcloud("run", "jobs", "describe", job)
-        worker.require(resource.get("kind") == "Job", "expected a Cloud Run review job")
+            if intent is None:
+                intent = {"owner": uuid4().hex, "state": "creating_job"}
+                _write_intent(intent_path, job, digest, intent["owner"], intent["state"])
+            worker.require(intent["state"] == "creating_job", "review job disappeared after submission intent")
+            try:
+                _gcloud("run", "jobs", "create", job, f"--image={IMAGE}",
+                        f"--service-account={worker.ACCOUNT}", "--tasks=1", "--parallelism=1",
+                        f"--task-timeout={RUN_TIMEOUT}s", "--max-retries=0", "--command=python",
+                        f"--labels={OWNER_LABEL}={intent['owner']}",
+                        f"--args=^|^-c|{program}", "--quiet", expect_json=False)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                raise ReviewPending(f"creation of review job {job} is unresolved; rerun launch to reconcile") from None
+            resource = _gcloud("run", "jobs", "describe", job, missing_resource=job)
+            if resource is None:
+                raise ReviewPending(f"review job {job} is not yet visible")
+        worker.require(isinstance(resource, dict) and resource.get("kind") == "Job", "expected a Cloud Run review job")
         _check_metadata(resource["metadata"], job)
         spec = resource["spec"]["template"]["spec"]
         worker.require(_check_template(spec, spec["template"]["spec"]) == program,
                        "existing review job does not match the immutable input")
         execution = _existing_execution(job, digest)
         if execution is None:
-            if not intent or intent["state"] != "ready_to_submit":
+            owner = resource["metadata"]["labels"].get(OWNER_LABEL)
+            if not intent or intent["state"] != "creating_job" or owner != intent["owner"]:
                 raise ReviewPending(f"review job {job} has no visible execution; submission remains unresolved")
-            _write_intent(intent_path, job, digest, "submission_pending")
+            _write_intent(intent_path, job, digest, intent["owner"], "submission_pending")
             try:
                 result = _gcloud("run", "jobs", "execute", job, "--async", "--quiet")
                 execution = result["metadata"]["name"]
@@ -326,9 +389,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("launch", "collect"))
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--retry-from", type=Path, help="prior terminal run directory with identical review input")
     args = parser.parse_args()
+    if args.retry_from is not None and args.mode != "launch":
+        parser.error("--retry-from is only valid with launch")
     try:
-        result = (launch if args.mode == "launch" else collect)(args.run_dir)
+        result = launch(args.run_dir, args.retry_from) if args.mode == "launch" else collect(args.run_dir)
     except ReviewPending as error:
         print(error, file=sys.stderr)
         return 3

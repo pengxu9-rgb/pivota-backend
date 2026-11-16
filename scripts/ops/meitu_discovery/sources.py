@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .scan import LOCALE, US_LOCALES
+
 
 NAMES = (
     'meitu_tracker_data.json', 'meitu_data.json', 'expansion_data.json',
@@ -39,14 +41,18 @@ def load_evidence(directory):
 def eligible_url(raw):
     if not isinstance(raw, str) or not raw:
         return None
-    url = urlsplit(raw)
+    try:
+        url = urlsplit(raw)
+    except ValueError:
+        return None
     host = url.hostname or ''
     bare = host.removeprefix('www.')
+    locale = LOCALE.match(url.path)
     product_path = PRODUCT_MARKERS.search(url.path) or url.path in VERIFIED_ROOT_PRODUCTS.get(bare, ())
     if (url.scheme != 'https' or url.netloc != host or not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', host)
             or bare in HISTORICAL_OR_UNVERIFIED or host == 'es-it1.cvs.com'
             or not product_path
-            or url.path.startswith(('/en-ca/', '/fr-ca/', '/en-gb/', '/en-au/'))):
+            or (locale and locale[1].casefold() not in US_LOCALES)):
         return None
     path = url.path.removesuffix('.js')
     query = sorted((key, val) for key, val in parse_qsl(url.query)
@@ -69,8 +75,10 @@ def build(evidence_directory, intake=None):
                for row in tracker['lines']}
     shopify = set(SHOPIFY_EVIDENCE)
     shopify.update(row[1] for row in tracker['channels'] if row[0] == 'US' and row[12] == 'Shopify')
-    shopify.update(urlsplit(row['pdp']).hostname for row in pilot['channels']
-                   if row.get('market') == 'US' and 'Shopify' in row.get('stock', ''))
+    shopify.update(
+        urlsplit(url).hostname for row in pilot['channels']
+        if row.get('market') == 'US' and 'Shopify' in row.get('stock', '') and (url := eligible_url(row.get('pdp')))
+    )
     shopify = {name.removeprefix('www.') for name in shopify}
     rows = {}
 

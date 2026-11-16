@@ -4,8 +4,10 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
 
 from .capture import _gtin
@@ -101,7 +103,7 @@ def sample_key(row):
                              "association": context, "evidence": sample}))
 
 
-def reuse_from_completion(input_bytes, result):
+def completion_decisions(input_bytes, result):
     rows = json.loads(input_bytes)
     if (result.get("scope"), result.get("market"), result.get("review_policy"),
             result.get("review_input_sha256"), result.get("candidate_count")) != (
@@ -116,7 +118,7 @@ def reuse_from_completion(input_bytes, result):
     if (not isinstance(reviews, list) or len(by_id) != len(rows) or len(reviews) != len(rows)
             or {row["candidate_id"] for row in reviews} != set(by_id)):
         raise ValueError("review completion does not cover the submitted sample IDs")
-    covered = set()
+    covered, held = set(), set()
     for result_row in reviews:
         row = by_id[result_row["candidate_id"]]
         if (result_row["url"] != row["tracked_source"]["url"]
@@ -127,21 +129,34 @@ def reuse_from_completion(input_bytes, result):
             raise ValueError("review sample identity is inconsistent")
         if result_row.get("disposition") == READY and reviewed_successfully(result_row.get("models")):
             covered.add(key)
-    return covered
+        elif result_row.get("disposition") == "held_for_source_or_mapping_review":
+            held.add(key)
+    return covered, held
+
+
+def reuse_from_completion(input_bytes, result):
+    covered, held = completion_decisions(input_bytes, result)
+    return covered - held
 
 
 def load_history(root, verify, exclude=None):
     """Re-query completed Cloud executions. Local files provide only locators and input bytes."""
     if not root.is_dir():
         raise ValueError("review history root must be a directory")
-    archives = sorted(path for path in root.iterdir() if path.is_dir() and path.resolve() != exclude
-                      and (path / "review-summary.json").is_file()
-                      and (path / "review-input.sha256").is_file() and (path / "review-execution.json").is_file())
+    runs = [path for path in root.iterdir() if path.is_dir()]
+    partitions = [part for run in runs for part in run.glob("part-*") if part.is_dir()]
+    archives = []
+    for path in sorted([*runs, *partitions]):
+        resolved = path.resolve()
+        if (resolved == exclude or exclude in resolved.parents
+                or not all((path / name).is_file() for name in ("review-summary.json", "review-input.sha256", "review-execution.json"))):
+            continue
+        archives.append(path)
 
     def load(path):
         locator = json.loads((path / "review-execution.json").read_bytes())
         if not {"job", "execution", "review_input_sha256"} <= locator.keys():
-            return set()
+            return set(), set()
         data = (path / "review-input.json").read_bytes()
         input_sha = (path / "review-input.sha256").read_text().strip()
         execution = locator["execution"]
@@ -150,19 +165,24 @@ def load_history(root, verify, exclude=None):
             raise ValueError(f"invalid archived review locator in {path.name}")
         result = verify(match[1], execution, input_sha)
         if result is None:
-            return set()
-        return reuse_from_completion(data, result)
+            return set(), set()
+        return completion_decisions(data, result)
 
+    covered, held = set(), set()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        return set().union(*pool.map(load, archives))
+        for approved, blocked in pool.map(load, archives):
+            covered.update(approved)
+            held.update(blocked)
+    return covered - held, held
 
 
-def plan(queries, covered=()):
+def plan(queries, covered=(), held=()):
     if (not queries or len({row.get("batch_id") for row in queries}) != 1
             or not queries[0].get("batch_id") or len({row["meitu_line"] for row in queries}) != len(queries)):
         raise ValueError("expected one batch of unique Meitu query receipts")
     covered = set(covered)
-    pending, reused = {}, set()
+    held = set(held)
+    pending, reused, blocked = {}, set(), set()
     for query in queries:
         if (query.get("scope"), query.get("market")) != ("meitu_official_rediscovery_query", "US"):
             raise ValueError("expected only US official rediscovery receipts")
@@ -182,12 +202,46 @@ def plan(queries, covered=()):
                           "associations": [association]}
                 row = {"tracked_source": source, "evidence": {**evidence, "variants": variants[start:start + SAMPLE_SIZE]}}
                 key = sample_key(row)
+                if key in held:
+                    blocked.add(key)
+                    continue
                 if key in covered:
                     reused.add(key)
                     continue
                 source["item_id"] = f"pdp-{key[:24]}"
                 pending.setdefault(key, row)
-    return [pending[key] for key in sorted(pending)], len(reused)
+    return [pending[key] for key in sorted(pending)], len(reused), len(blocked)
+
+
+def partition(rows, max_rows, fits):
+    if not rows:
+        return [canonical([]) + b"\n"]
+    payloads, offset = [], 0
+    while offset < len(rows):
+        limit = min(max_rows, len(rows) - offset)
+        while limit:
+            payload = canonical(rows[offset:offset + limit]) + b"\n"
+            if fits(payload):
+                break
+            limit //= 2
+        if not limit:
+            raise ValueError("one source-review sample exceeds the worker input limit")
+        payloads.append(payload)
+        offset += limit
+    return payloads
+
+
+def write_immutable(path, payload):
+    with NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        temporary.write(payload)
+    try:
+        try:
+            os.link(temporary.name, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise ValueError("review input already exists with different content; use a new run directory") from None
+    finally:
+        Path(temporary.name).unlink()
 
 
 def main():
@@ -198,19 +252,35 @@ def main():
     args = parser.parse_args()
     root = args.history_root or args.run_dir.parent
     queries = [json.loads(line) for line in args.queries.read_text().splitlines() if line.strip()]
-    from .review_cloud import read_completed_review
+    from .model_worker import MAX_INPUT_BYTES, MAX_INPUT_ROWS
+    from .review_cloud import _program, read_completed_review
 
-    rows, reused = plan(queries, load_history(root, read_completed_review, exclude=args.run_dir.resolve()))
+    if not args.history_root:
+        root.mkdir(parents=True, exist_ok=True)
+
+    covered, held = load_history(root, read_completed_review, exclude=args.run_dir.resolve())
+    rows, reused, blocked = plan(queries, covered, held)
+
+    def fits(payload):
+        if len(payload) > MAX_INPUT_BYTES:
+            return False
+        try:
+            _program(payload)
+        except ValueError:
+            return False
+        return True
+
+    payloads = partition(rows, MAX_INPUT_ROWS, fits)
+    runs = [args.run_dir / f"part-{idx:03d}" for idx in range(1, len(payloads) + 1)] if len(payloads) > 1 else [args.run_dir]
     args.run_dir.mkdir(parents=True, exist_ok=True)
-    output = args.run_dir / "review-input.json"
-    payload = canonical(rows) + b"\n"
-    try:
-        with output.open("xb") as file:
-            file.write(payload)
-    except FileExistsError:
-        if output.read_bytes() != payload:
-            raise SystemExit("review input already exists with different content; use a new run directory") from None
-    print(json.dumps({"pending_samples": len(rows), "reused_samples": reused}))
+    manifest = {"pending_samples": len(rows), "reused_samples": reused, "held_samples": blocked,
+                "runs": [str(run) for run in runs],
+                "input_sha256": [digest(payload) for payload in payloads]}
+    write_immutable(args.run_dir / "review-plan.json", canonical(manifest) + b"\n")
+    for run, payload in zip(runs, payloads, strict=True):
+        run.mkdir(parents=True, exist_ok=True)
+        write_immutable(run / "review-input.json", payload)
+    print(json.dumps(manifest))
 
 
 if __name__ == "__main__":

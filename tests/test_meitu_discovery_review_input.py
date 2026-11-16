@@ -35,8 +35,8 @@ def completion(rows, data):
 
 
 def test_samples_are_disjoint_and_bound_to_one_meitu_association():
-    rows, reused = review.plan([query(), query(2)])
-    assert reused == 0
+    rows, reused, held = review.plan([query(), query(2)])
+    assert reused == held == 0
     assert sorted(len(row["evidence"]["variants"]) for row in rows) == [1, 1, 4, 4]
     assert len({row["tracked_source"]["item_id"] for row in rows}) == 4
     assert {row["tracked_source"]["associations"][0]["meitu_line"] for row in rows} == {1, 2}
@@ -44,7 +44,7 @@ def test_samples_are_disjoint_and_bound_to_one_meitu_association():
 
 
 def test_authenticated_history_reuses_only_exact_samples(tmp_path):
-    rows, _ = review.plan([query()])
+    rows, _, _ = review.plan([query()])
     data = review.canonical(rows) + b"\n"
     result = completion(rows, data)
     previous = tmp_path / "previous"
@@ -61,19 +61,65 @@ def test_authenticated_history_reuses_only_exact_samples(tmp_path):
         calls.append((job, execution, fingerprint))
         return result
 
-    covered = review.load_history(tmp_path, verify)
+    covered, held = review.load_history(tmp_path, verify)
+    assert not held
     assert calls == [(JOB, EXECUTION, review.digest(data))]
-    assert review.plan([query()], covered) == ([], 2)
+    assert review.plan([query()], covered) == ([], 2, 0)
     assert len(review.plan([query(2)], covered)[0]) == 2
     assert len(review.plan([query(amount=2600)], covered)[0]) == 2
     assert len(review.plan([query(relation="related_title_candidate")], covered)[0]) == 2
     assert len(review.plan([query(start=106)], covered)[0]) == 2
-    assert review.load_history(tmp_path, verify, exclude=previous.resolve()) == set()
-    assert review.load_history(tmp_path, lambda *_: None) == set()
+    assert review.load_history(tmp_path, verify, exclude=previous.resolve()) == (set(), set())
+    assert review.load_history(tmp_path, lambda *_: None) == (set(), set())
+
+
+def test_authoritative_hold_prevents_reuse_of_disputed_sample(tmp_path):
+    rows, _, _ = review.plan([query(count=1)])
+    data = review.canonical(rows) + b"\n"
+    approved = completion(rows, data)
+    held = completion(rows, data)
+    held["reviews"][0]["disposition"] = "held_for_source_or_mapping_review"
+    held["reviews"][0]["models"][0]["decision"] = "hold"
+    held["reviews"][0]["models"][1]["decision"] = "hold"
+    for suffix in ("accepted", "held"):
+        path = tmp_path / suffix
+        path.mkdir()
+        (path / "review-input.json").write_bytes(data)
+        (path / "review-input.sha256").write_text(review.digest(data))
+        (path / "review-summary.json").write_text("{}")
+        (path / "review-execution.json").write_text(json.dumps(
+            {"job": JOB, "execution": f"{JOB}-{suffix}", "review_input_sha256": review.digest(data)}))
+
+    covered, held_keys = review.load_history(tmp_path, lambda _, execution, __: held if execution.endswith("-held") else approved)
+    assert not covered
+    assert review.plan([query(count=1)], covered, held_keys) == ([], 0, 1)
+
+
+def test_mixed_terminal_run_reschedules_only_incomplete_sample():
+    queries = [query(count=5)]
+    rows, _, _ = review.plan(queries)
+    data = review.canonical(rows)
+    result = completion(rows, data)
+    result["reviews"][0]["disposition"] = "held_for_source_or_mapping_review"
+    result["reviews"][1]["disposition"] = "model_review_incomplete"
+    covered, held = review.completion_decisions(data, result)
+    assert not covered and len(held) == 1
+    assert review.plan(queries, covered, held) == ([rows[1]], 0, 1)
+
+
+def test_review_partitions_preserve_every_sample_and_worker_bounds():
+    rows, _, _ = review.plan([query(line, count=24) for line in range(1, 15)])
+    partitions = review.partition(rows, 80, lambda data: len(json.loads(data)) <= 30)
+    assert len(rows) == 84 and len(partitions) > 1
+    assert all(0 < len(json.loads(payload)) <= 30 for payload in partitions)
+    assert [row for payload in partitions for row in json.loads(payload)] == rows
+    assert review.partition([], 80, lambda _: False) == [b"[]\n"]
+    with pytest.raises(ValueError):
+        review.partition(rows, 80, lambda _: False)
 
 
 def test_tampered_input_market_samples_and_policy_fail_closed():
-    rows, _ = review.plan([query()])
+    rows, _, _ = review.plan([query()])
     data = review.canonical(rows) + b"\n"
     result = completion(rows, data)
     for changed in ({"market": "CA"}, {"review_policy": "legacy"}, {"offer_db_writes": 1}):
@@ -87,7 +133,7 @@ def test_tampered_input_market_samples_and_policy_fail_closed():
 
 
 def test_hold_missing_round_and_duplicate_response_do_not_authorize_reuse():
-    rows, _ = review.plan([query(count=1)])
+    rows, _, _ = review.plan([query(count=1)])
     data = review.canonical(rows)
     result = completion(rows, data)
     model_rounds = result["reviews"][0]["models"]
@@ -108,6 +154,6 @@ def test_without_identity_or_with_foreign_country_quote_is_not_planned():
     source = query()
     evidence = source["candidates"][0]["evidence"]
     evidence["identity_status"] = "handle_mismatch"
-    assert review.plan([source]) == ([], 0)
+    assert review.plan([source]) == ([], 0, 0)
     evidence.update(identity_status="verified", storefront_country_proof="CA")
-    assert review.plan([source]) == ([], 0)
+    assert review.plan([source]) == ([], 0, 0)

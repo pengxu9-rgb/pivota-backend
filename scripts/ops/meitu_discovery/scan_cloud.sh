@@ -3,6 +3,7 @@ set -euo pipefail
 
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 project=pivota-staging
+project_number=184498324954
 region=us-west1
 account="sa-meitu-evidence-v1@$project.iam.gserviceaccount.com"
 image=us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:f969a6d733cd31767a1f93ef7709130f3f1af158264f3d17f869a51ff56d23d6
@@ -70,10 +71,14 @@ if len(program) >= 30000 or '|' in program:
     raise SystemExit('inline job payload exceeds the launcher envelope')
 launch = {'job': job, 'batch_id': batch, 'source_sha256': digest(source),
           'capture_sha256': digest(capture),
-          'manifest_sha256': digest(payload), 'query_lines': lines}
+          'manifest_sha256': digest(payload), 'program_sha256': digest(program.encode()),
+          'query_lines': lines}
 path = run_dir / 'launch.json'
-if path.exists() and json.loads(path.read_bytes()) != launch:
-    raise SystemExit('run directory already describes a different discovery batch')
+if path.exists():
+    recorded = json.loads(path.read_bytes())
+    recorded.setdefault('program_sha256', launch['program_sha256'])
+    if recorded != launch:
+        raise SystemExit('run directory already describes a different discovery batch')
 path.write_text(json.dumps(launch, indent=2, sort_keys=True) + '\n')
 (run_dir / 'manifest.json').write_bytes(payload)
 print(program)
@@ -125,6 +130,82 @@ if [[ "$status" != True ]]; then
     exit 3
 fi
 
+python3 - "$run_dir" "$project" "$project_number" "$region" "$account" "$image" "$job" "$execution" <<'PY'
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+import zlib
+
+
+def require(condition, reason):
+    if not condition:
+        raise SystemExit(reason)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def pinned_program(spec, task):
+    require(spec.get('taskCount') == 1 and spec.get('parallelism') == 1
+            and task.get('serviceAccountName') == account and str(task.get('timeoutSeconds')) == '1800'
+            and task.get('maxRetries', 0) == 0 and not task.get('volumes'),
+            'scan execution settings differ from the staging pins')
+    containers = task.get('containers', [])
+    require(len(containers) == 1, 'expected one scan container')
+    container = containers[0]
+    require(container.get('image') == image and container.get('command') == ['python']
+            and container.get('env') == [{'name': 'GOOGLE_CLOUD_PROJECT', 'value': project}]
+            and not container.get('envFrom') and not container.get('volumeMounts'),
+            'scan container differs from the read-only image or configuration')
+    args = container.get('args', [])
+    require(len(args) == 2 and args[0] == '-c' and isinstance(args[1], str) and len(args[1]) < 30000,
+            'unexpected scan container command')
+    return args[1]
+
+
+def unpack(program, name):
+    # Read the known literal envelope without interpreting the command.
+    pattern = rf"(?:^|;){name}=zlib\.decompress\(base64\.b64decode\('([A-Za-z0-9+/=]+)'\)\);"
+    matches = re.findall(pattern, program)
+    require(len(matches) == 1, 'scan executable has an unexpected packed envelope')
+    decoder = zlib.decompressobj()
+    try:
+        raw = decoder.decompress(base64.b64decode(matches[0], validate=True), 1_000_001)
+    except (ValueError, zlib.error) as exc:
+        raise SystemExit('invalid packed scan input') from exc
+    require(len(raw) <= 1_000_000 and decoder.eof and not decoder.unused_data, 'invalid packed scan input')
+    return raw
+
+
+run_dir, project, namespace, region, account, image, job, execution = sys.argv[1:]
+path = Path(run_dir)
+launch = json.loads((path / 'launch.json').read_bytes())
+detail = json.loads((path / 'execution-status.json').read_bytes())
+metadata = detail.get('metadata', {})
+labels = metadata.get('labels', {})
+require(detail.get('kind') == 'Execution' and metadata.get('name') == execution
+        and str(metadata.get('namespace')) == namespace and labels.get('cloud.googleapis.com/location') == region
+        and labels.get('run.googleapis.com/job') == job == launch.get('job'),
+        'execution belongs to another Cloud Run job or namespace')
+spec = detail['spec']
+program = pinned_program(spec, spec['template']['spec'])
+if 'program_sha256' in launch:
+    require(digest(program.encode()) == launch['program_sha256'], 'executed program differs from the launch digest')
+else:
+    archived = json.loads((path / 'job.json').read_bytes())['spec']['template']['spec']
+    require(program == pinned_program(archived, archived['template']['spec']),
+            'executed program differs from the archived job')
+source, capture, manifest = (unpack(program, name) for name in ('source', 'capture', 'manifest'))
+require(digest(source) == launch.get('source_sha256') and digest(capture) == launch.get('capture_sha256')
+        and digest(manifest) == launch.get('manifest_sha256') and manifest == (path / 'manifest.json').read_bytes()
+        and job == 'meitu-us-official-rediscovery-' + digest(source + b'\0' + capture + b'\0' + manifest)[:12],
+        'executed source, capture, or manifest differs from the launch')
+PY
+
 filter="resource.type=\"cloud_run_job\" AND resource.labels.location=\"$region\" AND resource.labels.job_name=\"$job\" AND labels.\"run.googleapis.com/execution_name\"=\"$execution\""
 gcloud logging read "$filter" --project="$project" --freshness=7d --limit=2000 --format=json > "$run_dir/execution-logs.json"
 python3 - "$run_dir" <<'PY'
@@ -164,7 +245,7 @@ if len(lines) < len(launch['query_lines']) or not summaries:
 if lines != launch['query_lines'] or len(summaries) != 1:
     raise SystemExit('execution did not publish exactly one receipt per query and one summary')
 summary_row = summaries[0]
-if summary_row.get('query_count') != len(lines) or any(summary_row.get(field) != 0 for field in (
+if summary_row.get('market') != 'US' or summary_row.get('query_count') != len(lines) or any(summary_row.get(field) != 0 for field in (
     'commerce_index_writes', 'merchant_db_writes', 'offer_db_writes',
 )):
     raise SystemExit('summary does not confirm all launched queries and zero database writes')

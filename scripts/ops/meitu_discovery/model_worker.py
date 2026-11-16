@@ -57,26 +57,31 @@ def review_packets(raw):
     packets = []
     seen = set()
     for row in rows:
-        source = row["tracked_source"]
-        evidence = row["evidence"]
-        item = source["item_id"]
+        require(isinstance(row, dict) and all(isinstance(row.get(key), dict) for key in ("tracked_source", "evidence")),
+                "invalid review row")
+        source, evidence = row["tracked_source"], row["evidence"]
+        item = source.get("item_id")
         require(_identifier(item, r"pdp-[a-f0-9]{16,64}") and item not in seen, "invalid or repeated candidate ID")
         seen.add(item)
-        url = source["url"]
+        url = source.get("url")
+        require(_clean_text(url, 1200), "missing Shopify candidate URL")
         parts = urlsplit(url)
         require(parts.scheme == "https" and parts.netloc == parts.hostname == source.get("host")
                 and not parts.query and not parts.fragment
                 and _identifier(parts.path, r"/(?:(?:en|en-us|us|usa)/)?products/[a-zA-Z0-9][a-zA-Z0-9-]{0,219}")
                 and source.get("source_kind") == "shopify_ajax", "invalid Shopify candidate URL")
-        associates = source["associations"]
-        require(isinstance(associates, list) and len(associates) == 1, "expected one official association")
+        associates = source.get("associations")
+        require(isinstance(associates, list) and len(associates) == 1 and isinstance(associates[0], dict),
+                "expected one official association")
         association = associates[0]
         require(association.get("source") == "official_rediscovery"
-                and association.get("relation") in {"original_title_candidate", "related_title_candidate"}
+                and association.get("relation") in ("original_title_candidate", "related_title_candidate")
                 and type(association.get("meitu_line")) is int and association["meitu_line"] > 0
                 and all(_clean_text(association.get(key), 300)
                         for key in ("meitu_id", "meitu_brand", "anchor_product")), "invalid official association")
-        observed = urlsplit(evidence["source_url"])
+        observed_url = evidence.get("source_url")
+        require(_clean_text(observed_url, 1200), "missing source evidence URL")
+        observed = urlsplit(observed_url)
         require(evidence.get("status") == "shopify_us_quote_observed" and evidence.get("currency") == "USD"
                 and evidence.get("storefront_country_proof") in (None, "US")
                 and evidence.get("currency_proof") == "product_cart_currency_cookie"
@@ -92,6 +97,7 @@ def review_packets(raw):
         require(isinstance(variants, list) and 1 <= len(variants) <= MAX_VARIANTS, "invalid review variant count")
         ids = set()
         for variant in variants:
+            require(isinstance(variant, dict), "invalid source variant evidence")
             native = variant.get("variant_id")
             require(_identifier(native, r"[1-9][0-9]{0,23}") and native not in ids
                     and _gtin(variant.get("gtin")) and _clean_text(variant.get("sku"), 300)
