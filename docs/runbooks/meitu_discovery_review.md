@@ -1,0 +1,43 @@
+# Meitu US storefront discovery and source review
+
+This operator workflow records US storefront evidence and plans source-only review. A successful source review allows read-only catalog preflight. Merchant identity, buyer destination eligibility, checkout quotes, and publication use their existing acceptance paths.
+
+## Discover and resume
+
+Keep the approved Meitu tracker and run artifacts in the operator workspace. Start a batch using the tracked official hosts and product names.
+
+```sh
+python -m scripts.ops.meitu_discovery.manifest \
+  --tracker "$evidence/meitu_tracker_data.json" --batch-id meitu-us-20261117-a > "$manifest"
+bash scripts/ops/meitu_discovery/scan_cloud.sh launch "$manifest" "$run"
+bash scripts/ops/meitu_discovery/scan_cloud.sh collect "$run"
+```
+
+The launcher uses the evidence-only service account in `pivota-staging`. It verifies the packaged scanner, manifest, image, and Cloud execution, then records one receipt per Meitu line. The run directory is immutable with respect to the submitted manifest. A local run uses the same manifest on stdin with `python -m scripts.ops.meitu_discovery.scan`.
+
+Start a fresh run for a continuation. The continuation carries deferred candidates, variant pages, and retryable failures. Read `coverage.status` even when `queries` becomes empty. An unverified official host and a provider cap remain visible for follow-up outside the current scan.
+
+```sh
+python -m scripts.ops.meitu_discovery.manifest \
+  --resume "$run/manifest.json" --query-receipts "$run/queries.jsonl" \
+  --batch-id meitu-us-20261117-b > "$next_manifest"
+```
+
+## Review exact source samples
+
+Keep completed review directories under the same history root across runs. For a separate work directory, pass the common parent with `--history-root`.
+
+```sh
+python -m scripts.ops.meitu_discovery.review_input "$run/queries.jsonl" \
+  --run-dir "$review_run" --history-root "$review_runs"
+python -m scripts.ops.meitu_discovery.review_cloud launch "$review_run"
+python -m scripts.ops.meitu_discovery.review_cloud collect "$review_run"
+```
+
+Each sample binds one Meitu relationship, one merchant listing, and up to four exact native variant quotes. Price, stock, title, GTIN, SKU, merchant, market evidence, or relationship changes produce a fresh sample. Completed results are reused only after the planner revalidates their Cloud execution, input digest, submitted sample, and completed model rounds. A pre-policy archive or an expired log contributes no reuse evidence. Two independently successful model rounds are required, with arbitration only when they disagree. A zero-count review input means the planner found no further eligible samples for that receipt.
+
+## Reconcile discovery and the handoff
+
+Build a fresh retailer source manifest and optional intake ledger with `python -m scripts.ops.meitu_discovery.sources --evidence-dir DIRECTORY --output MANIFEST --intake-ledger LEDGER`. The directory contains the existing tracker, original research, expansion, retailer, Olive Young and baseline files consumed by the builder. Keep original, alternative, dupe, historical and channel associations as evidence.
+
+Use `python -m scripts.ops.meitu_discovery.coverage --help` to reconcile the new intake, official query receipts, and older capture manifest with its bound receipts. Use `python -m scripts.ops.meitu_discovery.handoff --coverage --audit AUDIT --cohort COHORT` to account for all audited quote keys against an already prepared cohort. The next-page suggestion is a read-only review queue. The original cohort file remains the input for any separately reviewed apply.
