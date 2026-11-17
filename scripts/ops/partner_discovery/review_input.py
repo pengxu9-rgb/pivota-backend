@@ -87,7 +87,7 @@ def sample_key(row):
     source, evidence = row["tracked_source"], row["evidence"]
     associations = source["associations"]
     if len(associations) != 1 or associations[0].get("source") != "official_rediscovery":
-        raise ValueError("review sample must bind exactly one Meitu association")
+        raise ValueError("review sample must bind exactly one partner association")
     association = associations[0]
     context = {key: association[key] for key in ("meitu_line", "meitu_id", "meitu_brand", "anchor_product", "relation")}
     if (type(context["meitu_line"]) is not int or context["meitu_line"] < 1
@@ -179,7 +179,7 @@ def load_history(root, verify, exclude=None):
 def plan(queries, covered=(), held=()):
     if (not queries or len({row.get("batch_id") for row in queries}) != 1
             or not queries[0].get("batch_id") or len({row["meitu_line"] for row in queries}) != len(queries)):
-        raise ValueError("expected one batch of unique Meitu query receipts")
+        raise ValueError("expected one batch of unique partner query receipts")
     covered = set(covered)
     held = set(held)
     pending, reused, blocked = {}, set(), set()

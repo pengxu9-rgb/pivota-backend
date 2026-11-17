@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "policy_version": "olive-young-us-brand-direct-v4",
+  "listings": {
+    "seed_b": {
+      "seed_id": "eps_31f74c1ec20a4d5db0fa977f",
+      "url": "https://amuseseoulmakeup.com/products/banana-lip-oil",
+      "seller_ref": "merch_obs_1c4bc54448d534ca",
+      "price_minor": 1500,
+      "brand": "AMUSE",
+      "title": "Banana Lip Oil",
+      "description": "A 4.5 mL tinted lip oil with a glossy finish, a banana scent and a cushioned applicator. Shade 02 Banana is clear, while 04 Juicy Peach gives a peach tint.",
+      "variants": [
+        ["52547428942138", "8800299133494", "02 BANANA", "8800299133494"],
+        ["52547429007674", "8800299133517", "04 JUICY PEACH", "8800299133517"]
+      ],
+      "native_product_id": 10117885559098,
+      "corroboration_url": "https://kiokii.com/en-us/products/amuse-banana-lip-oil-4-5ml.js?country=US",
+      "machine_activation_allowed": true
+    },
+    "seed_c": {
+      "seed_id": "eps_6aa6d3d1e93a424b8c64d6c5",
+      "url": "https://romandbeauty.com/products/glasting-melting-balm",
+      "seller_ref": "merch_obs_acf4a659be2fb0fb",
+      "price_minor": 1400,
+      "brand": "rom&nd",
+      "title": "Glasting Melting Balm",
+      "description": "A 3.5 g tinted lip balm with a soft, melting texture and buildable, glass-like shine. Coco Nude is a beige nude and Mauve Whip is a mauve pink.",
+      "variants": [
+        ["41341731438667", "8800258082894", "COCO NUDE", "UGMB01"],
+        ["41341731635275", "8800258083112", "MAUVE WHIP", "UGMB07"]
+      ],
+      "native_product_id": 7317311291467,
+      "machine_activation_allowed": true
+    },
+    "seed_a": {
+      "seed_id": "eps_9f3368aa75d349e09914fbcb",
+      "url": "https://www.surrattbeauty.com/products/lipslique",
+      "seller_ref": "merch_obs_30f9ce3e44b7fcb4",
+      "price_minor": 3400,
+      "brand": "Surratt Beauty",
+      "title": "Lipslique",
+      "description": "Lipslique is a twist-up lip color with a lightweight, balm-like feel and a creamy finish. The formula contains macadamia seed oil for moisture and can be layered for more color. Each tube contains 1.56 g.",
+      "variants": [
+        ["31365263163459", "617037660642", "NU DE SOLEIL - PEACHY BEIGE", "SB003-10"],
+        ["31365263196227", "617037660635", "PARAMOUR - PEACHY CORAL", "SB003-09"]
+      ],
+      "native_product_id": 4389835046979,
+      "seller_source_ref": "surrattbeauty.com",
+      "shipping_source_url": "https://surrattbeauty.com/meta.json",
+      "native_shop_domain": "surrattbeauty.myshopify.com",
+      "policy_version": "surratt-us-brand-direct-v1",
+      "machine_activation_allowed": true
+    }
+  },
+  "scoped_listing": {
+    "pin_env": "EXTERNAL_SEED_MACHINE_REVIEW_AUTOMATIQUE_SEED_ID",
+    "external_product_id": "ext_5cb339225f03d6bbbf8d25dc",
+    "url": "https://www.surrattbeauty.com/products/automatique-lip-crayon",
+    "seller_ref": "merch_obs_30f9ce3e44b7fcb4",
+    "price_minor": 3400,
+    "brand": "Surratt Beauty",
+    "title": "Automatique Lip Crayon",
+    "description": "Automatique Lip Crayon is a twist-up lipstick with a slim applicator, creamy texture and a matte finish. Savoir Faire is the dusty rose shade currently sold by Surratt Beauty in the US.",
+    "variants": [
+      ["43054723465283", "609015652428", "SAVOIR FAIRE - DUSTY ROSE", "SB002-13"]
+    ],
+    "native_product_id": 7619240132675,
+    "seller_source_ref": "surrattbeauty.com",
+    "shipping_source_url": "https://surrattbeauty.com/meta.json",
+    "native_shop_domain": "surrattbeauty.myshopify.com",
+    "policy_version": "surratt-automatique-us-brand-direct-v1",
+    "machine_activation_allowed": true
+  },
+  "barcode_corroboration": {
+    "product_id": 10073908707648,
+    "title": "amuse banana lip oil 4.5ml",
+    "retailer_shade_titles": {"52547428974906": "03 Manuka Honey"}
+  },
+  "variant_expansion": {
+    "external_id": "ext_51577f22556c1f3aeb091391",
+    "additions": [
+      ["52547428909370", "8800299133487", "01 ZEN MATCHA", "8800299133487"],
+      ["52547428974906", "8800299133500", "03 MANUCA HONEY", "8800299133500"],
+      ["52547429040442", "8800299133524", "05 CRANBERRY POP", "8800299133524"],
+      ["52547429073210", "8800299133531", "06 ROSE SORBET", "8800299133531"]
+    ],
+    "policy_version": "amuse-us-variant-expansion-v1",
+    "native_shop_domain": "amuse-global.myshopify.com",
+    "proposer": "machine_review:amuse_us_variant_expansion",
+    "source": "meitu_us_official_variant_review",
+    "enable_flag": "MEITU_US_KIOKII_SIX_EXPANSION_ENABLED",
+    "retailer_evidence_prefix": "kiokii_us"
+  }
+}

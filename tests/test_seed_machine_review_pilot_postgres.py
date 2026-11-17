@@ -14,11 +14,20 @@ from fastapi import FastAPI
 
 from services import external_seed_gemini_reviewer as reviewer
 from services import external_seed_review_pilot as pilot
+from services.exact_retailer_cohorts import RETAILER_COHORT_B
 
 
-SURRATT = pilot.LISTINGS[pilot.SURRATT_SEED_ID]
+SEED_A_LISTING = pilot.LISTINGS[pilot.SEED_A_ID]
 PREFIX = "/employee/products/external-seeds"
 MACHINE_EMAIL = "review@pilot.iam.gserviceaccount.com"
+# The corroborating retailer read for seed B, from the reviewed config rather than literals.
+CORROBORATION = pilot._CORROBORATION
+_SEED_B_CANONICAL = [variant[0] for variant in pilot.LISTINGS[pilot.SEED_B_ID].variants]
+SEED_B_RETAILER_IDS = [
+    next(native for native, (canonical, _) in next(iter(RETAILER_COHORT_B.listings.values())).variants.items()
+         if canonical == wanted)
+    for wanted in _SEED_B_CANONICAL
+]
 
 
 def draft_for(listing):
@@ -43,17 +52,17 @@ def draft_for(listing):
     }
 
 
-def test_surratt_draft_matches_only_the_pinned_seller_listing_and_variants():
-    row, data = draft_for(SURRATT)
-    assert pilot.draft_matches_listing(row, data, SURRATT)
-    assert pilot.draft_matches_listing(row | {"domain": SURRATT.host}, data, SURRATT)
-    assert not pilot.draft_matches_listing(row | {"seller_ref": "some-other-seller"}, data, SURRATT)
-    assert not pilot.draft_matches_listing(row | {"domain": "shop.surrattbeauty.com"}, data, SURRATT)
-    assert not pilot.draft_matches_listing(row | {"destination_url": SURRATT.listing_urls[1]}, data, SURRATT)
-    assert not pilot.draft_matches_listing(row, data | {"variants": data["variants"][:1]}, SURRATT)
+def test_seed_a_draft_matches_only_the_pinned_seller_listing_and_variants():
+    row, data = draft_for(SEED_A_LISTING)
+    assert pilot.draft_matches_listing(row, data, SEED_A_LISTING)
+    assert pilot.draft_matches_listing(row | {"domain": SEED_A_LISTING.host}, data, SEED_A_LISTING)
+    assert not pilot.draft_matches_listing(row | {"seller_ref": "some-other-seller"}, data, SEED_A_LISTING)
+    assert not pilot.draft_matches_listing(row | {"domain": f"shop.{SEED_A_LISTING.seller_host}"}, data, SEED_A_LISTING)
+    assert not pilot.draft_matches_listing(row | {"destination_url": SEED_A_LISTING.listing_urls[1]}, data, SEED_A_LISTING)
+    assert not pilot.draft_matches_listing(row, data | {"variants": data["variants"][:1]}, SEED_A_LISTING)
     assert not pilot.draft_matches_listing(row, data | {"variants": [
         data["variants"][0] | {"url": data["variants"][0]["url"].replace("www.", "")}, data["variants"][1],
-    ]}, SURRATT)
+    ]}, SEED_A_LISTING)
 
 
 @pytest.fixture
@@ -77,7 +86,7 @@ async def route_db(monkeypatch):
     migrations = Path(__file__).resolve().parents[1] / "db" / "migrations"
     async with Database(url) as db:
         async with db.transaction(force_rollback=True):
-            schema = "test_surratt_review_" + uuid4().hex
+            schema = "test_seed_review_" + uuid4().hex
             await db.execute(f"CREATE SCHEMA {schema}")
             await db.execute(f"SET LOCAL search_path = {schema}")
             for name in ("044_external_product_seeds.sql", "058_catalog_core.sql",
@@ -112,19 +121,19 @@ async def insert_draft(db, seed_id, listing, *, seller_source_ref):
     ("wrong_seller", "observed_seller_changed"), ("active_alias", "active_seed_conflict"),
     ("prior_rejection_without_note", "employee_rejection_recorded"),
     ("other_seed_pinned", "activation_version_not_pinned"),
-    ("amuse_corroboration_changed", "variant_barcode_corroboration_unverified"),
-    ("activate_amuse", None), ("activate_romand", None), ("activate", None), ("append_failure", None),
+    ("seed_b_corroboration_changed", "variant_barcode_corroboration_unverified"),
+    ("activate_seed_b", None), ("activate_seed_c", None), ("activate", None), ("append_failure", None),
 ])
 async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monkeypatch, case, expected):
     from routes import employee_products as ep
     from services.external_seed_machine_review_ledger import load_machine_review
 
     seed_id = {
-        "activate_amuse": pilot.AMUSE_SEED_ID,
-        "amuse_corroboration_changed": pilot.AMUSE_SEED_ID,
-        "activate_romand": pilot.ROMAND_SEED_ID,
-        "other_seed_pinned": pilot.ROMAND_SEED_ID,
-    }.get(case, pilot.SURRATT_SEED_ID)
+        "activate_seed_b": pilot.SEED_B_ID,
+        "seed_b_corroboration_changed": pilot.SEED_B_ID,
+        "activate_seed_c": pilot.SEED_C_ID,
+        "other_seed_pinned": pilot.SEED_C_ID,
+    }.get(case, pilot.SEED_A_ID)
     listing = pilot.LISTINGS[seed_id]
     seller_host = listing.host if case == "wrong_seller" else listing.seller_host
     row = await insert_draft(route_db, seed_id, listing, seller_source_ref=seller_host)
@@ -160,8 +169,8 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         if case != "unpinned_version":
             pinned_version = version
             if case == "other_seed_pinned":
-                peer = pilot.LISTINGS[pilot.AMUSE_SEED_ID]
-                peer_row = await insert_draft(route_db, pilot.AMUSE_SEED_ID, peer, seller_source_ref=peer.seller_host)
+                peer = pilot.LISTINGS[pilot.SEED_B_ID]
+                peer_row = await insert_draft(route_db, pilot.SEED_B_ID, peer, seller_source_ref=peer.seller_host)
                 pinned_version = ep._seed_review_version(peer_row)
                 assert pinned_version != version
             monkeypatch.setenv("EXTERNAL_SEED_MACHINE_REVIEW_ACTIVATION_VERSION", pinned_version)
@@ -179,12 +188,12 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
     def storefront_session(_client, host, *_args):
         if listing.corroboration_url and host == urlsplit(listing.corroboration_url).hostname:
             return SimpleNamespace(json=AsyncMock(return_value=(200, {
-                "id": 10073908707648, "title": "AMUSE Banana Lip Oil 4.5ml",
+                "id": CORROBORATION["product_id"], "title": CORROBORATION["title"],
                 "variants": [
-                    {"id": 51629126123840, "title": "02 Banana", "barcode": (
-                        "8800299133517" if case == "amuse_corroboration_changed" else "8800299133494"
+                    {"id": int(SEED_B_RETAILER_IDS[0]), "title": pilot.LISTINGS[pilot.SEED_B_ID].variants[0][2], "barcode": (
+                        "8800299133517" if case == "seed_b_corroboration_changed" else "8800299133494"
                     )},
-                    {"id": 51896079974720, "title": "04 Juicy Peach", "barcode": "8800299133517"},
+                    {"id": int(SEED_B_RETAILER_IDS[1]), "title": pilot.LISTINGS[pilot.SEED_B_ID].variants[1][2], "barcode": "8800299133517"},
                 ],
             })))
         if host == listing.seller_host:
@@ -244,7 +253,7 @@ async def test_real_machine_route_is_id_version_and_seller_scoped(route_db, monk
         assert receipt["decision"].get("hold_reason") == expected
         assert receipt["outcome"] == ("hold" if expected else "activated")
         assert bool(receipt["active_review_version"]) == (expected is None)
-        model_count = 0 if case == "amuse_corroboration_changed" else 2
+        model_count = 0 if case == "seed_b_corroboration_changed" else 2
         assert {r["model_name"] for r in receipt["decision"]["receipts"].values()} == set(pilot.REVIEW_MODELS[:model_count])
         assert (await client.post(endpoint, json=req, headers=headers)).json() == receipt
         assert vertex.await_count == model_count

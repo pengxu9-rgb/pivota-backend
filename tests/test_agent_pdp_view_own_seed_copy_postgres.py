@@ -124,14 +124,14 @@ async def test_each_product_gets_its_own_newest_active_seed(scoped):
     assert got["pk_b"]["details_sections"] is None
 
 
-async def test_kiokii_destination_alias_cannot_supply_the_brands_seed_copy(scoped):
+async def test_cohort_b_destination_alias_cannot_supply_the_brands_seed_copy(scoped):
     from services.agent_pdp_view_assembler import fetch_own_seed_copy_for_keys
-    from services.surratt_retailer_pilot import KIOKII_BARE_FAMILY_URL, KIOKII_RETAILER_COHORT
+    from services.exact_retailer_cohorts import COHORT_B_BARE_FAMILY_URL, RETAILER_COHORT_B
 
-    key = KIOKII_RETAILER_COHORT.canonical_product_key
+    key = RETAILER_COHORT_B.canonical_product_key
     await _seed(scoped, "eps_official", key, seed_data={"seed_description_origin": "pdp_product_description"})
-    await _seed(scoped, "eps_kiokii", key, updated="2026-09-20",
-                destination_url=f"{KIOKII_BARE_FAMILY_URL}?variant=51896079974720",
+    await _seed(scoped, "eps_cohort_b_alias", key, updated="2026-09-20",
+                destination_url=f"{COHORT_B_BARE_FAMILY_URL}?variant=51896079974720",
                 seed_data={"seed_description_origin": "retailer_copy"})
 
     [seed] = (await fetch_own_seed_copy_for_keys([key], db=scoped)).values()

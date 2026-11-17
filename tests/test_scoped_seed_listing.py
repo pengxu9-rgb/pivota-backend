@@ -1,4 +1,4 @@
-"""Keep the Automatique pilot scoped to its reviewed US seed and exact referral."""
+"""Keep the single scoped listing pilot scoped to its reviewed US seed and exact referral."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,16 +16,16 @@ from tests.test_offers_one_per_seller_buyer_currency import _seed
 
 
 SEED_ID = "eps_0123456789abcdef01234567"
-PIN_ENV = "EXTERNAL_SEED_MACHINE_REVIEW_AUTOMATIQUE_SEED_ID"
-LISTING = pilot.AUTOMATIQUE_LISTING
+PIN_ENV = pilot.SCOPED_LISTING_PIN_ENV
+LISTING = pilot.SCOPED_LISTING
 NATIVE_ID, GTIN, SHADE, SELLER_SKU = LISTING.variants[0]
-PRODUCT_KEY = make_catalog_product_key(LISTING.seller_ref, "external_seed", pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID)
-SIGNATURE = make_pivota_signature_id(LISTING.seller_ref, "external_seed", pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID)
+PRODUCT_KEY = make_catalog_product_key(LISTING.seller_ref, "external_seed", pilot.SCOPED_EXTERNAL_PRODUCT_ID)
+SIGNATURE = make_pivota_signature_id(LISTING.seller_ref, "external_seed", pilot.SCOPED_EXTERNAL_PRODUCT_ID)
 SELECTED_PDP = f"{LISTING.url}?variant={NATIVE_ID}"
 
 
-def test_automatique_machine_review_needs_the_exact_seed_pin(monkeypatch):
-    legacy = (pilot.AMUSE_SEED_ID, pilot.ROMAND_SEED_ID, pilot.SURRATT_SEED_ID)
+def test_scoped_listing_machine_review_needs_the_exact_seed_pin(monkeypatch):
+    legacy = (pilot.SEED_B_ID, pilot.SEED_C_ID, pilot.SEED_A_ID)
     monkeypatch.delenv(PIN_ENV, raising=False)
     assert pilot.machine_review_listing(SEED_ID) is None
 
@@ -39,8 +39,8 @@ def test_automatique_machine_review_needs_the_exact_seed_pin(monkeypatch):
         monkeypatch.setenv(PIN_ENV, invalid)
         assert pilot.machine_review_listing(invalid) is None
 
-    monkeypatch.setenv(PIN_ENV, pilot.SURRATT_SEED_ID)
-    assert pilot.machine_review_listing(pilot.SURRATT_SEED_ID) is pilot.LISTINGS[pilot.SURRATT_SEED_ID]
+    monkeypatch.setenv(PIN_ENV, pilot.SEED_A_ID)
+    assert pilot.machine_review_listing(pilot.SEED_A_ID) is pilot.LISTINGS[pilot.SEED_A_ID]
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ def referral_case(monkeypatch):
     }
     seed = _seed(seed_id=SEED_ID, host=LISTING.host, variants=[variant])
     seed.update(
-        external_product_id=pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID,
+        external_product_id=pilot.SCOPED_EXTERNAL_PRODUCT_ID,
         seller_ref=LISTING.seller_ref,
         attached_product_key=PRODUCT_KEY,
         canonical_url=LISTING.url,
@@ -71,7 +71,7 @@ def referral_case(monkeypatch):
     sku_rows = [{
         "product_key": PRODUCT_KEY,
         "merchant_id": LISTING.seller_ref,
-        "source_product_id": pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID,
+        "source_product_id": pilot.SCOPED_EXTERNAL_PRODUCT_ID,
         "source_variant_id": NATIVE_ID,
         "sku_key": make_catalog_sku_key(PRODUCT_KEY, NATIVE_ID),
         "sku_payload": {"variant_id": NATIVE_ID, "variant_id_provenance": "merchant_issued"},
@@ -118,7 +118,7 @@ def _resolve(client, *, variant=NATIVE_ID, market="US", assumed=False):
     return response.json()["offers"]
 
 
-def test_automatique_turns_a_supported_cart_into_a_signed_exact_referral(monkeypatch, referral_case):
+def test_scoped_listing_turns_a_supported_cart_into_a_signed_exact_referral(monkeypatch, referral_case):
     would_mint_cart = []
     stock_identity = gateway._external_seed_redirect_identity
 
@@ -157,7 +157,7 @@ def test_automatique_turns_a_supported_cart_into_a_signed_exact_referral(monkeyp
     "wrong_variant", "no_variant", "other_market", "assumed_market", "wrong_seller",
     "wrong_gtin", "wrong_sku", "unselected_pdp", "missing_catalog_sku",
 ])
-def test_automatique_does_not_fall_back_to_a_family_link(referral_case, mismatch):
+def test_scoped_listing_does_not_fall_back_to_a_family_link(referral_case, mismatch):
     seed, variant = referral_case.seed, referral_case.variant
     args = {}
     if mismatch == "wrong_variant":

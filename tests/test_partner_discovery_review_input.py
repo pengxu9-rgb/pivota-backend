@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from scripts.ops.meitu_discovery import review_input as review
+from scripts.ops.partner_discovery import review_input as review
 
 
 URL = "https://brand.example/products/lip"
@@ -34,7 +34,7 @@ def completion(rows, data):
                         for row in rows]}
 
 
-def test_samples_are_disjoint_and_bound_to_one_meitu_association():
+def test_samples_are_disjoint_and_bound_to_one_partner_association():
     rows, reused, held = review.plan([query(), query(2)])
     assert reused == held == 0
     assert sorted(len(row["evidence"]["variants"]) for row in rows) == [1, 1, 4, 4]

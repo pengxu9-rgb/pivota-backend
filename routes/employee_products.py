@@ -4967,7 +4967,7 @@ async def run_external_seed_machine_review(
             )
             if conflict is not None:
                 reason = "active_seed_conflict"
-        if not reason and listing is pilot.AUTOMATIQUE_LISTING:
+        if not reason and listing is pilot.SCOPED_LISTING:
             native_id, gtin, *_ = listing.variants[0]
             duplicate = await database.fetch_val(
                 """

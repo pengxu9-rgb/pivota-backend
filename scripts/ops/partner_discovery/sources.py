@@ -1,4 +1,4 @@
-"""Build an immutable US discovery input from the Meitu tracker and its evidence."""
+"""Build an immutable US discovery input from the partner tracker and its evidence."""
 
 import argparse
 from collections import Counter
@@ -11,25 +11,22 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .scan import LOCALE, US_LOCALES
 
 
-NAMES = (
-    'meitu_tracker_data.json', 'meitu_data.json', 'expansion_data.json',
-    'v3_data.json', 'v5_oy_channels.json', 'meitu-us-batch-plan/cloud44-manifest.json',
-)
-HISTORICAL_OR_UNVERIFIED = {'amazon.com', 'beautykom.com', 'bloombarflowermarket.com', 'walmart.com'}
-BRAND_ALIASES = {'stilacosmetics.com': 'www.stilacosmetics.com', 'maccosmetics.com': 'www.maccosmetics.com',
-                 'surrattbeauty.com': 'www.surrattbeauty.com'}
+DATA_PATH = Path(__file__).resolve().parents[3] / "data" / "catalog_enrichment" / "us_discovery_storefronts.json"
+_DATA = json.loads(DATA_PATH.read_text(encoding="utf-8"))["sources"]
+NAMES = tuple(_DATA["evidence_files"])
+HISTORICAL_OR_UNVERIFIED = set(_DATA["historical_or_unverified"])
+EXCLUDED_HOSTS = frozenset(_DATA["excluded_hosts"])
+BRAND_ALIASES = dict(_DATA["brand_aliases"])
+HOST_PATH_PATTERNS = {host: re.compile(pattern) for host, pattern in _DATA["host_path_patterns"].items()}
+EXTRA_CONTROL_URLS = tuple(_DATA["extra_control_urls"])
+PINNED_HOST_COUNT = _DATA["pinned_host_count"]
 SELECTION_PARAMS = {'color', 'd', 'id', 'select', 'sku', 'skuid', 'swatchcolor', 'swatchsize', 'variant'}
-SHOPIFY_EVIDENCE = {'www.belleandblush.com', 'www.imagebeauty.com', 'kiokii.com', 'colourpop.com'}
+SHOPIFY_EVIDENCE = set(_DATA["shopify_evidence"])
 PRODUCT_MARKERS = re.compile(
     r'/(?:products?|p|shop|s|o|dp|ip|product-lippenstift|aisles-online/p|en-US|en-us|usa|en)/',
     re.IGNORECASE,
 )
-VERIFIED_ROOT_PRODUCTS = {
-    'aromibeauty.com': {
-        '/sugared-mauve-metallic-liquid-lipstick/',
-        '/aurora-glittery-lip-topper/',
-    },
-}
+VERIFIED_ROOT_PRODUCTS = {host: set(paths) for host, paths in _DATA["verified_root_products"].items()}
 
 
 def load_evidence(directory):
@@ -50,14 +47,14 @@ def eligible_url(raw):
     locale = LOCALE.match(url.path)
     product_path = PRODUCT_MARKERS.search(url.path) or url.path in VERIFIED_ROOT_PRODUCTS.get(bare, ())
     if (url.scheme != 'https' or url.netloc != host or not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', host)
-            or bare in HISTORICAL_OR_UNVERIFIED or host == 'es-it1.cvs.com'
+            or bare in HISTORICAL_OR_UNVERIFIED or host in EXCLUDED_HOSTS
             or not product_path
             or (locale and locale[1].casefold() not in US_LOCALES)):
         return None
     path = url.path.removesuffix('.js')
     query = sorted((key, val) for key, val in parse_qsl(url.query)
                    if key.casefold() in SELECTION_PARAMS or key.startswith('dwvar_'))
-    if host == 'us.oliveyoung.com' and not re.fullmatch(r'/products/UA\d+', path):
+    if host in HOST_PATH_PATTERNS and not HOST_PATH_PATTERNS[host].fullmatch(path):
         return None
     return urlunsplit(('https', BRAND_ALIASES.get(host, host), path, urlencode(query), ''))
 
@@ -155,7 +152,7 @@ def build(evidence_directory, intake=None):
 
     # Existing work is a control; these five families are not counted as new candidates.
     control_urls = {eligible_url(item['pdp']) for item in original_44['items']}
-    control_urls.add(eligible_url('https://www.charlottetilbury.com/us/product/matte-revolution-lipstick'))
+    control_urls.update(eligible_url(url) for url in EXTRA_CONTROL_URLS)
     for item in original_44['items']:
         add(item['pdp'], source='existing_cloud44_control', relation='existing_cloud44_listing_control',
             native_variant_candidate=item['native_variant_id'], gtin_candidate=item['gtin'],
@@ -169,13 +166,13 @@ def build(evidence_directory, intake=None):
     meitu_ids = {association['meitu_id'] for item in items for association in item['associations']
                  if 'meitu_id' in association}
     assert len(items) == len({item['item_id'] for item in items}) and len(items) > 100
-    assert sum(item['host'] == 'us.oliveyoung.com' for item in items) == 33
+    assert sum(item['host'] == PINNED_HOST_COUNT['host'] for item in items) == PINNED_HOST_COUNT['count']
     assert sum(item['repeat_control'] for item in items) >= 5
     return {'schema_version': 1, 'market': 'US', 'baseline_sha256': hashes, 'approved_hosts': hosts,
             'counts': {'candidate_urls': len(items) - sum(item['repeat_control'] for item in items),
                        'control_urls': sum(item['repeat_control'] for item in items), 'source_urls': len(items),
                        'storefront_hosts': len(hosts), 'meitu_lines_with_sources': len(meitu_ids),
-                       'olive_young_us_listings': 33, 'per_source_kind': dict(sorted(count_by_adapter.items()))},
+                       PINNED_HOST_COUNT['count_key']: PINNED_HOST_COUNT['count'], 'per_source_kind': dict(sorted(count_by_adapter.items()))},
             'items': items}
 
 

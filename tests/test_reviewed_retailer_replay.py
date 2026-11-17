@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from services import intake_identity
-from services.catalog_enrichment_agent import surratt_retailer_apply as replay
-from services.surratt_retailer_pilot import (
+from services.catalog_enrichment_agent import reviewed_retailer_apply as replay
+from services.exact_retailer_cohorts import (
     CANONICAL_CONTENT_KEY, CANONICAL_GROUP_ID, CANONICAL_PRODUCT_KEY,
-    KIOKII_EXPANSION_FLAG, KIOKII_INITIAL_OFFER_IDS, KIOKII_INITIAL_RETAILER_COHORT, KIOKII_RETAILER_COHORT,
+    COHORT_B_EXPANSION_FLAG, COHORT_B_INITIAL_OFFER_IDS, RETAILER_COHORT_B_INITIAL, RETAILER_COHORT_B,
     PROOF_KEY, RETAILERS,
 )
 
@@ -64,13 +64,13 @@ async def test_same_observation_replay_requires_exact_persisted_proof(monkeypatc
 
 
 @pytest.fixture
-def kiokii_expansion(monkeypatch):
-    cohort = KIOKII_RETAILER_COHORT
+def cohort_b_expansion(monkeypatch):
+    cohort = RETAILER_COHORT_B
     (key, retailer), = cohort.listings.items()
     now = datetime.now(timezone.utc)
     plan = {"pdps": [{"product_key": key}], "listing_spellings": {"status": "read"}, "offers": [], "skus": []}
     previous, additions = [], []
-    offer_ids = [*sorted(KIOKII_INITIAL_OFFER_IDS), *(f"offer:addition-{i}" for i in range(4))]
+    offer_ids = [*sorted(COHORT_B_INITIAL_OFFER_IDS), *(f"offer:addition-{i}" for i in range(4))]
     for (native, (canonical, gtin)), offer_id in zip(retailer.variants.items(), offer_ids, strict=True):
         proof = {"version": 1, "canonical_product_key": cohort.canonical_product_key,
                  "canonical_native_variant_id": canonical, "retailer_native_variant_id": native, "gtin14": gtin,
@@ -80,7 +80,7 @@ def kiokii_expansion(monkeypatch):
         plan["offers"].append({"offer_id": offer_id, "sku_key": sku_key, "list_price": 18.99,
                                "availability": "in_stock", "offer_payload": json.dumps({PROOF_KEY: proof})})
         plan["skus"].append({"sku_key": sku_key})
-        original = offer_id in KIOKII_INITIAL_OFFER_IDS
+        original = offer_id in COHORT_B_INITIAL_OFFER_IDS
         saved_proof = {**proof, "observed_at": (now - timedelta(minutes=20)).isoformat(),
                        "price_minor": 1499} if original else proof
         row = {"offer_id": offer_id, "proof": saved_proof, "merchant_id": retailer.merchant_id,
@@ -92,7 +92,7 @@ def kiokii_expansion(monkeypatch):
                "list_price": saved_proof["price_minor"] / 100, "offer_row": "unchanged", "sku_row": "unchanged"}
         (previous if original else additions).append(row)
 
-    monkeypatch.setenv(KIOKII_EXPANSION_FLAG, "1")
+    monkeypatch.setenv(COHORT_B_EXPANSION_FLAG, "1")
     monkeypatch.setattr(intake_identity, "intake_identity_enabled", lambda _: True)
     monkeypatch.setattr(intake_identity, "variant_barcode_match_enabled", lambda: True)
     monkeypatch.setattr(replay.enrichment, "plan_with_current_listings", AsyncMock(return_value=plan))
@@ -117,10 +117,10 @@ def kiokii_expansion(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kiokii_exact_expansion_writes_only_four_additions(kiokii_expansion):
-    db, witness, stock_apply, previous, additions = kiokii_expansion
+async def test_cohort_b_exact_expansion_writes_only_four_additions(cohort_b_expansion):
+    db, witness, stock_apply, previous, additions = cohort_b_expansion
     witness.side_effect = [previous, previous + additions]
-    receipt = await replay.apply_reviewed_retailer(db, {}, write=True, cohort=KIOKII_RETAILER_COHORT, expand_kiokii=True)
+    receipt = await replay.apply_reviewed_retailer(db, {}, write=True, cohort=RETAILER_COHORT_B, expand_cohort_b=True)
     assert receipt["existing"] == 2 and not receipt["replayed"]
     write_plan = stock_apply.await_args.args[0]
     assert len(write_plan["offers"]) == len(write_plan["skus"]) == 4
@@ -130,49 +130,53 @@ async def test_kiokii_exact_expansion_writes_only_four_additions(kiokii_expansio
 
 
 @pytest.mark.asyncio
-async def test_kiokii_expansion_replays_mixed_timestamp_complete_set(kiokii_expansion):
-    db, witness, stock_apply, previous, additions = kiokii_expansion
+async def test_cohort_b_expansion_replays_mixed_timestamp_complete_set(cohort_b_expansion):
+    db, witness, stock_apply, previous, additions = cohort_b_expansion
     witness.return_value = previous + additions
-    receipt = await replay.apply_reviewed_retailer(db, {}, write=True, cohort=KIOKII_RETAILER_COHORT, expand_kiokii=True)
+    receipt = await replay.apply_reviewed_retailer(db, {}, write=True, cohort=RETAILER_COHORT_B, expand_cohort_b=True)
     assert receipt["existing"] == 6 and receipt["replayed"]
     stock_apply.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_kiokii_expansion_refuses_partial_prior_state(kiokii_expansion):
-    db, witness, stock_apply, previous, additions = kiokii_expansion
+async def test_cohort_b_expansion_refuses_partial_prior_state(cohort_b_expansion):
+    db, witness, stock_apply, previous, additions = cohort_b_expansion
     witness.return_value = previous + additions[:1]
     with pytest.raises(ValueError, match="exactly the prior two or the complete six"):
-        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=KIOKII_RETAILER_COHORT, expand_kiokii=True)
+        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=RETAILER_COHORT_B, expand_cohort_b=True)
     stock_apply.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_kiokii_expansion_rejects_changed_original_sku(kiokii_expansion):
-    db, witness, _, previous, additions = kiokii_expansion
+async def test_cohort_b_expansion_rejects_changed_original_sku(cohort_b_expansion):
+    db, witness, _, previous, additions = cohort_b_expansion
     witness.side_effect = [previous, [{**previous[0], "sku_row": "changed"}, previous[1], *additions]]
     with pytest.raises(ValueError, match="changed an original SKU or quote"):
-        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=KIOKII_RETAILER_COHORT, expand_kiokii=True)
+        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=RETAILER_COHORT_B, expand_cohort_b=True)
 
 
 @pytest.mark.asyncio
-async def test_kiokii_expansion_requires_independent_opt_in(monkeypatch, kiokii_expansion):
-    db, _, stock_apply, _, _ = kiokii_expansion
-    monkeypatch.delenv(KIOKII_EXPANSION_FLAG)
+async def test_cohort_b_expansion_requires_independent_opt_in(monkeypatch, cohort_b_expansion):
+    db, _, stock_apply, _, _ = cohort_b_expansion
+    monkeypatch.delenv(COHORT_B_EXPANSION_FLAG)
     with pytest.raises(ValueError, match="requires its opt-in"):
-        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=KIOKII_RETAILER_COHORT, expand_kiokii=True)
+        await replay.apply_reviewed_retailer(db, {}, write=True, cohort=RETAILER_COHORT_B, expand_cohort_b=True)
     stock_apply.assert_not_awaited()
     db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_kiokii_refresh_selects_only_complete_persisted_cohorts(monkeypatch, kiokii_expansion):
-    from scripts.ops import kiokii_us_retailer_offers as refresh
+async def test_cohort_b_refresh_selects_only_complete_persisted_cohorts(monkeypatch, cohort_b_expansion):
+    import importlib
 
-    db, _, _, previous, additions = kiokii_expansion
+    from services.exact_retailer_cohorts import COHORT_B_CONFIG
+
+    refresh = importlib.import_module(COHORT_B_CONFIG["refresh"]["module"])
+
+    db, _, _, previous, additions = cohort_b_expansion
     monkeypatch.setattr(refresh, "retailer_witness", AsyncMock(side_effect=[previous, previous + additions,
                                                                          previous + additions[:1]]))
-    assert await refresh._persisted_cohort(db) is KIOKII_INITIAL_RETAILER_COHORT
-    assert await refresh._persisted_cohort(db) is KIOKII_RETAILER_COHORT
+    assert await refresh._persisted_cohort(db) is RETAILER_COHORT_B_INITIAL
+    assert await refresh._persisted_cohort(db) is RETAILER_COHORT_B
     with pytest.raises(ValueError, match="complete original two or expanded six"):
         await refresh._persisted_cohort(db)

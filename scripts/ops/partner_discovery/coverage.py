@@ -78,7 +78,7 @@ def reconcile(intake, sources, official, captures):
             line = src["meitu_line"]
             prior = results[line]
             if expected_meitu_ids[line] and expected_meitu_ids[line] != {str(prior.get("meitu_id"))}:
-                raise ValueError("official receipt does not match the original Meitu product")
+                raise ValueError("official receipt does not match the original partner product")
             row["official"] = {key: prior[key] for key in ("status", "host", "candidate_count")}
             row["official"]["pending"] = prior.get("coverage") or {}
             row["source_associations"] = by_line[line]

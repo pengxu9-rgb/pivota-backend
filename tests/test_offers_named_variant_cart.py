@@ -139,10 +139,10 @@ def _assert_referral(offer: Dict[str, Any]) -> None:
 
 @pytest.fixture
 def referral_listing():
-    from services.external_seed_review_pilot import LISTINGS, SURRATT_SEED_ID
+    from services.external_seed_review_pilot import LISTINGS, SEED_A_ID
 
     return replace(
-        LISTINGS[SURRATT_SEED_ID],
+        LISTINGS[SEED_A_ID],
         url=f"https://{HOST}/products/soft-pinch-liquid-blush",
         seller_ref="merch_obs_rare",
         variants=((ATTACHED, "001", "Bliss", "RB-0"), (NAMED, "002", "Adore", "RB-2")),

@@ -15,7 +15,8 @@ from . import model_worker as worker
 
 
 REGION = "us-west1"
-PROJECT_NUMBER = "184498324954"
+# sha256 of the staging project number; the raw number is not kept here.
+PROJECT_NUMBER_SHA256 = "c304d1ef041b8e30078f8483d6f540431bcf4eea830b6796b69da4cf82fd7281"
 IMAGE = ("us-west1-docker.pkg.dev/pivota-shared/pivota/backend@"
          "sha256:f969a6d733cd31767a1f93ef7709130f3f1af158264f3d17f869a51ff56d23d6")
 RUN_TIMEOUT = "600"
@@ -110,7 +111,7 @@ def _check_template(spec, task):
 
 
 def _check_metadata(metadata, name):
-    worker.require(metadata.get("name") == name and str(metadata.get("namespace")) == PROJECT_NUMBER
+    worker.require(metadata.get("name") == name and sha256(str(metadata.get("namespace")).encode()).hexdigest() == PROJECT_NUMBER_SHA256
                    and metadata.get("labels", {}).get("cloud.googleapis.com/location") == REGION,
                    "unexpected Cloud Run resource identity")
 

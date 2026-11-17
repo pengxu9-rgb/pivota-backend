@@ -38,11 +38,11 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
-from services.surratt_retailer_pilot import (
-    KIOKII_PROTECTED_LISTING_KEYS,
-    KIOKII_RETAILER_COHORT,
+from services.exact_retailer_cohorts import (
+    COHORT_B_PROTECTED_LISTING_KEYS,
+    RETAILER_COHORT_B,
     PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY,
-    SURRATT_RETAILER_COHORT,
+    RETAILER_COHORT_A,
 )
 from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
@@ -4970,7 +4970,7 @@ async def _handle_offers_resolve(
         request_metadata=request_metadata,
     )
     exact_retailer_cohort = exact_retailer_shades.matching_cohort(product_id, sku_id, observed_market_hint, merchant_scope)
-    surratt_exact_referrals = exact_retailer_cohort is SURRATT_RETAILER_COHORT
+    cohort_a_exact_referrals = exact_retailer_cohort is RETAILER_COHORT_A
     commerce_surface, commerce_surface_explicit = _resolve_commerce_surface(
         payload_surface=payload.commerce_surface,
         request_metadata=request_metadata,
@@ -5508,14 +5508,14 @@ async def _handle_offers_resolve(
                 )
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             variants = _seed_variants(seed_data)
-            automatique = external_seed_review_pilot.AUTOMATIQUE_LISTING
-            scoped_automatique = row_dict.get("destination_url") == automatique.url
-            if scoped_automatique and not (
+            scoped_listing = external_seed_review_pilot.SCOPED_LISTING
+            scoped_listing_seed = row_dict.get("destination_url") == scoped_listing.url
+            if scoped_listing_seed and not (
                 str(observed_market_hint or "").upper() == row_dict.get("market") == "US"
-                and row_dict.get("seller_ref") == automatique.seller_ref
-                and row_dict.get("external_product_id") == external_seed_review_pilot.AUTOMATIQUE_EXTERNAL_PRODUCT_ID
-                and str(seed_data.get("product_id") or "") == str(automatique.native_product_id)
-                and canonical_variant_id(sku_id) == automatique.variants[0][0]
+                and row_dict.get("seller_ref") == scoped_listing.seller_ref
+                and row_dict.get("external_product_id") == external_seed_review_pilot.SCOPED_EXTERNAL_PRODUCT_ID
+                and str(seed_data.get("product_id") or "") == str(scoped_listing.native_product_id)
+                and canonical_variant_id(sku_id) == scoped_listing.variants[0][0]
             ):
                 continue
 
@@ -5844,15 +5844,15 @@ async def _handle_offers_resolve(
                         ):
                             redirect_identity = _live_identity
                 selected_pdp = None
-                if scoped_automatique:
+                if scoped_listing_seed:
                     selected_pdp = _named_seed_variant_pdp_url(
                         str(canonical_url or destination_url), seed_id, redirect_identity.get("seller_ref"),
-                        v, sku_id, _handover, listing=automatique,
+                        v, sku_id, _handover, listing=scoped_listing,
                     )
                     if (
                         selected_pdp == str(canonical_url or destination_url)
-                        or v.get("barcode") != automatique.variants[0][1]
-                        or v.get("sku") != automatique.variants[0][3]
+                        or v.get("barcode") != scoped_listing.variants[0][1]
+                        or v.get("sku") != scoped_listing.variants[0][3]
                     ):
                         continue
                     redirect_identity = {**redirect_identity, "cart_variant_id": None}
@@ -6050,7 +6050,7 @@ async def _handle_offers_resolve(
                 )
 
                 pdp_destination = selected_pdp or str(canonical_url or destination_url)
-                if not scoped_automatique and (
+                if not scoped_listing_seed and (
                     _named_without_cart
                     and variant_match == "exact"
                     and len(matched_variants) == 1
@@ -7326,7 +7326,7 @@ async def _handle_offers_resolve(
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         catalog_rows = []
-        kiokii_offer_ids = set()
+        cohort_b_offer_ids = set()
         # FRESH PRICE FIRST, in a merged group only (see `_catalog_price_freshness_sql`): empty
         # fragments and no extra bind otherwise, so every other statement is the one main sends.
         _price_select, _price_order, _price_params = (
@@ -7335,7 +7335,7 @@ async def _handle_offers_resolve(
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
-        if surratt_exact_referrals:
+        if cohort_a_exact_referrals:
             # The product-grain statement can rank another shade before the caller's limit.
             catalog_rows = await exact_retailer_shades.read_offers(
                 database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
@@ -7357,16 +7357,16 @@ async def _handle_offers_resolve(
             )
             if _group_flag == "shadow":
                 _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
-        if exact_retailer_cohort is KIOKII_RETAILER_COHORT:
+        if exact_retailer_cohort is RETAILER_COHORT_B:
             try:
                 exact_rows = await exact_retailer_shades.read_offers(
                     database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
-                    cohort=KIOKII_RETAILER_COHORT,
+                    cohort=RETAILER_COHORT_B,
                 )
             except Exception:
-                logger.warning("Kiokii exact retailer offer lookup failed", exc_info=True)
+                logger.warning("Cohort B exact retailer offer lookup failed", exc_info=True)
             else:
-                kiokii_offer_ids = {row["offer_id"] for row in exact_rows}
+                cohort_b_offer_ids = {row["offer_id"] for row in exact_rows}
                 catalog_rows = [*exact_rows, *(catalog_rows or [])]
 
         # Hosts the seed lane already claimed. Read from `source`, which carries the raw
@@ -7393,8 +7393,8 @@ async def _handle_offers_resolve(
         deduped = 0
         for row in catalog_rows or []:
             r = dict(row)
-            kiokii_exact_referral = r.get("offer_id") in kiokii_offer_ids
-            exact_referral = surratt_exact_referrals or kiokii_exact_referral
+            cohort_b_exact_referral = r.get("offer_id") in cohort_b_offer_ids
+            exact_referral = cohort_a_exact_referrals or cohort_b_exact_referral
             destination = str(r.get("destination_url") or "").strip()
             if not destination.startswith(("http://", "https://")):
                 continue
@@ -7426,7 +7426,7 @@ async def _handle_offers_resolve(
                     **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if exact_referral else {}),
                     **({
                         "canonicalNativeVariantId": r["variant_id"], "retailerNativeVariantId": r["retailer_variant_id"],
-                    } if kiokii_exact_referral else {}),
+                    } if cohort_b_exact_referral else {}),
                 },
                 merchant_id=offer_merchant,
                 product_id=str(r.get("product_key") or "") or None,
@@ -7441,7 +7441,7 @@ async def _handle_offers_resolve(
             )
             if not redirect_url:
                 unattributed += 1
-                if kiokii_exact_referral:
+                if cohort_b_exact_referral:
                     continue
 
             if _group_mode:
@@ -10584,8 +10584,8 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
-    pilot_listing_keys = ", ".join(f"'{key}'" for key in SURRATT_RETAILER_COHORT.listings)
-    kiokii_listing_keys = ", ".join(f"'{key}'" for key in sorted(KIOKII_PROTECTED_LISTING_KEYS))
+    pilot_listing_keys = ", ".join(f"'{key}'" for key in RETAILER_COHORT_A.listings)
+    cohort_b_listing_keys = ", ".join(f"'{key}'" for key in sorted(COHORT_B_PROTECTED_LISTING_KEYS))
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10687,7 +10687,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND o.offer_type = 'retailer'
                        AND o.offer_mode = 'redirect'
                        AND o.suppressed_at IS NULL
-                       AND p.product_key NOT IN ({kiokii_listing_keys})
+                       AND p.product_key NOT IN ({cohort_b_listing_keys})
                        -- A reviewed listing only serves through the exact pilot reader once marked.
                        AND (p.product_key NOT IN ({pilot_listing_keys}) OR NOT EXISTS (
                            SELECT 1 FROM catalog_offers pilot
