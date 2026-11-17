@@ -5,28 +5,29 @@ import os
 from datetime import datetime
 
 from services.catalog_enrichment_agent import apply as enrichment
-from services.catalog_enrichment_agent.surratt_retailer_offers import scope_reviewed_plan
+from services.catalog_enrichment_agent.reviewed_retailer_offers import scope_reviewed_plan
 from services.catalog_identity import validated_source_gtin
-from services.surratt_retailer_pilot import (
-    KIOKII_BARE_FAMILY_URL, KIOKII_EXPANSION_FLAG, KIOKII_INITIAL_OFFER_IDS, KIOKII_INITIAL_RETAILER_COHORT,
-    KIOKII_PROTECTED_FAMILY_URLS, KIOKII_PROTECTED_LISTING_KEYS, KIOKII_RETAILER_COHORT, PROOF_KEY,
-    SURRATT_RETAILER_COHORT,
+from services.exact_retailer_cohorts import (
+    COHORT_A_CONFIG, COHORT_B_CONFIG,
+    COHORT_B_BARE_FAMILY_URL, COHORT_B_EXPANSION_FLAG, COHORT_B_INITIAL_OFFER_IDS, RETAILER_COHORT_B_INITIAL,
+    COHORT_B_PROTECTED_FAMILY_URLS, COHORT_B_PROTECTED_LISTING_KEYS, RETAILER_COHORT_B, PROOF_KEY,
+    RETAILER_COHORT_A,
 )
 
 
-async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RETAILER_COHORT, expand_kiokii=False):
+async def apply_reviewed_retailer(db, record, *, write: bool, cohort=RETAILER_COHORT_A, expand_cohort_b=False):
     """Confirm identity and ownership within the caller's transaction before writing."""
-    surratt = cohort is SURRATT_RETAILER_COHORT
-    is_kiokii = cohort is KIOKII_RETAILER_COHORT or cohort is KIOKII_INITIAL_RETAILER_COHORT
-    if expand_kiokii:
-        if cohort is not KIOKII_RETAILER_COHORT:
-            raise ValueError("the exact Kiokii expansion cohort is required")
+    is_cohort_a = cohort is RETAILER_COHORT_A
+    is_cohort_b = cohort is RETAILER_COHORT_B or cohort is RETAILER_COHORT_B_INITIAL
+    if expand_cohort_b:
+        if cohort is not RETAILER_COHORT_B:
+            raise ValueError("the exact cohort B expansion cohort is required")
         if write:
-            if os.getenv(KIOKII_EXPANSION_FLAG) != "1" or await db.fetch_val("SHOW transaction_isolation") != "serializable":
-                raise ValueError("Kiokii expansion requires its opt-in and serializable transaction")
+            if os.getenv(COHORT_B_EXPANSION_FLAG) != "1" or await db.fetch_val("SHOW transaction_isolation") != "serializable":
+                raise ValueError("cohort B expansion requires its opt-in and serializable transaction")
             await db.execute("SELECT pg_advisory_xact_lock(1160308171, 2)")
-    label = "surratt_exact_retailer_review_v1" if surratt else "meitu_us_kiokii_retailer_review_v1"
-    scope = {"include_reviewed_surratt": True} if surratt else {"reviewed_retailer_keys": tuple(cohort.listings)}
+    label = (COHORT_A_CONFIG if is_cohort_a else COHORT_B_CONFIG)["review_label"]
+    scope = {"include_reviewed_cohort_a": True} if is_cohort_a else {"reviewed_retailer_keys": tuple(cohort.listings)}
     plan = scope_reviewed_plan(
         await enrichment.plan_with_current_listings(
             [record], db=db, market="US", source_jsonl=label, **scope,
@@ -69,12 +70,12 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     ):
         raise ValueError("retailer has a verified domain claim")
     canonical = await canonical_witness(db, retailer, cohort=cohort)
-    aliases = {KIOKII_BARE_FAMILY_URL.removeprefix("https://"): key} if is_kiokii else None
+    aliases = {COHORT_B_BARE_FAMILY_URL.removeprefix("https://"): key} if is_cohort_b else None
     conflicts = await enrichment.find_legacy_retailer_listing_owners(plan, db, listing_aliases=aliases)
     if any(row["kind"] != "retired_owner" for row in conflicts):
         raise ValueError("a competing active listing already owns the retailer URL")
-    protected_urls = KIOKII_PROTECTED_FAMILY_URLS if is_kiokii else (retailer.family_url,)
-    protected_keys = sorted(KIOKII_PROTECTED_LISTING_KEYS) if is_kiokii else [key]
+    protected_urls = COHORT_B_PROTECTED_FAMILY_URLS if is_cohort_b else (retailer.family_url,)
+    protected_keys = sorted(COHORT_B_PROTECTED_LISTING_KEYS) if is_cohort_b else [key]
     if await db.fetch_val(
         """
         SELECT EXISTS (SELECT 1 FROM external_product_seeds
@@ -106,27 +107,27 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     if len(incoming) != 1:
         raise ValueError("reviewed retailer offers have different capture times")
     existing_ids = {row["offer_id"] for row in before}
-    if expand_kiokii:
-        if len(expected) != 6 or not KIOKII_INITIAL_OFFER_IDS <= expected.keys() or (
-            existing_ids != KIOKII_INITIAL_OFFER_IDS and existing_ids != expected.keys()
+    if expand_cohort_b:
+        if len(expected) != 6 or not COHORT_B_INITIAL_OFFER_IDS <= expected.keys() or (
+            existing_ids != COHORT_B_INITIAL_OFFER_IDS and existing_ids != expected.keys()
         ):
-            raise ValueError("Kiokii expansion requires exactly the prior two or the complete six offers")
+            raise ValueError("cohort B expansion requires exactly the prior two or the complete six offers")
         if await db.fetch_val("""
             SELECT EXISTS (SELECT 1 FROM catalog_offers
               WHERE product_key=:key AND market IS DISTINCT FROM 'US')
         """, {"key": key}):
-            raise ValueError("Kiokii expansion found another market on the reviewed listing")
-    elif cohort is KIOKII_RETAILER_COHORT and not before:
-        raise ValueError("the six Kiokii offers require the explicit reviewed expansion")
+            raise ValueError("cohort B expansion found another market on the reviewed listing")
+    elif cohort is RETAILER_COHORT_B and not before:
+        raise ValueError("the six cohort B offers require the explicit reviewed expansion")
 
     replay = False
     if before:
-        prior_scope = {offer_id: expected[offer_id] for offer_id in existing_ids} if expand_kiokii else expected
+        prior_scope = {offer_id: expected[offer_id] for offer_id in existing_ids} if expand_cohort_b else expected
         stored = _reviewed_observation_times(before, prior_scope, params, cohort)
-        already_expanded = expand_kiokii and existing_ids == expected.keys()
+        already_expanded = expand_cohort_b and existing_ids == expected.keys()
         if not already_expanded and min(incoming) < max(stored):
             raise ValueError("retailer capture predates the persisted observation")
-        if expand_kiokii:
+        if expand_cohort_b:
             # The first expansion adds four offers without rewriting either original quote or SKU.
             replay = already_expanded
             persisted = {row["offer_id"]: _row_proof(row) for row in before}
@@ -141,11 +142,11 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     if not write or replay:
         return receipt
 
-    if expand_kiokii:
+    if expand_cohort_b:
         offers = [offer for offer in plan["offers"] if offer["offer_id"] not in existing_ids]
         sku_keys = {offer["sku_key"] for offer in offers}
         plan = {**plan, "offers": offers, "skus": [sku for sku in plan["skus"] if sku["sku_key"] in sku_keys]}
-    expected_writes = 4 if expand_kiokii else len(retailer.variants)
+    expected_writes = 4 if expand_cohort_b else len(retailer.variants)
     counts = await enrichment.apply_ingest_plan(
         plan, batch_label=label, db=db, market="US", price_read=True,
     )
@@ -156,10 +157,10 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     after = await retailer_witness(db, params)
     require_retailer_rows(after, expected, params, cohort=cohort)
     require_offer_snapshot(after, _proof_offer_snapshot(expected))
-    if expand_kiokii and {r["offer_id"]: r for r in after if r["offer_id"] in existing_ids} != {
+    if expand_cohort_b and {r["offer_id"]: r for r in after if r["offer_id"] in existing_ids} != {
         r["offer_id"]: r for r in before
     }:
-        raise ValueError("Kiokii expansion changed an original SKU or quote")
+        raise ValueError("cohort B expansion changed an original SKU or quote")
     if await canonical_witness(db, retailer, cohort=cohort) != canonical:
         raise ValueError("reviewed canonical product or index changed during retailer apply")
     if await db.fetch_val(
@@ -170,7 +171,7 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=SURRATT_RET
     return receipt
 
 
-async def canonical_witness(db, retailer, *, cohort=SURRATT_RETAILER_COHORT):
+async def canonical_witness(db, retailer, *, cohort=RETAILER_COHORT_A):
     rows = await db.fetch_all(
         """
         SELECT to_jsonb(p)::text AS product_row, to_jsonb(i)::text AS index_row,
@@ -242,17 +243,17 @@ def _reviewed_observation_times(rows, expected, params, cohort):
         return observed
     # The first six-offer state may have one previous timestamp for the two original quotes
     # and one for the four additions. The normal refresh replaces both with a single capture.
-    if cohort is KIOKII_RETAILER_COHORT and len(expected) == 6 and KIOKII_INITIAL_OFFER_IDS <= expected.keys():
+    if cohort is RETAILER_COHORT_B and len(expected) == 6 and COHORT_B_INITIAL_OFFER_IDS <= expected.keys():
         original, added = set(), set()
         for row in rows:
-            timestamps = original if row["offer_id"] in KIOKII_INITIAL_OFFER_IDS else added
+            timestamps = original if row["offer_id"] in COHORT_B_INITIAL_OFFER_IDS else added
             timestamps.add(datetime.fromisoformat(_row_proof(row)["observed_at"]))
         if len(original) == len(added) == 1 and max(original) <= min(added):
             return observed
     raise ValueError("retailer persisted observations are inconsistent")
 
 
-def require_retailer_rows(rows, expected, params, *, compare_snapshot=True, cohort=SURRATT_RETAILER_COHORT):
+def require_retailer_rows(rows, expected, params, *, compare_snapshot=True, cohort=RETAILER_COHORT_A):
     if len(rows) != len(expected) or {row["offer_id"] for row in rows} != expected.keys():
         raise ValueError("retailer offer IDs are incomplete or collide with an earlier writer")
     observed_times = set()

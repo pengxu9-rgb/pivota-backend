@@ -1,4 +1,10 @@
-"""Atomically add four reviewed US anchors and their Kiokii referral offers."""
+"""Atomically add four reviewed US anchors and their cohort B referral offers.
+
+The job prefixes and the opt-in flag are read from config/reviewed_retailer_cohorts.json
+(cohort_b.expansion_job). The database host, database name and runtime service account the job
+must find are read from its environment: REVIEWED_JOB_DB_HOST, REVIEWED_JOB_DB_NAME and
+REVIEWED_JOB_SERVICE_ACCOUNT. An unset pin holds the run.
+"""
 
 import argparse
 import asyncio
@@ -12,20 +18,25 @@ from urllib.request import Request, urlopen
 
 from db.database import database
 from scripts.ops.kiokii_us_retailer_offers import fetch_storefront
-from services.amuse_us_variant_expansion import ORIGINAL, apply_anchors, prepare_review
-from services.catalog_enrichment_agent.surratt_retailer_apply import apply_reviewed_retailer
+from services.reviewed_variant_expansion import ORIGINAL, apply_anchors, prepare_review
+from services.catalog_enrichment_agent.reviewed_retailer_apply import apply_reviewed_retailer
 from services.exact_retailer_shades import read_offers
 from services.outbound_links_service import is_destination_domain_allowed
-from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT
+from services.exact_retailer_cohorts import COHORT_B_CONFIG, RETAILER_COHORT_B
 
 
-COHORT = KIOKII_RETAILER_COHORT
-PROFILES = {
-    "staging": ("pivota-staging", "10.122.0.5", "meitu_kiokii_us_stage", "meitu-stage-kiokii-us-six-",
-                "sa-backend@pivota-staging.iam.gserviceaccount.com"),
-    "production": ("pivota-prod", "10.25.0.2", "pivota_08220842_Zsqlgz", "meitu-prod-kiokii-us-six-",
-                   "sa-worker@pivota-prod.iam.gserviceaccount.com"),
-}
+COHORT = RETAILER_COHORT_B
+EXPANSION_JOB = COHORT_B_CONFIG["expansion_job"]
+PROJECTS = {"staging": "pivota-staging", "production": "pivota-prod"}
+
+
+def _profile(environment):
+    """(project, db host, db name, job prefix, service account); a missing pin is None."""
+    if environment not in PROJECTS:
+        return (None, None, None, None, None)
+    return (PROJECTS[environment], os.getenv("REVIEWED_JOB_DB_HOST") or None,
+            os.getenv("REVIEWED_JOB_DB_NAME") or None, EXPANSION_JOB["job_prefixes"][environment],
+            os.getenv("REVIEWED_JOB_SERVICE_ACCOUNT") or None)
 
 
 def metadata(key):
@@ -39,19 +50,20 @@ def metadata(key):
 
 def check_environment(sha):
     environment = os.getenv("PIVOTA_ENV")
-    project, host, catalog, prefix, account = PROFILES.get(environment, (None, None, None, None, None))
+    project, host, catalog, prefix, account = _profile(environment)
     dsn = urlsplit(os.environ["DATABASE_URL"])
     job = os.getenv("CLOUD_RUN_JOB", "")
     stamp = Path("/app/.image_commit_sha").read_text().strip()
     if (not re.fullmatch(r"[0-9a-f]{40}", sha) or stamp != sha or not prefix or not job.startswith(prefix)
+            or not host or not catalog or not account
             or not os.getenv("CLOUD_RUN_EXECUTION", "").startswith(job + "-")
             or (dsn.hostname, dsn.path) != (host, "/" + catalog)
             or os.getenv("GOOGLE_CLOUD_PROJECT") != project
             or metadata("project/project-id") != project
             or metadata("instance/service-accounts/default/email") != account):
-        raise ValueError("expected the pinned Kiokii job, backend image, service account, and database")
-    if os.getenv("MEITU_US_KIOKII_SIX_EXPANSION_ENABLED") != "1":
-        raise ValueError("AMUSE six-shade expansion is disabled")
+        raise ValueError("expected the pinned cohort B job, backend image, service account, and database")
+    if os.getenv(EXPANSION_JOB["enable_flag"]) != "1":
+        raise ValueError("seed B six-shade expansion is disabled")
     return environment, host, catalog
 
 
@@ -60,7 +72,7 @@ async def verify_database(host, catalog):
         "SELECT host(inet_server_addr())=:host AND current_database()=:db AND NOT pg_is_in_recovery()",
         {"host": host, "db": catalog},
     ):
-        raise ValueError("expected the reviewed Kiokii database primary")
+        raise ValueError("expected the reviewed cohort B database primary")
 
 
 async def require_domains(listing_url):
@@ -69,7 +81,7 @@ async def require_domains(listing_url):
     )]
     if any(not is_destination_domain_allowed(destination_url=link, allowed_domains=domains)
            for link in (ORIGINAL.url, listing_url)):
-        raise ValueError("the reviewed AMUSE and Kiokii US landing domains must be enabled")
+        raise ValueError("the reviewed seed B and cohort B US landing domains must be enabled")
 
 
 async def verify_retailer_offers(quotes, seller):
@@ -104,26 +116,26 @@ async def run(mode, sha):
             await database.execute("SELECT pg_advisory_xact_lock(1160308171, 2)")
             await require_domains(listing.family_url)
             anchor = await apply_anchors(review)
-            options = {"cohort": COHORT, "expand_kiokii": True}
+            options = {"cohort": COHORT, "expand_cohort_b": True}
             planned = await apply_reviewed_retailer(database, record, write=False, **options)
             if planned["existing"] != anchor["existing"]:
-                raise ValueError("AMUSE canonical and Kiokii offer counts must expand together")
+                raise ValueError("seed B canonical and cohort B offer counts must expand together")
             if (planned["product_key"], planned["seller_ref"], len(planned["offers"])) != (key, listing.merchant_id, 6):
-                raise ValueError("exact combined Kiokii expansion landed outside its reviewed identity")
+                raise ValueError("exact combined cohort B expansion landed outside its reviewed identity")
             if not planned["replayed"] and (review is None or {
                 offer_id: planned["offers"].get(offer_id) for offer_id in review.retailer_quotes
             } != review.retailer_quotes):
-                raise ValueError("new Kiokii offers differ from the scoped machine review")
+                raise ValueError("new cohort B offers differ from the scoped machine review")
             if not planned["replayed"] and await apply_reviewed_retailer(
                 database, record, write=True, **options,
             ) != planned:
-                raise ValueError("the Kiokii write differs from the reviewed plan")
+                raise ValueError("the cohort B write differs from the reviewed plan")
             replay = await apply_reviewed_retailer(database, record, write=True, **options)
             if replay["existing"] != 6 or not replay["replayed"] or planned["offers"] != replay["offers"]:
-                raise ValueError("exact combined Kiokii expansion is not replay-safe")
+                raise ValueError("exact combined cohort B expansion is not replay-safe")
             observed_offer_ids = await verify_retailer_offers(planned["offers"], listing.merchant_id)
         return {
-            "scope": "amuse_us_six_expansion", "schema_version": 1, "market": "US", "mode": mode,
+            "scope": EXPANSION_JOB["scope"], "schema_version": 1, "market": "US", "mode": mode,
             "environment": environment, "release_sha": sha, "database": catalog,
             "committed": mode == "apply" and not planned["replayed"],
             "same_capture_replayed": True, "canonical": anchor, "listing": planned,

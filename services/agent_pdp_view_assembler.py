@@ -34,9 +34,9 @@ from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
 )
-from services.surratt_retailer_pilot import (
-    KIOKII_PROTECTED_FAMILY_URLS, KIOKII_PROTECTED_LISTING_KEYS,
-    PROOF_KEY as SURRATT_RETAILER_SHADE_PROOF_KEY, RETAILERS as SURRATT_RETAILERS,
+from services.exact_retailer_cohorts import (
+    COHORT_B_PROTECTED_FAMILY_URLS, COHORT_B_PROTECTED_LISTING_KEYS,
+    PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY, RETAILERS as COHORT_A_RETAILERS,
 )
 from services.title_normalization import normalize_display_title
 
@@ -79,25 +79,25 @@ _SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
     row_source_system_expr="cp.source_system",
     row_source_ref_expr="cp.source_ref",
 )
-_SURRATT_RETAILER_KEYS = ", ".join(f"'{key}'" for key in SURRATT_RETAILERS)
-_KIOKII_RETAILER_KEYS = ", ".join(f"'{key}'" for key in sorted(KIOKII_PROTECTED_LISTING_KEYS))
-_KIOKII_LISTING_IDENTITIES = ", ".join(f"'{url.removeprefix('https://')}'" for url in KIOKII_PROTECTED_FAMILY_URLS)
+_COHORT_A_RETAILER_KEYS = ", ".join(f"'{key}'" for key in COHORT_A_RETAILERS)
+_COHORT_B_RETAILER_KEYS = ", ".join(f"'{key}'" for key in sorted(COHORT_B_PROTECTED_LISTING_KEYS))
+_COHORT_B_LISTING_IDENTITIES = ", ".join(f"'{url.removeprefix('https://')}'" for url in COHORT_B_PROTECTED_FAMILY_URLS)
 
 
-def _is_kiokii_seed_alias(seed_ref: str) -> str:
+def _is_cohort_b_seed_alias(seed_ref: str) -> str:
     def matches(field: str) -> str:
         return f"""COALESCE(lower(rtrim(regexp_replace(split_part(split_part({seed_ref}.{field}, '?', 1), '#', 1),
-                           '^https?://(www[.])?', '', 'i'), '/')) IN ({_KIOKII_LISTING_IDENTITIES}), FALSE)"""
+                           '^https?://(www[.])?', '', 'i'), '/')) IN ({_COHORT_B_LISTING_IDENTITIES}), FALSE)"""
 
     return f"({matches('canonical_url')} OR {matches('destination_url')})"
 
 
 def _is_excluded_exact_retailer_listing(product_key_ref: str) -> str:
-    return f"""(COALESCE({product_key_ref} IN ({_KIOKII_RETAILER_KEYS}), FALSE) OR
-        ({product_key_ref} IN ({_SURRATT_RETAILER_KEYS}) AND EXISTS (
+    return f"""(COALESCE({product_key_ref} IN ({_COHORT_B_RETAILER_KEYS}), FALSE) OR
+        ({product_key_ref} IN ({_COHORT_A_RETAILER_KEYS}) AND EXISTS (
         SELECT 1 FROM catalog_offers pilot
         WHERE pilot.product_key = {product_key_ref}
-          AND pilot.offer_payload->'{SURRATT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
+          AND pilot.offer_payload->'{EXACT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
     )))"""
 
 
@@ -160,7 +160,7 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
          AND pgm.platform_product_id = cp.source_product_id
         WHERE cp.content_key = :ck
         {_SOURCE_QUARANTINE_ANTI_JOIN}
-          -- Reviewed Surratt children are resolved at shade grain by offers.resolve.
+          -- Reviewed exact-retailer children are resolved at shade grain by offers.resolve.
           -- Exclude the entire marked listing before gathering generic prices and variants.
           AND NOT {_is_excluded_exact_retailer_listing('cp.product_key')}
         """,
@@ -242,7 +242,7 @@ async def fetch_external_seed_for_keys(
         FROM external_product_seeds seed
         WHERE attached_product_key = ANY(:keys)
           AND status = 'active'
-          AND NOT {_is_kiokii_seed_alias('seed')}
+          AND NOT {_is_cohort_b_seed_alias('seed')}
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -268,7 +268,7 @@ async def fetch_external_seed_by_id(
         SELECT id, attached_product_key, title, image_url, seed_data,
                canonical_url, destination_url,
                ({_is_excluded_exact_retailer_listing('seed.attached_product_key')}
-                OR {_is_kiokii_seed_alias('seed')}) AS exact_retailer_shade_listing
+                OR {_is_cohort_b_seed_alias('seed')}) AS exact_retailer_shade_listing
         FROM external_product_seeds seed
         WHERE id = :seed_id
         """,
@@ -307,7 +307,7 @@ async def fetch_own_seed_copy_for_keys(
         FROM external_product_seeds seed
         WHERE attached_product_key = ANY(:keys)
           AND status = 'active'
-          AND NOT {_is_kiokii_seed_alias('seed')}
+          AND NOT {_is_cohort_b_seed_alias('seed')}
         ORDER BY attached_product_key, updated_at DESC, id DESC
         """,
         {"keys": product_keys},

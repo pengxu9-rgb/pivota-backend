@@ -6,14 +6,14 @@ import sys
 
 import pytest
 
-from scripts.ops.meitu_discovery import sources
+from scripts.ops.partner_discovery import sources
 
 
 OPERATOR = Path(sources.__file__).parent
 PROJECT = "pivota-staging"
 NAMESPACE = "184498324954"
 REGION = "us-west1"
-ACCOUNT = "sa-meitu-evidence-v1@pivota-staging.iam.gserviceaccount.com"
+ACCOUNT = "evidence-reader@staging-project.example"
 IMAGE = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "a" * 64
 
 

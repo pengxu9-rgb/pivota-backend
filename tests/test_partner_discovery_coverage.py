@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from scripts.ops.meitu_discovery import coverage, handoff
+from scripts.ops.partner_discovery import coverage, handoff
 
 
 RETAILER_URL = "https://retailer.example/products/lip-pencil"
@@ -67,7 +67,7 @@ def test_intake_rejects_mismatched_capture_or_official_identity():
         coverage.previous_captures(previous, [{**receipt, "manifest_sha256": "0" * 64}])
     with pytest.raises(ValueError, match="one official result batch"):
         coverage.reconcile(intake, sources, [], {})
-    with pytest.raises(ValueError, match="original Meitu product"):
+    with pytest.raises(ValueError, match="original partner product"):
         coverage.reconcile(intake, sources, [{**official, "meitu_id": "different"}], {})
 
 

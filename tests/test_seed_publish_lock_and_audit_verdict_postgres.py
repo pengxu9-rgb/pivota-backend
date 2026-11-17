@@ -234,7 +234,7 @@ async def machine_pilot(env, monkeypatch):
     db, ep = env["db"], env["ep"]
     for statement in split_statements((_MIGRATIONS / "285_external_seed_machine_reviews.sql").read_text()):
         await db.execute(statement)
-    seed_id = pilot.SURRATT_SEED_ID
+    seed_id = pilot.SEED_A_ID
     listing = pilot.LISTINGS[seed_id]
     variants = [
         {"variant_id": vid, "barcode": gtin, "title": shade, "sku": sku, "price_currency": "USD",

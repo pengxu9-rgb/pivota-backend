@@ -1,4 +1,9 @@
-"""Plan, ingest or refresh the four reviewed Surratt US referral offers."""
+"""Plan, ingest or refresh the four reviewed cohort A US referral offers.
+
+The cohort's listings, storefront identity checks and job settings are read from
+config/reviewed_retailer_cohorts.json. The production database pins are read from the job
+environment (REVIEWED_JOB_DB_HOST, REVIEWED_JOB_DB_NAME); unset pins hold the run.
+"""
 
 import argparse
 import asyncio
@@ -12,31 +17,34 @@ from urllib.parse import urlsplit
 import httpx
 
 from services import crawl_politeness, shopify_edge_pacer
-from services.catalog_enrichment_agent.surratt_retailer_apply import apply_reviewed_retailer
+from services.catalog_enrichment_agent.reviewed_retailer_apply import apply_reviewed_retailer
 from services.catalog_identity import validated_source_gtin
 from services.curated_brand_feed import _note_response, shopify_product_to_record
 from services.exact_retailer_shades import read_offers
 from services.outbound_links_service import is_destination_domain_allowed
 from services.shopify_presentment import presentment_currency
-from services.surratt_retailer_pilot import RETAILERS
+from services.exact_retailer_cohorts import COHORT_A_CONFIG, RETAILERS
 
 
+REFRESH = COHORT_A_CONFIG["refresh"]
 PROD_PROJECT = "pivota-prod"
-PROD_HOST = "10.25.0.2"
-PROD_DATABASE = "pivota_08220842_Zsqlgz"
-JOB_PREFIX = "meitu-surratt-retailer-"
-WRITE_FLAG = "SURRATT_RETAILER_WRITE_ENABLED"
+PROD_HOST = os.getenv("REVIEWED_JOB_DB_HOST")
+PROD_DATABASE = os.getenv("REVIEWED_JOB_DB_NAME")
+JOB_PREFIX = REFRESH["job_prefix"]
+WRITE_FLAG = REFRESH["write_flag"]
+RELEASE_COMMIT_ENV = REFRESH["release_commit_env"]
+SCOPE = REFRESH["scope"]
 AGENT = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
-STORE_NAMES = {"bluemercury.com": "Bluemercury", "frendsbeauty.com": "Frends Beauty"}
+STORE_NAMES = REFRESH["store_names"]
 
 
 def storefront_record(listing, payload, observed_at):
     if (
         not isinstance(payload, dict)
         or str(payload.get("id")) != listing.native_product_id
-        or payload.get("handle") != "surratt-lipslique"
-        or str(payload.get("vendor", "")).strip().casefold() not in {"surratt", "surratt beauty"}
-        or "lipslique" not in str(payload.get("title", "")).casefold()
+        or payload.get("handle") != REFRESH["handle"]
+        or str(payload.get("vendor", "")).strip().casefold() not in set(REFRESH["vendor_names"])
+        or REFRESH["title_token"] not in str(payload.get("title", "")).casefold()
         or not isinstance(payload.get("variants"), list)
     ):
         raise ValueError("storefront listing identity changed")
@@ -63,14 +71,14 @@ def storefront_record(listing, payload, observed_at):
     if seen != listing.variants.keys():
         raise ValueError("reviewed shade pair is missing")
     description = str(payload.get("description") or "")
-    if str(payload.get("type") or "").casefold() != "lipstick" and not description.casefold().startswith(
-        "<p>lipstick, but lighter.</p>"
+    if str(payload.get("type") or "").casefold() != REFRESH["product_type"] and not description.casefold().startswith(
+        REFRESH["description_prefix"]
     ):
         raise ValueError("retailer product category changed")
     record = shopify_product_to_record(
         {**payload, "product_type": payload.get("type"), "body_html": description,
          "variants": variants, "images": [{"src": variants[0]["featured_image"]["src"]}]},
-        domain=listing.host, category_path="beauty/makeup/lip/lipstick", brand_override="Surratt Beauty",
+        domain=listing.host, category_path=REFRESH["category_path"], brand_override=REFRESH["brand_override"],
         emit_native_variants=True, currency="USD", source_role="retailer", retailer_name=STORE_NAMES[listing.host],
     )
     if not record or len(record.get("offers") or []) != 1:
@@ -104,13 +112,14 @@ def check_environment(mode):
         (os.getenv("PIVOTA_ENV"), os.getenv("GOOGLE_CLOUD_PROJECT")) != ("production", PROD_PROJECT)
         or not job.startswith(JOB_PREFIX)
         or not os.getenv("CLOUD_RUN_EXECUTION", "").startswith(f"{job}-")
+        or not PROD_HOST or not PROD_DATABASE
         or configured.hostname != PROD_HOST or configured.path != f"/{PROD_DATABASE}"
         or not re.fullmatch(r"[0-9a-f]{40}", stamp)
-        or os.getenv("SURRATT_RELEASE_COMMIT") != stamp
+        or os.getenv(RELEASE_COMMIT_ENV) != stamp
     ):
         raise ValueError("expected the reviewed production job, image and database")
     if mode != "plan" and os.getenv(WRITE_FLAG) != "1":
-        raise ValueError("reviewed Surratt writes are disabled")
+        raise ValueError("reviewed cohort A writes are disabled")
     return stamp
 
 
@@ -170,7 +179,7 @@ async def run(mode):
     records = [await fetch_storefront(listing) for listing in RETAILERS.values()]
     await database.connect()
     try:
-        return {"scope": "surratt_us_retailer_referrals", "mode": mode, "release_sha": stamp,
+        return {"scope": SCOPE, "mode": mode, "release_sha": stamp,
                 "listings": await apply_cohort(database, records, mode=mode)}
     finally:
         await database.disconnect()
@@ -182,7 +191,7 @@ def main():
     try:
         print(json.dumps(asyncio.run(run(parser.parse_args().mode)), sort_keys=True), flush=True)
     except ValueError as exc:
-        print(json.dumps({"scope": "surratt_us_retailer_referrals", "status": "held", "reason": str(exc)}), flush=True)
+        print(json.dumps({"scope": SCOPE, "status": "held", "reason": str(exc)}), flush=True)
         raise SystemExit(1) from None
 
 

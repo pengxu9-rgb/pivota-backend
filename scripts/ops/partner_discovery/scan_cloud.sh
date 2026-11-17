@@ -40,7 +40,7 @@ if not re.fullmatch(r'[a-z0-9-]{8,75}', batch) or not isinstance(queries, list) 
     raise SystemExit('expected a stable batch ID and nonempty query list')
 lines = sorted(query['line'] for query in queries)
 if len(lines) != len(set(lines)) or not all(type(line) is int and line > 0 for line in lines):
-    raise SystemExit('expected unique positive Meitu source lines')
+    raise SystemExit('expected unique positive partner source lines')
 payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
 
 def digest(raw):
@@ -253,7 +253,7 @@ for row in queries:
     source = expected[row['meitu_line']]
     if (row.get('market') != 'US' or any(row.get(field) != source[field] for field in ('meitu_id', 'brand', 'name', 'host'))
             or not isinstance(row.get('candidates'), list) or row.get('candidate_count') != len(row['candidates'])):
-        raise SystemExit(f"invalid candidate count for Meitu line {row['meitu_line']}")
+        raise SystemExit(f"invalid candidate count for partner line {row['meitu_line']}")
 ordered = sorted(queries, key=lambda row: row['meitu_line'])
 (path / 'queries.jsonl').write_text(''.join(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n' for row in ordered))
 summary = json.dumps(summary_row, ensure_ascii=False, sort_keys=True, indent=2) + '\n'

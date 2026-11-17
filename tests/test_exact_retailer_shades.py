@@ -1,4 +1,4 @@
-"""Drive exact Surratt referrals through offers.resolve and its signed redirect."""
+"""Drive exact cohort A and B referrals through offers.resolve and its signed redirect."""
 
 import json
 import os
@@ -12,16 +12,21 @@ from fastapi.testclient import TestClient
 from main import app
 from routes import agent_shop_gateway as gateway, outbound_links
 from services import exact_retailer_shades as shades
-from services.surratt_retailer_pilot import (
-    KIOKII_FLAG, KIOKII_PROTECTED_FAMILY_URLS, KIOKII_RETAILER_COHORT, PILOT_FLAG, PROOF_KEY, RETAILERS,
-    SURRATT_RETAILER_COHORT,
+from services.exact_retailer_cohorts import (
+    COHORT_B_FLAG, COHORT_B_PROTECTED_FAMILY_URLS, RETAILER_COHORT_B, PILOT_FLAG, PROOF_KEY, RETAILERS,
+    RETAILER_COHORT_A,
 )
+from services.external_seed_review_pilot import LISTINGS, SEED_A_ID, SEED_B_ID
 from tests.test_offers_one_per_seller_buyer_currency import _seed, _shade
 
 
 FIRST = "31365263163459"
 SECOND = "31365263196227"
-BRAND = "surrattbeauty.com"
+# The brand-direct seed hosts and retailer hosts come from the reviewed config, not literals.
+BRAND = LISTINGS[SEED_A_ID].seller_host
+BRAND_B = LISTINGS[SEED_B_ID].host
+FIRST_RETAILER_HOST = next(iter(RETAILERS.values())).host
+(COHORT_B_LISTING,) = RETAILER_COHORT_B.listings.values()
 
 
 def _sku(product_key, merchant_id, native_id, barcode):
@@ -33,7 +38,7 @@ def _sku(product_key, merchant_id, native_id, barcode):
     }
 
 
-def fixture_rows(named, cohort=SURRATT_RETAILER_COHORT):
+def fixture_rows(named, cohort=RETAILER_COHORT_A):
     rows = []
     for product_key, listing in cohort.listings.items():
         for native, (canonical, gtin) in listing.variants.items():
@@ -75,7 +80,7 @@ def http(monkeypatch):
     return TestClient(app), warm
 
 
-def _invoke(client, *, sku_id, limit=5, market="US", assumed=False, cohort=SURRATT_RETAILER_COHORT):
+def _invoke(client, *, sku_id, limit=5, market="US", assumed=False, cohort=RETAILER_COHORT_A):
     product = {"product_id": shades.canonical_signature(cohort), "sku_id": sku_id}
     result = client.post("/agent/shop/v1/invoke", json={
         "operation": "offers.resolve",
@@ -86,7 +91,7 @@ def _invoke(client, *, sku_id, limit=5, market="US", assumed=False, cohort=SURRA
     return result.json()["offers"]
 
 
-def _wire_sources(monkeypatch, named, rows, *, brand=BRAND, retailer="bluemercury.com", retailer_family=None,
+def _wire_sources(monkeypatch, named, rows, *, brand=BRAND, retailer=FIRST_RETAILER_HOST, retailer_family=None,
                   generic_rows=()):
     variant = {**_shade(0, "Named"), "variant_id": named, "shopify_variant_id": named}
     brand_seed = _seed(seed_id="seed-official", host=brand, variants=[variant])
@@ -137,7 +142,7 @@ def test_both_retailers_use_own_native_shade_and_cold_redirect(monkeypatch, http
         target = urlsplit(redirect.headers["location"])
         assert redirect.status_code == 302
         assert target.hostname == listing.host
-        assert target.path == "/products/surratt-lipslique"
+        assert target.path == listing.product_path
         assert parse_qs(target.query)["variant"] == [native]
     warm.assert_not_awaited()
 
@@ -184,9 +189,9 @@ def test_exact_selection_precedes_price_ranking_and_limit(monkeypatch, http):
     ("52547429040442", "51629126156608"),
     ("52547429073210", "51896079876416"),
 ])
-def test_kiokii_uses_own_native_shade_in_signed_referral(monkeypatch, http, canonical, native):
+def test_cohort_b_uses_own_native_shade_in_signed_referral(monkeypatch, http, canonical, native):
     client, warm = http
-    cohort = KIOKII_RETAILER_COHORT
+    cohort = RETAILER_COHORT_B
     (listing_key, listing), = cohort.listings.items()
     from services.catalog_enrichment_agent.ingestion import retailer_product_key
     from services.seller_identity import make_observed_retailer_id
@@ -194,16 +199,16 @@ def test_kiokii_uses_own_native_shade_in_signed_referral(monkeypatch, http, cano
     assert listing_key == retailer_product_key(listing.host, listing.family_url)
     assert listing.merchant_id == make_observed_retailer_id(listing.host)
     monkeypatch.delenv(PILOT_FLAG)
-    monkeypatch.setenv(KIOKII_FLAG, "1")
+    monkeypatch.setenv(COHORT_B_FLAG, "1")
     generic_offer = {
         "offer_id": "offer-other-shop", "merchant_id": "seller-other-shop", "product_key": "other-shop-product",
         "destination_url": "https://example.com/product", "offer_type": "retailer", "readiness_tier": "referral_only",
         "availability": "in_stock", "currency": "USD", "price_amount": 15,
     }
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
-                        AsyncMock(return_value=[listing.host, "amuseseoulmakeup.com", "example.com"]))
+                        AsyncMock(return_value=[listing.host, BRAND_B, "example.com"]))
     monkeypatch.setattr(gateway.settings, "outbound_warm_handoff_brands_raw", listing.host)
-    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand="amuseseoulmakeup.com",
+    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand=BRAND_B,
                           retailer=listing.host, retailer_family=listing.family_url, generic_rows=[generic_offer])
     offers = _invoke(client, sku_id=canonical, cohort=cohort)
     assert {offer["source"].get("seed_id") for offer in offers} == {"seed-official", None}
@@ -225,14 +230,14 @@ def test_kiokii_uses_own_native_shade_in_signed_referral(monkeypatch, http, cano
     warm.assert_not_awaited()
 
 
-def test_kiokii_exact_offer_is_gated_and_requires_a_signature(monkeypatch, http):
+def test_cohort_b_exact_offer_is_gated_and_requires_a_signature(monkeypatch, http):
     client, _ = http
-    cohort = KIOKII_RETAILER_COHORT
+    cohort = RETAILER_COHORT_B
     canonical = "52547429007674"
-    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand="amuseseoulmakeup.com")
+    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand=BRAND_B)
     offers = _invoke(client, sku_id=canonical, cohort=cohort)
     assert not any(offer["source"]["type"] == "catalog_offer" for offer in offers)
-    monkeypatch.setenv(KIOKII_FLAG, "1")
+    monkeypatch.setenv(COHORT_B_FLAG, "1")
     for fields in ({"market": "CA"}, {"market": "SG"}, {"assumed": True}, {"sku_id": None}, {"sku_id": FIRST}):
         offers = _invoke(client, cohort=cohort, **({"sku_id": canonical} | fields))
         assert not any(offer["source"]["type"] == "catalog_offer" for offer in offers)
@@ -242,19 +247,19 @@ def test_kiokii_exact_offer_is_gated_and_requires_a_signature(monkeypatch, http)
     assert calls == ["legacy"] * 7 + ["exact"]
 
 
-@pytest.mark.parametrize("family_url", KIOKII_PROTECTED_FAMILY_URLS)
-def test_kiokii_same_family_seeds_cannot_bypass_the_disabled_feature(monkeypatch, http, family_url):
+@pytest.mark.parametrize("family_url", COHORT_B_PROTECTED_FAMILY_URLS, ids=["localized_family", "bare_family"])
+def test_cohort_b_same_family_seeds_cannot_bypass_the_disabled_feature(monkeypatch, http, family_url):
     client, _ = http
     canonical = "52547429007674"
-    monkeypatch.delenv(KIOKII_FLAG, raising=False)
+    monkeypatch.delenv(COHORT_B_FLAG, raising=False)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
-                        AsyncMock(return_value=["kiokii.com", "amuseseoulmakeup.com"]))
-    calls = _wire_sources(monkeypatch, canonical, [], brand="amuseseoulmakeup.com", retailer="kiokii.com",
+                        AsyncMock(return_value=[COHORT_B_LISTING.host, BRAND_B]))
+    calls = _wire_sources(monkeypatch, canonical, [], brand=BRAND_B, retailer=COHORT_B_LISTING.host,
                           retailer_family=f"{family_url}?variant=51896079974720")
-    offers = _invoke(client, sku_id=canonical, cohort=KIOKII_RETAILER_COHORT)
+    offers = _invoke(client, sku_id=canonical, cohort=RETAILER_COHORT_B)
     assert [offer["source"].get("seed_id") for offer in offers] == ["seed-official"]
     assert calls == ["legacy"]
-    assert not shades.is_pilot_retailer_seed({"destination_url": "https://kiokii.com/products/other-product"}, None)
+    assert not shades.is_pilot_retailer_seed({"destination_url": f"https://{COHORT_B_LISTING.host}/products/other-product"}, None)
 
 
 @pytest.mark.asyncio
@@ -281,9 +286,9 @@ async def test_missing_or_out_of_window_proof_is_withheld_even_with_fresh_price(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("cohort", "canonical", "native_ids"), [
-    (SURRATT_RETAILER_COHORT, FIRST, ("32360830435403", "47230401151268")),
-    (KIOKII_RETAILER_COHORT, "52547429007674", ("51896079974720",)),
-], ids=["surratt", "kiokii"])
+    (RETAILER_COHORT_A, FIRST, ("32360830435403", "47230401151268")),
+    (RETAILER_COHORT_B, "52547429007674", ("51896079974720",)),
+], ids=["cohort_a", "cohort_b"])
 async def test_postgres_reader_requires_exact_ownership_market_and_live_chain(cohort, canonical, native_ids):
     from databases import Database
 

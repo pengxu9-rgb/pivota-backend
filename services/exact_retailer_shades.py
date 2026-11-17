@@ -11,17 +11,17 @@ from urllib.parse import urlsplit
 from services.catalog_identity import validated_source_gtin
 from services.handover_variant_identity import candidate_from_row, canonical_variant_id
 from services.seed_served_url import same_destination
-from services.surratt_retailer_pilot import (
-    KIOKII_PROTECTED_FAMILY_URLS, KIOKII_PROTECTED_LISTING_KEYS, KIOKII_RETAILER_COHORT,
-    PROOF_KEY, RETAILERS, SURRATT_RETAILER_COHORT, ExactRetailerCohort,
+from services.exact_retailer_cohorts import (
+    COHORT_B_PROTECTED_FAMILY_URLS, COHORT_B_PROTECTED_LISTING_KEYS, RETAILER_COHORT_B,
+    PROOF_KEY, RETAILERS, RETAILER_COHORT_A, ExactRetailerCohort,
 )
 
 
 RETAILER_HOSTS = frozenset(listing.host for listing in RETAILERS.values())
-_KIOKII_PROTECTED_LOCATIONS = frozenset((urlsplit(url).hostname, urlsplit(url).path)
-                                       for url in KIOKII_PROTECTED_FAMILY_URLS)
-_KIOKII_CANONICAL_VARIANTS = frozenset(
-    canonical_id for listing in KIOKII_RETAILER_COHORT.listings.values()
+_COHORT_B_PROTECTED_LOCATIONS = frozenset((urlsplit(url).hostname, urlsplit(url).path)
+                                       for url in COHORT_B_PROTECTED_FAMILY_URLS)
+_COHORT_B_CANONICAL_VARIANTS = frozenset(
+    canonical_id for listing in RETAILER_COHORT_B.listings.values()
     for canonical_id, _ in listing.variants.values()
 )
 _ROW_LIMIT = 121
@@ -67,7 +67,7 @@ def _canonical_signature(merchant_id, product_key):
     )
 
 
-def canonical_signature(cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
+def canonical_signature(cohort: ExactRetailerCohort = RETAILER_COHORT_A):
     return _canonical_signature(cohort.canonical_merchant_id, cohort.canonical_product_key)
 
 
@@ -80,23 +80,23 @@ def _matches_product(product_id, cohort):
 
 
 def applies(product_id, sku_id, observed_market, merchant_scope):
-    return (SURRATT_RETAILER_COHORT.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
-            and _matches_product(product_id, SURRATT_RETAILER_COHORT))
+    return (RETAILER_COHORT_A.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
+            and _matches_product(product_id, RETAILER_COHORT_A))
 
 
 def matching_cohort(product_id, sku_id, observed_market, merchant_scope):
     if applies(product_id, sku_id, observed_market, merchant_scope):
-        return SURRATT_RETAILER_COHORT
-    if (KIOKII_RETAILER_COHORT.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
-            and _native_id(sku_id) in _KIOKII_CANONICAL_VARIANTS
-            and _matches_product(product_id, KIOKII_RETAILER_COHORT)):
-        return KIOKII_RETAILER_COHORT
+        return RETAILER_COHORT_A
+    if (RETAILER_COHORT_B.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
+            and _native_id(sku_id) in _COHORT_B_CANONICAL_VARIANTS
+            and _matches_product(product_id, RETAILER_COHORT_B)):
+        return RETAILER_COHORT_B
     return None
 
 
-def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = SURRATT_RETAILER_COHORT):
+def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = RETAILER_COHORT_A):
     attached_key = row.get("attached_product_key")
-    if attached_key in KIOKII_PROTECTED_LISTING_KEYS or (cohort is SURRATT_RETAILER_COHORT and attached_key in RETAILERS):
+    if attached_key in COHORT_B_PROTECTED_LISTING_KEYS or (cohort is RETAILER_COHORT_A and attached_key in RETAILERS):
         return True
     for field in ("domain", "destination_url", "canonical_url"):
         value = str(row.get(field) or "")
@@ -105,9 +105,9 @@ def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = SURRATT_RET
         except ValueError:
             continue
         host = (address.hostname or "").lower().removeprefix("www.")
-        if cohort is SURRATT_RETAILER_COHORT and host in RETAILER_HOSTS:
+        if cohort is RETAILER_COHORT_A and host in RETAILER_HOSTS:
             return True
-        if (host, address.path.rstrip("/")) in _KIOKII_PROTECTED_LOCATIONS:
+        if (host, address.path.rstrip("/")) in _COHORT_B_PROTECTED_LOCATIONS:
             return True
     return False
 
@@ -173,7 +173,7 @@ def _offer(row, *, listing, canonical_product_key, canonical_id, gtin, now):
             "variant_id": canonical_id, "retailer_variant_id": retailer_id}
 
 
-async def read_offers(db, sku_id, *, timeout, cohort: ExactRetailerCohort = SURRATT_RETAILER_COHORT):
+async def read_offers(db, sku_id, *, timeout, cohort: ExactRetailerCohort = RETAILER_COHORT_A):
     """Accept only a unique, currently live paired variant with persisted review evidence."""
     numeric = _native_id(sku_id)
     if not numeric:

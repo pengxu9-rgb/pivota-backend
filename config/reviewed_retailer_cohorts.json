@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "proof_key": "exact_retailer_shade_v1",
+  "cohort_a": {
+    "flag": "SURRATT_EXACT_RETAILER_SHADES_ENABLED",
+    "canonical_merchant_id": "merch_obs_30f9ce3e44b7fcb4",
+    "canonical_external_id": "ext_2ef8d743c054c55cef2cf95e",
+    "canonical_group_id": "pg_ceb91ba4d550214bae12c9c91645c593",
+    "canonical_content_key": "ck_ceb91ba4d550214bae12c9c91645c593",
+    "review_label": "surratt_exact_retailer_review_v1",
+    "ingest_skip_reason": "reviewed_surratt_retailer_scope",
+    "listings": {
+      "ext:retailer:6548393ec7fb8f0f556da26b1469b3c0": {
+        "merchant_id": "merch_obs_a2e07b1e8a08148b",
+        "host": "bluemercury.com",
+        "native_product_id": "4586445307979",
+        "product_path": "/products/surratt-lipslique",
+        "variants": {
+          "32360830435403": ["31365263163459", "00617037660642"],
+          "32360830533707": ["31365263196227", "00617037660635"]
+        }
+      },
+      "ext:retailer:076846155d508678762f333db90f3069": {
+        "merchant_id": "merch_obs_1602ce9889534d7e",
+        "host": "frendsbeauty.com",
+        "native_product_id": "8542558028068",
+        "product_path": "/products/surratt-lipslique",
+        "variants": {
+          "47230401151268": ["31365263163459", "00617037660642"],
+          "47230401249572": ["31365263196227", "00617037660635"]
+        }
+      }
+    },
+    "refresh": {
+      "module": "scripts.ops.surratt_retailer_offers",
+      "scope": "surratt_us_retailer_referrals",
+      "job_prefix": "meitu-surratt-retailer-",
+      "write_flag": "SURRATT_RETAILER_WRITE_ENABLED",
+      "release_commit_env": "SURRATT_RELEASE_COMMIT",
+      "handle": "surratt-lipslique",
+      "vendor_names": ["surratt", "surratt beauty"],
+      "title_token": "lipslique",
+      "product_type": "lipstick",
+      "description_prefix": "<p>lipstick, but lighter.</p>",
+      "category_path": "beauty/makeup/lip/lipstick",
+      "brand_override": "Surratt Beauty",
+      "store_names": {"bluemercury.com": "Bluemercury", "frendsbeauty.com": "Frends Beauty"}
+    }
+  },
+  "cohort_b": {
+    "flag": "MEITU_US_KIOKII_EXACT_ENABLED",
+    "expansion_flag": "KIOKII_US_RETAILER_EXPANSION_ENABLED",
+    "canonical_merchant_id": "merch_obs_1c4bc54448d534ca",
+    "canonical_external_id": "ext_51577f22556c1f3aeb091391",
+    "canonical_group_id": "pg_d6608eb0dcd14006495d2676df6972d8",
+    "canonical_content_key": "ck_d6608eb0dcd14006495d2676df6972d8",
+    "review_label": "meitu_us_kiokii_retailer_review_v1",
+    "ingest_skip_reason": "reviewed_kiokii_retailer_scope",
+    "initial_variants": ["51629126123840", "51896079974720"],
+    "initial_offer_ids": [
+      "offer:catalog_enrichment_agent_v1:fc5ef310e498e089",
+      "offer:catalog_enrichment_agent_v1:ef54321432063313"
+    ],
+    "listings": {
+      "ext:retailer:e18722a4e9371490caee4b67526d208b": {
+        "merchant_id": "merch_obs_9e4d0e3a645af39b",
+        "host": "kiokii.com",
+        "native_product_id": "10073908707648",
+        "product_path": "/en-us/products/amuse-banana-lip-oil-4-5ml",
+        "variants": {
+          "51629126123840": ["52547428942138", "08800299133494"],
+          "51896079974720": ["52547429007674", "08800299133517"],
+          "51629126189376": ["52547428909370", "08800299133487"],
+          "51629126222144": ["52547428974906", "08800299133500"],
+          "51629126156608": ["52547429040442", "08800299133524"],
+          "51896079876416": ["52547429073210", "08800299133531"]
+        }
+      }
+    },
+    "bare_family_url": "https://kiokii.com/products/amuse-banana-lip-oil-4-5ml",
+    "bare_listing_key": "ext:retailer:581319a8b5513cdd0a9ff47ac6a6e027",
+    "refresh": {
+      "module": "scripts.ops.kiokii_us_retailer_offers",
+      "scope": "kiokii_us_exact_referrals",
+      "job_prefix": "meitu-kiokii-us-retailer-",
+      "write_flag": "KIOKII_US_RETAILER_WRITE_ENABLED",
+      "release_commit_env": "KIOKII_RELEASE_COMMIT",
+      "shop_path": "/en-us/meta.json",
+      "myshopify_domain": "kiokiiand.myshopify.com",
+      "handle": "amuse-banana-lip-oil-4-5ml",
+      "vendor": "AMUSE",
+      "brand_override": "AMUSE",
+      "retailer_name": "Kiokii and...",
+      "category_path": "beauty/makeup/lips/lip_oil",
+      "shade_identities": {
+        "51629126189376": ["01 Zen Matcha", "K0504000648"],
+        "51629126123840": ["02 Banana", "K0504000649"],
+        "51629126222144": ["03 Manuka Honey", "K0504000650"],
+        "51896079974720": ["04 Juicy Peach", "K0504000994"],
+        "51629126156608": ["05 Cranberry Pop", "K0504000651"],
+        "51896079876416": ["06 Rose Sorbet", "K0504000993"]
+      }
+    },
+    "expansion_job": {
+      "module": "scripts.ops.amuse_us_six_expansion",
+      "scope": "amuse_us_six_expansion",
+      "enable_flag": "MEITU_US_KIOKII_SIX_EXPANSION_ENABLED",
+      "job_prefixes": {
+        "staging": "meitu-stage-kiokii-us-six-",
+        "production": "meitu-prod-kiokii-us-six-"
+      }
+    }
+  }
+}

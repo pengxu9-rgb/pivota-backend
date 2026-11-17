@@ -6,7 +6,9 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import json
 import os
+from pathlib import Path
 import re
 from urllib.parse import urlsplit, urlunsplit
 
@@ -16,15 +18,19 @@ from services import crawl_politeness, shopify_presentment, storefront_currency
 from services.catalog_identity import validated_source_gtin
 from services.external_seed_model_review import ReviewTarget, build_review_snapshot, review_seed
 from services.shopify_storefront_session import MarketsRefused, ShopifyStorefrontSession, _ua
-from services.surratt_retailer_pilot import KIOKII_RETAILER_COHORT
+from services.exact_retailer_cohorts import RETAILER_COHORT_B
 
-POLICY_VERSION = "olive-young-us-brand-direct-v4"
+# The allowlisted drafts, their reviewed listing facts and the corroborating retailer read
+# live in config/external_seed_review_listings.json.
+LISTINGS_PATH = Path(__file__).resolve().parents[1] / "config" / "external_seed_review_listings.json"
+_CONFIG = json.loads(LISTINGS_PATH.read_text(encoding="utf-8"))
+POLICY_VERSION = _CONFIG["policy_version"]
 REVIEW_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash")
 EVIDENCE_MAX_AGE = timedelta(minutes=10)
-_AMUSE_BARCODE_SOURCE = "https://kiokii.com/en-us/products/amuse-banana-lip-oil-4-5ml.js?country=US"
-AMUSE_SEED_ID = "eps_31f74c1ec20a4d5db0fa977f"
-ROMAND_SEED_ID = "eps_6aa6d3d1e93a424b8c64d6c5"
-SURRATT_SEED_ID = "eps_9f3368aa75d349e09914fbcb"
+SEED_B_ID = _CONFIG["listings"]["seed_b"]["seed_id"]
+SEED_C_ID = _CONFIG["listings"]["seed_c"]["seed_id"]
+SEED_A_ID = _CONFIG["listings"]["seed_a"]["seed_id"]
+_CORROBORATION = _CONFIG["barcode_corroboration"]
 
 
 @dataclass(frozen=True)
@@ -60,52 +66,21 @@ class PilotListing:
         return (self.url, alias_url)
 
 
-LISTINGS = {
-    AMUSE_SEED_ID: PilotListing(
-        "https://amuseseoulmakeup.com/products/banana-lip-oil", "merch_obs_1c4bc54448d534ca", 1500,
-        "AMUSE", "Banana Lip Oil",
-        "A 4.5 mL tinted lip oil with a glossy finish, a banana scent and a cushioned applicator. "
-        "Shade 02 Banana is clear, while 04 Juicy Peach gives a peach tint.",
-        (("52547428942138", "8800299133494", "02 BANANA", "8800299133494"),
-         ("52547429007674", "8800299133517", "04 JUICY PEACH", "8800299133517")),
-        10117885559098, _AMUSE_BARCODE_SOURCE, machine_activation_allowed=True,
-    ),
-    ROMAND_SEED_ID: PilotListing(
-        "https://romandbeauty.com/products/glasting-melting-balm", "merch_obs_acf4a659be2fb0fb", 1400,
-        "rom&nd", "Glasting Melting Balm",
-        "A 3.5 g tinted lip balm with a soft, melting texture and buildable, glass-like shine. "
-        "Coco Nude is a beige nude and Mauve Whip is a mauve pink.",
-        (("41341731438667", "8800258082894", "COCO NUDE", "UGMB01"),
-         ("41341731635275", "8800258083112", "MAUVE WHIP", "UGMB07")),
-        7317311291467, machine_activation_allowed=True,
-    ),
-    SURRATT_SEED_ID: PilotListing(
-        "https://www.surrattbeauty.com/products/lipslique", "merch_obs_30f9ce3e44b7fcb4", 3400,
-        "Surratt Beauty", "Lipslique",
-        "Lipslique is a twist-up lip color with a lightweight, balm-like feel and a creamy finish. "
-        "The formula contains macadamia seed oil for moisture and can be layered for more color. "
-        "Each tube contains 1.56 g.",
-        (("31365263163459", "617037660642", "NU DE SOLEIL - PEACHY BEIGE", "SB003-10"),
-         ("31365263196227", "617037660635", "PARAMOUR - PEACHY CORAL", "SB003-09")),
-        4389835046979, seller_source_ref="surrattbeauty.com",
-        shipping_source_url="https://surrattbeauty.com/meta.json", native_shop_domain="surrattbeauty.myshopify.com",
-        policy_version="surratt-us-brand-direct-v1",
-        machine_activation_allowed=True,
-    ),
-}
+_LISTING_FIELDS = frozenset(PilotListing.__dataclass_fields__)
 
 
-AUTOMATIQUE_LISTING = PilotListing(
-    "https://www.surrattbeauty.com/products/automatique-lip-crayon", "merch_obs_30f9ce3e44b7fcb4", 3400,
-    "Surratt Beauty", "Automatique Lip Crayon",
-    "Automatique Lip Crayon is a twist-up lipstick with a slim applicator, creamy texture and a matte finish. "
-    "Savoir Faire is the dusty rose shade currently sold by Surratt Beauty in the US.",
-    (("43054723465283", "609015652428", "SAVOIR FAIRE - DUSTY ROSE", "SB002-13"),),
-    7619240132675, seller_source_ref="surrattbeauty.com",
-    shipping_source_url="https://surrattbeauty.com/meta.json", native_shop_domain="surrattbeauty.myshopify.com",
-    policy_version="surratt-automatique-us-brand-direct-v1", machine_activation_allowed=True,
-)
-AUTOMATIQUE_EXTERNAL_PRODUCT_ID = "ext_5cb339225f03d6bbbf8d25dc"
+def _listing(row: dict) -> PilotListing:
+    fields = {key: value for key, value in row.items() if key in _LISTING_FIELDS}
+    fields["variants"] = tuple(tuple(variant) for variant in fields["variants"])
+    return PilotListing(**fields)
+
+
+LISTINGS = {row["seed_id"]: _listing(row) for row in _CONFIG["listings"].values()}
+
+
+SCOPED_LISTING = _listing(_CONFIG["scoped_listing"])
+SCOPED_EXTERNAL_PRODUCT_ID = _CONFIG["scoped_listing"]["external_product_id"]
+SCOPED_LISTING_PIN_ENV = _CONFIG["scoped_listing"]["pin_env"]
 
 
 def machine_review_listing(seed_id: str) -> PilotListing | None:
@@ -113,9 +88,9 @@ def machine_review_listing(seed_id: str) -> PilotListing | None:
     listing = LISTINGS.get(seed_id)
     if listing is not None:
         return listing
-    pinned = os.getenv("EXTERNAL_SEED_MACHINE_REVIEW_AUTOMATIQUE_SEED_ID")
+    pinned = os.getenv(SCOPED_LISTING_PIN_ENV)
     if seed_id == pinned and re.fullmatch(r"eps_[0-9a-f]{24}", seed_id):
-        return AUTOMATIQUE_LISTING
+        return SCOPED_LISTING
     return None
 
 
@@ -212,15 +187,15 @@ async def _barcode_corroboration(client, listing: PilotListing, observed: dict) 
     code, detail = await session.json(f"{url.path}?{url.query}")
     variants = detail.get("variants") if code == 200 and isinstance(detail, dict) else None
     if (
-        not isinstance(variants, list) or detail.get("id") != 10073908707648
-        or str(detail.get("title") or "").strip().casefold() != "amuse banana lip oil 4.5ml"
+        not isinstance(variants, list) or detail.get("id") != _CORROBORATION["product_id"]
+        or str(detail.get("title") or "").strip().casefold() != _CORROBORATION["title"]
     ):
         return None
-    (retailer,) = KIOKII_RETAILER_COHORT.listings.values()
+    (retailer,) = RETAILER_COHORT_B.listings.values()
     expected_ids = {canonical: native for native, (canonical, _) in retailer.variants.items()}
     matched = {}
     for variant_id, brand in required.items():
-        retailer_shade = "03 Manuka Honey" if variant_id == "52547428974906" else brand["shade"]
+        retailer_shade = _CORROBORATION["retailer_shade_titles"].get(variant_id, brand["shade"])
         matches = [
             item for item in variants if isinstance(item, dict)
             and str(item.get("id") or "") == expected_ids.get(variant_id)

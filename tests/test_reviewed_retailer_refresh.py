@@ -1,26 +1,33 @@
 """Production refresh only accepts its two exact Shopify shades and US currency."""
 
 from datetime import datetime, timezone
+import importlib
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from scripts.ops import surratt_retailer_offers as refresh
 from services.catalog_enrichment_agent.apply import apply_ingest_plan
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
-from services.catalog_enrichment_agent.surratt_retailer_offers import scope_reviewed_plan
-from services.surratt_retailer_pilot import PROOF_KEY, RETAILERS
+from services.catalog_enrichment_agent.reviewed_retailer_offers import scope_reviewed_plan
+from services.exact_retailer_cohorts import COHORT_A_CONFIG, COHORT_B_CONFIG, PROOF_KEY, RETAILERS, RETAILER_COHORT_B
+
+# The refresh job entrypoint keeps its deployed module path; the config names it.
+refresh = importlib.import_module(COHORT_A_CONFIG["refresh"]["module"])
+
+
+REFRESH = refresh.REFRESH
+(COHORT_B_LISTING,) = RETAILER_COHORT_B.listings.values()
 
 
 def payload(listing):
     return {
-        "id": int(listing.native_product_id), "handle": "surratt-lipslique", "vendor": "Surratt",
-        "title": "Lipslique", "type": "Lipstick", "description": "Surratt Lipslique",
+        "id": int(listing.native_product_id), "handle": REFRESH["handle"], "vendor": REFRESH["vendor_names"][0],
+        "title": REFRESH["title_token"].capitalize(), "type": "Lipstick", "description": "Fixture lip color",
         "variants": [
             {"id": int(vid), "title": title, "option1": title, "sku": title,
              "barcode": gtin.lstrip("0"), "price": minor, "available": available,
-             "featured_image": {"src": "https://cdn.example.test/surratt.jpg"}}
+             "featured_image": {"src": "https://cdn.example.test/lip-color.jpg"}}
             for (vid, (_, gtin)), (title, minor, available) in zip(
                 listing.variants.items(), (("Nu De Soleil", 3400, True), ("Paramour", 3525, False)), strict=True)
         ],
@@ -34,7 +41,7 @@ def test_production_observation_uses_stock_projection_and_distinct_native_facts(
 
     now = datetime.now(timezone.utc)
     record = refresh.storefront_record(listing, payload(listing), now)
-    shaped = scope_reviewed_plan(ingest_validated_jsonl([record], market="US", include_reviewed_surratt=True))
+    shaped = scope_reviewed_plan(ingest_validated_jsonl([record], market="US", include_reviewed_cohort_a=True))
     assert shaped["pdps"][0]["pivota_signature_id"] is None
     assert shaped["pdps"][0]["pivota_canonical_url"] is None
     offers = [json.loads(row["offer_payload"])[PROOF_KEY] for row in shaped["offers"]]
@@ -75,7 +82,7 @@ def test_wrong_or_missing_stock_cannot_replace_existing_observation():
 async def test_stock_writer_cannot_publish_family_offer_or_active_seed_for_scope():
     listing = next(iter(RETAILERS.values()))
     held = refresh.storefront_record(listing, payload(listing), datetime.now(timezone.utc))
-    generic = ingest_validated_jsonl([held], market="US", include_reviewed_surratt=True)
+    generic = ingest_validated_jsonl([held], market="US", include_reviewed_cohort_a=True)
     assert generic["seeds"]
     with pytest.raises(ValueError, match="require the scoped retailer writer"):
         await apply_ingest_plan(generic, batch_label="unreviewed-refresh", db=object(), market="US")
@@ -90,7 +97,7 @@ def test_mixed_generic_plan_holds_only_reviewed_listing():
     from services.curated_brand_feed import shopify_product_to_record
 
     sibling = shopify_product_to_record(
-        raw, domain=listing.host, source_role="retailer", retailer_name="Bluemercury",
+        raw, domain=listing.host, source_role="retailer", retailer_name=refresh.STORE_NAMES[listing.host],
         category_path="beauty/makeup/lip/lipstick", currency="USD",
     )
     plan = ingest_validated_jsonl([held, sibling], market="US")
@@ -100,24 +107,24 @@ def test_mixed_generic_plan_holds_only_reviewed_listing():
 
 
 @pytest.mark.asyncio
-async def test_kiokii_bare_listing_cannot_enter_the_generic_or_reviewed_writer():
+async def test_cohort_b_bare_listing_cannot_enter_the_generic_or_reviewed_writer():
     from services.catalog_enrichment_agent.ingestion import retailer_product_key
     from services.curated_brand_feed import shopify_product_to_record
-    from services.surratt_retailer_pilot import KIOKII_BARE_FAMILY_URL, KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT
+    from services.exact_retailer_cohorts import COHORT_B_BARE_FAMILY_URL, COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B
 
     raw = {
-        "id": 10073908707648, "handle": "amuse-banana-lip-oil-4-5ml", "title": "AMUSE Banana Lip Oil",
-        "vendor": "AMUSE", "product_type": "Makeup", "images": [{"src": "https://cdn.example/lip.jpg"}],
+        "id": int(COHORT_B_LISTING.native_product_id), "handle": COHORT_B_CONFIG["refresh"]["handle"],
+        "title": "Fixture Lip Oil", "vendor": COHORT_B_CONFIG["refresh"]["vendor"], "product_type": "Makeup", "images": [{"src": "https://cdn.example/lip.jpg"}],
         "variants": [{"id": 51629126123840, "barcode": "8800299133494", "price": "18.99", "available": True}],
     }
-    record = shopify_product_to_record(raw, domain="kiokii.com", source_role="retailer", retailer_name="Kiokii",
+    record = shopify_product_to_record(raw, domain=COHORT_B_LISTING.host, source_role="retailer", retailer_name="Fixture Retailer",
                                        category_path="beauty/makeup/lip/lip_oil", currency="USD")
-    assert record["offers"][0]["destination_url"] == KIOKII_BARE_FAMILY_URL
-    assert retailer_product_key("kiokii.com", KIOKII_BARE_FAMILY_URL) == KIOKII_BARE_LISTING_KEY
-    plan = ingest_validated_jsonl([record], market="US", reviewed_retailer_keys=(KIOKII_BARE_LISTING_KEY,))
-    assert plan["skipped_reasons"] == {"reviewed_kiokii_retailer_scope": 1}
+    assert record["offers"][0]["destination_url"] == COHORT_B_BARE_FAMILY_URL
+    assert retailer_product_key(COHORT_B_LISTING.host, COHORT_B_BARE_FAMILY_URL) == COHORT_B_BARE_LISTING_KEY
+    plan = ingest_validated_jsonl([record], market="US", reviewed_retailer_keys=(COHORT_B_BARE_LISTING_KEY,))
+    assert plan["skipped_reasons"] == {COHORT_B_CONFIG["ingest_skip_reason"]: 1}
     assert not plan["pdps"] and not plan["seeds"]
-    with pytest.raises(ValueError, match="unlocalized Kiokii listing is reserved"):
-        await apply_ingest_plan({"pdps": [{"product_key": KIOKII_BARE_LISTING_KEY}],
-                                 "reviewed_secondary_group": KIOKII_RETAILER_COHORT.canonical_group_id},
+    with pytest.raises(ValueError, match="unlocalized cohort B listing is reserved"):
+        await apply_ingest_plan({"pdps": [{"product_key": COHORT_B_BARE_LISTING_KEY}],
+                                 "reviewed_secondary_group": RETAILER_COHORT_B.canonical_group_id},
                                 batch_label="unlocalized-test", db=object(), market="US")

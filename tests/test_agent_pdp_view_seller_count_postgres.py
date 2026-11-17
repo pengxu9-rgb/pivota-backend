@@ -322,33 +322,33 @@ def test_two_stores_are_two_sellers_and_multi_merchant(schema_engine, monkeypatc
     assert _scope(payload) == "multi_merchant_canonical"
 
 
-@pytest.mark.parametrize("scope", ["surratt", "kiokii", "kiokii_bare"])
+@pytest.mark.parametrize("scope", ["cohort_a", "cohort_b", "cohort_b_bare"])
 def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monkeypatch, scope):
     from dataclasses import replace
     from sqlalchemy import text
 
     from services import agent_pdp_view_assembler as assembler
-    from services.surratt_retailer_pilot import (
-        KIOKII_BARE_FAMILY_URL, KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT, PROOF_KEY, RETAILERS,
-        SURRATT_RETAILER_COHORT,
+    from services.external_seed_review_pilot import LISTINGS, SEED_A_ID, SEED_B_ID
+    from services.exact_retailer_cohorts import (
+        COHORT_B_BARE_FAMILY_URL, COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B, PROOF_KEY, RETAILERS,
+        RETAILER_COHORT_A,
     )
 
     _seed(schema_engine)
     _set_column(schema_engine, True)
-    exact = SURRATT_RETAILER_COHORT if scope == "surratt" else KIOKII_RETAILER_COHORT
+    exact = RETAILER_COHORT_A if scope == "cohort_a" else RETAILER_COHORT_B
     cohort = {"ck": exact.canonical_content_key, "group": exact.canonical_group_id}
     hidden = next(iter(exact.listings.items()))
-    if scope == "kiokii_bare":
-        hidden = (KIOKII_BARE_LISTING_KEY,
-                  replace(hidden[1], product_path=KIOKII_BARE_FAMILY_URL.removeprefix("https://kiokii.com")))
+    if scope == "cohort_b_bare":
+        hidden = (COHORT_B_BARE_LISTING_KEY,
+                  replace(hidden[1], product_path=COHORT_B_BARE_FAMILY_URL.removeprefix(f"https://{hidden[1].host}")))
     ordinary = list(RETAILERS.items())[1]
     hidden_key, hidden_listing = hidden
     _, ordinary_listing = ordinary
     seed_prefix = f"exact-{scope}"
-    brand_url = ("https://www.surrattbeauty.com/products/lipslique" if scope == "surratt"
-                 else "https://amuseseoulmakeup.com/products/banana-lip-oil")
+    brand_url = LISTINGS[SEED_A_ID if scope == "cohort_a" else SEED_B_ID].url
     brand_image = f"{brand_url}.jpg"
-    retailer_image = f"https://{hidden_listing.host}/lipslique.jpg"
+    retailer_image = f"https://{hidden_listing.host}/retailer-shade.jpg"
     with schema_engine.begin() as conn:
         _insert_product(conn, pk=exact.canonical_product_key, merchant=exact.canonical_merchant_id,
                         url=brand_url, title="Brand Product", primary=True, **cohort)
@@ -398,7 +398,7 @@ def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monk
                           "WHERE product_key=:pk"), {"marker": PROOF_KEY, "pk": hidden_key})
     generic = _run(monkeypatch, build)
     explicit_seed = _run(monkeypatch, build_from_retailer_seed)
-    if scope != "surratt":
+    if scope != "cohort_a":
         assert {offer["merchant_id"] for offer in generic["offers"]} == {
             exact.canonical_merchant_id, ordinary_listing.merchant_id,
         }

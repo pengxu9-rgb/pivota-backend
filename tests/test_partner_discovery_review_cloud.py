@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.ops.meitu_discovery import model_worker as worker
-from scripts.ops.meitu_discovery import review_cloud as cloud
-from scripts.ops.meitu_discovery import review_input
+from scripts.ops.partner_discovery import model_worker as worker
+from scripts.ops.partner_discovery import review_cloud as cloud
+from scripts.ops.partner_discovery import review_input
 
 
 def planned_input():

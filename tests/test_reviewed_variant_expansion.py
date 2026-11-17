@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from services import amuse_us_variant_expansion as expansion
+from services import reviewed_variant_expansion as expansion
 
 
 @pytest.mark.asyncio
@@ -15,7 +15,7 @@ async def test_expanded_anchors_replay_without_an_additional_seed_write(monkeypa
         }
         for native, (barcode, _, sku) in expected.items()
     ]
-    monkeypatch.setenv("MEITU_US_KIOKII_SIX_EXPANSION_ENABLED", "1")
+    monkeypatch.setenv(expansion.ENABLE_FLAG, "1")
     monkeypatch.setattr(expansion, "load_seed", AsyncMock(return_value={}))
     monkeypatch.setattr(expansion, "seed_variants", Mock(return_value=({}, expected)))
     monkeypatch.setattr(expansion, "canonical_rows", AsyncMock(return_value=projected))
