@@ -24,7 +24,10 @@ WHAT IS STORED. One surface_click_events row per hand-off, under its own surface
 catalog-attributed variant ids (Promoted Placements, the gateway's SHOPIFY_CATALOG_ATTRIBUTION):
 the sale, if any, is attributed to our saved Shopify catalog, and the cart link carries none of
 Pivota's own tracking members, so such a record carries no `referral_click_id` either. Readers that
-report hand-offs can tell the two kinds apart by it. Shopify's click id is not stored here.
+report hand-offs can tell the two kinds apart by it. Shopify's click id is not stored here. Its later
+state is `handed_off` for good: no Pivota click or order edge is keyed to it (Shopify reports the sale
+per catalog). The gateway's partner-facing get_order passes only its own allowlisted fields, so the
+member is not part of the partner contract.
 
 `binding` is the sha256 of the full esc id as handed out. A read must present the same esc id: a
 record id lifted into a forged esc id (other items, another cart) does not match, and neither does

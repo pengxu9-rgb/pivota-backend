@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, Literal, Optional, Type, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
 
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_forwarded_owner import adopt_forwarded_owner
@@ -95,6 +95,13 @@ class HandoffRecordBody(BaseModel):
         if value is False:
             raise ValueError("catalog_attributed is only ever true; omit it otherwise")
         return value
+
+    @model_validator(mode="after")
+    def _catalog_cart_names_no_click_of_ours(self) -> "HandoffRecordBody":
+        # A catalog-attributed cart's link carries none of Pivota's members, so it names no Pivota click.
+        if self.catalog_attributed is True and self.referral_click_id:
+            raise ValueError("a catalog_attributed hand-off carries no referral_click_id")
+        return self
 
 
 class HandoffReadBody(BaseModel):

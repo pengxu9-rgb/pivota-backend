@@ -651,3 +651,10 @@ async def test_catalog_attributed_accepts_only_true(world, value):
     else:
         assert res.status_code == 400, (value, res.text)
         assert await _row(RECORD_A) is None
+
+
+async def test_a_catalog_attributed_handoff_naming_a_click_of_ours_is_refused(world):
+    body = record_body(RECORD_A, ESC_A, catalog_attributed=True, referral_click_id=REFERRAL_A)
+    res = await record(world, PARTNER_A, body)
+    assert res.status_code == 400, res.text
+    assert await _row(RECORD_A) is None
