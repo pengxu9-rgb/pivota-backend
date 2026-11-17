@@ -570,7 +570,7 @@ async def test_a_task_past_the_poll_cap_is_looked_up_in_a_conversation_of_its_ow
     (_checkout_result("captcha-failed", success=False, order_id=None, total=None), "failed", "checkout_captcha_failed"),
     (_checkout_result("form-error", success=False, order_id=None, total=None), "failed", "checkout_form_error"),
     (_checkout_result("pay-disabled", success=False, order_id=None, total=None), "failed", "checkout_pay_disabled"),
-    (_checkout_result(order_id=None, errors=["card declined"]), "failed", "checkout_payment_no_order"),
+    (_checkout_result(order_id=None, errors=["card declined"]), "paying", "checkout_payment_no_order"),
     (_checkout_result(total=None), "completed", "checkout_total_unparsed"),
     (_checkout_result(total="EUR 51,49"), "completed", "checkout_total_unparsed"),
     (_checkout_result("timeout", success=False, order_id=None), "paying", "checkout_unknown_timeout"),
@@ -839,8 +839,17 @@ def test_no_provider_or_store_name_is_in_the_new_code():
 
     repo = Path(__file__).resolve().parents[1]
     names = ("ev" + "onet", "ever" + "onet", "agen" + "zo", "cardinfo" + "link")
-    for path in ("services/payment_orchestration/a2a_rail.py", "services/payment_orchestration/a2a_rail_worker.py",
-                 "db/a2a_rail_ledger.py", "db/migrations/287_a2a_rail_checkout_task_id.sql", "tests/test_a2a_rail_checkout.py"):
+    for path in (
+        "services/payment_orchestration/a2a_rail.py", "services/payment_orchestration/a2a_rail_worker.py",
+        "services/payment_orchestration/a2a_purchase_view.py", "db/a2a_rail_ledger.py", "db/agent_purchase_ledger.py",
+        "db/migrations/287_a2a_rail_checkout_task_id.sql", "db/migrations/down/287_a2a_rail_checkout_task_id_down.sql",
+        "db/migrations/288_a2a_rail_ceiling_source.sql", "db/migrations/down/288_a2a_rail_ceiling_source_down.sql",
+        "routes/agent_internal_commerce_purchases.py", "tests/test_agent_internal_commerce_purchases.py",
+        "tests/test_a2a_rail_checkout.py", "tests/test_a2a_rail_checkout_postgres.py", "tests/test_a2a_rail_client.py",
+        "tests/test_a2a_rail_ledger_postgres.py", "main.py",
+        "docs/adr/ADR-028-agent-completed-checkout.md",
+        "docs/adr/ADR-030-pivota-as-protocol-platform-card-networks-as-credential-layer.md",
+    ):
         text = (repo / path).read_text("utf-8").lower()
         assert not any(name in text for name in names), path
 
@@ -1023,3 +1032,235 @@ def test_migration_288_holds_the_columns_ddl():
     assert "schema-guard-exempt:" in up
     down = (repo / "db/migrations/down/288_a2a_rail_ceiling_source_down.sql").read_text("utf-8")
     assert "DROP COLUMN IF EXISTS ceiling_source" in down
+
+
+# ── review follow-ups (commit 4) ─────────────────────────────────────────────────────────────
+
+EXPIRY_RAW, EXPIRY_SHOWN = "1129", "11/29"
+
+
+def _string_values(obj):
+    """Every string leaf (and key) of a JSON-like value, to look for an exact credential value."""
+    if isinstance(obj, dict):
+        return set(map(str, obj)) | set().union(*(_string_values(v) for v in obj.values())) if obj else set()
+    if isinstance(obj, (list, tuple)):
+        return set().union(*(_string_values(v) for v in obj)) if obj else set()
+    return {str(obj)} if obj is not None else set()
+
+
+def _no_credential_in(text_or_obj):
+    text = text_or_obj if isinstance(text_or_obj, str) else json.dumps(text_or_obj, default=str)
+    for needle in (*NEEDLES, EXPIRY_SHOWN):
+        assert needle not in text, needle
+    if not isinstance(text_or_obj, str):
+        assert EXPIRY_RAW not in _string_values(text_or_obj)
+
+
+@pytest.mark.parametrize("answer,outcome,state,code,pending", [
+    (_task(_card("error", {"code": "TRY_LATER", "recoverable": True})),
+     "checkout_confirm_error_card", "paying", "checkout_confirm_error_card", True),
+    (_task(_card("error", {"code": "NOPE", "recoverable": False})),
+     "checkout_confirm_error_card", "paying", "checkout_confirm_error_card", True),
+    (_task(_card("error", {"code": "NO_FLAG"})),
+     "checkout_confirm_error_card", "paying", "checkout_confirm_error_card", True),
+    (httpx.Response(401), "rail_refused", "paying", "checkout_confirm_retry:http_error:401", False),
+    (httpx.Response(403), "rail_refused", "paying", "checkout_confirm_retry:http_error:403", False),
+    (httpx.Response(429), "rail_refused", "paying", "checkout_confirm_retry:http_error:429", False),
+    (httpx.Response(408), "checkout_confirm_unresolved", "paying", "checkout_confirm_unresolved", True),
+    (httpx.Response(409), "failed", "failed", "checkout_confirm_refused:http_error:409", False),
+])
+async def test_the_confirm_counts_only_text_and_a_definite_4xx_as_not_submitted(answer, outcome, state, code, pending):
+    pid = await _approving()
+    assert await _step(_approved(Rail(), confirm_answer=answer), pid) == outcome
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == (state, code)
+    assert (row["pending_write"] == worker.CHECKOUT_CONFIRM_ACTION) is pending
+    if outcome == "rail_refused":
+        # Sent again on the next poll, in the same checkout conversation.
+        rail = Rail().on("checkout.confirm#confirm", _checkout_await())
+        assert await _step(rail, pid) == "placing"
+        member = row["member_id"]
+        assert rail.sent[0]["context"] == _client(Rail()).context_for(member, f"{pid}_c")
+    if pending:
+        rail = Rail().on("checkout.confirm#confirm", _checkout_await())
+        assert await _step(rail, pid) == "checkout_held" and rail.sent == []
+
+
+async def test_a_confirm_refused_for_our_own_token_is_sent_again(monkeypatch):
+    pid = await _approving()
+    rail = _approved(Rail())
+    real = a2a_rail.A2ARailClient._access_token
+    calls = []
+
+    async def _no_token_for_the_confirm(self, member_id):
+        calls.append(1)
+        return None if len(calls) == 3 else await real(self, member_id)  # paid, setup, then confirm
+
+    monkeypatch.setattr(a2a_rail.A2ARailClient, "_access_token", _no_token_for_the_confirm)
+    assert await _step(rail, pid) == "rail_refused"
+    row = await _row(pid)
+    assert (row["pending_write"], row["last_error_code"]) == (None, "checkout_confirm_retry:auth_failed")
+
+
+async def test_payment_reached_without_an_order_is_held_not_failed(caplog):
+    pid = await _placing()
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        outcome = await _step(Rail().on("checkout.await#poll", _checkout_result(order_id=None)), pid)
+    assert outcome == worker.CHECKOUT_PAYMENT_NO_ORDER
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["terminal_at"]) == ("paying", "checkout_payment_no_order", None)
+    assert worker._sticky(row) and view.build_view(row)["last_error_code"] == "checkout_payment_no_order"
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+@pytest.mark.parametrize("missing", ["checkout_task_id", "ceiling_source"])
+async def test_a_half_healed_schema_never_starts_the_checkout_path(missing):
+    pid = await _unlocked()
+    await _ago("next_poll_at", 1, pid)
+    [held] = [r for r in await ledger.claim_due_purchases(W, limit=50) if r["id"] == pid]
+    rail = _lock_rail()
+    row = {k: v for k, v in held.items() if k != missing}  # what SELECT * returns before the heal
+    assert await worker.step(_client(rail), row, W) == "parked"
+    after = await _row(pid)
+    assert (rail.sent, after["state"], after["order_id"], after["last_error_code"]) == (
+        [], "quoting", None, worker.CHECKOUT_SCHEMA_INCOMPLETE)
+
+
+async def test_a_half_healed_schema_never_confirms_a_checkout_being_placed():
+    pid = await _approving()
+    assert await _step(_approved(Rail(), confirm_answer=httpx.Response(429)), pid) == "rail_refused"
+    await _ago("next_poll_at", 1, pid)
+    [held] = [r for r in await ledger.claim_due_purchases(W, limit=50) if r["id"] == pid]
+    rail = Rail().on("checkout.confirm#confirm", _checkout_await())
+    row = {k: v for k, v in held.items() if k != "checkout_task_id"}
+    assert await worker.step(_client(rail), row, W) == "parked"
+    assert rail.sent == [] and (await _row(pid))["last_error_code"] == worker.CHECKOUT_SCHEMA_INCOMPLETE
+
+
+def test_both_checkout_columns_heal_in_one_guarded_statement_on_postgres():
+    from db.schema_guard import guarded_add_columns
+
+    heal = ledger._HEAL_CHECKOUT_COLUMNS_PG
+    assert "checkout_task_id VARCHAR(128)" in heal and "ceiling_source VARCHAR(32)" in heal
+    assert len(guarded_add_columns(heal + ";")) == 1
+
+
+@pytest.mark.parametrize("answer", [
+    _checkout_await(),                                                        # it was submitted after all
+    _checkout_result(),
+    _task(_card("error", {"code": "CANNOT_CANCEL", "recoverable": False})),
+    httpx.Response(502),
+    httpx.ConnectError("reset"),
+])
+async def test_a_cancel_that_does_not_say_cancelled_is_held(answer):
+    pid = await _approving()
+    assert await _step(_approved(Rail(), confirm_answer=httpx.Response(429)), pid) == "rail_refused"
+    await _ago("state_entered_at", worker.CHECKOUT_CONFIRM_WINDOW_SECONDS + 5, pid)
+    assert await _step(Rail().on("checkout.confirm#cancel", answer), pid) == worker.CHECKOUT_CANCEL_UNRESOLVED
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_CANCEL_UNRESOLVED)
+
+
+async def test_an_unread_total_completes_loudly_and_the_view_says_so(caplog):
+    pid = await _placing()
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(Rail().on("checkout.await#poll", _checkout_result(total="$12,34")), pid) == "completed"
+    row = await _row(pid)
+    assert (row["final_total_minor"], row["last_error_code"]) == (None, "checkout_total_unparsed")
+    shown = view.build_view(row)
+    assert shown["last_error_code"] == "checkout_total_unparsed" and shown["totals"]["final_total_minor"] is None
+    assert any(r.levelno == logging.ERROR and "total unreadable" in r.getMessage() for r in caplog.records)
+
+
+def test_zero_and_comma_decimal_totals():
+    assert worker.checkout_total_minor("$0.00", "USD") == 0
+    assert worker.checkout_total_minor("$12,34", "USD") is None
+
+
+ECHO_CONFIRM = _task(_card("checkout.confirm", {
+    "merchant": "merchant.example", "cardLast4": "3478", "cardBrand": "visa",
+    "shown": EXPIRY_SHOWN, "ref": EXPIRY_RAW, "note": f"card {DPAN} ok", "auth": CRYPTO,
+    "nested": [{"whatever": DPAN}, {"x": CRYPTO.rstrip("=")}],
+}, ("confirm", "edit", "cancel"), kind="confirm"))
+
+
+def _echo_result(order_id="1001"):
+    return _task(_card("checkout.result", {
+        "task_id": "ckout_abc123", "state": "completed", "success": True, "status": "payment-reached",
+        "total": "$51.49", "errors": [], "order_id": order_id, "cardLast4": "3478", "duration_ms": 1,
+        "card": {"number": DPAN, "expiry": EXPIRY_SHOWN, "cvv": CRYPTO, "brand": "visa"},
+    }))
+
+
+async def test_the_relay_scrubs_the_tokens_own_values_from_an_echoing_confirm_card():
+    provider = _Provider(_token_result(), ECHO_CONFIRM)
+    relay = await _relay(provider)
+    confirm = relay.checkout.card("checkout.confirm")
+    assert confirm is not None and "confirm" in confirm.action_ids()
+    _no_credential_in(confirm.data)
+    _no_credential_in(repr(relay))
+    assert confirm.data["cardLast4"] == "3478" and confirm.data["merchant"] == "merchant.example"
+    # The unpadded cryptogram is no base64 shape the stripper knows: only the by-value scrub catches it.
+    assert CRYPTO.rstrip("=") not in json.dumps(confirm.data)
+
+
+async def test_an_echoed_card_never_reaches_the_ledger_logs_or_view(caplog):
+    pid = await _approving()
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(_approved(Rail(), setup_answer=ECHO_CONFIRM), pid) == "placing"
+        assert await _step(Rail().on("checkout.await#poll", _echo_result()), pid) == "completed"
+    row = await _row(pid)
+    assert row["merchant_order_id"] == "1001"
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    _no_credential_in(logged)
+    stored = [dict(r) for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")]
+    _no_credential_in(json.loads(json.dumps(stored, default=str)))
+    _no_credential_in(json.loads(json.dumps(view.build_view(row), default=str)))
+
+
+async def test_a_card_shaped_order_id_is_never_stored():
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=DPAN)), pid) == (
+        worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+    row = await _row(pid)
+    assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == (
+        "paying", None, worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+    assert DPAN not in await _stored_text()
+
+
+def test_a_long_order_number_that_fails_luhn_is_not_card_shaped():
+    assert worker._card_shaped(DPAN) and not worker._card_shaped("4895370012003479")
+    assert not worker._card_shaped("1001") and not worker._card_shaped("48953700120034781234")
+
+
+async def test_in_production_with_the_relay_on_paid_and_the_await_poll_go_only_through_the_relay(monkeypatch):
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    provider = _Provider(_token_result(), _token_result())
+    client = a2a_rail.A2ARailClient(BASE, KEY, transport=httpx.MockTransport(provider.handler))
+    for component, action in sorted(a2a_rail.TOKEN_RELAY_SOURCES):
+        with pytest.raises(a2a_rail.TokenStepRefused):
+            await client.send_action(member_id=MEMBER, context_id=client.context_for(MEMBER, "r"),
+                                     component=component, action=action)
+    assert provider.bodies == []
+    # The mint step is still a plain send (its answer is an approval page).
+    provider = _Provider(_visa_page())
+    client = a2a_rail.A2ARailClient(BASE, KEY, transport=httpx.MockTransport(provider.handler))
+    result = await client.send_action(member_id=MEMBER, context_id=client.context_for(MEMBER, "r"),
+                                      component="payment.token-setup", action="submit")
+    assert result.ok and len(provider.bodies) == 1
+    # Outside production nothing changes.
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    provider = _Provider(_await("PENDING"))
+    client = a2a_rail.A2ARailClient(BASE, KEY, transport=httpx.MockTransport(provider.handler))
+    assert (await client.send_action(member_id=MEMBER, context_id=client.context_for(MEMBER, "r"),
+                                     component="payment.await", action="poll")).ok
+
+
+async def test_with_the_checkout_on_no_paid_goes_out_without_the_relay():
+    pid = await _approving()
+    # The contact went incomplete after the token was asked for (an edited row, say).
+    await database.execute("UPDATE a2a_rail_purchases SET buyer_email = NULL WHERE id = :i", {"i": pid})
+    rail = Rail().on("payment.visa-action-required#paid", _token_result())
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["last_error_code"]) == ([], worker.CHECKOUT_CONTACT_INCOMPLETE)

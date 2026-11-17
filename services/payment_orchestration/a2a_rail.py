@@ -19,7 +19,9 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    memory, builds the provider's checkout `card` (`checkout_card_from_network_token`) and sends
    `checkout.setup#submit` back to the SAME provider. The token goes out of this module only in
    that request body, to the provider that issued it. Nothing above the module ever receives it:
-   both answers come back stripped, the raw body is dropped, no exception carries a value, and
+   both answers come back stripped, and inside the relay, where the token's value, cryptogram and
+   expiry are known, those exact strings are also scrubbed BY VALUE from every card returned,
+   whatever key they sit under (`_scrub_values`); the raw body is dropped, no exception carries a value, and
    `checkout.setup#submit` can be sent by nothing else (`RELAY_ONLY_ACTIONS`): `send_action`
    refuses it, so no caller can hand this module a card to send.
 2. ONLY ALLOWLISTED ACTIONS ARE SENT. `ALLOWED_ACTIONS` holds the payment-method, token and
@@ -48,14 +50,18 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    followed; response bodies read with a hard size cap; no body, payload, token, key or member id
    is ever logged.
 
-6. IN PRODUCTION THE TOKEN STEP RUNS ONLY FOR THE CHECKOUT RELAY. Every `TOKEN_STEP_ACTIONS` send
-   raises `TokenStepRefused` before any byte is sent when the platform resolves to production
-   (config.platform.is_production) AND the checkout relay's dial (A2A_RAIL_CHECKOUT_STEP_ENABLED,
-   default OFF) is off, whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says. Until
-   2026-11-17 the refusal was unconditional: those steps hand Pivota a network token and cryptogram.
-   The decision owner then allowed the token (never real card data) to pass through Pivota, so the
-   refusal is lifted for the one use that needs it, the relay of rule 1, and for nothing else: with
-   the relay's dial off, production behaves exactly as before. Non-production is unchanged.
+6. IN PRODUCTION THE TOKEN STEP RUNS ONLY FOR THE CHECKOUT RELAY. In production
+   (config.platform.is_production), whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says:
+   (a) with the checkout relay's dial (A2A_RAIL_CHECKOUT_STEP_ENABLED, default OFF) off, every
+   `TOKEN_STEP_ACTIONS` send raises `TokenStepRefused` before any byte is sent, exactly as before;
+   (b) with it on, the steps whose answer carries the approved token (`TOKEN_RELAY_SOURCES`: `paid`
+   and the await poll) may be sent ONLY through `relay_token_to_checkout`: `send_action` refuses
+   them (`TokenStepRefused`). The mint steps (`token-setup`, the picker's `select-method`) still go
+   through `send_action`: their answer is an approval page, and a token one returns unasked is
+   stripped and refused by the worker (`buyer_approval_missing`), never relayed. Until 2026-11-17 the
+   refusal was unconditional. The decision owner then allowed the token (never real card data) to
+   pass through Pivota, so the refusal is lifted for the one use that needs it, the relay of rule 1.
+   Non-production is unchanged.
 7. THE CHECKOUT WRITES HAVE THEIR OWN DIAL. `CHECKOUT_WRITE_ACTIONS` (the setup that carries the
    token, the confirm that submits the order, the cancel) raise `CheckoutStepRefused` before any
    byte is sent unless A2A_RAIL_CHECKOUT_STEP_ENABLED is on, in every environment. The checkout
@@ -202,6 +208,8 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
     # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
     "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
+    # a card's or token's expiry (the checkout's `card.expiry`, echoed back): no digit rule sees "11/29"
+    "expiry", "expirydate", "expdate", "expirationdate", "cardexpiry", "tokenexpiry",
 })
 #: Key fragments that only ever name an authentication credential (`paymentCryptogram`, `cavv`,
 #: `authenticationValue`, ...), matched as substrings of the canonical key.
@@ -693,6 +701,88 @@ class TokenRelay:
     refused: Optional[str] = None
 
 
+#: A known credential value shorter than this is matched exactly, never as a substring: an expiry like
+#: "1129" occurs inside ordinary ids and order numbers.
+_SCRUB_SUBSTRING_MIN = 8
+
+
+def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
+    """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
+    expiry (raw and as "MM/YY") only as a whole value."""
+    contains: List[str] = []
+    exact = set()
+    for key in ("value", "cryptogram", "expiryDate"):
+        raw = network_token.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        raw = raw.strip()
+        # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
+        for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
+            if len(form) >= _SCRUB_SUBSTRING_MIN:
+                contains.append(form)
+            exact.add(form)
+        match = _TOKEN_EXPIRY_RE.match(raw) if key == "expiryDate" else None
+        if match:
+            exact.add(f"{match.group(1)}/{match.group(2)}")
+    return tuple(contains), frozenset(exact)
+
+
+def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], depth: int = 0) -> Tuple[Any, int]:
+    """`value` with every string (or number) that is, or carries, a known credential removed WHOLE."""
+    def hit(text: str) -> bool:
+        return text in exact or any(needle in text for needle in contains)
+
+    if depth > _MAX_STRIP_DEPTH:
+        return None, 1
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        removed = 0
+        for key, item in value.items():
+            if hit(str(key)):
+                removed += 1
+                continue
+            out[key], count = _scrub_value(item, contains, exact, depth + 1)
+            removed += count
+        return out, removed
+    if isinstance(value, list):
+        items, removed = [], 0
+        for item in value:
+            cleaned, count = _scrub_value(item, contains, exact, depth + 1)
+            items.append(cleaned)
+            removed += count
+        return items, removed
+    if isinstance(value, str) or (isinstance(value, (int, float)) and not isinstance(value, bool)):
+        text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+        return (None, 1) if hit(text) else (value, 0)
+    return value, 0
+
+
+def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
+    """Remove the token's own value, cryptogram and expiry BY VALUE from every card of `result`, in place:
+    whatever key the provider echoes them under (rule 1). Counted in `credential_fields_stripped`."""
+    if result is None or not isinstance(network_token, Mapping):
+        return
+    contains, exact = _scrub_needles(network_token)
+    if not contains and not exact:
+        return
+    cards: List[Card] = []
+    for card in result.cards:
+        data, removed = _scrub_value(card.data, contains, exact)
+        component, kind = card.component, card.kind
+        for name in (component, kind or ""):
+            if name and (name in exact or any(n in name for n in contains)):
+                removed += 1
+        if component in exact or any(n in component for n in contains):
+            component = ""
+        if kind is not None and (kind in exact or any(n in kind for n in contains)):
+            kind = None
+        actions = tuple(a for a in card.actions if not (a.id in exact or any(n in a.id for n in contains)))
+        removed += len(card.actions) - len(actions)
+        result.credential_fields_stripped += removed
+        cards.append(Card(component=component, kind=kind, data=data, actions=actions))
+    result.cards = cards
+
+
 def _approved_token(body: Any, expected_token_id: str) -> Optional[Mapping[str, Any]]:
     """The raw `payment.token-result` data in the agent's answer that names `expected_token_id` and is
     ACTIVE, or None. Reads the unstripped body: the caller must not keep or return what it gets."""
@@ -847,6 +937,12 @@ class A2ARailClient:
         if (component, action) in RELAY_ONLY_ACTIONS:
             # Its payload is a card: only `relay_token_to_checkout` builds one (rule 1).
             raise ActionNotAllowed(f"{component}#{action} is sent only by the checkout relay")
+        if (component, action) in TOKEN_RELAY_SOURCES and _platform_is_production() and checkout_step_enabled():
+            # Rule 6 (b): in production the approved token is received only by the relay, which uses it
+            # and returns nothing of it. (With the relay's dial off, `_send` refuses these anyway.)
+            logger.error("a2a_rail: REFUSED %s#%s in production outside the checkout relay; nothing was sent",
+                         component, action)
+            raise TokenStepRefused(f"{component}#{action} is sent only through the checkout relay in production")
         result, _ = await self._send(
             member_id=member_id, context_id=context_id, component=component, action=action, payload=payload)
         return result
@@ -895,6 +991,7 @@ class A2ARailClient:
             if not isinstance(network_token, Mapping):
                 relay.refused = "network_token_missing"
                 return relay
+            _scrub_values(relay.token, network_token)
             brand = approved.get("paymentBrand") or network_token.get("brand")
             card = checkout_card_from_network_token(network_token, brand=brand, name=setup.cardholder_name)
             if card is None:
@@ -909,6 +1006,7 @@ class A2ARailClient:
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
                 action="submit", payload=checkout_payload)
+            _scrub_values(relay.checkout, network_token)
         except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
             # `_send` classifies every transport failure itself; this is anything else. The setup may or
             # may not have gone out: outcome unknown (and the exception's text, which could quote a

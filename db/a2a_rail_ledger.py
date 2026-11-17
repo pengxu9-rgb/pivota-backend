@@ -240,10 +240,19 @@ _ADD_CEILING_SOURCE_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
 )
 _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_source VARCHAR(32)"
-#: (column, Postgres heal, SQLite heal), in migration order.
-_HEALED_COLUMNS = (
-    ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_PG, _ADD_CHECKOUT_TASK_ID_SQLITE),
-    ("ceiling_source", _ADD_CEILING_SOURCE_PG, _ADD_CEILING_SOURCE_SQLITE),
+#: Both checkout columns in ONE guarded ALTER on Postgres (the DDL of 287 and 288, as one statement): they
+#: land together or not at all, so a boot that times out never leaves one without the other. The worker
+#: also refuses the checkout path on a row read without either (`a2a_rail_worker._checkout_schema_ready`):
+#: that row-level check is the real guard. SQLite cannot add two columns in one ALTER: one each.
+_HEAL_CHECKOUT_COLUMNS_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases"
+    " ADD COLUMN IF NOT EXISTS checkout_task_id VARCHAR(128),"
+    " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
+)
+#: (column, SQLite heal), in migration order.
+_HEALED_COLUMNS_SQLITE = (
+    ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
+    ("ceiling_source", _ADD_CEILING_SOURCE_SQLITE),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
@@ -260,22 +269,21 @@ async def ensure_a2a_rail_schema() -> None:
         for statement in (_CREATE_BUYER_REFS_OWNER_INDEX, _CREATE_PURCHASES_OWNER_INDEX, _CREATE_PURCHASES_DUE_INDEX):
             await _ensure_index(statement)
         await database.execute(_CREATE_WORKER_HEARTBEAT_PG)
-        # A lock-free catalog check first; each ALTER (ACCESS EXCLUSIVE) runs only while its column is
+        # A lock-free catalog check first; the ALTER (ACCESS EXCLUSIVE) runs only while a column is
         # missing, under schema_guard's lock_timeout. A timeout defers the heal to the next boot: only
         # the dark checkout step needs these columns.
-        for column, heal_pg, _ in _HEALED_COLUMNS:
-            for statement in guarded_add_columns(heal_pg + ";"):
-                try:
-                    await database.execute(statement)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("a2a_rail_ledger: %s heal deferred to next boot error_type=%s",
-                                   column, type(exc).__name__)
+        for statement in guarded_add_columns(_HEAL_CHECKOUT_COLUMNS_PG + ";"):
+            try:
+                await database.execute(statement)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("a2a_rail_ledger: checkout columns heal deferred to next boot error_type=%s",
+                               type(exc).__name__)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
         await database.execute(_CREATE_WORKER_HEARTBEAT_SQLITE)
         columns = {row["name"] for row in await database.fetch_all(_SQLITE_PURCHASE_COLUMNS)}
-        for column, _, heal_sqlite in _HEALED_COLUMNS:
+        for column, heal_sqlite in _HEALED_COLUMNS_SQLITE:
             if column not in columns:
                 await database.execute(heal_sqlite)
         await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)

@@ -19,7 +19,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from db.database import IS_POSTGRES, database  # noqa: E402
 from db.schema_guard import ensure_required_schema_light  # noqa: E402
 from db.buyer_vault import hash_agent_user_ref  # noqa: E402
+import db.a2a_rail_ledger as a2a_ledger  # noqa: E402
 import db.agent_purchase_ledger as purchases  # noqa: E402
+import services.payment_orchestration.purchase_view as purchase_view  # noqa: E402
 import db.reap_agentic_ledger as reap_ledger  # noqa: E402
 import routes.agent_internal_commerce_purchases as internal_routes  # noqa: E402
 from routes.agent_auth import get_agent_context  # noqa: E402
@@ -45,7 +47,8 @@ STREET = "1 Main St"
 async def _db():
     if not database.is_connected:
         await database.connect()
-    for table in ("agent_purchases", "reap_agentic_purchases", "reap_agentic_enrollments"):
+    for table in ("agent_purchases", "reap_agentic_purchases", "reap_agentic_enrollments", "a2a_rail_purchases",
+                  "a2a_rail_buyer_refs"):
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
     yield
@@ -227,3 +230,50 @@ async def test_the_read_writes_nothing():
     answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
     assert answer.status_code == 404
     assert (await database.fetch_one("SELECT COUNT(*) AS n FROM agent_purchases"))["n"] == 0
+
+
+async def _a2a(*, agent_id: str = AGENT, state: str = "paying") -> str:
+    row = await a2a_ledger.create_purchase(
+        agent_id=agent_id, agent_user_ref_hash=hash_agent_user_ref(USER_REF), merchant_domain="merchant.example",
+        checkout_url="https://merchant.example/cart/40000000001:1", currency="USD", our_price_minor=4650,
+        buyer_email=EMAIL, shipping_address={"addressLine1": STREET, "city": "Austin"})
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET state = :s, quoted_total_minor = 6348, ceiling_source = 'allowance_v1', "
+        "order_id = 'pvt-ap_x', checkout_task_id = 'ckout_internal1' WHERE id = :i", {"s": state, "i": row["id"]})
+    await purchases.ensure_a2a_parent(row["id"], basis="backfill")
+    return row["id"]
+
+
+async def test_an_a2a_rail_purchase_reads_the_same_as_on_the_public_route():
+    rail_id = await _a2a()
+    public = await _public(f"{PUBLIC}/{rail_id}")
+    assert public.status_code == 200, public.text
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and internal.json() == public.json()
+    body = internal.json()
+    assert (body["rail"], body["state"], body["totals"]["ceiling_source"]) == ("a2a", "placing", "allowance_v1")
+    text = json.dumps(body)
+    for leaked in (EMAIL, STREET, "ckout_internal1", "pvt-ap_x", hash_agent_user_ref(USER_REF)):
+        assert leaked not in text
+    theirs = await _get(f"{INTERNAL}/{rail_id}", headers=_headers(agent=OTHER_AGENT))
+    assert (theirs.status_code, _error(theirs)) == (404, "purchase_not_found")
+
+
+async def test_a_view_or_ledger_fault_is_a_503_never_a_500(monkeypatch):
+    rail_id = await _a2a()
+    real_view = purchase_view.unified_purchase
+
+    async def _broken_view(*a, **k):
+        raise RuntimeError("view blew up")
+
+    monkeypatch.setattr(purchase_view, "unified_purchase", _broken_view)
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert (answer.status_code, _error(answer)) == (503, "temporarily_unavailable")
+    monkeypatch.setattr(purchase_view, "unified_purchase", real_view)
+
+    async def _broken_ledger(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(purchases, "get_by_rail_id_for_agent", _broken_ledger)
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert (answer.status_code, _error(answer)) == (503, "temporarily_unavailable")

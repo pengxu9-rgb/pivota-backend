@@ -82,6 +82,11 @@ def _not_found() -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "purchase_not_found"})
 
 
+def _unavailable() -> JSONResponse:
+    """A ledger or view fault: "try again", never a 500 (and never which part failed)."""
+    return JSONResponse(status_code=503, content={"error": "temporarily_unavailable"})
+
+
 async def _parent_for_agent(purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
     if purchase_id.startswith("pp_"):
         return await purchases.get_for_agent(purchase_id, agent_id)
@@ -110,11 +115,15 @@ async def get_purchase_for_gateway(
         parent = await _parent_for_agent(purchase_id, agent_id)
     except Exception as exc:  # noqa: BLE001 - any ledger fault is "say nothing, retry", never a 500
         logger.warning("agent_internal_purchases: ledger read failed error_type=%s", type(exc).__name__)
-        return public._ledger_unavailable()
+        return _unavailable()
     owner = str((parent or {}).get("agent_user_ref_hash") or "")
     if parent is None or not owner:
         return _not_found()
     # The owner hash goes only to the owner-scoped view builders, never into the body.
     parent = {k: v for k, v in parent.items() if k != "agent_user_ref_hash"}
-    body, error = await public._unified_for(parent, agent_id, owner)
+    try:
+        body, error = await public._unified_for(parent, agent_id, owner)
+    except Exception as exc:  # noqa: BLE001 - a rail read or view fault is "try again", never a 500
+        logger.warning("agent_internal_purchases: view failed error_type=%s", type(exc).__name__)
+        return _unavailable()
     return error if error is not None else body
