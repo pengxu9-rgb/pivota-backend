@@ -920,7 +920,9 @@ async def test_v2_resend_after_the_consume_landed_is_refused_and_writes_nothing(
 
 async def test_the_consume_failing_is_not_what_keeps_the_quote_single_use(world: World) -> None:
     """The quote stays `active` (the consume never lands) and every lookup is made to find nothing
-    it could replay (another provider choice): only the database guard is left, and it holds."""
+    it could replay (another provider choice): only the database guard is left, and it holds. Its
+    read, before any refusal of the create, answers the second create; the write step is never
+    entered for it."""
     w = world
     w.quotes.consume_lands = False
     quote = w.quotes.add()
@@ -932,7 +934,8 @@ async def test_the_consume_failing_is_not_what_keeps_the_quote_single_use(world:
     assert first.status == 200 and len(rows) == 1
     assert w.quotes.quotes[quote]["status"] == "active"
     assert second.status == 409 and second.code == "QUOTE_CONSUMED", second.body
-    assert w.create_runs == ["r1", "r2"]
+    assert w.create_runs == ["r1"]
+    assert w.db.count("claim_read", "r2") >= 1
     assert w.db.count("order_insert", "r2") == 0, "the guard must refuse before the order is written"
 
 
@@ -1270,7 +1273,8 @@ async def test_a_claims_table_with_a_column_missing_refuses_the_order_it_does_no
             answer = await w.create(route, quote, key="key-1")
 
         assert_retriable_503(answer, "ORDER_QUOTE_GUARD_UNAVAILABLE")
-        assert w.create_runs == ["r1"]
+        # The guard's read, before the write step, is the one that meets the broken table.
+        assert w.create_runs == []
         assert w.db.count("order_insert") == 0
         assert await w.orders_for(quote) == []
         messages = [r.getMessage() for r in caplog.records if r.name == "db.orders"]

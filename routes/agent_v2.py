@@ -18,6 +18,7 @@ from models.order import CreateOrderRequest, OrderItem, ShippingAddress
 from models.catalog import PivotPaymentContext
 from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
+from routes.agent_api import answer_for_a_create_whose_quote_holds_its_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
 from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
@@ -1053,6 +1054,18 @@ async def create_order_v2(
             detail={"error": exc.code, "message": exc.message, "details": exc.details},
         )
 
+    # Another create for a quote that already holds its order: that order (inside this caller's
+    # replay scope) or 409 QUOTE_CONSUMED, before any refusal below can say nothing was ordered.
+    held = await answer_for_a_create_whose_quote_holds_its_order(
+        context,
+        merchant_id=quote.merchant_id,
+        quote_id=body.quote_id,
+        idempotency_key=body.idempotency_key,
+        preferred_psp=body.preferred_psp,
+    )
+    if held is not None:
+        return await _order_created_answer(held, body)
+
     request_json = quote.request_json if isinstance(quote.request_json, dict) else {}
     items = _order_items_from_quote_request(request_json)
     if not items:
@@ -1148,6 +1161,11 @@ async def create_order_v2(
         agent_user=agent_user,
         x_buyer_ref=body.buyer_context.buyer_ref,
     )
+    return await _order_created_answer(response, body)
+
+
+async def _order_created_answer(response: Any, body: CreateOrderBody) -> Dict[str, Any]:
+    """POST /agent/v2/orders' answer for the order agent order create answered (made or replayed)."""
     order_id = str((response or {}).get("order_id") or "").strip()
     if not order_id:
         raise HTTPException(status_code=502, detail="Order creation did not return an order_id")
