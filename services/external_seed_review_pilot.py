@@ -77,6 +77,14 @@ def _listing(row: dict) -> PilotListing:
 
 LISTINGS = {row["seed_id"]: _listing(row) for row in _CONFIG["listings"].values()}
 
+# Serving may preserve the selected shade for independently reviewed additions after
+# they are present in the active seed and catalog. Draft review uses LISTINGS only.
+NAMED_REFERRAL_VARIANTS = {
+    row["seed_id"]: row["named_referral_variants"]
+    for row in _CONFIG["listings"].values()
+    if "named_referral_variants" in row
+}
+
 
 SCOPED_LISTING = _listing(_CONFIG["scoped_listing"])
 SCOPED_EXTERNAL_PRODUCT_ID = _CONFIG["scoped_listing"]["external_product_id"]

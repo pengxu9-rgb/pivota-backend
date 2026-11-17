@@ -78,7 +78,7 @@ def _sku_row(vid: str) -> Dict[str, Any]:
 def _resolve(
     monkeypatch, client, seeds: List[Dict[str, Any]], *, sku_id: Optional[str] = None,
     sku_rows: Optional[List[Dict[str, Any]]] = None,
-    market_assumed: bool = False,
+    market_assumed: bool = False, allowed_host: str = HOST,
 ) -> List[Dict[str, Any]]:
     import routes.agent_shop_gateway as gateway
 
@@ -97,7 +97,7 @@ def _resolve(
     monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", open_gate)
-    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=[HOST]))
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=[allowed_host]))
     product: Dict[str, Any] = {"sku_id": sku_id} if sku_id else {"product_id": "sig_rare_blush"}
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -238,6 +238,76 @@ def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_
 
     _assert_referral(offer)
     assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+
+def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree(monkeypatch, client):
+    from routes import outbound_links
+    from services import external_seed_review_pilot as pilot
+
+    host = "brand.example"
+    family = f"https://{host}/products/tinted-balm"
+    seller = "merch_obs_example"
+    seed = _seed(seed_id="eps_referral_expansion", host=host)
+    product_key = f'prod::{seller}::external_seed::{seed["external_product_id"]}'
+    seed.update(attached_product_key=product_key, seller_ref=seller, canonical_url=family, destination_url=family,
+                title="Tinted Balm")
+    seed["seed_data"] = {"brand": "Example Brand", "snapshot": {}}
+    variants = []
+    catalog_skus = []
+    for index in range(15):
+        prefix = f"0001234567{index:03}"
+        checksum = -sum(int(digit) * weight for digit, weight in zip(prefix, (3, 1) * 7)) % 10
+        variant = _shade(index, f"Shade {index + 1}")
+        native_id = variant.pop("shopify_variant_id")
+        variant.update(sku=f"EX-{index + 1:02}", barcode=f"{prefix[1:]}{checksum}",
+                       url=f"{family}?variant={native_id}")
+        variants.append(variant)
+        catalog_skus.append({**_sku_row(native_id), "product_key": product_key,
+                             "sku_key": f"{product_key}::v:{native_id}"})
+    listing = pilot.PilotListing(
+        family, seller, 2500, "Example Brand", "Tinted Balm", "A tinted balm.",
+        tuple((v["variant_id"], v["barcode"], v["title"], v["sku"]) for v in variants[:2]), int(SPID),
+    )
+    additions = {v["variant_id"]: (v["barcode"].zfill(14), v["sku"]) for v in variants[2:]}
+    monkeypatch.setitem(pilot.LISTINGS, seed["id"], listing)
+    monkeypatch.setitem(pilot.NAMED_REFERRAL_VARIANTS, seed["id"], additions)
+    monkeypatch.setattr(outbound_links, "log_outbound_click", AsyncMock())
+
+    def resolve(native_id, rows):
+        offer, = _resolve(monkeypatch, client, [seed], sku_id=native_id, sku_rows=rows, allowed_host=host)
+        _assert_referral(offer)
+        return offer
+
+    seed["seed_data"]["variants"] = variants[:2]
+    for variant in variants[2:]:
+        offer = resolve(variant["variant_id"], catalog_skus[:2])
+        assert offer["source"]["variant_match"] == "fallback"
+        assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+    seed["seed_data"]["variants"] = variants
+    for variant in variants:
+        offer = resolve(variant["variant_id"], catalog_skus)
+        assert offer["source"]["variant_match"] == "exact"
+        target = offer["execution_spec"]["pdp_url"]
+        assert _payload(offer)["dest"] == target
+        location = urlparse(target)
+        assert location._replace(query="").geturl() == family
+        assert parse_qs(location.query)["variant"] == [variant["variant_id"]]
+        redirect = client.get("/r", params={"token": _token(offer)}, follow_redirects=False)
+        assert redirect.status_code == 302
+        assert redirect.headers["location"] == target
+
+    new_variant = variants[-1]
+    without_catalog = resolve(new_variant["variant_id"], catalog_skus[:-1])
+    assert "variant" not in parse_qs(urlparse(_payload(without_catalog)["dest"]).query)
+    for field in ("barcode", "sku"):
+        with monkeypatch.context() as mismatch:
+            mismatch.setitem(new_variant, field, variants[0][field])
+            offer = resolve(new_variant["variant_id"], catalog_skus)
+            assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+    assert pilot.machine_review_listing(seed["id"]) is listing
+    assert len(listing.variants) == 2
 
 
 # ------------------------------------------------------------------ the reviewer's case and kin
