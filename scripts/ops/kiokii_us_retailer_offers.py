@@ -2,9 +2,9 @@
 
 Run on the reviewed backend image from the dedicated production crawl-subnet
 job. Refresh requires the cohort's write flag (config/reviewed_retailer_cohorts.json,
-cohort_b.refresh.write_flag) set to 1 and the complete persisted cohort. The production
-database and storefront pins come from the job environment: REVIEWED_JOB_DB_HOST,
-REVIEWED_JOB_DB_NAME and EXACT_RETAILER_SHOPIFY_SHOP_ID. An unset pin holds the run.
+cohort_b.refresh.write_flag) set to 1 and the complete persisted cohort. The database its
+DATABASE_URL names, the server it reaches and the Shopify shop id the storefront returns must hash
+to the sha256 pins in scripts/ops/reviewed_job_pins.py; any mismatch holds the run before a write.
 An unusable storefront read leaves the previous observation to expire normally.
 """
 
@@ -27,6 +27,10 @@ from services.curated_brand_feed import _note_response, shopify_product_to_recor
 from services.exact_retailer_shades import read_offers
 from services.outbound_links_service import is_destination_domain_allowed
 from services.shopify_presentment import no_cookie_client, presentment_currency
+from scripts.ops.reviewed_job_pins import (
+    COHORT_B_SHOPIFY_SHOP_ID_SHA256, PROD_DB_HOST_SHA256, PROD_DB_NAME_SHA256, require_dsn_pins, require_pins,
+    require_server_pins,
+)
 from services.exact_retailer_cohorts import (
     COHORT_B_CONFIG, COHORT_B_INITIAL_OFFER_IDS, RETAILER_COHORT_B, RETAILER_COHORT_B_INITIAL,
 )
@@ -39,9 +43,6 @@ SHOP_URL = f"https://{LISTING.host}{REFRESH['shop_path']}"
 PRODUCT_URL = f"{LISTING.family_url}.js?country=US"
 SHADE_IDENTITIES = {native: tuple(identity) for native, identity in REFRESH["shade_identities"].items()}
 PROJECT = "pivota-prod"
-DATABASE = os.getenv("REVIEWED_JOB_DB_NAME")
-HOST = os.getenv("REVIEWED_JOB_DB_HOST")
-SHOP_ID = os.getenv("EXACT_RETAILER_SHOPIFY_SHOP_ID")
 JOB_PREFIX = REFRESH["job_prefix"]
 WRITE_FLAG = REFRESH["write_flag"]
 RELEASE_COMMIT_ENV = REFRESH["release_commit_env"]
@@ -59,10 +60,11 @@ def storefront_record(shop, product, observed_at, *, cohort=COHORT):
     listing = cohort.listings[LISTING_KEY]
     if not isinstance(shop, dict) or not isinstance(product, dict):
         raise ValueError("reviewed cohort B storefront did not return product and shop objects")
-    if not SHOP_ID or (str(shop.get("id")), shop.get("domain"), shop.get("myshopify_domain")) != (
-        SHOP_ID, LISTING.host, REFRESH["myshopify_domain"],
+    if (shop.get("domain"), shop.get("myshopify_domain")) != (
+        LISTING.host, REFRESH["myshopify_domain"],
     ) or not isinstance(shop.get("ships_to_countries"), list) or "US" not in shop["ships_to_countries"]:
         raise ValueError("reviewed Shopify seller or US shipping changed")
+    require_pins(shopify_shop_id=(str(shop.get("id")), COHORT_B_SHOPIFY_SHOP_ID_SHA256))
     if (str(product.get("id")), product.get("handle"), product.get("vendor")) != (
         LISTING.native_product_id, REFRESH["handle"], REFRESH["vendor"],
     ) or not isinstance(product.get("variants"), list):
@@ -132,11 +134,10 @@ def check_environment(*, write):
     if (
         (os.getenv("PIVOTA_ENV"), os.getenv("GOOGLE_CLOUD_PROJECT")) != ("production", PROJECT)
         or not job.startswith(JOB_PREFIX) or not os.getenv("CLOUD_RUN_EXECUTION", "").startswith(f"{job}-")
-        or not HOST or not DATABASE or not SHOP_ID
-        or (dsn.hostname, dsn.path) != (HOST, f"/{DATABASE}")
         or not re.fullmatch(r"[0-9a-f]{40}", stamp) or os.getenv(RELEASE_COMMIT_ENV) != stamp
     ):
         raise ValueError("expected the reviewed cohort B production job, image and database")
+    require_dsn_pins(dsn, host_sha256=PROD_DB_HOST_SHA256, name_sha256=PROD_DB_NAME_SHA256)
     if write and os.getenv(WRITE_FLAG) != "1":
         raise ValueError("reviewed cohort B refresh writes are disabled")
     return stamp
@@ -157,10 +158,8 @@ async def _persisted_cohort(db):
 async def refresh_existing(db, record, *, write, cohort=COHORT):
     async with db.transaction():
         await db.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE" + ("" if write else " READ ONLY"))
-        if not await db.fetch_val("""
-            SELECT host(inet_server_addr())=:host AND current_database()=:name AND NOT pg_is_in_recovery()
-        """, {"host": HOST, "name": DATABASE}):
-            raise ValueError("connection did not reach the reviewed production primary")
+        await require_server_pins(db, host_sha256=PROD_DB_HOST_SHA256, name_sha256=PROD_DB_NAME_SHA256,
+                                  reason="connection did not reach the reviewed production primary")
         if write:
             await db.execute("SELECT pg_advisory_xact_lock(1160308171, 2)")
         if await _persisted_cohort(db) is not cohort:

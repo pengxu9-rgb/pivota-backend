@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -11,7 +12,8 @@ from scripts.ops.partner_discovery import sources
 
 OPERATOR = Path(sources.__file__).parent
 PROJECT = "pivota-staging"
-NAMESPACE = "184498324954"
+# Placeholder project number; the launcher verifier takes its sha256, as the script passes its pin.
+NAMESPACE = "000000000000"
 REGION = "us-west1"
 ACCOUNT = "evidence-reader@staging-project.example"
 IMAGE = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "a" * 64
@@ -64,7 +66,8 @@ def verify_execution(case):
     run_dir, job, execution, detail = case
     (run_dir / "execution-status.json").write_text(json.dumps(detail))
     verifier = embedded_python(r'python3 - "\$run_dir" "\$project"')
-    return run_python(verifier, run_dir, PROJECT, NAMESPACE, REGION, ACCOUNT, IMAGE, job, execution)
+    namespace_sha256 = hashlib.sha256(NAMESPACE.encode()).hexdigest()
+    return run_python(verifier, run_dir, PROJECT, namespace_sha256, REGION, ACCOUNT, IMAGE, job, execution)
 
 
 def test_scan_collect_binds_the_packed_manifest_and_accepts_the_archived_job(scan_execution):

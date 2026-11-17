@@ -11,6 +11,15 @@ from scripts.ops.partner_discovery import review_cloud as cloud
 from scripts.ops.partner_discovery import review_input
 
 
+# A placeholder project number stands in for the pinned one; the pin is its sha256.
+NAMESPACE = "000000000000"
+
+
+@pytest.fixture(autouse=True)
+def placeholder_project_number(monkeypatch):
+    monkeypatch.setattr(cloud, "PROJECT_NUMBER_SHA256", sha256(NAMESPACE.encode()).hexdigest())
+
+
 def planned_input():
     url = "https://example.com/products/fixture-lip"
     evidence = {
@@ -44,7 +53,7 @@ def resources(raw, program=None):
     program = cloud._program(raw) if program is None else program
     job = cloud._job_name(program)
     execution = job + "-abc01"
-    metadata = {"name": job, "namespace": cloud.PROJECT_NUMBER,
+    metadata = {"name": job, "namespace": NAMESPACE,
                 "labels": {"cloud.googleapis.com/location": cloud.REGION}}
     run_metadata = {**metadata, "name": execution,
                     "labels": {**metadata["labels"], "run.googleapis.com/job": job}}

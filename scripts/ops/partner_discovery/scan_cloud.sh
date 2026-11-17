@@ -3,9 +3,11 @@ set -euo pipefail
 
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 project=pivota-staging
-project_number=184498324954
+# The staging project number and the evidence-only service account are pinned by sha256; the
+# raw values are not kept here and are never printed (a mismatch prints the observed digest).
+project_number_sha256=c304d1ef041b8e30078f8483d6f540431bcf4eea830b6796b69da4cf82fd7281
 region=us-west1
-account="sa-meitu-evidence-v1@$project.iam.gserviceaccount.com"
+account_sha256=9083f17052f0f2f4aaa37aee2c9725b44c8c4fe577c5818f1a9cb858ca4bfede
 image=us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:f969a6d733cd31767a1f93ef7709130f3f1af158264f3d17f869a51ff56d23d6
 
 mode="${1:-}"
@@ -14,6 +16,28 @@ case "$mode" in
     collect) run_dir="${2:?run directory required}" ;;
     *) printf 'Usage: %s launch MANIFEST RUN_DIRECTORY | collect RUN_DIRECTORY\n' "$0" >&2; exit 2 ;;
 esac
+
+sha256_text() {
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
+}
+
+# DISCOVERY_SERVICE_ACCOUNT may name the evidence account; otherwise the launcher selects the
+# account in the project whose email matches the pin. Either way the email must hash to the pin.
+pinned_account() {
+    local candidate="${DISCOVERY_SERVICE_ACCOUNT:-}" email
+    if [[ -z "$candidate" ]]; then
+        while read -r email; do
+            if [[ -n "$email" && "$(sha256_text "$email")" == "$account_sha256" ]]; then candidate="$email"; break; fi
+        done < <(gcloud iam service-accounts list --project="$project" --format='value(email)' 2>/dev/null || true)
+    fi
+    if [[ -z "$candidate" || "$(sha256_text "$candidate")" != "$account_sha256" ]]; then
+        printf 'reviewed identity pin mismatch: service_account sha256=%s\n' \
+            "$(if [[ -n "$candidate" ]]; then sha256_text "$candidate"; else echo missing; fi)" >&2
+        return 1
+    fi
+    printf '%s' "$candidate"
+}
+account="$(pinned_account)"
 
 if [[ "$mode" == launch ]]; then
     mkdir -p -- "$run_dir"
@@ -130,7 +154,7 @@ if [[ "$status" != True ]]; then
     exit 3
 fi
 
-python3 - "$run_dir" "$project" "$project_number" "$region" "$account" "$image" "$job" "$execution" <<'PY'
+python3 - "$run_dir" "$project" "$project_number_sha256" "$region" "$account" "$image" "$job" "$execution" <<'PY'
 import base64
 import hashlib
 import json
@@ -181,14 +205,15 @@ def unpack(program, name):
     return raw
 
 
-run_dir, project, namespace, region, account, image, job, execution = sys.argv[1:]
+run_dir, project, namespace_sha256, region, account, image, job, execution = sys.argv[1:]
 path = Path(run_dir)
 launch = json.loads((path / 'launch.json').read_bytes())
 detail = json.loads((path / 'execution-status.json').read_bytes())
 metadata = detail.get('metadata', {})
 labels = metadata.get('labels', {})
 require(detail.get('kind') == 'Execution' and metadata.get('name') == execution
-        and str(metadata.get('namespace')) == namespace and labels.get('cloud.googleapis.com/location') == region
+        and digest(str(metadata.get('namespace')).encode()) == namespace_sha256
+        and labels.get('cloud.googleapis.com/location') == region
         and labels.get('run.googleapis.com/job') == job == launch.get('job'),
         'execution belongs to another Cloud Run job or namespace')
 spec = detail['spec']

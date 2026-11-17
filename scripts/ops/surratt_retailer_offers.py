@@ -1,8 +1,9 @@
 """Plan, ingest or refresh the four reviewed cohort A US referral offers.
 
 The cohort's listings, storefront identity checks and job settings are read from
-config/reviewed_retailer_cohorts.json. The production database pins are read from the job
-environment (REVIEWED_JOB_DB_HOST, REVIEWED_JOB_DB_NAME); unset pins hold the run.
+config/reviewed_retailer_cohorts.json. The production database the job's DATABASE_URL names, and
+the server it reaches, must hash to the sha256 pins in scripts/ops/reviewed_job_pins.py; any
+mismatch holds the run before a write.
 """
 
 import argparse
@@ -24,12 +25,13 @@ from services.exact_retailer_shades import read_offers
 from services.outbound_links_service import is_destination_domain_allowed
 from services.shopify_presentment import presentment_currency
 from services.exact_retailer_cohorts import COHORT_A_CONFIG, RETAILERS
+from scripts.ops.reviewed_job_pins import (
+    PROD_DB_HOST_SHA256, PROD_DB_NAME_SHA256, require_dsn_pins, require_server_pins,
+)
 
 
 REFRESH = COHORT_A_CONFIG["refresh"]
 PROD_PROJECT = "pivota-prod"
-PROD_HOST = os.getenv("REVIEWED_JOB_DB_HOST")
-PROD_DATABASE = os.getenv("REVIEWED_JOB_DB_NAME")
 JOB_PREFIX = REFRESH["job_prefix"]
 WRITE_FLAG = REFRESH["write_flag"]
 RELEASE_COMMIT_ENV = REFRESH["release_commit_env"]
@@ -112,12 +114,11 @@ def check_environment(mode):
         (os.getenv("PIVOTA_ENV"), os.getenv("GOOGLE_CLOUD_PROJECT")) != ("production", PROD_PROJECT)
         or not job.startswith(JOB_PREFIX)
         or not os.getenv("CLOUD_RUN_EXECUTION", "").startswith(f"{job}-")
-        or not PROD_HOST or not PROD_DATABASE
-        or configured.hostname != PROD_HOST or configured.path != f"/{PROD_DATABASE}"
         or not re.fullmatch(r"[0-9a-f]{40}", stamp)
         or os.getenv(RELEASE_COMMIT_ENV) != stamp
     ):
         raise ValueError("expected the reviewed production job, image and database")
+    require_dsn_pins(configured, host_sha256=PROD_DB_HOST_SHA256, name_sha256=PROD_DB_NAME_SHA256)
     if mode != "plan" and os.getenv(WRITE_FLAG) != "1":
         raise ValueError("reviewed cohort A writes are disabled")
     return stamp
@@ -127,11 +128,8 @@ async def apply_cohort(db, records, *, mode):
     write = mode != "plan"
     async with db.transaction():
         await db.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE" + ("" if write else " READ ONLY"))
-        confirmed = await db.fetch_val("""
-            SELECT host(inet_server_addr())=:host AND current_database()=:name AND NOT pg_is_in_recovery()
-        """, {"host": PROD_HOST, "name": PROD_DATABASE})
-        if not confirmed:
-            raise ValueError("connection did not reach the reviewed production primary")
+        await require_server_pins(db, host_sha256=PROD_DB_HOST_SHA256, name_sha256=PROD_DB_NAME_SHA256,
+                                  reason="connection did not reach the reviewed production primary")
         if write:
             await db.execute("SELECT pg_advisory_xact_lock(1160308171, 1)")
         readable_index = await db.fetch_val("""
