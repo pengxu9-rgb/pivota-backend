@@ -408,6 +408,7 @@ from routes.store_audit_public_intake import claim_router as store_audit_claim_r
 from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
 from routes.agent_internal_decision_slates import router as agent_internal_decision_slates_router
+from routes.agent_internal_commerce_purchases import router as agent_internal_commerce_purchases_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.buyer_api import router as buyer_router
@@ -1455,6 +1456,7 @@ app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonym
 app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
 app.include_router(agent_internal_decision_slates_router)  # Gateway-served slates into the decision ledger (/agent/internal/decision-slates)
+app.include_router(agent_internal_commerce_purchases_router)  # AgenPas gateway purchase read, server to server (/agent/internal/commerce/purchases); dark: AGENPAS_INTERNAL_READ_ENABLED
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
 app.include_router(refund_api_router)  # Refund processing
