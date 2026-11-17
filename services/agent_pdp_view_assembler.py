@@ -36,7 +36,7 @@ from services.source_quarantine import (
 )
 from services.exact_retailer_cohorts import (
     EXACT_ONLY_FAMILY_URLS, EXACT_ONLY_LISTING_KEYS,
-    PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY, RETAILERS as COHORT_A_RETAILERS,
+    PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY,
 )
 from services.title_normalization import normalize_display_title
 
@@ -79,7 +79,6 @@ _SOURCE_QUARANTINE_ANTI_JOIN = build_quarantine_anti_join_sql(
     row_source_system_expr="cp.source_system",
     row_source_ref_expr="cp.source_ref",
 )
-_COHORT_A_RETAILER_KEYS = ", ".join(f"'{key}'" for key in COHORT_A_RETAILERS)
 _EXACT_ONLY_RETAILER_KEYS = ", ".join(f"'{key}'" for key in sorted(EXACT_ONLY_LISTING_KEYS))
 _EXACT_ONLY_LISTING_IDENTITIES = ", ".join(f"'{url.removeprefix('https://')}'" for url in EXACT_ONLY_FAMILY_URLS)
 
@@ -93,12 +92,13 @@ def _is_exact_only_seed_alias(seed_ref: str) -> str:
 
 
 def _is_excluded_exact_retailer_listing(product_key_ref: str) -> str:
-    return f"""(COALESCE({product_key_ref} IN ({_EXACT_ONLY_RETAILER_KEYS}), FALSE) OR
-        ({product_key_ref} IN ({_COHORT_A_RETAILER_KEYS}) AND EXISTS (
+    # Any listing carrying a reviewed exact-shade proof is excluded here regardless of which
+    # cohort config or private manifest this runtime loaded (fail closed without the manifest).
+    return f"""(COALESCE({product_key_ref} IN ({_EXACT_ONLY_RETAILER_KEYS}), FALSE) OR EXISTS (
         SELECT 1 FROM catalog_offers pilot
         WHERE pilot.product_key = {product_key_ref}
           AND pilot.offer_payload->'{EXACT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
-    )))"""
+    ))"""
 
 
 # ---------------------------------------------------------------------

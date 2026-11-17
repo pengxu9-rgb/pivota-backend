@@ -1,9 +1,11 @@
 from hashlib import sha256
 import json
+import pathlib
 
 import pytest
 
 from services import exact_retailer_cohorts as cohorts
+from services.seller_identity import make_observed_retailer_id
 
 
 def _gtin(number):
@@ -30,7 +32,7 @@ def manifest(monkeypatch):
         "canonical_signature_id": "sig_" + "3" * 32,
         "listings": {
             LISTING_KEY: {
-                "merchant_id": "merch_obs_" + "4" * 16,
+                "merchant_id": make_observed_retailer_id("example-retailer.example"),
                 "host": "example-retailer.example",
                 "native_product_id": "73000000000000",
                 "product_path": "/products/lip-color",
@@ -80,7 +82,8 @@ def test_private_manifest_refuses_changed_bytes(manifest, monkeypatch, tmp_path)
         cohorts.load_private_manifest()
 
 
-@pytest.mark.parametrize("invalid", ("unsafe_key", "wrong_host", "duplicate_gtin", "missing_sku", "duplicate_field"))
+@pytest.mark.parametrize("invalid", ("unsafe_key", "wrong_host", "duplicate_gtin", "missing_sku", "duplicate_field",
+                                     "not_the_host_retailer_id", "retailer_is_canonical_merchant"))
 def test_private_manifest_refuses_invalid_data(manifest, monkeypatch, tmp_path, invalid):
     listing = manifest["listings"][LISTING_KEY]
     first, second = list(listing["variants"])[:2]
@@ -92,9 +95,60 @@ def test_private_manifest_refuses_invalid_data(manifest, monkeypatch, tmp_path, 
         listing["variants"][first][1] = listing["variants"][second][1]
     elif invalid == "missing_sku":
         del manifest["refresh"]["sku_by_variant"][first]
+    elif invalid == "not_the_host_retailer_id":
+        listing["merchant_id"] = "merch_obs_" + "4" * 16
+    elif invalid == "retailer_is_canonical_merchant":
+        manifest["canonical_merchant_id"] = listing["merchant_id"]
     source = json.dumps(manifest).encode()
     if invalid == "duplicate_field":
         source = source.replace(b'"version": 1', b'"version": 2, "version": 1')
     _configure(monkeypatch, tmp_path, source)
     with pytest.raises(ValueError, match="unreadable or invalid"):
         cohorts.load_private_manifest()
+
+
+
+def _import_cohorts(env):
+    # A fresh interpreter, so module identity in this test process is untouched.
+    import os
+    import subprocess
+    import sys
+
+    probe = (
+        "import json, logging, sys\n"
+        "logging.basicConfig(stream=sys.stderr, level=logging.ERROR)\n"
+        "from services import exact_retailer_cohorts as c\n"
+        "print(json.dumps({'cohort_c': c.RETAILER_COHORT_C is not None,"
+        " 'listing_keys': sorted(c.EXACT_ONLY_LISTING_KEYS), 'family_urls': list(c.EXACT_ONLY_FAMILY_URLS)}))\n"
+    )
+    child_env = {key: value for key, value in os.environ.items()
+                 if key not in (cohorts.COHORT_C_MANIFEST, cohorts.COHORT_C_MANIFEST_SHA256,
+                                cohorts.COHORT_C_FLAG, cohorts.COHORT_C_WRITE_FLAG, "DATABASE_URL")}
+    child_env.update(env)
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=child_env,
+                         cwd=str(pathlib.Path(cohorts.__file__).resolve().parents[1]), timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    return json.loads(run.stdout.strip().splitlines()[-1]), run.stderr
+
+
+def test_bad_manifest_at_import_disables_only_cohort_c(manifest, tmp_path):
+    source = json.dumps(manifest).encode()
+    path = tmp_path / "cohort.json"
+    path.write_bytes(source + b" ")
+    result, stderr = _import_cohorts({cohorts.COHORT_C_MANIFEST: str(path),
+                                      cohorts.COHORT_C_MANIFEST_SHA256: sha256(source).hexdigest(),
+                                      cohorts.COHORT_C_FLAG: "1"})
+    assert result["cohort_c"] is False
+    assert LISTING_KEY not in result["listing_keys"]
+    assert "cohort C disabled" in stderr
+
+
+def test_good_manifest_at_import_wires_cohort_c_exclusions(manifest, tmp_path):
+    source = json.dumps(manifest).encode()
+    path = tmp_path / "cohort.json"
+    path.write_bytes(source)
+    result, _ = _import_cohorts({cohorts.COHORT_C_MANIFEST: str(path),
+                                 cohorts.COHORT_C_MANIFEST_SHA256: sha256(source).hexdigest()})
+    assert result["cohort_c"] is True
+    assert LISTING_KEY in result["listing_keys"]
+    assert "https://example-retailer.example/products/lip-color" in result["family_urls"]

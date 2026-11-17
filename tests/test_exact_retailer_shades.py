@@ -206,10 +206,10 @@ def configured_historical_cohort(monkeypatch):
     return cohort
 
 
-@pytest.mark.parametrize("generic_timeout", [False, True])
 def test_supplemental_historical_signature_preserves_exact_signed_us_shade(
-    monkeypatch, http, generic_timeout, configured_historical_cohort,
+    monkeypatch, http, configured_historical_cohort,
 ):
+    generic_timeout = False
     client, warm = http
     cohort = configured_historical_cohort
     listing, = cohort.listings.values()
@@ -496,3 +496,28 @@ async def test_postgres_reader_requires_exact_ownership_market_and_live_chain(co
         await conn.execute("UPDATE catalog_offers SET market='US', suppression_reason='held' WHERE offer_id=ANY(:ids)",
                            {"ids": [f"offer-{native}" for native in native_ids]})
         assert await shades.read_offers(conn, canonical, timeout=1, cohort=cohort) == []
+
+
+def test_supplemental_generic_lookup_failure_is_not_answered_by_exact_rows_alone(
+    monkeypatch, http, configured_historical_cohort,
+):
+    # Like cohort B: a failed generic catalog lookup must not be swallowed, which would answer with
+    # the exact retailer rows alone and silently drop every other seller.
+    client, _ = http
+    cohort = configured_historical_cohort
+    listing, = cohort.listings.values()
+    (native, (canonical, _)), = listing.variants.items()
+    monkeypatch.setenv(cohort.flag, "1")
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=[listing.host, "brand.example"]))
+    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand="brand.example",
+                          retailer=listing.host, retailer_family=listing.family_url, generic_timeout=True)
+    product = {"product_id": shades.canonical_signature(cohort), "sku_id": f"gid://shopify/ProductVariant/{canonical}"}
+    result = client.post("/agent/shop/v1/invoke", json={
+        "operation": "offers.resolve",
+        "payload": {"product": product, "limit": 5, "market": "US", "market_assumed": False, "tool": "*"},
+        "metadata": {"source": "creator-agent-ui"},
+    })
+    offers = result.json().get("offers") or [] if result.status_code == 200 else []
+    assert not [offer for offer in offers if offer.get("merchant_id") == listing.merchant_id], (result.status_code, offers)
+    assert "exact" not in calls

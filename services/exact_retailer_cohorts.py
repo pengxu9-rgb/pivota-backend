@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from hmac import compare_digest
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -108,6 +109,13 @@ def _valid_private_manifest(config):
             or not _matches(listing["product_path"], r"/products/[a-z0-9]+(?:-[a-z0-9]+)*")
             or not _matches(listing["native_product_id"], r"[1-9][0-9]{0,19}")):
         return False
+    from services.seller_identity import make_observed_retailer_id
+
+    try:
+        if listing["merchant_id"] != make_observed_retailer_id(listing["host"]):
+            return False
+    except ValueError:
+        return False
     variants = listing["variants"]
     if not isinstance(variants, dict) or len(variants) != 8:
         return False
@@ -151,6 +159,16 @@ def load_private_manifest():
     return config
 
 
+def _load_private_manifest_or_disable():
+    # A bad manifest disables only cohort C, loudly. Rows already carrying the exact-shade proof
+    # stay excluded from every generic path by the proof itself, so this fails closed.
+    try:
+        return load_private_manifest()
+    except ValueError as error:
+        logging.getLogger(__name__).error("cohort C disabled: %s", error)
+        return None
+
+
 RETAILERS = _listings(COHORT_A_CONFIG)
 
 RETAILER_COHORT_A = ExactRetailerCohort(
@@ -167,7 +185,7 @@ RETAILER_COHORT_B = ExactRetailerCohort(
     canonical_content_key=COHORT_B_CONFIG["canonical_content_key"],
     listings=_listings(COHORT_B_CONFIG),
 )
-COHORT_C_CONFIG = load_private_manifest()
+COHORT_C_CONFIG = _load_private_manifest_or_disable()
 RETAILER_COHORT_C = None if COHORT_C_CONFIG is None else ExactRetailerCohort(
     flag=COHORT_C_FLAG,
     canonical_product_key=COHORT_C_CONFIG["canonical_product_key"],
