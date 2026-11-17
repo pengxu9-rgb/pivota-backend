@@ -3,9 +3,11 @@
 The buyer opens a signed AgenPas link on the gateway. They hold no agent key and no JWT, and the gateway
 never stores a partner's credentials, so the gateway reads the purchase here, server to server.
 
-  AUTH   `X-Internal-Key` must equal AGENT_AUTH_INTROSPECT_INTERNAL_KEY, the key the gateway already
-         holds for /agent/internal/auth/introspect and the other /agent/internal routers. Compared in
-         constant time, as bytes. Missing on the server: 503, never open. Missing or wrong: 401.
+  AUTH   `X-Internal-Key` must equal AGENPAS_INTERNAL_READ_KEY, a key DEDICATED to this read: a key that
+         reads any agent's purchase must not share scope with the introspect key
+         (AGENT_AUTH_INTROSPECT_INTERNAL_KEY), which this route never accepts. Compared in constant time,
+         as bytes. Missing on the server, or shorter than INTERNAL_READ_KEY_MIN_LENGTH (32) characters:
+         503, never open. Missing or wrong in the request: 401.
   SCOPE  `X-Agenpas-Agent-Id`, the agent id the gateway verified on the signed link. The read is scoped
          by (agent id, purchase id) IN SQL (db/agent_purchase_ledger.get_for_agent): another agent's
          purchase and no purchase are the same 404. NOT by the end user: the gateway's `usr_…` ref is not
@@ -40,7 +42,10 @@ from services.payment_orchestration.rails import RAIL_ID_PREFIX
 logger = logging.getLogger(__name__)
 
 AGENPAS_INTERNAL_READ_ENABLED_ENV = "AGENPAS_INTERNAL_READ_ENABLED"
-INTERNAL_KEY_ENV = "AGENT_AUTH_INTROSPECT_INTERNAL_KEY"
+#: This route's own key. Not the introspect key: that one is held for other /agent/internal routers.
+INTERNAL_KEY_ENV = "AGENPAS_INTERNAL_READ_KEY"
+#: A configured key shorter than this counts as missing (503): a short key is a guessable key.
+INTERNAL_READ_KEY_MIN_LENGTH = 32
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 #: An agent id as the gateway passes it: an opaque id, checked before any bind (a NUL on Postgres raises).
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
@@ -58,8 +63,8 @@ def _read_enabled() -> None:
 
 def _require_internal_key(x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key")) -> None:
     expected = str(os.getenv(INTERNAL_KEY_ENV) or "").strip()
-    if not expected:
-        # Never open: a server without the key refuses everyone.
+    if len(expected) < INTERNAL_READ_KEY_MIN_LENGTH:
+        # Never open: a server without the key (or with one too short to count) refuses everyone.
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={"error": "internal_key_not_configured"})
     provided = str(x_internal_key or "").strip()

@@ -847,7 +847,7 @@ def test_no_provider_or_store_name_is_in_the_new_code():
         "routes/agent_internal_commerce_purchases.py", "tests/test_agent_internal_commerce_purchases.py",
         "tests/test_a2a_rail_checkout.py", "tests/test_a2a_rail_checkout_postgres.py", "tests/test_a2a_rail_client.py",
         "tests/test_a2a_rail_ledger_postgres.py", "main.py",
-        "docs/adr/ADR-028-agent-completed-checkout.md",
+        "docs/adr/ADR-028-agent-completed-checkout.md", "docs/agent_purchases_routes.md",
         "docs/adr/ADR-030-pivota-as-protocol-platform-card-networks-as-credential-layer.md",
     ):
         text = (repo / path).read_text("utf-8").lower()

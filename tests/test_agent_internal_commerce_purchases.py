@@ -35,7 +35,8 @@ pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm")
 
 INTERNAL = "/agent/internal/commerce/purchases"
 PUBLIC = "/agent/v2/commerce/purchases"
-KEY = "internal_test_key_0123456789"
+KEY = "agenpas_read_test_key_0123456789abcdef"  # >= 32 characters (a shorter one counts as missing)
+INTROSPECT_KEY = "introspect_test_key_0123456789abcdef"
 AGENT = "agent_agenpas_internal"
 OTHER_AGENT = "agent_agenpas_other"
 USER_REF = "user-pat"
@@ -59,6 +60,7 @@ def _env(monkeypatch):
     monkeypatch.setenv(purchases.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
     monkeypatch.setenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV, "1")
     monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, KEY)
+    monkeypatch.setenv("AGENT_AUTH_INTROSPECT_INTERNAL_KEY", INTROSPECT_KEY)
     monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
 
 
@@ -277,3 +279,31 @@ async def test_a_view_or_ledger_fault_is_a_503_never_a_500(monkeypatch):
     monkeypatch.setattr(purchases, "get_by_rail_id_for_agent", _broken_ledger)
     answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
     assert (answer.status_code, _error(answer)) == (503, "temporarily_unavailable")
+
+
+def test_the_read_has_its_own_key_env():
+    assert internal_routes.INTERNAL_KEY_ENV == "AGENPAS_INTERNAL_READ_KEY"
+
+
+async def test_the_introspect_key_never_opens_this_read(monkeypatch):
+    rail_id = await _reap()
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers(key=INTROSPECT_KEY))
+    assert (answer.status_code, _error(answer)) == (401, "unauthorized")
+    # Not even when it is the only internal key the server has.
+    monkeypatch.delenv(internal_routes.INTERNAL_KEY_ENV)
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers(key=INTROSPECT_KEY))
+    assert answer.status_code == 503
+
+
+@pytest.mark.parametrize("configured", ["short", "x" * 31, "  " + "y" * 31 + "  "])
+async def test_a_configured_key_shorter_than_32_characters_counts_as_missing(monkeypatch, configured):
+    rail_id = await _reap()
+    monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, configured)
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers(key=configured.strip()))
+    assert (answer.status_code, _error(answer)) == (503, "internal_key_not_configured")
+
+
+async def test_a_32_character_key_is_enough(monkeypatch):
+    rail_id = await _reap()
+    monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, "z" * 32)
+    assert (await _get(f"{INTERNAL}/{rail_id}", headers=_headers(key="z" * 32))).status_code == 200
