@@ -98,7 +98,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   paying (a checkout)   -> no task yet: CONFIRM, write-ahead `checkout.confirm#confirm`. A MONEY WRITE: it
                            submits the merchant's checkout. Answered with the task: recorded in the
                            statement that resolves the write. ONLY two answers mean "not submitted" and
-                           fail the purchase: text only (measured) and a definite non-retryable 4xx. Our
+                           fail the purchase: text only (measured) and a validation 4xx (400, 422); a 409
+                           (`checkout_confirm_conflict`) or any other 4xx (`checkout_confirm_ambiguous_4xx`)
+                           may mean the order is already in, and is HELD. Our
                            own credentials (401, 403, no token) and a throttle (429) are confirmed again,
                            same conversation, within the window. An error card (whatever `recoverable`
                            says: not measured for a confirm) is HELD (`checkout_confirm_error_card`), and
@@ -1381,15 +1383,26 @@ CHECKOUT_ORDER_ID_CARD_SHAPED = "checkout_order_id_card_shaped"
 #: The confirm window passed and the cancel's answer did not say the flow was cancelled: the order may
 #: be in. Held.
 CHECKOUT_CANCEL_UNRESOLVED = "checkout_cancel_unresolved"
+#: A 409 on the confirm: it may mean the order is already in. Held, the write kept.
+CHECKOUT_CONFIRM_CONFLICT = "checkout_confirm_conflict"
+#: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
+CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_UNRESOLVED, CHECKOUT_CONFIRM_UNRECOGNISED, CHECKOUT_TASK_INVALID, CHECKOUT_TASK_MISMATCH,
     CHECKOUT_RESULT_UNRECOGNISED, CHECKOUT_RESULT_OVERDUE, CHECKOUT_TOTAL_OVER_APPROVED,
     CHECKOUT_UNKNOWN_TIMEOUT, CHECKOUT_UNKNOWN_SCRIPT_ERROR, CHECKOUT_CONFIRM_ERROR_CARD,
     CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_ORDER_ID_CARD_SHAPED, CHECKOUT_CANCEL_UNRESOLVED,
+    CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX,
 })
 #: The confirm answers that were refused before anything was submitted and may be sent again, in the
 #: same conversation, within the confirm window: our own credentials (401, 403, no token) or a throttle.
 _CONFIRM_RESEND_4XX = frozenset({401, 403, 429})
+#: The ONLY 4xx answers to a confirm that fail the purchase: validation refusals, which say the request
+#: was never accepted. Every other 4xx (409 conflict, 404, 410, 423, 425, ...) may mean "already
+#: confirmed or submitted": when we cannot tell whether an order exists, the rule is HOLD, because a
+#: failed purchase invites a second real one.
+_CONFIRM_NOT_ACCEPTED_4XX = frozenset({400, 422})
+
 _CARD_SHAPED_ORDER_RE = re.compile(r"^\d{13,19}\Z")
 #: Result statuses that say the checkout was NOT submitted to the merchant: the purchase fails.
 _CHECKOUT_NOT_SUBMITTED = frozenset({"captcha-failed", "form-error", "pay-disabled"})
@@ -1685,7 +1698,7 @@ async def _confirm_answer(s: _Step, result: Any) -> str:
         await s.release(POLL_CHECKOUT, CHECKOUT_PLACING)
         return "placing"
     # ONLY TWO ANSWERS SAY "NOT SUBMITTED": text only (measured: a confirm that is not accepted is answered
-    # in text, and nothing was submitted), and a definite, non-retryable 4xx. Everything else is held or,
+    # in text, and nothing was submitted), and a validation 4xx (400, 422). Everything else is held or,
     # for our own credentials and throttling, sent again.
     kind, status = result.kind, getattr(result, "http_status", None)
     if kind == "unexpected_text":
@@ -1699,8 +1712,13 @@ async def _confirm_answer(s: _Step, result: Any) -> str:
         await ledger.clear_pending_write(s.id, s.worker, action)
         await s.release(POLL_RETRY, _code("checkout_confirm_retry", result))
         return "rail_refused"
-    if kind == "http_error" and isinstance(status, int) and 400 <= status < 500 and status != 408:
+    if kind == "http_error" and status in _CONFIRM_NOT_ACCEPTED_4XX:
+        # A validation refusal: the request was never accepted, so nothing was submitted.
         return await _checkout_failed(s, _code("checkout_confirm_refused", result), resolves=action)
+    if kind == "http_error" and isinstance(status, int) and 400 <= status < 500:
+        # A conflict or any other 4xx: it may mean the order is already in. Held, the write kept.
+        logger.error("a2a_rail_worker: confirm answered http_status=%s purchase=%s; held", status, s.id)
+        return await _checkout_hold(s, CHECKOUT_CONFIRM_CONFLICT if status == 409 else CHECKOUT_CONFIRM_AMBIGUOUS_4XX)
     # Unseen (a 408 included: the transport reads it as outcome_unknown on a write): the order may be in. Never resent, and the poll and the lookup both need the task id that
     # this answer would have carried: held for a human, the write kept.
     return await _checkout_hold(s, CHECKOUT_CONFIRM_UNRESOLVED)

@@ -1067,7 +1067,16 @@ def _no_credential_in(text_or_obj):
     (httpx.Response(403), "rail_refused", "paying", "checkout_confirm_retry:http_error:403", False),
     (httpx.Response(429), "rail_refused", "paying", "checkout_confirm_retry:http_error:429", False),
     (httpx.Response(408), "checkout_confirm_unresolved", "paying", "checkout_confirm_unresolved", True),
-    (httpx.Response(409), "failed", "failed", "checkout_confirm_refused:http_error:409", False),
+    # A conflict may mean "already confirmed or submitted": held, never failed (a failure invites a second
+    # real purchase). So is every 4xx that does not clearly mean "never accepted".
+    (httpx.Response(409), "checkout_confirm_conflict", "paying", "checkout_confirm_conflict", True),
+    (httpx.Response(404), "checkout_confirm_ambiguous_4xx", "paying", "checkout_confirm_ambiguous_4xx", True),
+    (httpx.Response(410), "checkout_confirm_ambiguous_4xx", "paying", "checkout_confirm_ambiguous_4xx", True),
+    (httpx.Response(423), "checkout_confirm_ambiguous_4xx", "paying", "checkout_confirm_ambiguous_4xx", True),
+    (httpx.Response(425), "checkout_confirm_ambiguous_4xx", "paying", "checkout_confirm_ambiguous_4xx", True),
+    # Validation refusals: never accepted, nothing submitted.
+    (httpx.Response(400), "failed", "failed", "checkout_confirm_refused:http_error:400", False),
+    (httpx.Response(422), "failed", "failed", "checkout_confirm_refused:http_error:422", False),
 ])
 async def test_the_confirm_counts_only_text_and_a_definite_4xx_as_not_submitted(answer, outcome, state, code, pending):
     pid = await _approving()
@@ -1264,3 +1273,9 @@ async def test_with_the_checkout_on_no_paid_goes_out_without_the_relay():
     assert await _step(rail, pid) == "failed"
     row = await _row(pid)
     assert (rail.sent, row["last_error_code"]) == ([], worker.CHECKOUT_CONTACT_INCOMPLETE)
+
+
+def test_only_validation_4xx_answers_fail_a_confirm():
+    assert worker._CONFIRM_NOT_ACCEPTED_4XX == {400, 422}
+    assert worker._CONFIRM_RESEND_4XX == {401, 403, 429}
+    assert {"checkout_confirm_conflict", "checkout_confirm_ambiguous_4xx"} <= worker._CHECKOUT_HOLD_CODES
