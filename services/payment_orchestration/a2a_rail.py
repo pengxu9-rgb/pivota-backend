@@ -686,6 +686,12 @@ def _setup_problem(setup: Any) -> Optional[str]:
     return None
 
 
+def checkout_setup_problem(setup: Any) -> Optional[str]:
+    """Why `relay_token_to_checkout` would refuse `setup` before sending anything (a fixed phrase), or
+    None. Lets a caller check BEFORE it records a write-ahead."""
+    return _setup_problem(setup)
+
+
 @dataclass
 class TokenRelay:
     """The outcome of `relay_token_to_checkout`. Both answers are stripped like every other answer.
@@ -765,6 +771,12 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
     contains, exact = _scrub_needles(network_token)
     if not contains and not exact:
         return
+    def hit(text: Optional[str]) -> bool:
+        return bool(text) and (text in exact or any(n in text for n in contains))
+
+    if hit(result.context_id):
+        result.context_id = None
+        result.credential_fields_stripped += 1
     cards: List[Card] = []
     for card in result.cards:
         data, removed = _scrub_value(card.data, contains, exact)
@@ -776,8 +788,16 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
             component = ""
         if kind is not None and (kind in exact or any(n in kind for n in contains)):
             kind = None
-        actions = tuple(a for a in card.actions if not (a.id in exact or any(n in a.id for n in contains)))
-        removed += len(card.actions) - len(actions)
+        actions = []
+        for action in card.actions:
+            if hit(action.id):
+                removed += 1
+                continue
+            dispatch = None if hit(action.dispatch) else action.dispatch
+            role = None if hit(action.role) else action.role
+            removed += (dispatch != action.dispatch) + (role != action.role)
+            actions.append(CardAction(id=action.id, dispatch=dispatch, role=role))
+        actions = tuple(actions)
         result.credential_fields_stripped += removed
         cards.append(Card(component=component, kind=kind, data=data, actions=actions))
     result.cards = cards
@@ -975,23 +995,38 @@ class A2ARailClient:
         if not (isinstance(expected_token_id, str) and _RAIL_TOKEN_ID_RE.match(expected_token_id)):
             raise ValueError("expected_token_id must be the rail's token id")
         self._check_conversation(member_id, checkout_context_id)
+        # What the token answer carried, read from the raw body INSIDE `_send`, before its log line: the
+        # approved token result and its network token, for the scrub and the card. Dropped in `finally`.
+        held: Dict[str, Any] = {}
+
+        def _take_token(result: A2AResult, body: Any) -> None:
+            try:
+                approved = _approved_token(body, expected_token_id) if result.ok else None
+                network_token = approved.get("networkToken") if approved is not None else None
+                held["approved"] = approved
+                if isinstance(network_token, Mapping):
+                    held["network_token"] = network_token
+                    _scrub_values(result, network_token)
+            except Exception as exc:  # noqa: BLE001 - never raised out of `_send`; the relay sends nothing
+                logger.warning("a2a_rail: token answer unreadable error_type=%s", type(exc).__name__)
+                held.clear()
+
         token_result, body = await self._send(
-            member_id=member_id, context_id=context_id, component=component, action=action, payload=payload)
+            member_id=member_id, context_id=context_id, component=component, action=action, payload=payload,
+            inspect=_take_token)
+        body = None
         relay = TokenRelay(token=token_result)
         approved = network_token = card = checkout_payload = None
         try:
-            approved = _approved_token(body, expected_token_id) if token_result.ok else None
-            body = None
+            approved, network_token = held.get("approved"), held.get("network_token")
             token_card = token_result.card("payment.token-result") if token_result.ok else None
             if approved is None or token_card is None or token_card.data.get("paymentTokenId") != expected_token_id:
                 # Not this purchase's ACTIVE token (pending, failed, another token, a money result): nothing
                 # goes to the checkout; the caller reads `token` as it always has.
                 return relay
-            network_token = approved.get("networkToken")
             if not isinstance(network_token, Mapping):
                 relay.refused = "network_token_missing"
                 return relay
-            _scrub_values(relay.token, network_token)
             brand = approved.get("paymentBrand") or network_token.get("brand")
             card = checkout_card_from_network_token(network_token, brand=brand, name=setup.cardholder_name)
             if card is None:
@@ -1003,10 +1038,12 @@ class A2ARailClient:
                 "card": card,
                 "idempotency_key": setup.idempotency_key,
             }
+            known = network_token
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
-                action="submit", payload=checkout_payload)
-            _scrub_values(relay.checkout, network_token)
+                action="submit", payload=checkout_payload,
+                inspect=lambda result, _body: _scrub_values(result, known))
+            known = None
         except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
             # `_send` classifies every transport failure itself; this is anything else. The setup may or
             # may not have gone out: outcome unknown (and the exception's text, which could quote a
@@ -1014,7 +1051,8 @@ class A2ARailClient:
             logger.warning("a2a_rail: checkout relay failed error_type=%s", type(exc).__name__)
             relay.checkout = A2AResult(kind="outcome_unknown", may_write=True)
         finally:
-            body = approved = network_token = card = checkout_payload = None  # noqa: F841 - drop the references
+            body = approved = network_token = card = checkout_payload = known = None  # noqa: F841 - drop them
+            held.clear()
         return relay
 
     def _check_conversation(self, member_id: str, context_id: str) -> None:
@@ -1033,9 +1071,12 @@ class A2ARailClient:
         component: str,
         action: str,
         payload: Optional[Mapping[str, Any]] = None,
+        inspect: Optional[Callable[[A2AResult, Any], None]] = None,
     ) -> Tuple[A2AResult, Any]:
         """(the classified, stripped result, the RAW parsed body or None). The raw body may carry a
-        credential: only `relay_token_to_checkout` looks at it, and nothing returns it upward."""
+        credential: only `relay_token_to_checkout` looks at it, and nothing returns it upward.
+        `inspect(result, body)`, when given, runs on a parsed answer BEFORE it is logged (`_done`), so the
+        relay's by-value scrub happens before any part of the answer reaches a log line."""
         if (component, action) not in ALLOWED_ACTIONS:
             raise ActionNotAllowed(f"{component}#{action} is not an allowed rail action")
         if (component, action) in TOKEN_STEP_ACTIONS and token_step_refused_in_production():
@@ -1105,6 +1146,8 @@ class A2ARailClient:
         result.http_status = status
         if may_write and result.kind == "protocol_error":
             result.kind = "outcome_unknown"
+        if inspect is not None:
+            inspect(result, parsed)
         return self._done(result, component, action, started), parsed
 
     def _done(self, result: A2AResult, component: str, action: str, started: float) -> A2AResult:

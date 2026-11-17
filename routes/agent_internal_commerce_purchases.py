@@ -16,12 +16,16 @@ never stores a partner's credentials, so the gateway reads the purchase here, se
   BODY   the SAME unified body `GET /agent/v2/commerce/purchases/{id}` returns, built by the same
          builders (services/payment_orchestration/purchase_view, through the public route's
          `_unified_for`), from the parent's own owner identity: no PII, no rail ids, only vetted URLs.
-  DIAL   AGENPAS_INTERNAL_READ_ENABLED, default off. Off: 404, the body of an unknown route, before the
-         key is even looked at (the route does not exist until it is armed).
+  DIAL   AGENPAS_INTERNAL_READ_ENABLED, default off, read WHEN THE APP IS BUILT (`mount`, called by
+         main.py). Off: the route is not registered at all, so every method on the path, and the OpenAPI
+         schema, answer exactly as for a path that does not exist. TURNING IT ON NEEDS A RESTART (a new
+         revision). The dial is also checked on every request: turned off without a restart, a GET answers
+         the unknown-route 404 before the key is looked at (other methods then answer 405 until the restart).
 
 Read-only: it writes nothing, heals no parent (a rail purchase whose parent row is still missing is a
-404 here until the events job or a public read heals it) and calls no rail. No rate limit yet (the key's
-holders are exempt from the rate limiter): a follow-up.
+404 here until the events job or a public read heals it) and calls no rail. NOT exempt from the rate
+limiter (only the introspect key is, middleware/rate_limiter.py): gateway page reads count as anonymous
+traffic and can be throttled (429) under a burst. An exemption or a limit of its own is a follow-up.
 """
 
 from __future__ import annotations
@@ -81,6 +85,15 @@ router = APIRouter(
     tags=["agent-internal-commerce-purchases"],
     dependencies=[Depends(_read_enabled), Depends(_require_internal_key)],
 )
+
+
+def mount(app: Any) -> bool:
+    """Register this router on `app` only while the dial is on (read now, at build). Returns whether it
+    did. Dial off: nothing is registered, so the app is exactly what it was without this module."""
+    if not is_enabled():
+        return False
+    app.include_router(router)
+    return True
 
 
 def _not_found() -> JSONResponse:

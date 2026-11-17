@@ -31,7 +31,12 @@ from main import app  # noqa: E402
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
-pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm")
+# The SQLite arm; tests/test_agent_internal_commerce_purchases_postgres.py runs these same tests on Postgres.
+pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
+#: Whether main.app already carries the read (built with it registered), and whether the dial was on when
+#: it was built (read at build: CI builds it off).
+_MOUNTED_AT_IMPORT = any(getattr(r, "path", "").startswith("/agent/internal/commerce/purchases") for r in app.routes)
+_ARMED_AT_IMPORT = internal_routes.is_enabled()
 
 INTERNAL = "/agent/internal/commerce/purchases"
 PUBLIC = "/agent/v2/commerce/purchases"
@@ -48,11 +53,41 @@ STREET = "1 Main St"
 async def _db():
     if not database.is_connected:
         await database.connect()
-    for table in ("agent_purchases", "reap_agentic_purchases", "reap_agentic_enrollments", "a2a_rail_purchases",
-                  "a2a_rail_buyer_refs"):
+    # On Postgres agent_purchases is shared with other files: only its rail rows are cleared.
+    tables = ("reap_agentic_purchases", "reap_agentic_enrollments", "a2a_rail_purchases", "a2a_rail_buyer_refs")
+    if not IS_POSTGRES:
+        tables = ("agent_purchases",) + tables
+    for table in tables:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
-    yield
+    if not IS_POSTGRES:
+        yield
+        return
+    await database.execute("DELETE FROM agent_purchases WHERE rail IN ('reap', 'a2a')")
+    # asyncpg's pool belongs to this test's event loop: give it back at the end of every test.
+    try:
+        yield
+    finally:
+        await database.disconnect()
+
+
+@pytest.fixture(autouse=True)
+def _mounted(request):
+    """The read as an app built with the dial ON registers it (`mount`), at the front of the route table.
+    Tests named `..._dial_off_at_build_...` see main.app exactly as it was built (dial off in CI)."""
+    if "_dial_off_at_build_" in request.node.name or _MOUNTED_AT_IMPORT:
+        yield
+        return
+    before = list(app.router.routes)
+    app.include_router(internal_routes.router)
+    added = [r for r in app.router.routes if r not in before]
+    app.router.routes[:] = added + before
+    app.openapi_schema = None
+    try:
+        yield
+    finally:
+        app.router.routes[:] = before
+        app.openapi_schema = None
 
 
 @pytest.fixture(autouse=True)
@@ -307,3 +342,50 @@ async def test_a_32_character_key_is_enough(monkeypatch):
     rail_id = await _reap()
     monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, "z" * 32)
     assert (await _get(f"{INTERNAL}/{rail_id}", headers=_headers(key="z" * 32))).status_code == 200
+
+
+METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+
+
+@pytest.mark.skipif(_ARMED_AT_IMPORT, reason="main.app was built with AGENPAS_INTERNAL_READ_ENABLED on")
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("key", [None, KEY])
+async def test_with_the_dial_off_at_build_every_method_answers_like_a_path_that_does_not_exist(method, key):
+    rail_id = await _reap()
+    transport = httpx.ASGITransport(app=app)
+    async with _REAL_ASYNC_CLIENT(transport=transport, base_url="http://test") as http:
+        ours = await http.request(method, f"{INTERNAL}/{rail_id}", headers=_headers(key=key))
+        unknown = await http.request(method, f"/agent/internal/commerce/no-such-path/{rail_id}", headers=_headers(key=key))
+    # Byte for byte what a path that does not exist answers (404; OPTIONS is the CORS layer's for both).
+    assert ours.status_code == unknown.status_code == (404 if method != "OPTIONS" else unknown.status_code)
+    assert ours.headers.get("allow") == unknown.headers.get("allow")
+    if method not in ("HEAD", "OPTIONS"):
+        assert _envelope(ours) == _envelope(unknown)
+    elif method == "OPTIONS":
+        assert ours.content == unknown.content
+
+
+@pytest.mark.skipif(_ARMED_AT_IMPORT, reason="main.app was built with AGENPAS_INTERNAL_READ_ENABLED on")
+def test_with_the_dial_off_at_build_the_route_is_not_registered_or_in_the_openapi_schema():
+    assert not any(getattr(r, "path", "").startswith(INTERNAL) for r in app.routes)
+    app.openapi_schema = None
+    assert not any(path.startswith(INTERNAL) for path in app.openapi()["paths"])
+
+
+def test_mount_registers_the_route_only_with_the_dial_on(monkeypatch):
+    from fastapi import FastAPI
+
+    monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    off = FastAPI()
+    assert internal_routes.mount(off) is False and not any(INTERNAL in getattr(r, "path", "") for r in off.routes)
+    monkeypatch.setenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV, "1")
+    on = FastAPI()
+    assert internal_routes.mount(on) is True and any(INTERNAL in getattr(r, "path", "") for r in on.routes)
+
+
+def test_main_registers_the_read_through_mount_only():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text("utf-8")
+    assert "agent_internal_commerce_purchases.mount(app)" in source
+    assert "agent_internal_commerce_purchases_router" not in source

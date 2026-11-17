@@ -137,6 +137,8 @@ def _await(status="PENDING", token="ptk_1"):
     return _task(_card("payment.await", {"paymentTokenId": token, "status": status}))
 
 
+#: A definite cancel: a card answer with no sign of a submission (the cancel's real shape is not measured).
+CANCELLED = _task(_card("checkout.cancelled", {"state": "cancelled"}))
 CONFIRM_CARD = _task(_card("checkout.confirm", {
     "merchant": "merchant.example", "shipping": {"email": EMAIL, "city": "Austin"}, "cardLast4": "3478",
     "cardBrand": "visa"}, ("confirm", "edit", "cancel"), kind="confirm"))
@@ -483,7 +485,8 @@ async def test_an_approved_token_is_relayed_confirmed_and_the_merchant_order_com
     paid, setup, confirm = rail.sent
     # `paid` holds its write-ahead across the relay; the confirm (a money write) has its own.
     assert paid["pending"] == setup["pending"] == "payment.visa-action-required#paid"
-    assert confirm["pending"] == worker.CHECKOUT_CONFIRM_ACTION and confirm["payload"] == {}
+    assert confirm["pending"] == worker.CHECKOUT_CONFIRM_ACTION
+    assert confirm["payload"] == {"idempotency_key": f"pvt-{pid}-checkout"}  # the setup's key, every confirm
     assert setup["context"] == confirm["context"] != paid["context"]
     assert setup["payload"]["card"] == {"number": DPAN, "expiry": "11/29", "cvv": CRYPTO, "name": "Pat Example",
                                         "brand": "visa"}
@@ -571,8 +574,8 @@ async def test_a_task_past_the_poll_cap_is_looked_up_in_a_conversation_of_its_ow
     (_checkout_result("form-error", success=False, order_id=None, total=None), "failed", "checkout_form_error"),
     (_checkout_result("pay-disabled", success=False, order_id=None, total=None), "failed", "checkout_pay_disabled"),
     (_checkout_result(order_id=None, errors=["card declined"]), "paying", "checkout_payment_no_order"),
-    (_checkout_result(total=None), "completed", "checkout_total_unparsed"),
-    (_checkout_result(total="EUR 51,49"), "completed", "checkout_total_unparsed"),
+    (_checkout_result(total=None), "paying", "checkout_total_unverified"),
+    (_checkout_result(total="EUR 51,49"), "paying", "checkout_total_unverified"),
     (_checkout_result("timeout", success=False, order_id=None), "paying", "checkout_unknown_timeout"),
     (_checkout_result("script-error", success=False, order_id=None), "paying", "checkout_unknown_script_error"),
     (_checkout_result(total="$51.50"), "paying", "checkout_total_over_approved"),
@@ -602,8 +605,6 @@ async def test_each_checkout_result_lands_on_its_own_state_and_code(answer, stat
 
 @pytest.mark.parametrize("answer,code", [
     (SETUP_FORM, "checkout_setup_incomplete"),
-    (httpx.Response(502), "checkout_setup_unresolved"),
-    (httpx.ConnectError("reset"), "checkout_setup_unresolved"),
     (httpx.Response(400), "checkout_setup_refused:http_error:400"),
     (_task(_card("error", {"code": "BAD_CARD", "recoverable": False})), "checkout_setup_refused:error_card:200"),
     (_task(_card("checkout.something-else", {})), "checkout_setup_unrecognised"),
@@ -647,14 +648,16 @@ async def test_an_incomplete_contact_mints_no_token_at_all():
     assert (await _row(pid))["last_error_code"] == worker.CHECKOUT_CONTACT_INCOMPLETE
 
 
-async def test_a_setup_marker_left_by_an_unseen_answer_fails_the_purchase_without_a_send():
+async def test_a_setup_marker_left_by_an_unseen_answer_is_held_without_a_send():
     pid = await _approving()
     await database.execute("UPDATE a2a_rail_purchases SET pending_write = :w, pending_write_at = CURRENT_TIMESTAMP, "
                            "last_error_code = 'paid_sent:1:await'", {"w": worker.CHECKOUT_SETUP_ACTION})
     rail = Rail()
-    assert await _step(rail, pid) == "failed"
+    assert await _step(rail, pid) == "checkout_setup_unresolved"
     row = await _row(pid)
-    assert (rail.sent, row["state"], row["last_error_code"]) == ([], "failed", worker.CHECKOUT_SETUP_UNRESOLVED)
+    assert (rail.sent, row["state"], row["last_error_code"]) == ([], "paying", "checkout_setup_unresolved")
+    rail = Rail()
+    assert await _step(rail, pid) == "checkout_held" and rail.sent == []
 
 
 # ── the worker: the confirm is a money write ─────────────────────────────────────────────────
@@ -684,7 +687,6 @@ async def test_a_confirm_answered_with_no_task_is_held_with_the_write_kept():
 
 
 @pytest.mark.parametrize("answer,code", [
-    (_text_only("I could not place that order."), "checkout_confirm_not_accepted"),
     (httpx.Response(400), "checkout_confirm_refused:http_error:400"),
 ])
 async def test_a_confirm_that_is_not_accepted_fails_nothing_was_submitted(answer, code):
@@ -707,7 +709,7 @@ async def test_a_throttled_confirm_is_confirmed_again_next_poll_and_then_not_aft
     pid = await _approving()
     assert await _step(_approved(Rail(), confirm_answer=httpx.Response(429)), pid) == "rail_refused"
     await _ago("state_entered_at", worker.CHECKOUT_CONFIRM_WINDOW_SECONDS + 5, pid)
-    rail = Rail().on("checkout.confirm#cancel", _text_only("Cancelled."))
+    rail = Rail().on("checkout.confirm#cancel", CANCELLED)
     assert await _step(rail, pid) == "failed"
     assert rail.actions() == ["checkout.confirm#cancel"]
     assert (await _row(pid))["last_error_code"] == worker.CHECKOUT_CONFIRM_WINDOW_PASSED
@@ -845,6 +847,7 @@ def test_no_provider_or_store_name_is_in_the_new_code():
         "db/migrations/287_a2a_rail_checkout_task_id.sql", "db/migrations/down/287_a2a_rail_checkout_task_id_down.sql",
         "db/migrations/288_a2a_rail_ceiling_source.sql", "db/migrations/down/288_a2a_rail_ceiling_source_down.sql",
         "routes/agent_internal_commerce_purchases.py", "tests/test_agent_internal_commerce_purchases.py",
+        "tests/test_agent_internal_commerce_purchases_postgres.py",
         "tests/test_a2a_rail_checkout.py", "tests/test_a2a_rail_checkout_postgres.py", "tests/test_a2a_rail_client.py",
         "tests/test_a2a_rail_ledger_postgres.py", "main.py",
         "docs/adr/ADR-028-agent-completed-checkout.md", "docs/agent_purchases_routes.md",
@@ -1064,7 +1067,7 @@ def _no_credential_in(text_or_obj):
     (_task(_card("error", {"code": "NO_FLAG"})),
      "checkout_confirm_error_card", "paying", "checkout_confirm_error_card", True),
     (httpx.Response(401), "rail_refused", "paying", "checkout_confirm_retry:http_error:401", False),
-    (httpx.Response(403), "rail_refused", "paying", "checkout_confirm_retry:http_error:403", False),
+    (httpx.Response(403), "checkout_confirm_ambiguous_4xx", "paying", "checkout_confirm_ambiguous_4xx", True),
     (httpx.Response(429), "rail_refused", "paying", "checkout_confirm_retry:http_error:429", False),
     (httpx.Response(408), "checkout_confirm_unresolved", "paying", "checkout_confirm_unresolved", True),
     # A conflict may mean "already confirmed or submitted": held, never failed (a failure invites a second
@@ -1158,6 +1161,7 @@ def test_both_checkout_columns_heal_in_one_guarded_statement_on_postgres():
     _checkout_await(),                                                        # it was submitted after all
     _checkout_result(),
     _task(_card("error", {"code": "CANNOT_CANCEL", "recoverable": False})),
+    _text_only("Cancelled."),                                                 # prose is not a definite cancel
     httpx.Response(502),
     httpx.ConnectError("reset"),
 ])
@@ -1170,15 +1174,17 @@ async def test_a_cancel_that_does_not_say_cancelled_is_held(answer):
     assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_CANCEL_UNRESOLVED)
 
 
-async def test_an_unread_total_completes_loudly_and_the_view_says_so(caplog):
+@pytest.mark.parametrize("total", ["$12,34", "€230.00", "CA$250.00", "$250.00 CAD", "250.00", None, 2300])
+async def test_an_unverified_final_total_is_held_never_completed(total, caplog):
     pid = await _placing()
     with caplog.at_level(logging.ERROR, logger=worker.__name__):
-        assert await _step(Rail().on("checkout.await#poll", _checkout_result(total="$12,34")), pid) == "completed"
+        outcome = await _step(Rail().on("checkout.await#poll", _checkout_result(total=total)), pid)
+    assert outcome == "checkout_total_unverified"
     row = await _row(pid)
-    assert (row["final_total_minor"], row["last_error_code"]) == (None, "checkout_total_unparsed")
-    shown = view.build_view(row)
-    assert shown["last_error_code"] == "checkout_total_unparsed" and shown["totals"]["final_total_minor"] is None
-    assert any(r.levelno == logging.ERROR and "total unreadable" in r.getMessage() for r in caplog.records)
+    assert (row["state"], row["final_total_minor"], row["merchant_order_id"], row["last_error_code"]) == (
+        "paying", None, None, "checkout_total_unverified")
+    assert view.build_view(row)["last_error_code"] == "checkout_total_unverified" and worker._sticky(row)
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
 
 
 def test_zero_and_comma_decimal_totals():
@@ -1277,5 +1283,186 @@ async def test_with_the_checkout_on_no_paid_goes_out_without_the_relay():
 
 def test_only_validation_4xx_answers_fail_a_confirm():
     assert worker._CONFIRM_NOT_ACCEPTED_4XX == {400, 422}
-    assert worker._CONFIRM_RESEND_4XX == {401, 403, 429}
+    assert worker._CONFIRM_RESEND_4XX == {401, 429}
     assert {"checkout_confirm_conflict", "checkout_confirm_ambiguous_4xx"} <= worker._CHECKOUT_HOLD_CODES
+
+
+# ── controller review, commit 7 ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("prose", ["Your order #1001 has been placed.", "I could not place that order.", "OK"])
+async def test_a_text_only_confirm_answer_is_held_with_the_write_kept(prose):
+    pid = await _approving()
+    assert await _step(_approved(Rail(), confirm_answer=_text_only(prose)), pid) == "checkout_confirm_text_only"
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"], row["last_error_code"], row["terminal_at"]) == (
+        "paying", worker.CHECKOUT_CONFIRM_ACTION, "checkout_confirm_text_only", None)
+    rail = Rail().on("checkout.confirm#confirm", _checkout_await())
+    assert await _step(rail, pid) == "checkout_held" and rail.sent == []  # never resent
+
+
+def _confirm_with(data):
+    return _task(_card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478", **data},
+                       ("confirm", "edit", "cancel"), kind="confirm"))
+
+
+#: Every total-like spelling matched: top level, one and two levels down, any case / separator.
+TOTAL_SPELLINGS = [
+    {"total": "{t}"}, {"Total": "{t}"}, {"amount": "{t}"}, {"grandTotal": "{t}"}, {"grand_total": "{t}"},
+    {"total_price": "{t}"}, {"totalPrice": "{t}"}, {"TOTAL-PRICE": "{t}"},
+    {"totals": {"total": "{t}"}}, {"order": {"amount": "{t}"}}, {"summary": {"order": {"grandTotal": "{t}"}}},
+]
+
+
+def _fill(spelling, total):
+    return json.loads(json.dumps(spelling).replace("{t}", total))
+
+
+@pytest.mark.parametrize("spelling", TOTAL_SPELLINGS, ids=lambda d: json.dumps(d))
+async def test_a_confirm_card_total_above_the_ceiling_is_cancelled_instead_of_confirmed(spelling):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(_fill(spelling, "$999.00"))).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert rail.actions() == ["payment.visa-action-required#paid", "checkout.setup#submit", "checkout.confirm#cancel"]
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "checkout_confirm_total_refused", None)
+
+
+@pytest.mark.parametrize("spelling", TOTAL_SPELLINGS, ids=lambda d: json.dumps(d))
+async def test_a_confirm_card_total_within_the_ceiling_is_confirmed(spelling):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(_fill(spelling, "$51.49")))
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions() and "checkout.confirm#cancel" not in rail.actions()
+
+
+@pytest.mark.parametrize("total", ["€40.00", "CA$40.00", "$40.00 CAD", "40.00", "forty dollars", 4000, {"value": 4000}])
+async def test_an_unreadable_or_foreign_confirm_card_total_is_cancelled(total):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with({"total": total})).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "checkout_confirm_total_refused"
+
+
+@pytest.mark.parametrize("answer", [_text_only("Cancelled."), _checkout_await(), httpx.Response(502)])
+async def test_a_refused_confirm_card_total_whose_cancel_is_not_definite_is_held(answer):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with({"total": "$999.00"})).on("checkout.confirm#cancel", answer)
+    assert await _step(rail, pid) == "checkout_cancel_unresolved"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert (await _row(pid))["state"] == "paying"
+
+
+async def test_a_confirm_card_without_a_total_like_field_proceeds_only_under_the_tokens_amount_cap():
+    """Unknown fields (subtotal, shipping, tax, a total nested too deep) are not totals: the confirm goes out,
+    and what bounds the charge is the token's amount, minted for exactly the ceiling (the mint test below)."""
+    pid = await _approving()
+    card = _confirm_with({"subtotal": "$999.00", "shipping": "$999.00", "tax": "$999.00", "note": "free gift",
+                          "a": {"b": {"c": {"total": "$999.00"}}}})
+    rail = _approved(Rail(), setup_answer=card)
+    assert await _step(rail, pid) == "placing"
+    assert rail.actions()[-1] == "checkout.confirm#confirm"
+    assert (await _row(pid))["quoted_total_minor"] == TOTAL
+
+
+async def test_the_mint_carries_exactly_the_locked_ceiling_and_the_order_reference():
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "approval_page_issued"
+    mint = rail.payload("payment.token-setup#submit")
+    row = await _row(pid)
+    assert mint["amount_cents"] == row["quoted_total_minor"] == TOTAL
+    assert mint["external_transaction_id"] == row["order_id"] == ORDER
+    assert "currency" not in mint  # USD only: the token step refuses any other currency before minting
+
+
+@pytest.mark.parametrize("order_id,ceiling", [(ORDER, None), (ORDER, 0), (ORDER, -5), (None, TOTAL), ("  ", TOTAL)])
+async def test_a_malformed_lock_never_mints(order_id, ceiling):
+    pid = await _unlocked()
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = :t WHERE id = :i",
+                           {"o": order_id, "t": ceiling, "i": pid})
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["last_error_code"], row["payment_token_id"]) == ([], "checkout_lock_invalid", None)
+
+
+async def test_a_non_usd_locked_row_never_mints():
+    pid = await _unlocked(currency="EUR")
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = :t WHERE id = :i",
+                           {"o": ORDER, "t": TOTAL, "i": pid})
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    assert "payment.token-setup#submit" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "token_currency_unsupported"
+
+
+@pytest.mark.parametrize("answer,code", [
+    (_checkout_await(), "checkout_setup_submitted"),
+    (_checkout_result(), "checkout_setup_submitted"),
+    (httpx.Response(502), "checkout_setup_unresolved"),
+    (httpx.ReadTimeout("slow"), "checkout_setup_unresolved"),
+    (httpx.ConnectError("reset"), "checkout_setup_unresolved"),
+    (httpx.Response(200, content=b"{not json"), "checkout_setup_unresolved"),
+    (_text_only("Done, your order is in."), "checkout_setup_unresolved"),
+    (httpx.Response(409), "checkout_setup_unresolved"),
+])
+async def test_a_setup_showing_a_submission_or_never_seen_is_held_not_failed(answer, code):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=answer)
+    assert await _step(rail, pid) == code
+    assert "checkout.confirm#confirm" not in rail.actions()
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["terminal_at"]) == ("paying", code, None)
+    rail = Rail().on("checkout.confirm#confirm", _checkout_await())
+    assert await _step(rail, pid) == "checkout_held" and rail.sent == []
+
+
+@pytest.mark.parametrize("data", [
+    {"success": True, "order_id": None},
+    {"success": None, "order_id": None},
+])
+@pytest.mark.parametrize("status", ["captcha-failed", "form-error", "pay-disabled"])
+async def test_a_contradictory_result_is_held(status, data):
+    pid = await _placing()
+    answer = _checkout_result(status, total=None, **data)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "checkout_result_unrecognised"
+    assert (await _row(pid))["state"] == "paying"
+
+
+async def test_a_relay_that_cannot_be_sent_ends_cleanly_with_nothing_sent():
+    pid = await _approving()
+    await database.execute("UPDATE a2a_rail_purchases SET payment_token_id = NULL WHERE id = :i", {"i": pid})
+    rail = Rail().on("payment.visa-action-required#paid", _token_result())
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["pending_write"], row["last_error_code"]) == ([], None, "checkout_relay_refused")
+
+
+async def test_a_relay_refusing_after_the_write_ahead_resolves_it_and_ends_cleanly(monkeypatch):
+    pid = await _approving()
+
+    async def _refuses(*a, **k):
+        raise ValueError("refused before the first byte")
+
+    monkeypatch.setattr(a2a_rail.A2ARailClient, "relay_token_to_checkout", _refuses)
+    rail = Rail()
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["pending_write"], row["last_error_code"]) == ([], None, "checkout_relay_refused")
+
+
+async def test_the_scrub_covers_action_dispatch_role_and_the_context_id_and_runs_before_the_log_line(caplog):
+    loose = CRYPTO.rstrip("=")  # alphanumeric: a valid identifier shape
+    answer = _task(_card(f"x.{loose}", {"ok": 1}), {"kind": "data", "data": {
+        "component": "checkout.confirm", "kind": "confirm", "data": {"merchant": "merchant.example"},
+        "actions": [{"id": "confirm", "dispatch": loose, "role": loose}, {"id": "cancel"}]}})
+    answer["result"]["contextId"] = loose
+    provider = _Provider(_token_result(), answer)
+    with caplog.at_level(logging.DEBUG, logger=a2a_rail.__name__):
+        relay = await _relay(provider)
+    confirm = relay.checkout.card("checkout.confirm")
+    assert [(a.id, a.dispatch, a.role) for a in confirm.actions] == [("confirm", None, None), ("cancel", None, None)]
+    assert relay.checkout.context_id is None and loose not in repr(relay)
+    assert all(loose not in r.getMessage() for r in caplog.records)
