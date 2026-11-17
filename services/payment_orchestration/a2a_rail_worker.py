@@ -76,6 +76,15 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   So the setup runs in the same call (the same tick) as the answer carrying the token: the value cannot
   be kept, and whether the await poll hands the token out a second time is not measured.
 
+  quoting (not locked)  -> THE LOCK. The checkout skill gives no quote before ordering, so Pivota locks the
+                           order itself (only with the token step on too): its own order reference
+                           (`checkout_order_id`, deterministic from the purchase id) in `order_id`, and in
+                           `quoted_total_minor` an approval CEILING from `checkout_ceiling` (our price x
+                           quantity + a tax and a shipping allowance, capped), with how it was built in
+                           `ceiling_source`. One write, never repeated (`lock_checkout_order_as_holder`),
+                           and the token step below runs on it in the same step. `checkout_ceiling` is the
+                           seam: a merchant's own all-in quote replaces that one function later. No
+                           price: `failed` (`checkout_price_missing`); not USD, or above the cap: `refused`.
   quoting (locked)      -> before a token is minted, the buyer's contact must make a complete checkout
                            address (`checkout_contact_incomplete` otherwise, nothing sent): a token minted
                            for a checkout that cannot be filled would only be an orphan.
@@ -1368,6 +1377,106 @@ def checkout_total_minor(value: Any, currency: Any) -> Optional[int]:
     return int(match.group("units").replace(",", "")) * 100 + int(match.group("cents") or 0)
 
 
+#: The approval ceiling's allowances, by env (read live). The checkout path has no quote: the buyer
+#: approves, and the token is minted for, an upper bound on what the merchant's checkout can come to.
+A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV = "A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS"
+A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV = "A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR"
+A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV = "A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR"
+CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT = 1500
+CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT = 1000
+CHECKOUT_CEILING_MAX_MINOR_DEFAULT = 20000
+#: How today's ceiling is built (stored in `ceiling_source`): items + the two allowances above.
+CEILING_SOURCE_ALLOWANCE_V1 = "allowance_v1"
+#: The currencies a ceiling is computed in: the token step's (only USD is measured).
+CHECKOUT_CEILING_CURRENCIES = TOKEN_CURRENCIES
+CHECKOUT_PRICE_MISSING = "checkout_price_missing"
+CHECKOUT_CURRENCY_UNSUPPORTED = "checkout_currency_unsupported"
+CHECKOUT_CEILING_OVER_CAP = "checkout_ceiling_over_cap"
+CHECKOUT_CEILING_OVER_RAIL_LIMIT = "checkout_ceiling_over_rail_limit"
+CHECKOUT_ORDER_ID_PREFIX = "pvt-"
+
+
+class CeilingRefused(ValueError):
+    """No ceiling for this row: `code` says why (a ledger code), and whether the purchase is refused or
+    failed (`refused`)."""
+
+    def __init__(self, code: str, *, refused: bool):
+        super().__init__(code)
+        self.code, self.refused = code, refused
+
+
+def _env_int(name: str, default: int, *, low: int, high: int) -> int:
+    """An integer allowance from the env, or `default` (logged) when it is not one in [low, high]."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or not low <= value <= high:
+        logger.warning("a2a_rail_worker: %s is not an integer in [%s, %s]; using %s", name, low, high, default)
+        return default
+    return value
+
+
+def checkout_ceiling(row: Mapping[str, Any]) -> Tuple[int, str]:
+    """THE SEAM: the approval ceiling for a checkout-path purchase, in minor units, and how it was built.
+
+    Today (`allowance_v1`): our price x quantity, plus a tax allowance (A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS,
+    default 1500 = 15%, rounded UP to the cent), plus a shipping allowance
+    (A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR, default 1000), at most A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR
+    (default 20000) and within the rail's own cap for the currency. A merchant's own all-in quote (its UCP
+    checkout) replaces this function and nothing else. Raises `CeilingRefused`; never guesses a price."""
+    currency = str(row.get("currency") or "").upper()
+    if currency not in CHECKOUT_CEILING_CURRENCIES:
+        raise CeilingRefused(CHECKOUT_CURRENCY_UNSUPPORTED, refused=True)
+    price, quantity = row.get("our_price_minor"), row.get("quantity")
+    if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
+        raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
+    bps = _env_int(A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT, low=0, high=10000)
+    shipping = _env_int(A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT,
+                        low=0, high=100_000)
+    cap = _env_int(A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, CHECKOUT_CEILING_MAX_MINOR_DEFAULT, low=1, high=10_000_000)
+    items = price * quantity
+    tax = -(-items * bps // 10000)  # up to the cent
+    ceiling = items + tax + shipping
+    if ceiling > cap:
+        raise CeilingRefused(CHECKOUT_CEILING_OVER_CAP, refused=True)
+    if not rail_router.amount_ok(ceiling, currency):
+        raise CeilingRefused(CHECKOUT_CEILING_OVER_RAIL_LIMIT, refused=True)
+    return ceiling, CEILING_SOURCE_ALLOWANCE_V1
+
+
+def checkout_order_id(purchase_id: str) -> str:
+    """Pivota's order reference for a checkout-path purchase (the token's `external_transaction_id`):
+    deterministic from the purchase id. A dot every 8 characters of the id's hex, so no run of digits
+    is long enough to read as a card number (the ledger refuses one in `order_id`)."""
+    prefix, _, hexpart = str(purchase_id).partition("_")
+    chunks = ".".join(hexpart[i:i + 8] for i in range(0, len(hexpart), 8))
+    return f"{CHECKOUT_ORDER_ID_PREFIX}{prefix}_{chunks}"
+
+
+async def _lock_checkout_order(s: _Step) -> str:
+    """Lock the order for the checkout path (see the module docstring), then run the token step on it."""
+    try:
+        ceiling, source = checkout_ceiling(s.row)
+    except CeilingRefused as refusal:
+        if refusal.refused:
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason=refusal.code)
+            return await _settled(s, moved, "refused")
+        return await _token_failed(s, "quoting", refusal.code)
+    moved = await ledger.lock_checkout_order_as_holder(
+        s.id, s.worker, order_id=checkout_order_id(s.id), quoted_total_minor=ceiling, ceiling_source=source)
+    if moved is None:
+        return await _settled(s, None, "lost")
+    s.row = moved
+    return await _quoting(s)
+
+
 def _checkout_idempotency_key(purchase_id: str) -> str:
     """Deterministic per purchase: a repeated setup for one purchase is one checkout at the provider."""
     return f"pvt-{purchase_id}-checkout"
@@ -1696,6 +1805,12 @@ async def _quoting(s: _Step) -> str:
             # The token would be relayed into a checkout that cannot be filled: no token is minted.
             return await _token_failed(s, "quoting", CHECKOUT_CONTACT_INCOMPLETE)
         return await _start_token(s)
+    if (
+        a2a_rail.checkout_step_enabled() and token_step_enabled() and row.get("payment_method_id")
+        and not row.get("order_id") and row.get("quoted_total_minor") is None and not row.get("payment_token_id")
+    ):
+        # The checkout path: no quote exists before ordering, so Pivota locks the order itself.
+        return await _lock_checkout_order(s)
     # Not locked yet (the quote and the lock are the order protocol's), or a token is already recorded
     # (a re-quote must void it first): nothing here may act.
     return await _parked(s)

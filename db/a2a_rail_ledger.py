@@ -232,11 +232,24 @@ _ADD_CHECKOUT_TASK_ID_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS checkout_task_id VARCHAR(128)"
 )
 _ADD_CHECKOUT_TASK_ID_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN checkout_task_id VARCHAR(128)"
+# Migration 288: how the checkout path's approval ceiling (`quoted_total_minor`) was built, e.g.
+# `allowance_v1` (Pivota's own estimate: items + a tax and a shipping allowance). Written only by
+# `lock_checkout_order_as_holder`, with the ceiling, so the view can say the amount is an upper bound.
+# Nullable, no default, like 287; every other statement works on a table that does not have it yet.
+_ADD_CEILING_SOURCE_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
+)
+_ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_source VARCHAR(32)"
+#: (column, Postgres heal, SQLite heal), in migration order.
+_HEALED_COLUMNS = (
+    ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_PG, _ADD_CHECKOUT_TASK_ID_SQLITE),
+    ("ceiling_source", _ADD_CEILING_SOURCE_PG, _ADD_CEILING_SOURCE_SQLITE),
+)
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278 and 287. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287 and 288. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -247,22 +260,24 @@ async def ensure_a2a_rail_schema() -> None:
         for statement in (_CREATE_BUYER_REFS_OWNER_INDEX, _CREATE_PURCHASES_OWNER_INDEX, _CREATE_PURCHASES_DUE_INDEX):
             await _ensure_index(statement)
         await database.execute(_CREATE_WORKER_HEARTBEAT_PG)
-        # A lock-free catalog check first; the ALTER (ACCESS EXCLUSIVE) runs only while the column is
+        # A lock-free catalog check first; each ALTER (ACCESS EXCLUSIVE) runs only while its column is
         # missing, under schema_guard's lock_timeout. A timeout defers the heal to the next boot: only
-        # the dark checkout step needs the column.
-        for statement in guarded_add_columns(_ADD_CHECKOUT_TASK_ID_PG + ";"):
-            try:
-                await database.execute(statement)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("a2a_rail_ledger: checkout_task_id heal deferred to next boot error_type=%s",
-                               type(exc).__name__)
+        # the dark checkout step needs these columns.
+        for column, heal_pg, _ in _HEALED_COLUMNS:
+            for statement in guarded_add_columns(heal_pg + ";"):
+                try:
+                    await database.execute(statement)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("a2a_rail_ledger: %s heal deferred to next boot error_type=%s",
+                                   column, type(exc).__name__)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
         await database.execute(_CREATE_WORKER_HEARTBEAT_SQLITE)
         columns = {row["name"] for row in await database.fetch_all(_SQLITE_PURCHASE_COLUMNS)}
-        if "checkout_task_id" not in columns:
-            await database.execute(_ADD_CHECKOUT_TASK_ID_SQLITE)
+        for column, _, heal_sqlite in _HEALED_COLUMNS:
+            if column not in columns:
+                await database.execute(heal_sqlite)
         await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_DUE_INDEX)
@@ -722,6 +737,49 @@ async def clear_pending_write(purchase_id: str, worker_id: str, action: str) -> 
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_CLEAR_PENDING_WRITE_SQL, values))
     return _purchase(await database.fetch_one(_CLEAR_PENDING_WRITE_SQL_SQLITE, values))
+
+
+# The checkout path's order lock: Pivota's own order reference and the approval ceiling the token is
+# then minted for, on a held `quoting` row that has neither yet, no token and no pending write. Never a
+# second time: a locked row is not locked again (a re-quote clears both first, through the transition).
+_LOCK_CHECKOUT_ORDER_SQL = """
+    UPDATE a2a_rail_purchases
+       SET order_id = :order_id,
+           quoted_total_minor = :quoted_total_minor,
+           ceiling_source = :ceiling_source,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'quoting'
+       AND claimed_by = :holder
+       AND pending_write IS NULL
+       AND payment_token_id IS NULL
+       AND order_id IS NULL
+       AND quoted_total_minor IS NULL
+       AND contact_purged_at IS NULL
+    RETURNING *
+"""
+_LOCK_CHECKOUT_ORDER_SQL_SQLITE = _LOCK_CHECKOUT_ORDER_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+_CEILING_SOURCE_RE = re.compile(r"^[a-z0-9_]{1,32}\Z")
+
+
+async def lock_checkout_order_as_holder(
+    purchase_id: str, worker_id: str, *, order_id: str, quoted_total_minor: int, ceiling_source: str
+) -> Optional[Dict[str, Any]]:
+    """Lock a held `quoting` row for the checkout path. None when the row is not held in `quoting`, is
+    already locked, holds a token or a pending write, or its contact was purged. Malformed values (a
+    card-number shaped order id included) raise before any SQL."""
+    values = {
+        "id": purchase_id,
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "order_id": _rail_ref(_require(_RAIL_REF_RE, order_id, "order_id"), "order_id"),
+        "quoted_total_minor": _require_minor(quoted_total_minor, "quoted_total_minor", positive=True),
+        "ceiling_source": _require(_CEILING_SOURCE_RE, ceiling_source, "ceiling_source"),
+    }
+    if values["quoted_total_minor"] is None:
+        raise ValueError("quoted_total_minor is required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_LOCK_CHECKOUT_ORDER_SQL, values))
+    return _purchase(await database.fetch_one(_LOCK_CHECKOUT_ORDER_SQL_SQLITE, values))
 
 
 # The provider's checkout task, once its confirm is answered: recorded in the SAME statement that

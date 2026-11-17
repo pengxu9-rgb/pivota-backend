@@ -24,8 +24,9 @@ _MIGRATION = _REPO / "db/migrations/268_a2a_rail_ledger.sql"
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs")
 _MIGRATION_278 = _REPO / "db/migrations/278_a2a_rail_worker_heartbeat.sql"
-#: The checkout task id column (the checkout relay): applied on top of 268 by the parity check.
+#: The checkout path's columns (task id, ceiling source): applied on top of 268 by the parity check.
 _MIGRATION_287 = _REPO / "db/migrations/287_a2a_rail_checkout_task_id.sql"
+_MIGRATION_288 = _REPO / "db/migrations/288_a2a_rail_ceiling_source.sql"
 AGENT = "agent_a2a_pg"
 PAGE = "https://pay.rail.test/approve/1"
 
@@ -90,13 +91,16 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
 
     for table in _TABLES:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
-    for migration in (_MIGRATION, _MIGRATION_287):
+    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288):
         for statement in split_statements(migration.read_text(encoding="utf-8")):
             await database.execute(statement)
     from_migration = [await _fingerprint(t) for t in _TABLES]
     assert await database.fetch_one(
         "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
         "AND column_name = 'checkout_task_id' AND data_type = 'character varying' AND character_maximum_length = 128")
+    assert await database.fetch_one(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
+        "AND column_name = 'ceiling_source' AND data_type = 'character varying' AND character_maximum_length = 32")
     assert [name for name, _ in from_migration[0][2]] == [
         "ck_a2a_rail_purchases_action", "ck_a2a_rail_purchases_price",
         "ck_a2a_rail_purchases_quantity", "ck_a2a_rail_purchases_state"]

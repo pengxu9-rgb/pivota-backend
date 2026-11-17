@@ -9,6 +9,8 @@ re-vetted at read time, because both came from the rail and both are meant to be
                              rail's allowlist (by SHA-256, as the transport does), the kind matching
                              the state, and not past its deadline. Otherwise absent: nowhere to send
                              the buyer, which is exactly what an absent key says.
+  totals.ceiling_source      present when `quoted_total_minor` is an approval ceiling Pivota built (the
+                             checkout path has no quote): how it was built, e.g. `allowance_v1`.
   merchant_order_status_url  the merchant's own order page: https, on the merchant's domain or one of
                              its subdomains. A platform host (any store can mint one) is not
                              evidence it is THIS merchant's page, so it is not shown.
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
@@ -39,6 +42,8 @@ _KIND_FOR_STATE = {
 
 #: How soon an agent polling should ask again, by state. None once terminal.
 _POLL_AFTER = {"opened": 5, "quoting": 5, "paying": 5, "needs_payment_method": 15, "awaiting_authorization": 15}
+
+_CEILING_SOURCE_RE = re.compile(r"^[a-z0-9_]{1,32}\Z")
 
 _PUBLIC_COLUMNS = (
     "id", "state", "merchant_domain", "product_key", "product_name", "variant_title", "quantity",
@@ -95,6 +100,12 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
         "shipping_minor": row.get("shipping_minor"),
         "tax_minor": row.get("tax_minor"),
     }
+    # The checkout path has no quote: `quoted_total_minor` is then an approval CEILING Pivota built (items
+    # plus tax and shipping allowances), and this says how. Present only for such a ceiling, so a reader
+    # can say "you approve up to this; the final total includes shipping and tax".
+    source = row.get("ceiling_source")
+    if row.get("quoted_total_minor") is not None and isinstance(source, str) and _CEILING_SOURCE_RE.match(source):
+        view["totals"]["ceiling_source"] = source
     expires = _aware(row.get("buyer_action_expires_at"))
     if (
         _KIND_FOR_STATE.get(state) is not None

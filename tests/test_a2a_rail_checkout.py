@@ -32,6 +32,7 @@ from db.schema_guard import ensure_required_schema_light  # noqa: E402
 import db.a2a_rail_ledger as ledger  # noqa: E402
 from services.payment_orchestration import a2a_purchase_view as view  # noqa: E402
 from services.payment_orchestration import a2a_rail, a2a_rail_worker as worker  # noqa: E402
+from services.payment_orchestration import router as rail_router  # noqa: E402
 
 # The SQLite arm; tests/test_a2a_rail_checkout_postgres.py runs these same tests on Postgres.
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
@@ -68,6 +69,8 @@ def _dials(monkeypatch):
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
+    # The rail's own per-currency cap (the create route needs it set; the ceiling must fit it too).
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000")
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(HOST.encode()).hexdigest()}))
 
 
@@ -840,3 +843,183 @@ def test_no_provider_or_store_name_is_in_the_new_code():
                  "db/a2a_rail_ledger.py", "db/migrations/287_a2a_rail_checkout_task_id.sql", "tests/test_a2a_rail_checkout.py"):
         text = (repo / path).read_text("utf-8").lower()
         assert not any(name in text for name in names), path
+
+
+# ── the checkout path's lock: Pivota's order reference and approval ceiling ──────────────────
+
+
+async def _unlocked(**kw):
+    """A purchase in `quoting` with an ACTIVE card and no lock yet (what the door + first step leave)."""
+    args = dict(agent_id="agent_w", agent_user_ref_hash="h" * 64, merchant_domain="merchant.example",
+                checkout_url="https://merchant.example/cart/40000000001:1", currency="USD", our_price_minor=4650,
+                buyer_email=EMAIL, shipping_address=ADDRESS)
+    args.update(kw)
+    pid = (await ledger.create_purchase(**args))["id"]
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA)), pid) == "method_ready"
+    row = await _row(pid)
+    assert (row["state"], row["order_id"], row["quoted_total_minor"]) == ("quoting", None, None)
+    return pid
+
+
+def _lock_rail():
+    return Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+
+
+@pytest.mark.parametrize("price,quantity,expected", [
+    (4650, 1, 4650 + 698 + 1000),     # 15% of 46.50 = 6.975 -> 6.98 (up to the cent)
+    (4000, 2, 8000 + 1200 + 1000),
+    (1, 1, 1 + 1 + 1000),
+])
+def test_the_ceiling_is_items_plus_tax_and_shipping_allowances_rounded_up(price, quantity, expected):
+    assert worker.checkout_ceiling({"currency": "USD", "our_price_minor": price, "quantity": quantity}) == (
+        expected, worker.CEILING_SOURCE_ALLOWANCE_V1)
+
+
+def test_the_ceiling_allowances_and_cap_are_config_and_a_bad_value_falls_back(monkeypatch):
+    row = {"currency": "USD", "our_price_minor": 10000, "quantity": 1}
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, "1000")
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, "0")
+    assert worker.checkout_ceiling(row)[0] == 11000
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, "10999")
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling(row)
+    assert raised.value.code == worker.CHECKOUT_CEILING_OVER_CAP and raised.value.refused
+    for bad in ("x", "-1", "99999"):
+        monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, bad)
+        monkeypatch.delenv(worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, raising=False)
+        assert worker.checkout_ceiling(row)[0] == 10000 + 1500 + 0  # the default 15%
+
+
+@pytest.mark.parametrize("row,code,refused", [
+    ({"currency": "EUR", "our_price_minor": 4650, "quantity": 1}, "checkout_currency_unsupported", True),
+    ({"currency": "USD", "our_price_minor": None, "quantity": 1}, "checkout_price_missing", False),
+    ({"currency": "USD", "our_price_minor": 0, "quantity": 1}, "checkout_price_missing", False),
+    ({"currency": "USD", "our_price_minor": True, "quantity": 1}, "checkout_price_missing", False),
+    ({"currency": "USD", "our_price_minor": 4650, "quantity": None}, "checkout_price_missing", False),
+    ({"currency": "USD", "our_price_minor": 18000, "quantity": 1}, "checkout_ceiling_over_cap", True),
+])
+def test_no_ceiling_is_guessed(row, code, refused):
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling(row)
+    assert (raised.value.code, raised.value.refused) == (code, refused)
+
+
+def test_a_ceiling_above_the_rails_own_cap_is_refused(monkeypatch):
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:6000")
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling({"currency": "USD", "our_price_minor": 4650, "quantity": 1})
+    assert (raised.value.code, raised.value.refused) == ("checkout_ceiling_over_rail_limit", True)
+
+
+def test_the_order_reference_is_deterministic_and_never_card_shaped():
+    import uuid
+
+    from services.payment_orchestration.a2a_rail import _has_card_number
+
+    assert worker.checkout_order_id("ap_0123456789abcdef01234567") == "pvt-ap_01234567.89abcdef.01234567"
+    assert worker.checkout_order_id("ap_0123456789abcdef01234567") == worker.checkout_order_id("ap_0123456789abcdef01234567")
+    assert not _has_card_number(worker.checkout_order_id("ap_" + "4" * 24))
+    for _ in range(2000):
+        order_id = worker.checkout_order_id(f"ap_{uuid.uuid4().hex[:24]}")
+        assert not _has_card_number(order_id) and ledger._rail_ref(order_id, "order_id") == order_id
+
+
+async def test_the_lock_writes_the_order_and_ceiling_and_the_token_is_asked_for_exactly_that():
+    pid = await _unlocked()
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "approval_page_issued"
+    row = await _row(pid)
+    expected = 4650 + 698 + 1000
+    assert (row["order_id"], row["quoted_total_minor"], row["ceiling_source"]) == (
+        worker.checkout_order_id(pid), expected, "allowance_v1")
+    setup = rail.payload("payment.token-setup#submit")
+    assert (setup["amount_cents"], setup["external_transaction_id"]) == (expected, worker.checkout_order_id(pid))
+    assert (row["state"], row["payment_token_id"]) == ("awaiting_authorization", "ptk_1")
+    totals = view.build_view(row)["totals"]
+    assert (totals["quoted_total_minor"], totals["ceiling_source"]) == (expected, "allowance_v1")
+
+
+async def test_a_second_tick_never_relocks_or_moves_the_ceiling(monkeypatch):
+    pid = await _unlocked()
+    # Locked through the ledger (as a first tick does), then the next tick must use that lock as it is.
+    await _ago("next_poll_at", 1, pid)
+    [held] = [r for r in await ledger.claim_due_purchases(W, limit=50) if r["id"] == pid]
+    ceiling, source = worker.checkout_ceiling(held)
+    first = await ledger.lock_checkout_order_as_holder(
+        pid, W, order_id=worker.checkout_order_id(pid), quoted_total_minor=ceiling, ceiling_source=source)
+    assert first is not None
+    assert await ledger.lock_checkout_order_as_holder(
+        pid, W, order_id="pvt-other", quoted_total_minor=1, ceiling_source="other") is None  # never twice
+    await ledger.release_claim(pid, W)
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, "0")  # a changed config later
+
+    async def _no_relock(*a, **k):
+        raise AssertionError("a locked purchase was locked again")
+
+    monkeypatch.setattr(ledger, "lock_checkout_order_as_holder", _no_relock)
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "approval_page_issued"
+    row = await _row(pid)
+    assert (row["order_id"], row["quoted_total_minor"]) == (worker.checkout_order_id(pid), ceiling)
+    assert rail.payload("payment.token-setup#submit")["amount_cents"] == ceiling
+
+
+async def test_over_the_cap_the_purchase_is_refused_and_nothing_is_sent():
+    pid = await _unlocked(our_price_minor=18000)
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "refused"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["refusal_reason"], row["order_id"]) == (
+        [], "refused", "checkout_ceiling_over_cap", None)
+
+
+async def test_a_non_usd_purchase_is_refused_and_nothing_is_sent():
+    pid = await _unlocked(currency="EUR")
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "refused"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["refusal_reason"]) == ([], "refused", "checkout_currency_unsupported")
+
+
+async def test_a_missing_price_fails_and_nothing_is_sent():
+    pid = await _unlocked()
+    await _ago("next_poll_at", 1, pid)
+    [held] = [r for r in await ledger.claim_due_purchases(W, limit=50) if r["id"] == pid]
+    rail = _lock_rail()
+    # The column is NOT NULL > 0 in the ledger; the step must still never guess one.
+    assert await worker.step(_client(rail), {**held, "our_price_minor": None}, W) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["last_error_code"], row["order_id"]) == (
+        [], "failed", "checkout_price_missing", None)
+
+
+@pytest.mark.parametrize("dials", ["checkout_off", "token_off", "both_off"])
+async def test_with_either_dial_off_an_unlocked_purchase_parks_exactly_as_before(monkeypatch, dials):
+    pid = await _unlocked()
+    if dials in ("checkout_off", "both_off"):
+        monkeypatch.delenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV)
+    if dials in ("token_off", "both_off"):
+        monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+
+    async def _no_lock(*a, **k):
+        raise AssertionError("locked with a dial off")
+
+    monkeypatch.setattr(ledger, "lock_checkout_order_as_holder", _no_lock)
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "parked"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["order_id"], row["quoted_total_minor"], row["ceiling_source"],
+            row["last_error_code"]) == ([], "quoting", None, None, None, "shop_protocol_pending")
+    assert "ceiling_source" not in view.build_view(row)["totals"]
+
+
+def test_migration_288_holds_the_columns_ddl():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    up = (repo / "db/migrations/288_a2a_rail_ceiling_source.sql").read_text("utf-8")
+    squash = lambda text: " ".join(text.split())  # noqa: E731
+    assert squash(ledger._ADD_CEILING_SOURCE_PG) in squash(up)
+    assert "schema-guard-exempt:" in up
+    down = (repo / "db/migrations/down/288_a2a_rail_ceiling_source_down.sql").read_text("utf-8")
+    assert "DROP COLUMN IF EXISTS ceiling_source" in down
