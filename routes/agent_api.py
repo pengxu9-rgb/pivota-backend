@@ -764,6 +764,24 @@ async def _load_replayable_agent_order_create_response_with_backoff(
     return None
 
 
+#: Set on the caller's context once an order create's governance ran, so it runs once per create
+#: when a route validates before calling agent_create_order (its rate counts requests).
+ORDER_CREATE_GOVERNANCE_VALIDATED = "order_create_governance_validated"
+
+
+async def validate_order_create_governance(context: Any) -> None:
+    """An agent order create's governance: the agent's status (`blocked` or `suspended`: 403) and
+    its request rate (429). Neither answer is a listed refusal. It runs before anything of the
+    create is answered, an order the quote already holds included."""
+    from services.agent_governance import agent_governance
+
+    await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+    try:
+        setattr(context, ORDER_CREATE_GOVERNANCE_VALIDATED, True)
+    except Exception:  # noqa: BLE001 - a context that takes no attribute is validated again below
+        pass
+
+
 async def answer_for_a_quote_that_holds_its_order(
     holder: Any,
     order_request: Any,
@@ -8855,11 +8873,13 @@ async def agent_create_order(
     if order_request.merchant_id == EXTERNAL_SEED_MERCHANT_ID:
         raise HTTPException(status_code=400, detail="EXTERNAL_PRODUCT_CHECKOUT_DISABLED")
 
-    # STEP 1: Governance validation (before main logic)
+    # STEP 1: Governance validation (before main logic), once per create: POST /agent/v2/orders
+    # runs it itself before it answers anything (validate_order_create_governance).
     from services.agent_governance import agent_governance
     _t = time.perf_counter()
     try:
-        await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+        if getattr(context, ORDER_CREATE_GOVERNANCE_VALIDATED, False) is not True:
+            await validate_order_create_governance(context)
     finally:
         logger.info(
             "[AgentAPI][PERF] step=validate_request_compat duration_ms=%d order=%s",

@@ -68,7 +68,7 @@ ENVELOPE_PATH = REPO / "contracts" / "error_envelope_status_codes.json"
 # to it is a change to what the gateway may do with money and must land in both repositories. The
 # notes file is this repository's own; the envelope table is vendored by the gateway's test fixture.
 CONTRACT_SHA256 = "221f4bb28485caea22e7c0a84ae0c55e4f3ef644fca85a63ed3342adb80706a3"
-NOTES_SHA256 = "b5eed2224babd0a46d92a2a32107cc20bb341ab40b2c24ca35f6e447b60ceaf3"
+NOTES_SHA256 = "b26315e9541eb2fffa97a05133b2f0038dc7c7d72731087067090a86b16ed27d"
 ENVELOPE_SHA256 = "74e2875f61e8c3a96ba7a4a768731c7052d346d0ee3faec10c7c8954fdd1a3f5"
 
 #: THE list. Every case below reads the pairs from the file; none is written out a second time.
@@ -171,6 +171,9 @@ def test_c0_the_notes_say_where_the_code_and_the_reason_are() -> None:
     assert "before the first copy's order row is written" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
     assert "reads as no holder" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
     assert COMMERCE_PATH_UNKNOWN in NOTES["not_listed_on_purpose"]["503 TEMPORARY_UNAVAILABLE"]
+    rate = NOTES["not_listed_on_purpose"]["429"]
+    assert "on both routes" in rate and "blocked or suspended" in rate and "403 (unlisted)" in rate
+    assert "/agent/v1/orders/create" not in rate
     assert sorted(NOTES["not_listed_on_purpose"]) == ["409 QUOTE_CONSUMED", "429", "503 TEMPORARY_UNAVAILABLE"]
 
 
@@ -530,7 +533,7 @@ _CALLS_ON_THE_PATH: Dict[str, str] = {
     "_timed_load_replayable_agent_order_create_response": "a local wrapper of the replay lookup; checked here",
     "_set_request_taxonomy_state": "sets attributes on request.state",
     "_get_order_create_lock": "the in-process per-merchant lock",
-    "validate_request_compat": "governance: reads the agent's policy, counts the request in memory",
+    "validate_order_create_governance": "governance: reads the agent's policy (blocked, suspended), counts the request in memory",
     "emit_best_effort": "a best-effort telemetry event; no order",
     "require_quote_for_caller": "reads the quote's owner",
     "should_require_quote_for_order_create": "reads the merchant's quote-first setting",
@@ -839,7 +842,7 @@ def _insert_after(fn: ast.AST, anchor: ast.stmt, new: List[ast.stmt]) -> None:
 
 def _remove(fn: ast.AST, stmt: ast.stmt) -> None:
     block = _statement_list_of(fn, stmt)
-    block[:] = [s for s in block if s is not stmt]
+    block[:] = [s for s in block if s is not stmt] or [ast.Pass()]
 
 
 _ESCAPES = {
@@ -1028,6 +1031,185 @@ def test_c1_a_listed_refusal_above_the_holder_answer_is_caught(path: str) -> Non
     ).body)
 
     assert "PREFLIGHT_FAILED" in listed_codes_above_the_holder_answer(path, ast.unparse(tree))
+
+
+
+#: Governance runs before each create function answers a quote that holds its order.
+_GOVERNANCE_FIRST = {
+    "routes/agent_api.py": ("agent_create_order", "validate_order_create_governance", "answer_for_a_quote_that_holds_its_order"),
+    "routes/agent_v2.py": ("create_order_v2", "validate_order_create_governance", "answer_for_a_create_whose_quote_holds_its_order"),
+}
+
+
+def governance_comes_first(path: str, source: str) -> List[str]:
+    function, governance, answer = _GOVERNANCE_FIRST[path]
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+    )
+    gov = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == governance]
+    ans = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer]
+    if len(gov) != 1 or len(ans) != 1:
+        return [f"{function}: governance calls {len(gov)}, holder answers {len(ans)}"]
+    problems = []
+    if not _position(gov[0]) < _position(ans[0]):
+        problems.append(f"{function}: governance runs after the holder answer")
+    replays = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)
+        and n.value.id in ("replay_response", "idempotency_cache_value")
+    ]
+    if any(_position(r) < _position(gov[0]) for r in replays):
+        problems.append(f"{function}: an order is replayed before governance")
+    return problems
+
+
+@pytest.mark.parametrize("path", sorted(_GOVERNANCE_FIRST))
+def test_c1_governance_runs_before_a_held_quote_is_answered(path: str) -> None:
+    """A blocked or suspended agent (governance's 403) is refused before an order its quote holds,
+    or one this create already made (the cache and the replay lookup), is answered with its payment
+    surface."""
+    assert governance_comes_first(path, (REPO / path).read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("path", sorted(_GOVERNANCE_FIRST))
+def test_c1_governance_moved_below_the_holder_answer_is_caught(path: str) -> None:
+    function, governance, answer = _GOVERNANCE_FIRST[path]
+    tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function)
+    gov_stmt = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == governance))
+    ans_stmt = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer))
+    _remove(fn, gov_stmt)
+    _insert_after(fn, ans_stmt, [gov_stmt])
+
+    assert governance_comes_first(path, ast.unparse(tree)) != []
+
+
+#: (file, function, the holder answer, the name its result is bound to)
+_HELD_BRANCHES = [
+    ("routes/agent_api.py", "agent_create_order", "answer_for_a_quote_that_holds_its_order", "held_quote_response"),
+    ("routes/agent_v2.py", "create_order_v2", "answer_for_a_create_whose_quote_holds_its_order", "held"),
+]
+
+
+def held_branch_problems(source: str, function: str, answer: str, name: str) -> List[str]:
+    """Once a holder is known, the create may only answer that order. Every branch on the holder
+    answer's result holds a bookkeeping assignment at most, then `return` of that result (as is, or
+    through v2's `_order_created_answer`); and no listed code is written between the answer and the
+    end of its branch."""
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+    )
+    problems: List[str] = []
+    branches = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(n.test))
+    ]
+    if len(branches) != 1:
+        return [f"{function}: {len(branches)} branches on {name}"]
+    branch = branches[0]
+    if branch.orelse:
+        problems.append(f"{function}: the held branch has an else")
+    *head, last = branch.body
+    for stmt in head:
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else []
+        if not (len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "_agent_order_id_for_perf"):
+            problems.append(f"{function}:{stmt.lineno} the held branch does more than answer: {ast.unparse(stmt)[:60]}")
+    value = last.value if isinstance(last, ast.Return) else None
+    plain = isinstance(value, ast.Name) and value.id == name
+    via_v2 = (
+        isinstance(value, ast.Await) and isinstance(value.value, ast.Call) and _callee(value.value) == "_order_created_answer"
+        and isinstance(value.value.args[0], ast.Name) and value.value.args[0].id == name
+    )
+    if not (plain or via_v2):
+        problems.append(f"{function}: the held branch does not end by answering the order")
+    answer_at = min(_position(c) for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer)
+    end = (branch.end_lineno, branch.end_col_offset)
+    for const in ast.walk(fn):
+        if isinstance(const, ast.Constant) and const.value in LISTED_CODES and answer_at <= _position(const) <= end:
+            problems.append(f"{function}:{const.lineno} {const.value} next to the holder answer")
+    return problems
+
+
+#: The functions that answer a quote that holds its order: none writes a listed code.
+_HOLDER_ANSWER_FUNCTIONS = [
+    ("routes/agent_api.py", "answer_for_a_quote_that_holds_its_order"),
+    ("routes/agent_api.py", "answer_for_a_create_whose_quote_holds_its_order"),
+    ("routes/agent_api.py", "_replay_order_that_holds_quote"),
+    ("routes/agent_v2.py", "_order_created_answer"),
+    ("db/orders.py", "read_quote_claim_holder"),
+]
+
+
+@pytest.mark.parametrize("path, function, answer, name", _HELD_BRANCHES, ids=[b[1] for b in _HELD_BRANCHES])
+def test_c1_a_held_branch_only_answers_the_order(path: str, function: str, answer: str, name: str) -> None:
+    assert held_branch_problems((REPO / path).read_text(encoding="utf-8"), function, answer, name) == []
+
+
+@pytest.mark.parametrize("path, function", _HOLDER_ANSWER_FUNCTIONS, ids=[f[1] for f in _HOLDER_ANSWER_FUNCTIONS])
+def test_c1_the_holder_answer_functions_write_no_listed_code(path: str, function: str) -> None:
+    assert listed_codes_at_or_after_the_write_step((REPO / path).read_text(encoding="utf-8"), function, None) == []
+
+
+@pytest.mark.parametrize("path, function, answer, name", _HELD_BRANCHES, ids=[b[1] for b in _HELD_BRANCHES])
+def test_c1_a_listed_refusal_in_the_held_branch_is_caught(path: str, function: str, answer: str, name: str) -> None:
+    """MG: a conditional listed refusal inside the branch that runs once an order is known."""
+    tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function)
+    branch = next(n for n in ast.walk(fn) if isinstance(n, ast.If) and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(n.test)))
+    branch.body[0:0] = ast.parse(
+        f'if str({name}.get("currency") or "") != "oopq":\n'
+        '    raise HTTPException(status_code=409, detail={"error": "PREFLIGHT_FAILED", "message": "planted"})\n'
+    ).body
+
+    assert held_branch_problems(ast.unparse(tree), function, answer, name) != []
+
+
+#: Everything else that runs around these routes. Reviewed: none writes an order, a claim, a payment
+#: or an order event. Adding one fails here until it is read and named.
+_APP_MIDDLEWARE = {
+    "UsageLoggerMiddleware", "RateLimitMiddleware", "StructuredLoggingMiddleware", "SyntheticCallMiddleware",
+    "ErrorHandlerMiddleware", "SecurityHeadersMiddleware", "AP2SecurityMiddleware", "TieredCORSMiddleware",
+}
+_APP_HTTP_MIDDLEWARE_FUNCTIONS = {"add_service_version_headers", "cors_preflight_passthrough"}
+
+
+def _keyword(call: ast.Call, name: str) -> Optional[ast.AST]:
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def test_c1_no_router_or_app_dependency_and_only_the_reviewed_middleware_around_the_routes() -> None:
+    main = _tree("main.py")
+    app_calls = [
+        n for n in ast.walk(main)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "app" for t in n.targets)
+        and isinstance(n.value, ast.Call) and _call_key(n.value) == "FastAPI"
+    ]
+    assert len(app_calls) == 1 and _keyword(app_calls[0].value, "dependencies") is None
+    for path in ("routes/agent_api.py", "routes/agent_v2.py"):
+        routers = [
+            n.value for n in _tree(path).body
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "router" for t in n.targets)
+        ]
+        assert len(routers) == 1 and _keyword(routers[0], "dependencies") is None, path
+    includes = [
+        n for n in ast.walk(main)
+        if isinstance(n, ast.Call) and _call_key(n) == "app.include_router" and n.args
+        and isinstance(n.args[0], ast.Name) and n.args[0].id in ("agent_api_router", "agent_v2_router")
+    ]
+    assert len(includes) == 2 and all(_keyword(c, "dependencies") is None for c in includes)
+    added = {
+        ast.unparse(n.args[0]) for n in ast.walk(main)
+        if isinstance(n, ast.Call) and _call_key(n) == "app.add_middleware" and n.args
+    }
+    assert added == _APP_MIDDLEWARE, f"middleware to review: {sorted(added ^ _APP_MIDDLEWARE)}"
+    http = {
+        n.name for n in ast.walk(main)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(d, ast.Call) and _call_key(d) == "app.middleware" for d in n.decorator_list)
+    }
+    assert http == _APP_HTTP_MIDDLEWARE_FUNCTIONS, f"middleware to review: {sorted(http ^ _APP_HTTP_MIDDLEWARE_FUNCTIONS)}"
 
 
 def _functions_reading(path: str, name: str) -> Set[str]:
@@ -2544,6 +2726,99 @@ async def test_c3_v2_answers_a_held_quote_before_its_own_refusals(
     assert writes == [1] and len(await cw.orders_for(quote)) == 1
 
 
+
+def _agent_status(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """The real governance check, with the agent's policy at `status`."""
+    import services.agent_governance as governance
+
+    gov = governance.agent_governance
+
+    async def policy(_agent_id: str, **_: Any) -> Dict[str, Any]:
+        return {"status": status, "max_requests_per_minute": 1000}
+
+    monkeypatch.setattr(gov, "validate_request", type(gov).validate_request.__get__(gov))
+    monkeypatch.setattr(gov, "_get_policy", policy)
+
+
+_PAYMENT_SURFACE = ("client_secret", "payment_action", "payment_intent_id", "instructions")
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("status", ["blocked", "suspended"])
+@pytest.mark.parametrize("second", ["identical_resend", "another_provider"])
+async def test_c3_a_blocked_or_suspended_agent_gets_nothing_of_its_order(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, status: str, second: str
+) -> None:
+    """The agent made an order; an operator then blocks or suspends it. Its next create for that
+    quote (the same create again, or with a provider named) is refused 403 by governance: no order,
+    no payment surface. Governance runs before the quote's claim is answered, on both routes."""
+    _real_replay_lookup(monkeypatch)
+    quote = cw.quotes.add()
+    made = await _post_route(cw, route, quote, tag="r1")
+    assert made.status == 200, made.body
+    _agent_status(monkeypatch, status)
+    body = _v1_payload(cw, quote) if route == "v1" else v2_body(quote)
+    if second == "another_provider":
+        body["preferred_psp"] = "adyen"
+
+    again = await cw._post(_route_path(route), body, agent=AGENT_A, tag="r2")
+
+    assert again.status == 403, (again.status, again.body)
+    assert_not_listed(again)
+    text = json.dumps(again.body)
+    assert made.order_id not in text and not any(field in text for field in _PAYMENT_SURFACE), text
+    assert cw.create_runs == ["r1"]
+
+
+async def test_c3_v2_a_claim_read_that_fails_once_on_a_held_quote_is_the_503(
+    cw: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only v2's own read of the quote's claim fails, once, for a quote that holds its order, on a
+    create v2 would itself refuse (no buyer email anywhere). "Could not tell" is the 503, never a
+    listed refusal and never "no holder" (the order create's own read would not be reached)."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    made = await post_v2(cw, v2_body(quote), tag="r1")
+    assert made.status == 200, made.body
+    _snapshot_loses(cw, "customer_email")
+    reads_before = cw.db.count("claim_read")
+    cw.db.fail("claim_read", "before", times=1, tag="r2")
+
+    again = await post_v2(cw, {**v2_body(quote, email=None), "preferred_psp": "adyen"}, tag="r2")
+
+    assert again.status == 503, (again.status, again.body)
+    assert again.body["error"]["details"]["reason"] == "ORDER_QUOTE_GUARD_UNAVAILABLE"
+    assert_not_listed(again)
+    assert cw.db.count("claim_read") == reads_before + 1, "more than v2's own read ran"
+    assert cw.create_runs == ["r1"] and writes == [1]
+
+
+@pytest.mark.parametrize("first_made_with", ["api_key", "another_checkout_intent"])
+async def test_c3_v2_a_checkout_token_never_gets_an_order_made_outside_its_intent(
+    cw: World, monkeypatch: pytest.MonkeyPatch, first_made_with: str
+) -> None:
+    """Independent of the merchant-refusal cases: the order is made under the agent's key (or under
+    another checkout intent), and a checkout token of the same agent sends the identical v2 create.
+    The token's intent narrows the replay: 409 QUOTE_CONSUMED, never the order's answer."""
+    _real_replay_lookup(monkeypatch)
+    _checkout_token_context(monkeypatch)
+    quote = cw.quotes.add()
+    first_kw: Dict[str, Any] = {}
+    if first_made_with == "another_checkout_intent":
+        first_kw = {"headers": {"X-Checkout-Token": "first"}, "real_auth": True}
+    made = await post_v2(cw, v2_body(quote), tag="r1", **first_kw)
+    assert made.status == 200, made.body
+
+    again = await post_v2(cw, v2_body(quote), tag="r2", headers={"X-Checkout-Token": "second"}, real_auth=True)
+
+    assert again.status == 409, (again.status, again.body)
+    details = again.body["error"]["details"]
+    assert details["error"] == "QUOTE_CONSUMED" and details["details"]["order_id"] == made.order_id
+    assert not any(field in json.dumps(again.body) for field in _PAYMENT_SURFACE)
+    assert cw.create_runs == ["r1"] and len(await cw.orders_for(quote)) == 1
+
+
 async def test_c3_a_failed_policy_read_is_logged_at_error_with_its_type(
     cw: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2679,10 +2954,6 @@ async def test_a_resend_after_the_order_can_be_refused_429_before_the_replay_loo
         sentence = "Rate limit exceeded: 5 requests/minute (limit: 1)"
     again = await _post_route(cw, route, quote, tag="r3", **keyed)
 
-    if route == "v2" and limit == "governance":
-        # v2 reads the quote's claim (and answers its order) before the order create's governance.
-        assert again.status == 200 and again.order_id == first.order_id, again.body
-        return
     assert again.status == 429, again.body
     assert again.body["error"]["details"] == {"error": sentence}
     assert again.body["error"]["code"] == ENVELOPE["status_code"]["429"][0]

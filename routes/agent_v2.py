@@ -18,7 +18,7 @@ from models.order import CreateOrderRequest, OrderItem, ShippingAddress
 from models.catalog import PivotPaymentContext
 from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
-from routes.agent_api import answer_for_a_create_whose_quote_holds_its_order
+from routes.agent_api import answer_for_a_create_whose_quote_holds_its_order, validate_order_create_governance
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
 from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
@@ -1053,6 +1053,11 @@ async def create_order_v2(
             status_code=409,
             detail={"error": exc.code, "message": exc.message, "details": exc.details},
         )
+
+    # Governance first (the agent's status: blocked or suspended, and its rate): a blocked agent is
+    # refused before anything of an order is answered, the payment surface of one it already has
+    # included. Once per create: the order create below does not run it again.
+    await validate_order_create_governance(context)
 
     # Another create for a quote that already holds its order: that order (inside this caller's
     # replay scope) or 409 QUOTE_CONSUMED, before any refusal below can say nothing was ordered.
