@@ -620,3 +620,34 @@ async def test_a_v2_nonce_is_single_use(world):
     assert first.status_code == 200, first.text
     again = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=token)
     assert again.status_code == 409 and (again.json().get("detail") or {}).get("reason") == "replay"
+
+
+# --- a Shopify catalog-attributed hand-off (gateway SHOPIFY_CATALOG_ATTRIBUTION, gw#2592 review P2-1) ----------
+
+
+async def test_a_catalog_attributed_handoff_is_marked_and_read_back_as_one(world):
+    res = await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, quote_source="seller_cart", catalog_attributed=True))
+    assert res.status_code == 200, res.text
+    assert _ctx(await _row(RECORD_A))["catalog_attributed"] is True
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["catalog_attributed"] is True
+    assert body["status"] == "handed_off"
+
+
+async def test_an_ordinary_handoff_carries_no_catalog_member(world):
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A))
+    assert "catalog_attributed" not in _ctx(await _row(RECORD_A))
+    assert "catalog_attributed" not in (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+
+
+@pytest.mark.parametrize("value", [False, "true", 1, None, [True]], ids=["false", "string", "one", "null", "list"])
+async def test_catalog_attributed_accepts_only_true(world, value):
+    body = {**record_body(RECORD_A, ESC_A), "catalog_attributed": value}
+    res = await record(world, PARTNER_A, body)
+    if value is None:
+        # JSON null is the absent member: an ordinary hand-off.
+        assert res.status_code == 200, res.text
+        assert "catalog_attributed" not in _ctx(await _row(RECORD_A))
+    else:
+        assert res.status_code == 400, (value, res.text)
+        assert await _row(RECORD_A) is None

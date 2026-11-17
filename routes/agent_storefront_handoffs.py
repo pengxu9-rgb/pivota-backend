@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, Literal, Optional, Type, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
 
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_forwarded_owner import adopt_forwarded_owner
@@ -85,6 +85,16 @@ class HandoffRecordBody(BaseModel):
     referral_click_id: Optional[str] = Field(default=None, pattern=_anchored(handoffs.REFERRAL_CLICK_ID_RE.pattern))
     price_as_of: Optional[str] = Field(default=None, max_length=40, pattern=_anchored(r"\d{4}-\d{2}-\d{2}T[0-9:.]+(Z|[+-]\d{2}:\d{2})"))
     merchant_id: Optional[str] = Field(default=None, max_length=50, pattern=_anchored(r"[A-Za-z0-9_.:-]+"))
+    # The seller's cart was sent with Shopify catalog-attributed ids. Only `true` is accepted: the gateway omits the
+    # member otherwise, and a JSON false, a string or a number is refused like any malformed member.
+    catalog_attributed: Optional[StrictBool] = None
+
+    @field_validator("catalog_attributed")
+    @classmethod
+    def _only_true(cls, value: Optional[bool]) -> Optional[bool]:
+        if value is False:
+            raise ValueError("catalog_attributed is only ever true; omit it otherwise")
+        return value
 
 
 class HandoffReadBody(BaseModel):
@@ -152,6 +162,7 @@ async def record_storefront_handoff(
             referral_click_id=body.referral_click_id,
             price_as_of=body.price_as_of,
             merchant_id=body.merchant_id,
+            catalog_attributed=body.catalog_attributed is True,
         ))
     except Exception as exc:  # noqa: BLE001 -- the gateway hands the id out unrecorded; say so
         logger.warning("storefront_handoff.record_failed error_type=%s", type(exc).__name__)
