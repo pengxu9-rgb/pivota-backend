@@ -527,13 +527,18 @@ class World:
         tag: str,
         headers: Optional[Dict[str, str]] = None,
         content: Optional[bytes] = None,
+        real_auth: bool = False,
     ) -> Answer:
+        """`real_auth`: the route's real auth dependency runs (the case doubles what it reads)."""
         from routes.agent_auth import get_agent_context
 
         async def context() -> _Context:
             return _Context(_REQUEST_AGENT.get())
 
-        self.app.dependency_overrides[get_agent_context] = context
+        if real_auth:
+            self.app.dependency_overrides.pop(get_agent_context, None)
+        else:
+            self.app.dependency_overrides[get_agent_context] = context
         tag_token = _REQUEST_TAG.set(tag)
         agent_token = _REQUEST_AGENT.set(agent)
         try:

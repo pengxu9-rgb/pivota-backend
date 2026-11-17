@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "contracts/order_create_prologue_refusals.json: the nine [status, code] pairs POST /agent/v2/orders answers ONLY from the request's prologue, before the first call of the order write step, so no order row can exist because of this request when one is answered. That file is byte-identical to the agent gateway's copy (both sides pin its sha256). This file is this repository's own notes on how to read such an answer; tests/test_order_create_prologue_refusals_contract.py pins every statement in it.",
+  "about": "contracts/order_create_prologue_refusals.json: the ten [status, code] pairs POST /agent/v2/orders answers ONLY before any order row of this request can be written: nine from the request's prologue, before the first call of the order write step, and one (MERCHANT_NOT_ACCEPTING_ORDERS) from inside the write step's function, above its order write. So no order row can exist because of this request when one is answered. That file is byte-identical to the agent gateway's copy (both sides pin its sha256). This file is this repository's own notes on how to read such an answer; tests/test_order_create_prologue_refusals_contract.py pins every statement in it.",
   "envelope": {
     "code": "error.details.error",
     "reason": "error.details.reason",
@@ -15,9 +15,15 @@
     "only_across_a_change_of_the_signing_secret_note": "There is one signing secret and no previous-secret slot. A copy accepted under the old value and delivered again after the value changed (or was removed) is told `bad_mac` (or `no_secret`), not `replay`.",
     "subject_has_a_second_site": "`subject` is also answered after the nonce was claimed, when the partner's agent record cannot be read at adoption. That is still before the route body."
   },
+  "MERCHANT_NOT_ACCEPTING_ORDERS": {
+    "where": "Listed at 403 only. Raised at two places inside the order write step's function, both above its order write: the merchant's status is one that takes no orders, or the order would be charged through the merchant's own payment provider and the merchant is not approved.",
+    "after_a_written_row": "Never answered. The in-request busy retry runs the write step again only after a replay lookup that read the table found no order; a lookup that fails is the retriable 503 and the write step is not run again; and a second run's refusal is raised while the first run's busy error is being handled, so it leaves as that 503. A resend of the same create after its order was made is answered with that order by the replay lookup before the write step is entered.",
+    "residual_race": "Two copies of one create in flight at the same moment, the second one's replay lookup reading the table before the first one's row is written, while the merchant's status changes between the two: the second copy can be told this code while the first copy makes the order. This is the same class as PREFLIGHT_FAILED (a live read in the prologue that can change between two copies)."
+  },
   "QUOTE_NOT_FOUND": "Listed at 404 only (the caller does not own the quote, or it does not exist). The same code at 409 is the write step's own re-check of the quote, which can follow a written order, and at 400 is the pre-flight's; neither is listed.",
   "not_listed_on_purpose": {
     "503 TEMPORARY_UNAVAILABLE": "The database was busy, or it could not be told whether the order already exists (error.details.reason is then ORDER_REPLAY_LOOKUP_UNAVAILABLE or ORDER_QUOTE_GUARD_UNAVAILABLE). An order may exist.",
-    "409 QUOTE_CONSUMED": "The quote already has its order."
+    "409 QUOTE_CONSUMED": "The quote already has its order.",
+    "429": "No 429 is listed, under any code. A resend of a create that was already accepted (the same signed bytes, or the same caller's create again) reaches the rate-limit middleware and the auth dependency's limits before the partner assertion's nonce is looked at, and the governance limit before the order replay lookup, so a 429 can be the answer while the first copy's order exists. Today the middleware's 429 names `rate_limit_exceeded` and the other limits answer a sentence."
   }
 }
