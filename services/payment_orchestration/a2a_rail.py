@@ -7,19 +7,32 @@ sends one structured action, and classifies the answer. It decides nothing about
 
 THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 2026-10-11:
 
-1. NO CARD DATA LEAVES THIS MODULE. `payment.token-result` returns `networkToken.value` and
+1. NO CARD DATA LEAVES THIS MODULE UPWARD. `payment.token-result` returns `networkToken.value` and
    `networkToken.cryptogram` in cleartext, by design on the provider's side. `_strip_credentials`
    removes every credential-shaped field from every card BEFORE a card is returned, so nothing
    above this module can log or store one. Each removal is counted (`credential_fields_stripped`),
    so an operator can see that the provider is still sending them. The provider's free-text parts
    are never returned at all (only how many there were): prose is not a shape a stripper can trust.
-2. ONLY ALLOWLISTED ACTIONS ARE SENT. `ALLOWED_ACTIONS` holds the payment-method and token steps
-   Pivota uses. The provider's standalone money skills (`payment.pay-*`, `payment.charge-token-*`,
-   `payment.token-result#charge`, refunds without an order) charge under the DEVELOPER's key,
-   which would make Pivota the payee; they are not on the list, so they raise `ActionNotAllowed`
-   before any byte is sent. Three allowed steps (`action-required#paid`, `visa-action-required#paid`,
+   THE ONE WAY A CREDENTIAL MOVES (decision owner, 2026-11-17: a network token may pass through
+   Pivota; a real card number or security code never): `relay_token_to_checkout` sends the step
+   whose answer carries the approved token, and in the same call, from the raw answer held in
+   memory, builds the provider's checkout `card` (`checkout_card_from_network_token`) and sends
+   `checkout.setup#submit` back to the SAME provider. The token goes out of this module only in
+   that request body, to the provider that issued it. Nothing above the module ever receives it:
+   both answers come back stripped, the raw body is dropped, no exception carries a value, and
+   `checkout.setup#submit` can be sent by nothing else (`RELAY_ONLY_ACTIONS`): `send_action`
+   refuses it, so no caller can hand this module a card to send.
+2. ONLY ALLOWLISTED ACTIONS ARE SENT. `ALLOWED_ACTIONS` holds the payment-method, token and
+   checkout steps Pivota uses. The provider's standalone money skills (`payment.pay-*`,
+   `payment.charge-token-*`, `payment.token-result#charge`, refunds without an order) charge under
+   the DEVELOPER's key, which would make Pivota the payee; they are not on the list, so they raise
+   `ActionNotAllowed` before any byte is sent. Nor is `checkout.result#retry` (it takes a card
+   again). Three allowed steps (`action-required#paid`, `visa-action-required#paid`,
    `await#poll`) are shared with a money flow, so (a) a conversation id must be one this client signed (`context_for`),
    and (b) any money-result card in an answer is `money_result`, logged at ERROR, never `ok`.
+   `checkout.confirm#confirm` IS a money write (it submits the merchant's checkout, which charges
+   the buyer's token): it is not a money skill under Pivota's key, it is never classed read-only,
+   and its timeout is `outcome_unknown` like every other write (rule 4).
 3. STRUCTURED ACTIONS ONLY, NEVER FREE TEXT. The provider's intent detection is an LLM. A free-text
    request is not deterministic, so this module has no way to send one. A free-text ANSWER where a
    card was expected (measured: `payment.method-add` without `user_email` answers "What's your
@@ -35,11 +48,18 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    followed; response bodies read with a hard size cap; no body, payload, token, key or member id
    is ever logged.
 
-6. THE TOKEN STEP IS REFUSED IN PRODUCTION, IN CODE. Every `TOKEN_STEP_ACTIONS` send raises
-   `TokenStepRefused` before any byte is sent when the platform resolves to production
-   (config.platform.is_production), whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says:
-   those steps make the provider hand Pivota a network token and cryptogram (rule 1), and no env
-   value may turn that on in production. Non-production behaviour is unchanged.
+6. IN PRODUCTION THE TOKEN STEP RUNS ONLY FOR THE CHECKOUT RELAY. Every `TOKEN_STEP_ACTIONS` send
+   raises `TokenStepRefused` before any byte is sent when the platform resolves to production
+   (config.platform.is_production) AND the checkout relay's dial (A2A_RAIL_CHECKOUT_STEP_ENABLED,
+   default OFF) is off, whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says. Until
+   2026-11-17 the refusal was unconditional: those steps hand Pivota a network token and cryptogram.
+   The decision owner then allowed the token (never real card data) to pass through Pivota, so the
+   refusal is lifted for the one use that needs it, the relay of rule 1, and for nothing else: with
+   the relay's dial off, production behaves exactly as before. Non-production is unchanged.
+7. THE CHECKOUT WRITES HAVE THEIR OWN DIAL. `CHECKOUT_WRITE_ACTIONS` (the setup that carries the
+   token, the confirm that submits the order, the cancel) raise `CheckoutStepRefused` before any
+   byte is sent unless A2A_RAIL_CHECKOUT_STEP_ENABLED is on, in every environment. The checkout
+   READS (`checkout.await#poll`, `checkout.lookup#submit`) are not gated here: the worker decides.
 
 Dark by default: `from_env()` returns None unless A2A_RAIL_ENABLED is on and both
 A2A_RAIL_BASE_URL and A2A_RAIL_API_KEY are set.
@@ -69,6 +89,8 @@ A2A_RAIL_BASE_URL_ENV = "A2A_RAIL_BASE_URL"
 A2A_RAIL_API_KEY_ENV = "A2A_RAIL_API_KEY"
 #: Optional: signs conversation ids. Set it so an API-key rotation does not orphan open flows.
 A2A_RAIL_CONTEXT_SECRET_ENV = "A2A_RAIL_CONTEXT_SECRET"
+#: THE CHECKOUT RELAY'S DIAL, default OFF (rules 6 and 7). Read live on every call.
+A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV = "A2A_RAIL_CHECKOUT_STEP_ENABLED"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 #: SHA-256 of the provider's production and test host names (lower case). The API key is only ever
@@ -117,11 +139,39 @@ ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.action-required", "paid"),
     ("payment.visa-action-required", "paid"),
     ("payment.await", "poll"),
+    # the provider's checkout skill: it fills and submits the merchant's checkout itself (guest
+    # checkout). `setup` carries the approved token (relay only, rule 1); `confirm` submits the order
+    # (irreversible, a money write); `cancel` ends a flow that was never confirmed (nothing submitted);
+    # `await#poll` and `lookup` read the submission's progress. Measured on the dev host 2026-11-17.
+    ("checkout.setup", "submit"),
+    ("checkout.confirm", "confirm"),
+    ("checkout.confirm", "cancel"),
+    ("checkout.await", "poll"),
+    ("checkout.lookup", "submit"),
+})
+
+#: Sent ONLY by `relay_token_to_checkout`, never by `send_action`: its payload carries the token's
+#: card fields, which this module builds itself (rule 1). A caller cannot hand in a card to send.
+RELAY_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({("checkout.setup", "submit")})
+
+#: The checkout writes, refused unless the checkout dial is on (rule 7).
+CHECKOUT_WRITE_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
+    ("checkout.setup", "submit"),
+    ("checkout.confirm", "confirm"),
+    ("checkout.confirm", "cancel"),
+})
+
+#: The token steps whose answer may carry the approved token, so the ones the relay may follow.
+TOKEN_RELAY_SOURCES: FrozenSet[Tuple[str, str]] = frozenset({
+    ("payment.action-required", "paid"),
+    ("payment.visa-action-required", "paid"),
+    ("payment.await", "poll"),
 })
 
 #: The token step: `token-setup` and the in-flow picker's `select-method` mint a network token; the
 #: approval page's `paid` and the `await` poll are answered with `payment.token-result`, which carries
-#: `networkToken.value` and `networkToken.cryptogram` in cleartext. Refused in production (rule 6).
+#: `networkToken.value` and `networkToken.cryptogram` in cleartext. Refused in production unless the
+#: checkout relay is armed (rule 6).
 TOKEN_STEP_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.token-setup", "submit"),
     ("payment.method-list", "select-method"),
@@ -137,6 +187,9 @@ READ_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.method-add-await-card", "poll"),
     ("payment.method-add-await", "poll"),
     ("payment.await", "poll"),
+    # the checkout's progress, by its task id: reads (lookup in a conversation of its own)
+    ("checkout.await", "poll"),
+    ("checkout.lookup", "submit"),
 })
 
 #: Key prefixes whose whole subtree is a payment credential. Matched case-insensitively with `_`,
@@ -182,6 +235,7 @@ _CONTEXT_SIG_HEX = 16
 _MEMBER_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 _CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 _CONTEXT_REF_RE = re.compile(r"^[A-Za-z0-9_]{1,80}\Z")
+_RAIL_TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 _ERROR_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}\Z")
 
 
@@ -194,17 +248,27 @@ class ActionNotAllowed(ValueError):
 
 
 class TokenStepRefused(ActionNotAllowed):
-    """A token-step action in production (rule 6). Refused whatever the env says; nothing was sent."""
+    """A token-step action in production with the checkout relay off (rule 6); nothing was sent."""
+
+
+class CheckoutStepRefused(ActionNotAllowed):
+    """A checkout write with the checkout dial off (rule 7); nothing was sent."""
 
 
 def is_enabled() -> bool:
     return (os.getenv(A2A_RAIL_ENABLED_ENV) or "").strip().lower() in _TRUTHY
 
 
+def checkout_step_enabled() -> bool:
+    """The checkout relay's dial (A2A_RAIL_CHECKOUT_STEP_ENABLED), default OFF. Read live."""
+    return (os.getenv(A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
 def token_step_refused_in_production() -> bool:
-    """True when the token step must be refused: the platform resolves to production. Read live from
-    the environment on every call; no flag, dial or kwarg overrides it."""
-    return _platform_is_production()
+    """True when the token step must be refused: the platform resolves to production and the checkout
+    relay's dial is off. Read live from the environment on every call; no other flag, dial or kwarg
+    overrides it (rule 6)."""
+    return _platform_is_production() and not checkout_step_enabled()
 
 
 def _host_digest(host: str) -> str:
@@ -506,6 +570,145 @@ def parse_response(body: Any) -> A2AResult:
     return result
 
 
+# ── the checkout relay (rule 1's one exception) ──────────────────────────────────────────────
+
+#: The card brands the checkout skill takes (`card.brand`).
+CHECKOUT_CARD_BRANDS: FrozenSet[str] = frozenset({"visa", "mastercard"})
+#: The shipping fields the checkout skill takes (measured 2026-11-17). `state` is required for the US.
+CHECKOUT_SHIPPING_REQUIRED: Tuple[str, ...] = (
+    "email", "first_name", "last_name", "phone", "country", "address1", "city", "zip_code",
+)
+CHECKOUT_SHIPPING_OPTIONAL: Tuple[str, ...] = ("address2", "state")
+_CHECKOUT_SHIPPING_MAX = 256
+_TOKEN_NUMBER_RE = re.compile(r"^\d{13,19}\Z")
+_TOKEN_EXPIRY_RE = re.compile(r"^(0[1-9]|1[0-2])(\d{2})\Z")
+_CRYPTOGRAM_RE = re.compile(r"^[A-Za-z0-9+/=_-]{4,128}\Z")
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}\Z")
+_COUNTRY_RE = re.compile(r"^[A-Z]{2}\Z")
+
+
+def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: Any) -> Optional[Dict[str, str]]:
+    """THE ONE PLACE the approved network token becomes the checkout skill's `card`. Pure: no I/O, no
+    logging, never raises; None when any field is missing or malformed (the caller sees only that).
+
+    OPEN QUESTION WITH THE PROVIDER: which card field takes the token cryptogram. Until it is answered
+    the mapping is: number = `networkToken.value` (the DPAN), expiry = `networkToken.expiryDate` read as
+    MMYY and sent as "MM/YY", cvv = `networkToken.cryptogram`, brand = the card's brand, name = the
+    cardholder name the caller gives. Changing that answer changes this function and nothing else."""
+    if not isinstance(network_token, Mapping):
+        return None
+    number = network_token.get("value")
+    cryptogram = network_token.get("cryptogram")
+    expiry = network_token.get("expiryDate")
+    card_brand = str(brand or "").strip().lower()
+    holder = " ".join(str(name or "").split())
+    if not (isinstance(number, str) and _TOKEN_NUMBER_RE.match(number)):
+        return None
+    if not (isinstance(cryptogram, str) and _CRYPTOGRAM_RE.match(cryptogram)):
+        return None
+    match = _TOKEN_EXPIRY_RE.match(expiry) if isinstance(expiry, str) else None
+    if match is None or card_brand not in CHECKOUT_CARD_BRANDS or not 0 < len(holder) <= _CHECKOUT_SHIPPING_MAX:
+        return None
+    return {
+        "number": number,
+        "expiry": f"{match.group(1)}/{match.group(2)}",
+        "cvv": cryptogram,
+        "name": holder,
+        "brand": card_brand,
+    }
+
+
+def _clean_field(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > _CHECKOUT_SHIPPING_MAX or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        return None
+    return text
+
+
+def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
+    """The checkout skill's `shipping`, validated, or None. Only the skill's own keys; every required
+    one present; `state` for the US; no value that carries a card number (an address is never a way
+    to send card data). Never raises, never logs (the values are the buyer's PII)."""
+    if not isinstance(value, Mapping):
+        return None
+    allowed = set(CHECKOUT_SHIPPING_REQUIRED) | set(CHECKOUT_SHIPPING_OPTIONAL)
+    if not set(value) <= allowed:
+        return None
+    out: Dict[str, str] = {}
+    for key in (*CHECKOUT_SHIPPING_REQUIRED, *CHECKOUT_SHIPPING_OPTIONAL):
+        if value.get(key) is None:
+            continue
+        text = _clean_field(value.get(key))
+        if text is None or _has_card_number(text):
+            return None
+        out[key] = text
+    if any(key not in out for key in CHECKOUT_SHIPPING_REQUIRED) or not _COUNTRY_RE.match(out["country"]):
+        return None
+    if out["country"] == "US" and "state" not in out:
+        return None
+    return out
+
+
+@dataclass(frozen=True)
+class CheckoutSetup:
+    """What the relay sends with the token: everything but the card, which only this module builds.
+    The buyer's address and name are kept out of repr, so an error message cannot quote them."""
+
+    checkout_url: str
+    shipping: Mapping[str, str] = field(repr=False)
+    cardholder_name: str = field(repr=False)
+    #: Deterministic per purchase (the provider lists it as required), so a repeat is one checkout.
+    idempotency_key: str = ""
+
+
+def _setup_problem(setup: Any) -> Optional[str]:
+    """Why `setup` cannot be sent (a fixed phrase, never a value), or None."""
+    if not isinstance(setup, CheckoutSetup):
+        return "setup must be a CheckoutSetup"
+    url = str(setup.checkout_url or "")
+    authority = url.split("/", 3)[2] if url.startswith("https://") and url.count("/") >= 2 else ""
+    if not authority or "@" in authority or len(url) > 2048 or any(ch.isspace() or ord(ch) < 0x20 for ch in url):
+        return "checkout_url must be an https URL with a host and no credentials"
+    if checkout_shipping(setup.shipping) is None:
+        return "shipping is incomplete or not the checkout's shape"
+    if not _IDEMPOTENCY_KEY_RE.match(str(setup.idempotency_key or "")):
+        return "idempotency_key must be 8..128 of [A-Za-z0-9_.:-]"
+    return None
+
+
+@dataclass
+class TokenRelay:
+    """The outcome of `relay_token_to_checkout`. Both answers are stripped like every other answer.
+
+    token     the answer to the token step that was sent (`paid` or the await poll)
+    checkout  the answer to `checkout.setup#submit`, or None when it was not sent
+    refused   why it was not sent although the answer was THIS purchase's ACTIVE token (a code:
+              `network_token_missing`, `card_unmappable`); None otherwise
+    """
+
+    token: A2AResult
+    checkout: Optional[A2AResult] = None
+    refused: Optional[str] = None
+
+
+def _approved_token(body: Any, expected_token_id: str) -> Optional[Mapping[str, Any]]:
+    """The raw `payment.token-result` data in the agent's answer that names `expected_token_id` and is
+    ACTIVE, or None. Reads the unstripped body: the caller must not keep or return what it gets."""
+    task = body.get("result") if isinstance(body, dict) else None
+    if not isinstance(task, dict):
+        return None
+    for part in _latest_agent_parts(task):
+        data = part.get("data") if part.get("kind") == "data" else None
+        inner = data.get("data") if isinstance(data, dict) else None
+        if not (isinstance(inner, dict) and data.get("component") == "payment.token-result"):
+            continue
+        if inner.get("paymentTokenId") == expected_token_id and str(inner.get("status") or "").upper() == "ACTIVE":
+            return inner
+    return None
+
+
 # ── the client ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -641,21 +844,113 @@ class A2ARailClient:
         payload: Optional[Mapping[str, Any]] = None,
     ) -> A2AResult:
         """Send ONE structured action in conversation `context_id` on behalf of `member_id`."""
-        if (component, action) not in ALLOWED_ACTIONS:
-            raise ActionNotAllowed(f"{component}#{action} is not an allowed rail action")
-        if (component, action) in TOKEN_STEP_ACTIONS and token_step_refused_in_production():
-            logger.error(
-                "a2a_rail: REFUSED %s#%s in production: the token step would hand Pivota a network "
-                "token and cryptogram; refused in code whatever the env says; nothing was sent",
-                component, action,
-            )
-            raise TokenStepRefused(f"{component}#{action} is refused in production (A2A token step)")
+        if (component, action) in RELAY_ONLY_ACTIONS:
+            # Its payload is a card: only `relay_token_to_checkout` builds one (rule 1).
+            raise ActionNotAllowed(f"{component}#{action} is sent only by the checkout relay")
+        result, _ = await self._send(
+            member_id=member_id, context_id=context_id, component=component, action=action, payload=payload)
+        return result
+
+    async def relay_token_to_checkout(
+        self,
+        *,
+        member_id: str,
+        context_id: str,
+        component: str,
+        action: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        expected_token_id: str,
+        checkout_context_id: str,
+        setup: CheckoutSetup,
+    ) -> TokenRelay:
+        """Send the token step `component#action` (`paid`, or the await poll) and, when its answer is
+        the ACTIVE token `expected_token_id`, relay that token into the provider's checkout in the same
+        call: `checkout.setup#submit` in `checkout_context_id`, with `setup` and the card this module
+        builds from the raw answer (rule 1). Everything is checked before the first byte is sent, so a
+        token never arrives with nowhere to go. Returns both answers stripped; never raises once the
+        first request is out (a failure of the second request is classified, like any answer)."""
+        if (component, action) not in TOKEN_RELAY_SOURCES:
+            raise ActionNotAllowed(f"{component}#{action} does not answer with the approved token")
+        if not checkout_step_enabled():
+            raise CheckoutStepRefused(f"the checkout relay is off ({A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV})")
+        problem = _setup_problem(setup)
+        if problem is not None:
+            raise ValueError(problem)
+        if not (isinstance(expected_token_id, str) and _RAIL_TOKEN_ID_RE.match(expected_token_id)):
+            raise ValueError("expected_token_id must be the rail's token id")
+        self._check_conversation(member_id, checkout_context_id)
+        token_result, body = await self._send(
+            member_id=member_id, context_id=context_id, component=component, action=action, payload=payload)
+        relay = TokenRelay(token=token_result)
+        approved = network_token = card = checkout_payload = None
+        try:
+            approved = _approved_token(body, expected_token_id) if token_result.ok else None
+            body = None
+            token_card = token_result.card("payment.token-result") if token_result.ok else None
+            if approved is None or token_card is None or token_card.data.get("paymentTokenId") != expected_token_id:
+                # Not this purchase's ACTIVE token (pending, failed, another token, a money result): nothing
+                # goes to the checkout; the caller reads `token` as it always has.
+                return relay
+            network_token = approved.get("networkToken")
+            if not isinstance(network_token, Mapping):
+                relay.refused = "network_token_missing"
+                return relay
+            brand = approved.get("paymentBrand") or network_token.get("brand")
+            card = checkout_card_from_network_token(network_token, brand=brand, name=setup.cardholder_name)
+            if card is None:
+                relay.refused = "card_unmappable"
+                return relay
+            checkout_payload = {
+                "checkout_url": setup.checkout_url,
+                "shipping": checkout_shipping(setup.shipping),
+                "card": card,
+                "idempotency_key": setup.idempotency_key,
+            }
+            relay.checkout, _ = await self._send(
+                member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
+                action="submit", payload=checkout_payload)
+        except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
+            # `_send` classifies every transport failure itself; this is anything else. The setup may or
+            # may not have gone out: outcome unknown (and the exception's text, which could quote a
+            # value, is dropped: only its type is logged).
+            logger.warning("a2a_rail: checkout relay failed error_type=%s", type(exc).__name__)
+            relay.checkout = A2AResult(kind="outcome_unknown", may_write=True)
+        finally:
+            body = approved = network_token = card = checkout_payload = None  # noqa: F841 - drop the references
+        return relay
+
+    def _check_conversation(self, member_id: str, context_id: str) -> None:
         if not _MEMBER_ID_RE.match(str(member_id or "")):
             raise ValueError("member_id must be an opaque id of 1..128 safe characters")
         if not _CONTEXT_ID_RE.match(str(context_id or "")):
             raise ValueError("context_id must be 1..128 safe characters")
         if not self._is_own_context(context_id, member_id):
             raise ValueError("context_id was not made by this client's context_for() for this member")
+
+    async def _send(
+        self,
+        *,
+        member_id: str,
+        context_id: str,
+        component: str,
+        action: str,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[A2AResult, Any]:
+        """(the classified, stripped result, the RAW parsed body or None). The raw body may carry a
+        credential: only `relay_token_to_checkout` looks at it, and nothing returns it upward."""
+        if (component, action) not in ALLOWED_ACTIONS:
+            raise ActionNotAllowed(f"{component}#{action} is not an allowed rail action")
+        if (component, action) in TOKEN_STEP_ACTIONS and token_step_refused_in_production():
+            logger.error(
+                "a2a_rail: REFUSED %s#%s in production: the token step hands Pivota a network token and "
+                "cryptogram, allowed in production only for the checkout relay (%s is off); nothing was sent",
+                component, action, A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV,
+            )
+            raise TokenStepRefused(f"{component}#{action} is refused in production (A2A token step)")
+        if (component, action) in CHECKOUT_WRITE_ACTIONS and not checkout_step_enabled():
+            logger.error("a2a_rail: REFUSED %s#%s: the checkout dial is off; nothing was sent", component, action)
+            raise CheckoutStepRefused(f"{component}#{action} is refused while the checkout dial is off")
+        self._check_conversation(member_id, context_id)
         body = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -678,7 +973,7 @@ class A2ARailClient:
 
         token = await self._access_token(member_id)
         if token is None:
-            return self._done(A2AResult(kind="auth_failed"), component, action, started)
+            return self._done(A2AResult(kind="auth_failed"), component, action, started), None
         import httpx
 
         try:
@@ -689,30 +984,30 @@ class A2ARailClient:
             )
         except (httpx.TimeoutException, asyncio.TimeoutError):
             kind = "outcome_unknown" if may_write else "timeout"
-            return self._done(A2AResult(kind=kind), component, action, started)
+            return self._done(A2AResult(kind=kind), component, action, started), None
         except httpx.HTTPError:
             kind = "outcome_unknown" if may_write else "transport"
-            return self._done(A2AResult(kind=kind), component, action, started)
+            return self._done(A2AResult(kind=kind), component, action, started), None
         except Exception:  # noqa: BLE001 - anything else mid-request: same rule, classified not raised
             kind = "outcome_unknown" if may_write else "transport"
-            return self._done(A2AResult(kind=kind), component, action, started)
+            return self._done(A2AResult(kind=kind), component, action, started), None
         if status == 401:
             # The cached token was refused: forget it so the next call re-mints. Never resent here.
             self._tokens.pop(member_id, None)
         if too_large:
             kind = "outcome_unknown" if may_write else "too_large"
-            return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
+            return self._done(A2AResult(kind=kind, http_status=status), component, action, started), None
         if status != 200:
             # Only a 4xx (other than 408) proves a write was refused. A 5xx, a 408, a 202 or a 3xx
             # does not: on a maybe-write those are outcome_unknown.
             refused = 400 <= status < 500 and status != 408
             kind = "outcome_unknown" if may_write and not refused else "http_error"
-            return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
+            return self._done(A2AResult(kind=kind, http_status=status), component, action, started), None
         result = parse_response(parsed)
         result.http_status = status
         if may_write and result.kind == "protocol_error":
             result.kind = "outcome_unknown"
-        return self._done(result, component, action, started)
+        return self._done(result, component, action, started), parsed
 
     def _done(self, result: A2AResult, component: str, action: str, started: float) -> A2AResult:
         result.may_write = (component, action) not in READ_ONLY_ACTIONS

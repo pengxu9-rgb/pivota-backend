@@ -287,7 +287,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | In-process ACP lane, AP2 routes | **Frozen dark** |
 | Purchase door, router, parent ledger, purchase events (ADR-029) | **Keep**: the one system of record for partner-completed purchases (D3 path 2). Not retired |
 | The two partner rails (Reap agentic purchase; the A2A token rail and its order step) | **Keep as built, dark.** Work that the agreed partner flow needs waits on the partner's side: a first supervised live purchase on one, an order specification and sandbox on the other. The freeze stops only custom plumbing outside the agreed contract; the agreed flow's own remaining work continues (owner, 2026-11-10) |
-| The A2A rail's token step (returns a credential to the caller) | **Refused in production in code** (#2759), whatever any switch says |
+| The A2A rail's token step (returns a credential to the caller) | **Refused in production in code** (#2759), whatever any switch says. *2026-11-17 (owner):* lifted only for the checkout relay: the approved network token is passed, in memory, back into the payment partner's checkout skill, which fills the merchant's checkout; real card data never passes through Pivota. Behind `A2A_RAIL_TOKEN_STEP_ENABLED` and, in production, `A2A_RAIL_CHECKOUT_STEP_ENABLED` (both off by default) |
 | Pivota-issued cards (`/agent/v1/cards`), refused in production | **Remove** (owner decision, 2026-11-08) |
 | Settlement and transfer jobs | **Paused**; retire with the affiliate payout plan |
 
