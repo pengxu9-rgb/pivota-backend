@@ -1,4 +1,4 @@
-"""Drive exact cohort A and B referrals through offers.resolve and its signed redirect."""
+"""Drive reviewed retailer referrals through offers.resolve and its signed redirect."""
 
 import json
 import os
@@ -14,7 +14,7 @@ from routes import agent_shop_gateway as gateway, outbound_links
 from services import exact_retailer_shades as shades
 from services.exact_retailer_cohorts import (
     COHORT_B_FLAG, COHORT_B_PROTECTED_FAMILY_URLS, RETAILER_COHORT_B, PILOT_FLAG, PROOF_KEY, RETAILERS,
-    RETAILER_COHORT_A,
+    RETAILER_COHORT_A, ExactRetailerCohort, RetailerListing,
 )
 from services.external_seed_review_pilot import LISTINGS, SEED_A_ID, SEED_B_ID
 from tests.test_offers_one_per_seller_buyer_currency import _seed, _shade
@@ -92,7 +92,7 @@ def _invoke(client, *, sku_id, limit=5, market="US", assumed=False, cohort=RETAI
 
 
 def _wire_sources(monkeypatch, named, rows, *, brand=BRAND, retailer=FIRST_RETAILER_HOST, retailer_family=None,
-                  generic_rows=()):
+                  generic_rows=(), generic_timeout=False):
     variant = {**_shade(0, "Named"), "variant_id": named, "shopify_variant_id": named}
     brand_seed = _seed(seed_id="seed-official", host=brand, variants=[variant])
     legacy_seed = _seed(seed_id="seed-legacy-retailer", host=retailer, variants=[variant])
@@ -107,6 +107,8 @@ def _wire_sources(monkeypatch, named, rows, *, brand=BRAND, retailer=FIRST_RETAI
             return rows
         if "JOIN catalog_offers o ON o.product_key = p.product_key" in query:
             calls.append("legacy")
+            if generic_timeout:
+                raise TimeoutError
             return list(generic_rows)
         if "FROM external_product_seeds" in query:
             return [brand_seed, legacy_seed]
@@ -179,6 +181,136 @@ def test_exact_selection_precedes_price_ranking_and_limit(monkeypatch, http):
     retailer = [offer for offer in offers if offer["source"]["type"] == "catalog_offer"]
     assert len(retailer) == 1 and retailer[0]["price"] == 19
     assert retailer[0]["source"]["variant_id"] == FIRST
+
+
+def _historical_placeholder_cohort():
+    native, canonical, gtin = "11111111111111", "22222222222222", "01234567890128"
+    listing = RetailerListing("seller-retailer", "retailer.example", "33333333333333",
+                              {native: (canonical, gtin)}, "/products/lip-color")
+    listing_key = "ext:retailer:placeholder"
+    return ExactRetailerCohort("EXACT_RETAILER_TEST_ENABLED", "ext:historical-bookmark::a1", "seller-brand",
+                               "pg_placeholder", "ck_placeholder", {listing_key: listing}, "sig_historical")
+
+
+@pytest.fixture
+def configured_historical_cohort(monkeypatch):
+    cohort = _historical_placeholder_cohort()
+    (listing_key, listing), = cohort.listings.items()
+    monkeypatch.setattr(shades, "RETAILER_COHORT_C", cohort)
+    monkeypatch.setattr(gateway, "RETAILER_COHORT_C", cohort)
+    monkeypatch.setattr(gateway, "EXACT_ONLY_LISTING_KEYS", gateway.EXACT_ONLY_LISTING_KEYS | {listing_key})
+    monkeypatch.setattr(shades, "EXACT_ONLY_LISTING_KEYS", shades.EXACT_ONLY_LISTING_KEYS | {listing_key})
+    monkeypatch.setattr(shades, "_EXACT_ONLY_LOCATIONS", shades._EXACT_ONLY_LOCATIONS | {
+        (listing.host, listing.product_path),
+    })
+    return cohort
+
+
+@pytest.mark.parametrize("generic_timeout", [False, True])
+def test_supplemental_historical_signature_preserves_exact_signed_us_shade(
+    monkeypatch, http, generic_timeout, configured_historical_cohort,
+):
+    client, warm = http
+    cohort = configured_historical_cohort
+    listing, = cohort.listings.values()
+    (native, (canonical, _)), = listing.variants.items()
+    monkeypatch.setenv(cohort.flag, "1")
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=[listing.host, "brand.example"]))
+    calls = _wire_sources(monkeypatch, canonical, fixture_rows(canonical, cohort), brand="brand.example",
+                          retailer=listing.host, retailer_family=listing.family_url, generic_timeout=generic_timeout)
+    offers = _invoke(client, sku_id=f"gid://shopify/ProductVariant/{canonical}", cohort=cohort)
+    offer, = [offer for offer in offers if offer["merchant_id"] == listing.merchant_id]
+    assert offer["source"]["retailer_variant_id"] == native
+    assert offer["source"]["variant_id"] == canonical
+    assert offer["cart_prefilled"] is False
+    assert parse_qs(urlsplit(offer["url"]).query) == {"variant": [native]}
+    token = parse_qs(urlsplit(offer["affiliate_url"]).query)["token"][0]
+    response = client.get("/r", params={"token": token}, headers={"user-agent": "Mozilla/5.0"}, follow_redirects=False)
+    assert response.status_code == 302
+    target = urlsplit(response.headers["location"])
+    assert (target.hostname, target.path) == (listing.host, listing.product_path)
+    assert parse_qs(target.query)["variant"] == [native]
+    assert calls == ["legacy", "exact"]
+    warm.assert_not_awaited()
+
+    for query in ({"sku_id": "44444444444444"}, {"sku_id": canonical, "assumed": True},
+                  {"sku_id": canonical, "market": "CA"}):
+        remaining = _invoke(client, cohort=cohort, **query)
+        assert all(offer.get("merchant_id") != listing.merchant_id for offer in remaining)
+        assert all(offer.get("source", {}).get("seed_id") != "seed-legacy-retailer" for offer in remaining)
+    assert calls.count("exact") == 1
+
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value=None))
+    remaining = _invoke(client, sku_id=canonical, cohort=cohort)
+    assert all(offer.get("merchant_id") != listing.merchant_id for offer in remaining)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", [None, "signature", "duplicate_gtin", "unstamped", "reader_limit"])
+async def test_historical_writer_witness_verifies_serving_selectors_and_all_anchor_skus(monkeypatch, problem):
+    from services.catalog_enrichment_agent.reviewed_retailer_apply import canonical_witness
+
+    cohort = _historical_placeholder_cohort()
+    listing, = cohort.listings.values()
+    (canonical, gtin), = listing.variants.values()
+    stock_witness = [{"source_variant_id": canonical, "barcode": gtin}]
+    reader_rows = fixture_rows(canonical, cohort)[:1]
+    if problem == "signature":
+        reader_rows = []  # A different stored signature, platform, currency, or seller is not selected.
+    elif problem == "duplicate_gtin":
+        reader_rows.append(_sku(cohort.canonical_product_key, cohort.canonical_merchant_id, "55555555555555", gtin))
+    elif problem == "unstamped":
+        reader_rows[0]["sku_payload"].pop("variant_id_provenance")
+    elif problem == "reader_limit":
+        monkeypatch.setattr(shades, "_ROW_LIMIT", 2)
+
+    async def query(sql, params):
+        if "AS shade_proof" in sql:
+            assert params["canonical_signature"] == "sig_historical"
+            assert "p.pivota_signature_id = :canonical_signature" in sql
+            assert "s.source_product_id = p.source_product_id AND s.platform = p.platform" in sql
+            assert "m.status = 'observed'" in sql and "s.currency = 'USD'" in sql
+            assert "source_variant_id=ANY" not in sql
+            return reader_rows
+        return stock_witness
+
+    fetch = AsyncMock(side_effect=query)
+    db = type("DB", (), {"fetch_all": fetch})()
+    if problem:
+        with pytest.raises(ValueError, match="unique merchant-issued GTIN anchor is missing"):
+            await canonical_witness(db, listing, cohort=cohort)
+    else:
+        assert await canonical_witness(db, listing, cohort=cohort) == stock_witness
+    assert fetch.await_count == 2
+
+
+def test_third_reviewed_listing_is_excluded_from_generic_offers_without_serving_flag(
+    monkeypatch, configured_historical_cohort,
+):
+    cohort = configured_historical_cohort
+    monkeypatch.delenv(cohort.flag, raising=False)
+    (key, listing), = cohort.listings.items()
+    (canonical, _), = listing.variants.values()
+    assert shades.matching_cohort(shades.canonical_signature(cohort), canonical, "US", None) is None
+    assert key in gateway.EXACT_ONLY_LISTING_KEYS
+    sorted_keys = ", ".join(f"'{value}'" for value in sorted(gateway.EXACT_ONLY_LISTING_KEYS))
+    assert f"p.product_key NOT IN ({sorted_keys})" in gateway._catalog_offers_statement("", "")
+    assert shades.is_pilot_retailer_seed({"attached_product_key": key}, None)
+    assert shades.is_pilot_retailer_seed({"destination_url": f"{listing.family_url}/?variant=123456"}, None)
+
+
+def test_absent_third_cohort_preserves_prior_exact_matching(monkeypatch):
+    monkeypatch.setattr(shades, "RETAILER_COHORT_C", None)
+    monkeypatch.setenv(PILOT_FLAG, "1")
+    monkeypatch.setenv(COHORT_B_FLAG, "1")
+    assert shades.matching_cohort(shades.canonical_signature(RETAILER_COHORT_A), FIRST, "US", None) is RETAILER_COHORT_A
+    canonical_b, _ = next(iter(COHORT_B_LISTING.variants.values()))
+    assert shades.matching_cohort(shades.canonical_signature(RETAILER_COHORT_B), canonical_b, "US", None) is RETAILER_COHORT_B
+    placeholder = _historical_placeholder_cohort()
+    listing, = placeholder.listings.values()
+    (canonical_c, _), = listing.variants.values()
+    assert shades.matching_cohort(shades.canonical_signature(placeholder), canonical_c, "US", None) is None
 
 
 @pytest.mark.parametrize(("canonical", "native"), [
