@@ -14,8 +14,8 @@ WHAT IS DOUBLED. Everything around the order row: the agent context, governance,
 and the payment surface, telemetry.
 
 HOW A DATABASE FAILURE IS INJECTED. `db.orders.database` is wrapped (`FaultyDatabase`): each
-statement `db.orders` sends is named by what it is (`replay_lookup`, `claim_insert`, `claim_select`,
-`claim_order_exists`, `order_insert`) and a fault raises a busy error either BEFORE the statement
+statement `db.orders` sends is named by what it is (`replay_lookup`, `claim_read`, `claim_insert`,
+`claim_select`, `claim_order_exists`, `order_insert`) and a fault raises a busy error either BEFORE the statement
 runs (it never reached the database) or AFTER it ran (it committed and the answer was lost). Every
 statement is its own autocommit transaction, so "after the insert, before the commit" and "after
 the commit" are the same point: AFTER. Gates (asyncio events) hold one request at a named
@@ -72,6 +72,8 @@ def classify_statement(query: Any) -> str:
         flat = " ".join(query.split()).lower()
         if flat.startswith("insert into order_quote_claims"):
             return "claim_insert"
+        if flat.startswith("select c.order_id from order_quote_claims c join orders"):
+            return "claim_read"
         if flat.startswith("select order_id from order_quote_claims"):
             return "claim_select"
         if flat.startswith("select order_id from orders where order_id"):

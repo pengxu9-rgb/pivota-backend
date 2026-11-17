@@ -143,6 +143,7 @@ from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 from utils.transient_errors import (
     ORDER_REPLAY_LOOKUP_UNAVAILABLE,
+    commerce_path_unknown_http_exception_fields,
     db_busy_http_exception,
     is_asyncpg_busy_error,
     order_existence_unknown_http_exception_fields,
@@ -8997,6 +8998,40 @@ async def agent_create_order(
             _agent_order_id_for_perf,
         )
 
+        # Quote-first idempotency: scope the default replay key by preferred_psp as well.
+        # This prevents a first PSP-specific checkout attempt from silently replaying into
+        # later attempts that reuse the same quote with a different explicit provider choice.
+        if order_request.quote_id and not order_request.idempotency_key:
+            order_request.idempotency_key = order_create_idempotency_key
+
+        # An order this create already made is answered FIRST, before anything below can refuse
+        # the request: the commerce-path decision reads the store live, and a resend after a store
+        # change (or while the policy read cannot tell) must get its order, not a refusal that says
+        # nothing was ordered. The cached answer, then the replay lookup's. A lookup that failed is
+        # the retriable 503 (raised here); a cache read that failed is raised where it always was,
+        # below the commerce-path decision (the lookup, which reads the table, found no order).
+        # Idempotency replay: if provided and already processed, replay the cached response.
+        idempotency_cache_value = None if isinstance(idempotency_cache, BaseException) else getattr(idempotency_cache, "value", None)
+        if idempotency_cache and isinstance(idempotency_cache_value, dict):
+            if (
+                idempotency_cache_value.get("status") == "success"
+                and idempotency_cache_value.get("order_id")
+                and (idempotency_cache_value.get("merchant_id") in (None, order_request.merchant_id))
+            ):
+                _agent_order_id_for_perf = idempotency_cache_value.get("order_id")
+                return idempotency_cache_value
+
+        if isinstance(replay_response, BaseException):
+            raise replay_response
+        if replay_response:
+            _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
+            await _cache_agent_order_create_response_best_effort(
+                getattr(order_request, "idempotency_key", None),
+                replay_response,
+                **replay_owner,
+            )
+            return replay_response
+
         if isinstance(store_info_for_policy, BaseException):
             raise store_info_for_policy
 
@@ -9029,8 +9064,10 @@ async def agent_create_order(
                         **({"details": e.details} if getattr(e, "details", None) else {}),
                     },
                 )
-            except Exception:
-                platform_for_policy = None
+            except Exception as policy_read_failed:
+                # Could not tell which commerce path serves this merchant: a retriable 503, never
+                # the listed "unsupported" refusal (that says the path was decided).
+                raise HTTPException(**commerce_path_unknown_http_exception_fields()) from policy_read_failed
 
         commerce_policy = resolve_commerce_execution_policy(
             platform=platform_for_policy,
@@ -9046,36 +9083,8 @@ async def agent_create_order(
                 },
             )
 
-        # Quote-first idempotency: scope the default replay key by preferred_psp as well.
-        # This prevents a first PSP-specific checkout attempt from silently replaying into
-        # later attempts that reuse the same quote with a different explicit provider choice.
-        if order_request.quote_id and not order_request.idempotency_key:
-            order_request.idempotency_key = order_create_idempotency_key
-
         if isinstance(idempotency_cache, BaseException):
             raise idempotency_cache
-
-        # Idempotency replay: if provided and already processed, replay the cached response.
-        idempotency_cache_value = getattr(idempotency_cache, "value", None)
-        if idempotency_cache and isinstance(idempotency_cache_value, dict):
-            if (
-                idempotency_cache_value.get("status") == "success"
-                and idempotency_cache_value.get("order_id")
-                and (idempotency_cache_value.get("merchant_id") in (None, order_request.merchant_id))
-            ):
-                _agent_order_id_for_perf = idempotency_cache_value.get("order_id")
-                return idempotency_cache_value
-
-        if isinstance(replay_response, BaseException):
-            raise replay_response
-        if replay_response:
-            _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
-            await _cache_agent_order_create_response_best_effort(
-                getattr(order_request, "idempotency_key", None),
-                replay_response,
-                **replay_owner,
-            )
-            return replay_response
 
         precomputed_loaded_quote = None
 
