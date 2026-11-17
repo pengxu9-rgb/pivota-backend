@@ -2746,13 +2746,17 @@ _PAYMENT_SURFACE = ("client_secret", "payment_action", "payment_intent_id", "ins
 @pytest.mark.parametrize("route", ["v2", "v1"])
 @pytest.mark.parametrize("status", ["blocked", "suspended"])
 @pytest.mark.parametrize("second", ["identical_resend", "another_provider"])
+@pytest.mark.parametrize("consume", ["lands", "does_not_land"])
 async def test_c3_a_blocked_or_suspended_agent_gets_nothing_of_its_order(
-    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, status: str, second: str
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, status: str, second: str, consume: str
 ) -> None:
     """The agent made an order; an operator then blocks or suspends it. Its next create for that
-    quote (the same create again, or with a provider named) is refused 403 by governance: no order,
-    no payment surface. Governance runs before the quote's claim is answered, on both routes."""
+    quote (the same create again, or with a provider named) is refused 403 by governance: no order
+    id, no payment surface. Governance runs before any read of the quote on both routes, so this
+    holds when the quote's consume landed (the usual case: v2's quote read would otherwise answer
+    409 QUOTE_CONSUMED with the order id) and when it did not (the claim would answer)."""
     _real_replay_lookup(monkeypatch)
+    cw.quotes.consume_lands = consume == "lands"
     quote = cw.quotes.add()
     made = await _post_route(cw, route, quote, tag="r1")
     assert made.status == 200, made.body
@@ -2767,6 +2771,95 @@ async def test_c3_a_blocked_or_suspended_agent_gets_nothing_of_its_order(
     assert_not_listed(again)
     text = json.dumps(again.body)
     assert made.order_id not in text and not any(field in text for field in _PAYMENT_SURFACE), text
+    assert cw.create_runs == ["r1"]
+    if consume == "lands":
+        assert cw.quotes.quotes[quote]["status"] == "consumed", "the case needs the consume to have landed"
+
+
+
+def test_c1_governance_is_the_first_awaited_call_of_each_create() -> None:
+    """Governance decides from the caller alone. On both routes it is the first thing a create
+    awaits: before the quote's owner is checked, the quote read (v2 answers a consumed quote with
+    its order id) or any claim read."""
+    for path, function in (("routes/agent_v2.py", "create_order_v2"), ("routes/agent_api.py", "agent_create_order")):
+        fn = next(
+            n for n in ast.walk(_tree(path))
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == function
+        )
+        awaited = sorted(
+            (n for stmt in fn.body for n in ast.walk(stmt) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)),
+            key=_position,
+        )
+        assert awaited and _callee(awaited[0].value) == "validate_order_create_governance", (
+            path, [_callee(a.value) for a in awaited[:3]]
+        )
+
+
+def test_c1_governance_moved_below_the_quote_read_is_caught() -> None:
+    tree = ast.parse((REPO / "routes/agent_v2.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2")
+    gov = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "validate_order_create_governance"))
+    quote_read = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "load_active_quote_or_raise"))
+    _remove(fn, gov)
+    _insert_after(fn, quote_read, [gov])
+    moved = next(
+        n for n in ast.walk(ast.parse(ast.unparse(tree)))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2"
+    )
+    awaited = sorted(
+        (n for stmt in moved.body for n in ast.walk(stmt) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)),
+        key=_position,
+    )
+
+    assert _callee(awaited[0].value) != "validate_order_create_governance"
+
+
+def _count_real_governance(monkeypatch: pytest.MonkeyPatch) -> Tuple[List[str], Any]:
+    """The REAL governance check, counted: every call of `validate_request`, and the agent's real
+    request counter. Only the policy row is given (the test database has no policies table)."""
+    import services.agent_governance as governance
+
+    gov = governance.agent_governance
+    real = type(gov).validate_request.__get__(gov)
+    calls: List[str] = []
+
+    async def counted(agent_id: str, *, fail_closed: bool = False) -> None:
+        calls.append(agent_id)
+        await real(agent_id, fail_closed=fail_closed)
+
+    async def policy(_agent_id: str, **_: Any) -> Dict[str, Any]:
+        return {"status": "active", "max_requests_per_minute": 100000}
+
+    monkeypatch.setattr(gov, "validate_request", counted)
+    monkeypatch.setattr(gov, "_get_policy", policy)
+    monkeypatch.setattr(gov, "_metrics_store", {})
+    return calls, gov
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("consume", ["lands", "does_not_land"])
+async def test_c3_governance_counts_each_create_once(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, consume: str
+) -> None:
+    """A create, its identical resend, and a create for the held quote with a provider named each
+    pass governance exactly once, and count once against the agent's per-minute rate: v2 runs it
+    itself and the order create then skips it."""
+    _real_replay_lookup(monkeypatch)
+    calls, gov = _count_real_governance(monkeypatch)
+    cw.quotes.consume_lands = consume == "lands"
+    quote = cw.quotes.add()
+
+    answers = []
+    for n, body in enumerate([None, None, {"preferred_psp": "adyen"}], start=1):
+        payload = _v1_payload(cw, quote) if route == "v1" else v2_body(quote)
+        payload.update(body or {})
+        answers.append(await cw._post(_route_path(route), payload, agent=AGENT_A, tag=f"r{n}"))
+        assert calls == [AGENT_A] * n, (n, calls, answers[-1].status, answers[-1].body)
+        assert gov._metrics_store[AGENT_A].requests == n, (n, gov._metrics_store[AGENT_A].requests)
+
+    made, again, other = answers
+    assert made.status == 200, made.body
+    assert again.status in (200, 409) and other.status == 409, (again.body, other.body)
     assert cw.create_runs == ["r1"]
 
 

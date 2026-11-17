@@ -1042,6 +1042,12 @@ async def create_order_v2(
     context: AgentContext = Depends(forwarded_owner_context("create_order", resource=("body", "quote_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
+    # Governance first, as the order create's STEP 1 is on v1: the agent's status (blocked or
+    # suspended: 403) and its rate (429), decided from the caller alone, before any read of the
+    # quote. A blocked agent is told nothing of a quote or an order, not even a consumed quote's
+    # order id. Once per create: the order create below does not run it again.
+    await validate_order_create_governance(context)
+
     # S-28: the quote carries its preview's buyer email and address into the order below, so a
     # quote the caller does not own is refused first, as if it did not exist.
     await require_quote_for_caller(body.quote_id, context)
@@ -1053,11 +1059,6 @@ async def create_order_v2(
             status_code=409,
             detail={"error": exc.code, "message": exc.message, "details": exc.details},
         )
-
-    # Governance first (the agent's status: blocked or suspended, and its rate): a blocked agent is
-    # refused before anything of an order is answered, the payment surface of one it already has
-    # included. Once per create: the order create below does not run it again.
-    await validate_order_create_governance(context)
 
     # Another create for a quote that already holds its order: that order (inside this caller's
     # replay scope) or 409 QUOTE_CONSUMED, before any refusal below can say nothing was ordered.
