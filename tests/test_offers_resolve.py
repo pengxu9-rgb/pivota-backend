@@ -6525,3 +6525,22 @@ def test_offers_resolve_prices_exactly_the_registry_pricing_regions_and_nz_is_no
         else:
             assert (body["status"], body["error"]["reason"], body["market"], reads) == ("error", "market_not_priced", code, []), code
 
+
+
+# The markets the gateway prices (PIVOTA-Agent src/auroraBff/buyerRegion.js BUYER_REGION_CURRENCY), written out: a
+# registry change that unprices one of them must fail here, not quietly turn its buyers into market_not_priced.
+_GATEWAY_PRICED_MARKETS = frozenset({"US", "SG", "GB", "JP", "FR", "HR", "FI", "AU", "SE", "KR", "HK", "CA"})
+
+
+def test_offers_resolve_answers_every_market_the_gateway_prices_and_the_registry_prices_exactly_those(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    from services import market_registry
+
+    assert set(market_registry.pricing_region_currency()) == _GATEWAY_PRICED_MARKETS
+    for code in sorted(_GATEWAY_PRICED_MARKETS):
+        res, reads = _market_resolve(monkeypatch, client, code)
+        body = res.json()
+        assert res.status_code == 200, code
+        assert body["status"] != "error" and "error" not in body, (code, body.get("error"))
+        assert reads, f"{code}: answered, so the catalog was read"
