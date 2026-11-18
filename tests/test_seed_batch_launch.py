@@ -650,8 +650,11 @@ def test_a_failed_listing_at_publish_keeps_the_lock_and_is_not_ok(monkeypatch, t
 
 @pytest.mark.parametrize("armed_rows", [
     [("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-manual", False)],
-    [("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-manual", True)]],
-    ids=["running", "finished"])
+    [("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-manual", True)],
+    # Same names as before arming, but the listing now shows one unfinished (a status the API dropped or
+    # a re-listed execution): the second half of the check refuses on its own.
+    [("reviewed-seed-batch-batch-one-old", False)]],
+    ids=["running", "finished", "known_name_now_unfinished"])
 def test_an_execution_that_appears_while_arming_refuses_execute_and_disarms(monkeypatch, tmp_path, armed_rows):
     held(tmp_path)
     fake = Gcloud(armed_rows=armed_rows)
@@ -682,3 +685,81 @@ def test_the_digest_step_validates_both_values_before_use():
     digest_step = next(s for s in steps() if s["id"] == "digest-is-the-release-tag")["args"][1]
     assert '[[ "$$RELEASE" =~ ^[0-9a-f]{40}$$ && "$$DIGEST" =~ ^sha256:[0-9a-f]{64}$$ ]]' in digest_step
     assert digest_step.index("=~") < digest_step.index("gcloud artifacts")
+
+
+def test_an_execution_still_running_at_the_deadline_reports_the_job_armed_and_holds(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(states=(None,))
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    ticks = iter(range(0, 10 ** 9, 100))
+    monkeypatch.setattr(launch.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(launch.LaunchRefused, match="terminal state"):
+        launch.cmd_run(run_args())
+    assert "disarmed" not in json.loads((tmp_path / "run.json").read_text())
+    fake = Gcloud(log=line(ENTRY))
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert result["job_armed"] is True and not result["ok"] and result["lock"].startswith("HELD")
+    assert not released(fake.calls)
+
+
+def test_a_failed_execute_with_no_identified_execution_reports_the_job_armed(monkeypatch, tmp_path):
+    held(tmp_path)
+    monkeypatch.setattr(launch.subprocess, "run", Gcloud(execute_fails=True, listed=[("reviewed-seed-batch-batch-one-old", True)]))
+    with pytest.raises(launch.LaunchRefused, match="lock stays held"):
+        launch.cmd_run(run_args())
+    fake = Gcloud()
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert result["job_armed"] is True and not result["ok"] and not released(fake.calls)
+
+
+@pytest.mark.parametrize("killed", ["before_the_armed_deploy_returned", "after_arming_before_execute"])
+def test_a_run_step_killed_after_arming_keeps_the_lock_and_says_armed(monkeypatch, tmp_path, killed):
+    """The container dies (no finally runs): run.json is left with armed=True and no disarm record."""
+    held(tmp_path)
+    state = {"execution": None, "state": None, "error": None, "execute_attempted": False, "armed": True,
+             "executions_pre_arm": ["reviewed-seed-batch-batch-one-old"]}
+    if killed == "after_arming_before_execute":
+        state["executions_before"] = ["reviewed-seed-batch-batch-one-old"]
+    (tmp_path / "run.json").write_text(json.dumps(state))
+    fake = Gcloud(log="")
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert result["job_armed"] is True and not result["ok"] and "ARMED" in result["lock"]
+    assert not released(fake.calls)
+    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json"]       # no lock.json: nothing was released
+
+
+def test_a_clean_disarm_still_releases(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud()
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    assert json.loads((tmp_path / "run.json").read_text())["disarmed"] is True
+    fake.log = "\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})])
+    publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert result["ok"] and result["job_armed"] is False and released(fake.calls)
+
+
+def test_a_run_step_killed_after_a_clean_execution_but_before_the_disarm_is_not_ok(monkeypatch, tmp_path):
+    """The batch committed and the execution succeeded, but no disarm was recorded: not ok, HELD, job_armed."""
+    held(tmp_path)
+    (tmp_path / "run.json").write_text(json.dumps({
+        "execution": "reviewed-seed-batch-batch-one-x7k2p", "state": "EXECUTION_SUCCEEDED", "error": None,
+        "execute_attempted": True, "armed": True, "executions_pre_arm": ["reviewed-seed-batch-batch-one-old"],
+        "executions_before": ["reviewed-seed-batch-batch-one-old"]}))
+    fake = Gcloud(log="\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})]))
+    fake.executed = True
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert result["batch_lines"] == 1 and result["entries"][0]["status"] == "committed"   # receipts still published
+    assert not result["ok"] and result["decision"] is None and result["job_armed"] is True and "ARMED" in result["lock"]
+    assert not released(fake.calls)

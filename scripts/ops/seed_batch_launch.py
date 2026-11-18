@@ -399,8 +399,10 @@ def lock_decision(state: dict) -> str | None:
         return "HELD: execute was attempted and no execution could be identified; check before removing the lock"
     if state.get("execution") and state.get("state") not in TERMINAL:
         return "HELD: the execution's state is not terminal; do not remove the lock"
-    if state.get("armed") and state.get("disarmed") is False:
-        return "HELD: the job is still ARMED (disarm failed); disarm it before removing the lock"
+    # Armed and not KNOWN to be disarmed (the disarm failed, was skipped while something may run, or the run step
+    # was killed before it got there): the job can still be executed with the write flag.
+    if state.get("armed") and state.get("disarmed") is not True:
+        return "HELD: the job is still ARMED (disarm failed or never ran); disarm it before removing the lock"
     if state.get("execution_found_by_lookup"):
         return ("HELD: the execute call failed and the execution was found by lookup; confirm it is this build's "
                 "before removing the lock")
@@ -459,12 +461,12 @@ def cmd_publish(args) -> None:
                     f" (still running: {', '.join(running) or 'none'})")
     lock = held or "to be released after result.json (outcome in lock.json)"
     result = summarise(rows, mode=args.mode, run_state=state, bad_lines=bad, lock=lock)
-    if state.get("armed") and state.get("disarmed") is False:
+    if state.get("armed") and state.get("disarmed") is not True:
         result["ok"], result["decision"] = False, None
     if unsure or (held and held.startswith(("HELD: a FOREIGN", "HELD: the execute call failed"))):
         result["ok"], result["decision"] = False, None
     result.update(build=build_id(), batch_id=args.batch_id, release=args.release, log_error=log_error,
-                  job_armed=bool(state.get("armed")) and state.get("disarmed") is False)
+                  job_armed=bool(state.get("armed")) and state.get("disarmed") is not True)
     # result.json first, so a failure in the release below cannot lose it.
     put(prefix, "result.json", json.dumps(result, indent=1))
     print(json.dumps(result, indent=1))
