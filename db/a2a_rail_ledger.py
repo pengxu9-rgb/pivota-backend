@@ -240,6 +240,12 @@ _ADD_CEILING_SOURCE_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
 )
 _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_source VARCHAR(32)"
+# Migration 289: how many times a held checkout was looked up, counted BEFORE each lookup goes out
+# (`count_checkout_lookup_as_holder`), so a crash mid-lookup still counts. Nullable, no default, like 287.
+_ADD_CHECKOUT_LOOKUPS_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
+)
+_ADD_CHECKOUT_LOOKUPS_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN checkout_lookups INTEGER"
 #: Both checkout columns in ONE guarded ALTER on Postgres (the DDL of 287 and 288, as one statement): they
 #: land together or not at all, so a boot that times out never leaves one without the other. The worker
 #: also refuses the checkout path on a row read without either (`a2a_rail_worker._checkout_schema_ready`):
@@ -247,18 +253,20 @@ _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_
 _HEAL_CHECKOUT_COLUMNS_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases"
     " ADD COLUMN IF NOT EXISTS checkout_task_id VARCHAR(128),"
-    " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
+    " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32),"
+    " ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
 )
 #: (column, SQLite heal), in migration order.
 _HEALED_COLUMNS_SQLITE = (
     ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
     ("ceiling_source", _ADD_CEILING_SOURCE_SQLITE),
+    ("checkout_lookups", _ADD_CHECKOUT_LOOKUPS_SQLITE),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287 and 288. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287, 288 and 289. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -860,6 +868,57 @@ async def adopt_checkout_task_as_holder(
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_ADOPT_CHECKOUT_TASK_SQL, values))
     return _purchase(await database.fetch_one(_ADOPT_CHECKOUT_TASK_SQL_SQLITE, values))
+
+
+# A held checkout's lookups, counted WRITE-AHEAD (before the read goes out), so a step that crashes in the
+# middle of one still counts it: at most `max_tries` per row, ever. Fenced on the holder and `paying`.
+_COUNT_CHECKOUT_LOOKUP_SQL = """
+    UPDATE a2a_rail_purchases
+       SET checkout_lookups = COALESCE(checkout_lookups, 0) + 1,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'paying'
+       AND claimed_by = :holder
+       AND COALESCE(checkout_lookups, 0) < :max_tries
+    RETURNING *
+"""
+_COUNT_CHECKOUT_LOOKUP_SQL_SQLITE = _COUNT_CHECKOUT_LOOKUP_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def count_checkout_lookup_as_holder(purchase_id: str, worker_id: str, *, max_tries: int) -> Optional[Dict[str, Any]]:
+    """Count one lookup of a held checkout before it is sent. None when the cap is reached, or the row is not
+    this worker's `paying` row: then no lookup may go out."""
+    if isinstance(max_tries, bool) or not isinstance(max_tries, int) or not 1 <= max_tries <= 50:
+        raise ValueError("max_tries must be in 1..50")
+    values = {"id": _require(_ID_RE, purchase_id, "purchase_id"),
+              "holder": _require(_WORKER_RE, worker_id, "worker_id"), "max_tries": max_tries}
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_COUNT_CHECKOUT_LOOKUP_SQL, values))
+    return _purchase(await database.fetch_one(_COUNT_CHECKOUT_LOOKUP_SQL_SQLITE, values))
+
+
+# A task id an answer AFTER the confirm named, noted on a row held for that answer (its card code was
+# scrubbed): recorded so a human has the task to look up, WITHOUT resolving the confirm's pending write.
+_NOTE_CHECKOUT_TASK_SQL = """
+    UPDATE a2a_rail_purchases
+       SET checkout_task_id = :checkout_task_id, updated_at = clock_timestamp()
+     WHERE id = :id AND state = 'paying' AND claimed_by = :holder AND checkout_task_id IS NULL
+    RETURNING *
+"""
+_NOTE_CHECKOUT_TASK_SQL_SQLITE = _NOTE_CHECKOUT_TASK_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def note_checkout_task_as_holder(purchase_id: str, worker_id: str, *, checkout_task_id: str) -> Optional[Dict[str, Any]]:
+    """Record the task id on a `paying` row this worker holds that has none, leaving any pending write. None
+    otherwise. Malformed values raise before any SQL."""
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "checkout_task_id": _rail_ref(_require(_RAIL_REF_RE, checkout_task_id, "checkout_task_id"), "checkout_task_id"),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_NOTE_CHECKOUT_TASK_SQL, values))
+    return _purchase(await database.fetch_one(_NOTE_CHECKOUT_TASK_SQL_SQLITE, values))
 
 
 # ── the operator's resolution of a HELD checkout ─────────────────────────────────────────────

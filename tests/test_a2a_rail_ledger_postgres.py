@@ -27,6 +27,7 @@ _MIGRATION_278 = _REPO / "db/migrations/278_a2a_rail_worker_heartbeat.sql"
 #: The checkout path's columns (task id, ceiling source): applied on top of 268 by the parity check.
 _MIGRATION_287 = _REPO / "db/migrations/287_a2a_rail_checkout_task_id.sql"
 _MIGRATION_288 = _REPO / "db/migrations/288_a2a_rail_ceiling_source.sql"
+_MIGRATION_289 = _REPO / "db/migrations/289_a2a_rail_checkout_lookups.sql"
 AGENT = "agent_a2a_pg"
 PAGE = "https://pay.rail.test/approve/1"
 
@@ -91,7 +92,7 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
 
     for table in _TABLES:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
-    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288):
+    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288, _MIGRATION_289):
         for statement in split_statements(migration.read_text(encoding="utf-8")):
             await database.execute(statement)
     from_migration = [await _fingerprint(t) for t in _TABLES]

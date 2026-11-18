@@ -1527,8 +1527,10 @@ CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 #: know that speaks of payment or completion (`paid`, `payment_reached`, `completed`): a charge may exist.
 #: Held, as a payment-reached code.
 CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
-#: An answer AFTER the confirm went out (the confirm's own answer, a poll, a lookup, the result) echoed a card
-#: security code (a2a_rail.has_card_code: prose or a card string, scrubbed in the transport). Money may have
+#: An answer that may come after the confirm echoed a card security code (a2a_rail.has_card_code: prose or a
+#: card string, scrubbed in the transport): the confirm's own answer, a poll, a result, or a LOOKUP. A lookup
+#: also runs on rows held as setup_unresolved / pending_check / paying_without_task, where the confirm may
+#: never have gone out; holding (and refusing "not charged") is the safe side either way. Money may have
 #: moved, so it is HELD, the write kept: never failed, and never "not charged" by an operator either (it is one
 #: of `_CHECKOUT_PAYMENT_REACHED_CODES`: resolve-held refuses it as `payment_reached_recorded`). (Before the confirm, the setup's
 #: answer with such an echo is simply not confirmed: cancelled, failed only on a definite cancel.)
@@ -1544,13 +1546,15 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
 })
 #: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`), and
-#: `checkout_answer_scrubbed`, written only AFTER the confirm went out (its result may have said payment-reached
-#: before the echo was scrubbed): our own ledger then records that the order may have been placed and paid.
+#: `checkout_answer_scrubbed`, written on an answer that may come after the confirm (the confirm's answer, a
+#: poll, a result, or a lookup, which may also run on a row whose confirm never went out; its result may have
+#: said payment-reached before the echo was scrubbed): our own ledger then records that the order may have been placed and paid.
 #: The operator path can NEVER mark these "not charged" (refused as `payment_reached_recorded`): they need a
 #: human and the merchant (a refund), not a `failed`. Every hold code is either here or in
 #: `_OPERATOR_RESOLVABLE_HOLD_CODES` (a test holds the partition, that every hold written in
 #: `_checkout_result`'s payment-reached branch is here, and that `checkout_answer_scrubbed` is written only
-#: by the post-confirm readers).
+#: by the readers of answers that may follow a confirm: the confirm's answer, the poll / task lookup, and
+#: the held-checkout lookup).
 _CHECKOUT_PAYMENT_REACHED_CODES = frozenset({
     CHECKOUT_TOTAL_OVER_APPROVED, CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_ORDER_ID_CARD_SHAPED,
     CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
@@ -1977,7 +1981,15 @@ async def _confirm_answer(s: _Step, result: Any) -> str:
     if getattr(result, "kind", None) == "money_result":
         return await _unresolved_write(s, action, result)
     if _card_code_echoed(result):
-        # After the confirm: held, the write kept (never resent, never failed).
+        # After the confirm: held, the write kept (never resent, never failed). The task id the answer named,
+        # if it survived the scrub, is noted (without resolving the write) so a human has a task to look up.
+        named = next((c.data.get("task_id") for c in (result.card("checkout.await"), result.card("checkout.result"))
+                      if c is not None), None) if getattr(result, "ok", False) else None
+        if isinstance(named, str) and named:
+            try:
+                await ledger.note_checkout_task_as_holder(s.id, s.worker, checkout_task_id=named)
+            except ValueError:
+                logger.warning("a2a_rail_worker: unstorable task id on a scrubbed confirm answer purchase=%s", s.id)
         return await _checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)
     if result.ok:
         final, waiting = result.card("checkout.result"), result.card("checkout.await")
@@ -2098,6 +2110,8 @@ def _lookup_eligible(row: Mapping[str, Any]) -> bool:
         and code not in _CHECKOUT_PAYMENT_REACHED_CODES
         and a2a_rail.checkout_step_enabled() and _checkout_schema_ready(row)
         and _paying_seconds(row) <= CHECKOUT_LOOKUP_WINDOW_SECONDS
+        # Counted write-ahead (migration 289); a row read without the column is never looked up.
+        and "checkout_lookups" in row and int(row.get("checkout_lookups") or 0) < CHECKOUT_LOOKUP_MAX_TRIES
     )
 
 
@@ -2120,10 +2134,21 @@ def _lookup_wait(row: Mapping[str, Any]) -> int:
 
 async def _checkout_lookup(s: _Step) -> str:
     """ONE read-only lookup of a held checkout by our idempotency key, in the lookup conversation. Never
-    sends a write (`checkout.lookup#submit` is a read on the provider's side; no write-ahead is marked)."""
+    sends a write (`checkout.lookup#submit` is a read on the provider's side). Counted write-ahead first, so
+    at most CHECKOUT_LOOKUP_MAX_TRIES ever go out per row, a crash mid-lookup included."""
     row = s.row
     code = str(row.get("last_error_code") or "")
+    if await ledger.count_checkout_lookup_as_holder(s.id, s.worker, max_tries=CHECKOUT_LOOKUP_MAX_TRIES) is None:
+        # The cap is reached (or the row is no longer ours): held for a human, nothing sent.
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "checkout_held"
     result = await s.send(CHECKOUT_LOOKUP, {"task_id": _checkout_idempotency_key(s.id)}, context=s.lookup_context)
+    if getattr(result, "kind", None) == "money_result":
+        # The provider reported money moving in the lookup conversation: parked for good, like every other
+        # read on this rail. The operator can never end it as not charged.
+        logger.error("a2a_rail_worker: money-result card on a checkout lookup purchase=%s; parked for a human", s.id)
+        await s.release(POLL_PARKED, "money_result_seen")
+        return "money_result_seen"
     if _card_code_echoed(result):
         return await _checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)
     final = result.card("checkout.result") if getattr(result, "ok", False) else None
@@ -2131,20 +2156,33 @@ async def _checkout_lookup(s: _Step) -> str:
     card = final or waiting
     task_id = card.data.get("task_id") if card is not None else None
     if card is None or not (isinstance(task_id, str) and task_id):
-        # Not found, an error, prose, a money-result card, or an answer that names no task: still held,
-        # unchanged, and looked up again on the backoff (or left for a human past the window).
+        # Not found, an error, prose, or an answer that names no task: still held, unchanged, and looked up
+        # again on the backoff (or left for a human past the window or the cap).
         await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
         return "checkout_held"
     known = row.get("checkout_task_id")
     if known and known != task_id:
         return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
+    if not known and final is not None:
+        status = str(final.data.get("status") or "").strip().lower()
+        if status in _CHECKOUT_NOT_SUBMITTED or final.data.get("success") is False:
+            # NOTHING TIES THIS ANSWER TO OUR CHECKOUT: the lookup names a task we never recorded, and the
+            # provider's lookup resolution is not measured (another purchase's result could come back). A
+            # "not submitted" on it would fail a purchase that may be charged and invite a second buy: it
+            # KEEPS the hold, and the task is not adopted. Completing on a verified total, and an await that
+            # leads to the poll, are bounded and stay. Binding a lookup's answer to our idempotency key, our
+            # checkout URL or our merchant waits for the sandbox measurement of what a lookup echoes.
+            logger.warning("a2a_rail_worker: held checkout lookup said not submitted on an unbound task "
+                           "purchase=%s code=%s; still held", s.id, code)
+            await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
+            return "checkout_held"
     if not known:
         try:
             adopted = await ledger.adopt_checkout_task_as_holder(s.id, s.worker, checkout_task_id=task_id)
         except ValueError:
             return await _checkout_hold(s, CHECKOUT_TASK_INVALID)
         if adopted is None:
-            return await _settled(s, None, "checkout_held")
+            return await _checkout_hold(s, code)
         s.row = adopted
     elif row.get("pending_write"):
         # The lookup answered for the write nobody saw: it is resolved (never resent).

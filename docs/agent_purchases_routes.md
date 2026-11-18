@@ -165,10 +165,15 @@ good: no sweep ends `paying`, and **nothing ends a hold automatically** except o
 cause is an answer nobody saw (`a2a_rail_worker._CHECKOUT_LOOKUP_CODES`: setup / confirm / cancel unresolved,
 the pending check, paying without a task, a prose / unrecognised / error-card confirm answer), the worker
 asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purchase id>-checkout`), read-only,
-in its own conversation, when the time in `paying` has doubled (1, 2, 4 ... minutes, at most 9 times in
-4 hours). A definite result goes through the ordinary result rules (completed only on a verified total; a
-held code stays held); an await records the task and the poll goes on; anything else leaves it held. It never
-resends a setup or a confirm, and never looks up a hold written after payment was reported. A 409 on the
+in its own conversation. The first lookup comes when the hold's own park ends, about 10 minutes after the
+hold (`POLL_PARKED`); then again each time the time in `paying` has doubled, within 4 hours, and at most 9
+times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 289), so a
+crash in the middle of one still counts. A definite result goes through the ordinary result rules
+(completed only on a verified total; a held code stays held), EXCEPT that a "not submitted" answer on a task
+the purchase never recorded keeps the hold (nothing yet ties a lookup's answer to our checkout); an await
+records the task and the poll goes on; a money-result answer parks it for good (`money_result_seen`, never
+"not charged"); anything else leaves it held. It never resends a setup or a confirm, and never looks up a
+hold written after payment was reported. A 409 on the
 confirm (the same key with another body: our own bug) is held and never looked up. Otherwise a human does:
 
 1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
@@ -201,7 +206,8 @@ check the gate itself.
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
 `checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`, and
-`checkout_answer_scrubbed`, written only after the confirm went out, when an answer echoed a card code; the
+`checkout_answer_scrubbed`, written when an answer that may follow a confirm echoed a card code (the confirm's
+answer, a poll, a result, or a lookup, which may also run on a row whose confirm never went out); the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
 written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
 for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id
