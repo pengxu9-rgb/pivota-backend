@@ -12328,10 +12328,10 @@ def _named_seed_variant_pdp_url(
     ):
         return family_url
 
-    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_VARIANTS
+    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_LISTINGS, NAMED_REFERRAL_VARIANTS
 
     additions = NAMED_REFERRAL_VARIANTS.get(seed_id, {}) if listing is None else {}
-    listing = listing or LISTINGS.get(seed_id)
+    listing = listing or LISTINGS.get(seed_id) or NAMED_REFERRAL_LISTINGS.get(seed_id)
     if (
         listing is None
         or seller_ref != listing.seller_ref

@@ -240,7 +240,8 @@ def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_
     assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
 
 
-def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree(monkeypatch, client):
+@pytest.mark.parametrize("listed_in", ["public_listings", "private_manifest_v2"])
+def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree(monkeypatch, client, listed_in):
     from routes import outbound_links
     from services import external_seed_review_pilot as pilot
 
@@ -271,7 +272,9 @@ def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree
     # Shade 16 is in the seed and the catalog with a matching URL, but was never reviewed.
     unreviewed = variants[15]
     additions = {v["variant_id"]: (v["barcode"].zfill(14), v["sku"]) for v in variants[2:15]}
-    monkeypatch.setitem(pilot.LISTINGS, seed["id"], listing)
+    # A v2 manifest seed is NOT in the public LISTINGS: it brings its own reviewed listing identity.
+    monkeypatch.setitem(pilot.LISTINGS if listed_in == "public_listings" else pilot.NAMED_REFERRAL_LISTINGS,
+                        seed["id"], listing)
     monkeypatch.setitem(pilot.NAMED_REFERRAL_VARIANTS, seed["id"], additions)
     monkeypatch.setattr(outbound_links, "log_outbound_click", AsyncMock())
 
@@ -313,7 +316,8 @@ def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree
             offer = resolve(new_variant["variant_id"], catalog_skus)
             assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
 
-    assert pilot.machine_review_listing(seed["id"]) is listing
+    # Draft review never widens to a private v2 listing.
+    assert pilot.machine_review_listing(seed["id"]) is (listing if listed_in == "public_listings" else None)
     assert len(listing.variants) == 2
 
 
@@ -412,7 +416,7 @@ def test_named_referral_manifest_refusals_disable_only_pinning(tmp_path, monkeyp
         data = ('{"schema_version": 1, "listings": {"eps_x": {"100000000002": ["%s", "EX-02"], '
                 '"100000000002": ["%s", "EX-03"]}}}' % (good, other)).encode()
     elif case == "too_large":
-        data = data + b" " * (32769 - len(data))
+        data = data + b" " * (pilot._MANIFEST_LIMIT + 1 - len(data))
     path = _write_manifest(tmp_path, monkeypatch, data)
     if case == "bad_pin":
         monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256, "0" * 63)
@@ -858,3 +862,119 @@ def test_a_name_restating_the_product_id_is_not_a_variant_claim(monkeypatch, cli
             "availability": "in_stock"}
     offer = _resolve(monkeypatch, client, [_attached([lone])], sku_id=SPID)[0]
     assert offer["execution_spec"]["variant_id"] == ATTACHED
+
+
+def _v2_listing(**changes):
+    raw = {"url": "https://shop.example/products/tinted-oil", "seller_ref": "merch_obs_0123456789abcdef",
+           "native_product_id": 7, "variants": [["200000000001", _gtin14("0001234567020"), "Shade A", "EX-A1"]]}
+    return {**raw, **changes}
+
+
+def _v2_payload(listing=None, additions=None, seed_id="eps_0123456789abcdef01234567"):
+    entry = {"additions": additions or {"200000000002": [_gtin14("0001234567021"), "EX-A2"]}}
+    if listing is not False:
+        entry["listing"] = listing or _v2_listing()
+    return {"schema_version": 2, "listings": {seed_id: entry}}
+
+
+def test_named_referral_manifest_v2_loads_private_listing_and_additions(tmp_path, monkeypatch):
+    from services import external_seed_review_pilot as pilot
+
+    _write_manifest(tmp_path, monkeypatch, _v2_payload())
+    gtin = _gtin14("0001234567021")
+    additions, private = pilot.load_named_referral_manifest({"eps_x": _manifest_listing()})
+    assert additions == {"eps_0123456789abcdef01234567": {"200000000002": (gtin, "EX-A2")}}
+    listing = private["eps_0123456789abcdef01234567"]
+    assert (listing.url, listing.seller_ref, listing.native_product_id) == (
+        "https://shop.example/products/tinted-oil", "merch_obs_0123456789abcdef", 7)
+    assert listing.variants == (("200000000001", _gtin14("0001234567020"), "Shade A", "EX-A1"),)
+    assert not listing.machine_activation_allowed
+    # The v1 entry point returns the same additions.
+    assert pilot.load_named_referral_variants({"eps_x": _manifest_listing()}) == additions
+
+
+def test_named_referral_manifest_v2_may_extend_a_public_listing_without_its_own_identity(tmp_path, monkeypatch):
+    from services import external_seed_review_pilot as pilot
+
+    _write_manifest(tmp_path, monkeypatch, _v2_payload(listing=False, seed_id="eps_x"))
+    additions, private = pilot.load_named_referral_manifest({"eps_x": _manifest_listing()})
+    assert additions == {"eps_x": {"200000000002": (_gtin14("0001234567021"), "EX-A2")}} and private == {}
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("listing_for_public_seed", "repeats a public reviewed listing"),
+    ("unknown_seed_without_listing", "not a reviewed listing"),
+    ("bad_seed_id", "seed id is invalid"),
+    ("extra_entry_key", "{additions, listing?}"),
+    ("extra_listing_key", "{url, seller_ref, native_product_id, variants}"),
+    ("http_url", "https product page"),
+    ("url_with_query", "https product page"),
+    ("collection_url", "https product page"),
+    ("bad_seller_ref", "seller_ref is invalid"),
+    ("product_id_as_string", "native_product_id is invalid"),
+    ("product_id_bool", "native_product_id is invalid"),
+    ("no_existing_variants", "no existing variants"),
+    ("variant_three_fields", "[native id, GTIN-14, shade, SKU]"),
+    ("variant_bad_gtin", "[native id, GTIN-14, shade, SKU]"),
+    ("variant_blank_shade", "[native id, GTIN-14, shade, SKU]"),
+    ("duplicate_listing_variant", "repeats a variant"),
+    ("addition_repeats_listing_variant", "repeats a reviewed listing variant"),
+    ("addition_reuses_listing_gtin", "not unique"),
+    ("schema_version_3", "schema_version: 1 or 2"),
+])
+def test_named_referral_manifest_v2_refusals_disable_only_pinning(tmp_path, monkeypatch, caplog, case, expected):
+    from services import external_seed_review_pilot as pilot
+
+    existing = ["200000000001", _gtin14("0001234567020"), "Shade A", "EX-A1"]
+    payload = {
+        "listing_for_public_seed": lambda: _v2_payload(seed_id="eps_x"),
+        "unknown_seed_without_listing": lambda: _v2_payload(listing=False),
+        "bad_seed_id": lambda: _v2_payload(seed_id="eps_short"),
+        "extra_entry_key": lambda: {"schema_version": 2, "listings": {"eps_0123456789abcdef01234567": {
+            **_v2_payload()["listings"]["eps_0123456789abcdef01234567"], "note": "x"}}},
+        "extra_listing_key": lambda: _v2_payload(listing={**_v2_listing(), "brand": "x"}),
+        "http_url": lambda: _v2_payload(listing=_v2_listing(url="http://shop.example/products/tinted-oil")),
+        "url_with_query": lambda: _v2_payload(listing=_v2_listing(url="https://shop.example/products/tinted-oil?v=1")),
+        "collection_url": lambda: _v2_payload(listing=_v2_listing(url="https://shop.example/collections/lips")),
+        "bad_seller_ref": lambda: _v2_payload(listing=_v2_listing(seller_ref="merch_obs_example")),
+        "product_id_as_string": lambda: _v2_payload(listing=_v2_listing(native_product_id="7")),
+        "product_id_bool": lambda: _v2_payload(listing=_v2_listing(native_product_id=True)),
+        "no_existing_variants": lambda: _v2_payload(listing=_v2_listing(variants=[])),
+        "variant_three_fields": lambda: _v2_payload(listing=_v2_listing(variants=[existing[:3]])),
+        "variant_bad_gtin": lambda: _v2_payload(listing=_v2_listing(variants=[[existing[0], "0001234567020", *existing[2:]]])),
+        "variant_blank_shade": lambda: _v2_payload(listing=_v2_listing(variants=[[*existing[:2], " ", existing[3]]])),
+        "duplicate_listing_variant": lambda: _v2_payload(listing=_v2_listing(variants=[existing, existing])),
+        "addition_repeats_listing_variant": lambda: _v2_payload(additions={"200000000001": [_gtin14("0001234567021"), "EX-A2"]}),
+        "addition_reuses_listing_gtin": lambda: _v2_payload(additions={"200000000002": [existing[1], "EX-A2"]}),
+        "schema_version_3": lambda: {**_v2_payload(), "schema_version": 3},
+    }[case]()
+    _write_manifest(tmp_path, monkeypatch, payload)
+    with caplog.at_level("ERROR", logger=pilot.__name__):
+        assert pilot.load_named_referral_manifest({"eps_x": _manifest_listing()}) == ({}, {})
+    assert any(expected in record.getMessage() for record in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+def test_named_referral_manifest_v2_is_wired_at_import_from_env(tmp_path):
+    import hashlib
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from services import external_seed_review_pilot as pilot
+
+    data = json.dumps(_v2_payload()).encode()
+    path = tmp_path / "named.json"
+    path.write_bytes(data)
+    env = {key: value for key, value in os.environ.items() if key != "DATABASE_URL"}
+    env.update({pilot.NAMED_REFERRAL_VARIANTS_MANIFEST: str(path),
+                pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256: hashlib.sha256(data).hexdigest()})
+    probe = ("import json; from services import external_seed_review_pilot as p; "
+             "print(json.dumps({k: [l.url, l.seller_ref, list(map(list, l.variants))] "
+             "for k, l in p.NAMED_REFERRAL_LISTINGS.items()}))")
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env,
+                         cwd=str(Path(pilot.__file__).resolve().parents[1]), timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    listing = _v2_listing()
+    assert json.loads(run.stdout.strip().splitlines()[-1]) == {
+        "eps_0123456789abcdef01234567": [listing["url"], listing["seller_ref"], listing["variants"]]}

@@ -85,13 +85,20 @@ LISTINGS = {row["seed_id"]: _listing(row) for row in _CONFIG["listings"].values(
 # they are present in the active seed and catalog. Draft review uses LISTINGS only.
 # The reviewed additions are real catalog identifiers, so they live in a private manifest
 # mounted per runtime: NAMED_REFERRAL_VARIANTS_MANIFEST_PATH, pinned by
-# NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256. Shape:
+# NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256. Shapes:
 #   {"schema_version": 1, "listings": {"<seed_id>": {"<native variant id>": ["<GTIN-14>", "<SKU>"]}}}
+#   {"schema_version": 2, "listings": {"<seed_id>": {
+#       "listing": {"url": "https://<store>/products/<handle>", "seller_ref": "merch_obs_<16 hex>",
+#                   "native_product_id": <int>, "variants": [["<native id>", "<GTIN-14>", "<shade>", "<SKU>"], ...]},
+#       "additions": {"<native variant id>": ["<GTIN-14>", "<SKU>"]}}}}
+# v2 `listing` carries the reviewed listing identity of a seed that is NOT in the public LISTINGS (and is
+# refused for one that is). Serving still matches it against the live seed's seller and family URL.
 # Unset: no additions. Set but unreadable, unpinned or invalid: no additions and an ERROR
 # log; only this shade pinning is disabled (links fall back to the family page).
 NAMED_REFERRAL_VARIANTS_MANIFEST = "NAMED_REFERRAL_VARIANTS_MANIFEST_PATH"
 NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256 = "NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256"
-_MANIFEST_LIMIT = 32768
+_MANIFEST_LIMIT = 131072
+_SELLER_REF = re.compile(r"merch_obs_[0-9a-f]{16}\Z")
 _NATIVE_VARIANT_ID = re.compile(r"[1-9][0-9]{0,23}\Z")
 _SKU = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}\Z")
 _logger = logging.getLogger(__name__)
@@ -104,17 +111,58 @@ def _unique_object(pairs):
     return dict(pairs)
 
 
-def validate_named_referral_variants(config, listings) -> dict[str, dict[str, tuple[str, str]]]:
-    """Return the reviewed additions keyed by seed, or raise ValueError naming the first problem."""
+def _private_listing(raw) -> PilotListing:
+    if not isinstance(raw, dict) or raw.keys() != {"url", "seller_ref", "native_product_id", "variants"}:
+        raise ValueError("manifest listing must be {url, seller_ref, native_product_id, variants}")
+    url = urlsplit(raw["url"]) if isinstance(raw["url"], str) else None
+    if (url is None or url.scheme != "https" or not url.hostname or url.query or url.fragment
+            or not url.path.startswith("/products/") or url.path.count("/") != 2 or len(raw["url"]) > 300):
+        raise ValueError("manifest listing url is not an https product page")
+    if not isinstance(raw["seller_ref"], str) or not _SELLER_REF.fullmatch(raw["seller_ref"]):
+        raise ValueError("manifest listing seller_ref is invalid")
+    if type(raw["native_product_id"]) is not int or not 0 < raw["native_product_id"] < 10 ** 20:
+        raise ValueError("manifest listing native_product_id is invalid")
+    variants = raw["variants"]
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("manifest listing has no existing variants")
+    checked = []
+    for variant in variants:
+        if (not isinstance(variant, list) or len(variant) != 4 or not all(isinstance(item, str) for item in variant)
+                or not _NATIVE_VARIANT_ID.fullmatch(variant[0]) or validated_source_gtin(variant[1]) != variant[1]
+                or len(variant[1]) != 14 or not 0 < len(variant[2].strip()) <= 80 or not _SKU.fullmatch(variant[3])):
+            raise ValueError("manifest listing variant must be [native id, GTIN-14, shade, SKU]")
+        checked.append(tuple(variant))
+    if len({v[0] for v in checked}) != len(checked):
+        raise ValueError("manifest listing repeats a variant")
+    # Serving reads url, seller_ref and variants only; the review-only fields stay empty.
+    return PilotListing(url=raw["url"], seller_ref=raw["seller_ref"], price_minor=0, brand="", title="",
+                        description="", variants=tuple(checked), native_product_id=raw["native_product_id"])
+
+
+def validate_named_referral_manifest(config, listings):
+    """Return (additions by seed, private listings by seed), or raise ValueError naming the first problem."""
     if (not isinstance(config, dict) or config.keys() != {"schema_version", "listings"}
-            or type(config["schema_version"]) is not int or config["schema_version"] != 1):
-        raise ValueError("manifest must be {schema_version: 1, listings: {...}}")
+            or type(config["schema_version"]) is not int or config["schema_version"] not in (1, 2)):
+        raise ValueError("manifest must be {schema_version: 1 or 2, listings: {...}}")
+    version = config["schema_version"]
     entries = config["listings"]
     if not isinstance(entries, dict) or not entries:
         raise ValueError("manifest lists no seeds")
-    result = {}
-    for seed_id, additions in entries.items():
+    result, private = {}, {}
+    for seed_id, entry in entries.items():
         listing = listings.get(seed_id)
+        if version == 1:
+            additions = entry
+        else:
+            if not isinstance(entry, dict) or not ({"additions"} <= entry.keys() <= {"additions", "listing"}):
+                raise ValueError("manifest v2 seed must be {additions, listing?}")
+            additions = entry["additions"]
+            if "listing" in entry:
+                if listing is not None:
+                    raise ValueError("manifest v2 listing repeats a public reviewed listing")
+                if not isinstance(seed_id, str) or not re.fullmatch(r"eps_[0-9a-f]{24}", seed_id):
+                    raise ValueError("manifest v2 seed id is invalid")
+                listing = private[seed_id] = _private_listing(entry["listing"])
         if listing is None:
             raise ValueError("manifest seed is not a reviewed listing")
         if not isinstance(additions, dict) or not additions:
@@ -141,15 +189,21 @@ def validate_named_referral_variants(config, listings) -> dict[str, dict[str, tu
             seen_skus.add(sku)
             checked[native_id] = (gtin, sku)
         result[seed_id] = checked
-    return result
+    return result, private
 
 
-def load_named_referral_variants(listings=None) -> dict[str, dict[str, tuple[str, str]]]:
+def validate_named_referral_variants(config, listings) -> dict[str, dict[str, tuple[str, str]]]:
+    """The reviewed additions keyed by seed (v1 and v2), or raise ValueError naming the first problem."""
+    return validate_named_referral_manifest(config, listings)[0]
+
+
+def load_named_referral_manifest(listings=None):
+    """(additions by seed, private listings by seed). Any refusal disables only this shade pinning."""
     listings = LISTINGS if listings is None else listings
     path = os.getenv(NAMED_REFERRAL_VARIANTS_MANIFEST)
     digest = os.getenv(NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256)
     if not path and not digest:
-        return {}
+        return {}, {}
     try:
         if not path or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("manifest requires a path and a SHA-256 pin")
@@ -161,13 +215,17 @@ def load_named_referral_variants(listings=None) -> dict[str, dict[str, tuple[str
             raise ValueError("manifest is too large")
         if not compare_digest(sha256(data).hexdigest(), digest):
             raise ValueError("manifest bytes do not match the SHA-256 pin")
-        return validate_named_referral_variants(json.loads(data, object_pairs_hook=_unique_object), listings)
+        return validate_named_referral_manifest(json.loads(data, object_pairs_hook=_unique_object), listings)
     except (OSError, ValueError, RecursionError) as error:
         _logger.error("named referral variants manifest refused; shade pinning disabled: %s", error)
-        return {}
+        return {}, {}
 
 
-NAMED_REFERRAL_VARIANTS = load_named_referral_variants()
+def load_named_referral_variants(listings=None) -> dict[str, dict[str, tuple[str, str]]]:
+    return load_named_referral_manifest(listings)[0]
+
+
+NAMED_REFERRAL_VARIANTS, NAMED_REFERRAL_LISTINGS = load_named_referral_manifest()
 
 
 SCOPED_LISTING = _listing(_CONFIG["scoped_listing"])
