@@ -595,6 +595,26 @@ _SELECT_BY_RAIL_ID_FOR_OWNER_SQL = """
        AND agent_user_ref_hash = :agent_user_ref_hash
 """
 
+# The server-to-server read (routes/agent_internal_commerce_purchases.py): scoped by the AGENT only, for
+# a caller that holds the internal key and the agent id a signed link carries, but no end-user identity.
+# Both conjuncts in the SQL, as above: another agent's purchase and no purchase are the same None. It also
+# returns the parent's owner hash, which that route passes to the rail's owner-scoped view (the view
+# builders take it) and never returns.
+_SELECT_FOR_AGENT_SQL = """
+    SELECT id, rail, executor, rail_purchase_id, routing_plan, created_at, agent_user_ref_hash
+      FROM agent_purchases
+     WHERE id = :id
+       AND agent_id = :agent_id
+"""
+
+_SELECT_BY_RAIL_ID_FOR_AGENT_SQL = """
+    SELECT id, rail, executor, rail_purchase_id, routing_plan, created_at, agent_user_ref_hash
+      FROM agent_purchases
+     WHERE rail = :rail
+       AND rail_purchase_id = :rail_purchase_id
+       AND agent_id = :agent_id
+"""
+
 _LIST_FOR_OWNER_SQL = """
     SELECT id, rail, executor, rail_purchase_id, routing_plan, created_at
       FROM agent_purchases
@@ -637,6 +657,22 @@ async def get_by_rail_id_for_owner(
                 "agent_id": agent_id,
                 "agent_user_ref_hash": agent_user_ref_hash,
             },
+        )
+    )
+
+
+async def get_for_agent(purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    """The parent of `purchase_id` if it is `agent_id`'s, with its `agent_user_ref_hash`. Internal reads
+    only: the hash must never reach a response."""
+    return _parent(await database.fetch_one(_SELECT_FOR_AGENT_SQL, {"id": purchase_id, "agent_id": agent_id}))
+
+
+async def get_by_rail_id_for_agent(rail: str, rail_purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    """`get_for_agent` by a rail's own id (`rp_`, `ap_`)."""
+    return _parent(
+        await database.fetch_one(
+            _SELECT_BY_RAIL_ID_FOR_AGENT_SQL,
+            {"rail": rail, "rail_purchase_id": rail_purchase_id, "agent_id": agent_id},
         )
     )
 

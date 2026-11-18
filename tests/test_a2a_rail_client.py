@@ -299,12 +299,15 @@ async def test_a_transport_error_on_a_maybe_write_is_outcome_unknown():
     assert (await _send(client, "payment.await", "poll")).kind == "transport"
 
 
-def test_the_read_only_set_is_exactly_the_four_reads():
-    # Pinned, not inferred: classing a write as read-only would turn its timeout into a resend.
+def test_the_read_only_set_is_exactly_the_six_reads():
+    # Pinned, not inferred: classing a write as read-only would turn its timeout into a resend. The
+    # checkout's confirm (it submits the order) is NOT here; its progress reads are.
     assert a2a.READ_ONLY_ACTIONS == {
         ("payment.method-view", "submit"), ("payment.method-add-await-card", "poll"),
         ("payment.method-add-await", "poll"), ("payment.await", "poll"),
+        ("checkout.await", "poll"), ("checkout.lookup", "submit"),
     }
+    assert not a2a.READ_ONLY_ACTIONS & a2a.CHECKOUT_WRITE_ACTIONS
     assert a2a.READ_ONLY_ACTIONS <= a2a.ALLOWED_ACTIONS
 
 
@@ -775,9 +778,11 @@ async def test_in_production_every_token_step_action_raises_before_any_request(
     monkeypatch, caplog, shape, component, action,
 ):
     _platform(monkeypatch, **shape)
-    # Every dial this code ever read, ON: none of them may matter.
+    # Every dial but the checkout relay's, ON: none of them may matter (the relay's own dial is the
+    # one that lifts the refusal; tests/test_a2a_rail_checkout.py pins that).
     monkeypatch.setenv("A2A_RAIL_ENABLED", "1")
     monkeypatch.setenv("A2A_RAIL_TOKEN_STEP_ENABLED", "1")
+    monkeypatch.delenv("A2A_RAIL_CHECKOUT_STEP_ENABLED", raising=False)
     rail = _Rail(TOKEN_RESULT)
     with caplog.at_level(logging.ERROR, logger=a2a.__name__):
         with pytest.raises(a2a.TokenStepRefused):

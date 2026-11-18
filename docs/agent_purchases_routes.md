@@ -63,6 +63,23 @@ decided before any database read.
 - Reads do not depend on the Reap rail's own dial: like Reap's GET, a stored purchase stays
   readable while the rail is switched off.
 
+## `GET /agent/internal/commerce/purchases/{purchase_id}` (server to server, AgenPas)
+
+The gateway's read for the AgenPas page a buyer opens from a signed link (the buyer holds no agent key;
+the gateway keeps no partner credentials). Dark until `AGENPAS_INTERNAL_READ_ENABLED` is on AT STARTUP:
+off, the route is not registered, so every method and the OpenAPI schema look exactly like a path that
+does not exist. Turning it on needs a restart.
+
+- `X-Internal-Key` must equal `AGENPAS_INTERNAL_READ_KEY`, a key dedicated to this read (never the
+  introspect key, `AGENT_AUTH_INTROSPECT_INTERNAL_KEY`). Missing or wrong: 401. Not configured on the
+  server, or shorter than 32 characters: 503, never open.
+- `X-Agenpas-Agent-Id` scopes the read by (agent, purchase id); another agent's purchase is the same 404
+  `purchase_not_found` as no purchase. `X-Agenpas-Agent-User-Ref` is ignored (not the backend's user
+  identity).
+- The body is exactly the one `GET /agent/v2/commerce/purchases/{purchase_id}` returns for that purchase.
+- A ledger or view fault: 503 `temporarily_unavailable`. Read-only. Not exempt from the rate limiter
+  (only the introspect key is): page reads count as anonymous traffic and can 429 under a burst.
+
 ## `GET /agent/v2/commerce/purchases?limit=N`
 
 The caller's purchases, newest first, each in the shape above. `limit` is 1..100 (default 20);

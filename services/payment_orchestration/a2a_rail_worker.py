@@ -23,9 +23,10 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            because every purchase needs the buyer's own approval.
   awaiting_authorization -> tell the rail the buyer may be done (`paid`) on a spaced schedule
                            (APPROVAL_SCHEDULE), then poll the await card if the rail answers with one.
-                           ACTIVE for this token: the buyer approved, but there is no pay step yet, so
-                           the purchase cannot finish: FAILED now (`pay_step_unavailable`), not left to
-                           lapse on the page deadline as if the buyer had not approved. FAILED: `failed`.
+                           ACTIVE for this token: the buyer approved. With the checkout step off (below)
+                           there is no pay step, so the purchase cannot finish: FAILED now
+                           (`pay_step_unavailable`), not left to lapse on the page deadline as if the buyer
+                           had not approved. FAILED: `failed`.
   quoting, not locked; paying -> PARKED (`shop_protocol_pending`). The quote, the order lock and the pay
                            depend on the rail's order protocol, which is not settled; nothing here
                            guesses at a step that can move money. The lifetime ceiling in the ledger's
@@ -65,6 +66,84 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   A hold stops PIVOTA; it stops nothing at the rail (there is no cancel call): the rail can still
   complete a held order. A human resolves every hold with the rail (complete or fail it by hand,
   refund through the provider).
+
+── THE CHECKOUT STEP (its own dial, A2A_RAIL_CHECKOUT_STEP_ENABLED, default OFF) ──────────────
+
+  With the dial on (and the token dial: the step follows the token), an ACTIVE token is not the end: the
+  transport relays it into the rail provider's checkout skill (a2a_rail.relay_token_to_checkout), which
+  fills and submits the merchant's Shopify checkout itself (guest checkout). THE TOKEN NEVER REACHES THIS
+  MODULE: it is used inside the transport call that received it, and both answers come back stripped.
+  So the setup runs in the same call (the same tick) as the answer carrying the token: the value cannot
+  be kept, and whether the await poll hands the token out a second time is not measured.
+
+  quoting (not locked)  -> THE LOCK. The checkout skill gives no quote before ordering, so Pivota locks the
+                           order itself (only with the token step on too): its own order reference
+                           (`checkout_order_id`, deterministic from the purchase id) in `order_id`, and in
+                           `quoted_total_minor` an approval CEILING from `checkout_ceiling` (our price x
+                           quantity + a tax and a shipping allowance, capped), with how it was built in
+                           `ceiling_source`. One write, never repeated (`lock_checkout_order_as_holder`),
+                           and the token step below runs on it in the same step. `checkout_ceiling` is the
+                           seam: a merchant's own all-in quote replaces that one function later. No
+                           price: `failed` (`checkout_price_missing`); not USD, or above the cap: `refused`.
+  quoting (locked)      -> before a token is minted, the buyer's contact must make a complete checkout
+                           address (`checkout_contact_incomplete` otherwise, nothing sent): a token minted
+                           for a checkout that cannot be filled would only be an orphan.
+  awaiting_authorization -> `paid` (or the await poll) goes out THROUGH THE RELAY. This purchase's ACTIVE
+                           token: the setup goes out with it. The relay's write-ahead has its own name
+                           (`checkout.relay#paid`, or `checkout.setup#submit` for the await poll), so a step
+                           CUT while the relay is out (the scheduler's deadline, an instance kill, a lost
+                           lease) is HELD (`checkout_setup_unresolved`), never reconciled by resending `paid`
+                           (that would carry the token into a second setup); `_reconcile_token` also holds a
+                           plain `paid` on a checkout-path row. The setup's answer is the confirm card:
+                           -> `paying` with the HOLD code `checkout_confirm_pending_check`, which only the
+                           confirm's own answer, in the same step, replaces: interrupted anywhere from here,
+                           the row stays held. A setup that asks for more fields or is definitely refused
+                           (400/401/422/429, our token exchange): `failed`. A setup answered with a
+                           submission (`checkout_setup_submitted`), never seen, a 403, an error card or
+                           another ambiguous 4xx (`checkout_setup_unresolved`): HELD in `paying`.
+  paying (a checkout)   -> THE CONFIRM, only in the setup's own step, after scanning THAT step's confirm card:
+                           every value at any depth (`confirm_card_refused`). Any amount above the ceiling,
+                           malformed, negative, in another currency, a bare number under a money key, or a
+                           card too large to scan: CANCELLED instead (write-ahead `checkout.confirm#cancel`;
+                           `checkout_confirm_total_refused` on a definite cancel, else HELD
+                           `checkout_cancel_unresolved`). Otherwise the confirm, write-ahead
+                           `checkout.confirm#confirm`, body `{}`. A MONEY WRITE: it submits the merchant's
+                           checkout. Answered with the task: recorded in the statement that resolves the
+                           write. ONLY a validation 4xx (400, 422) fails the purchase. Our own token exchange
+                           failing (nothing sent) is retried once in the step, then HELD
+                           (`checkout_confirm_not_sent`). Every other answer is HELD with the write kept:
+                           text only (`checkout_confirm_text_only`), an error card
+                           (`checkout_confirm_error_card`), 409 (`checkout_confirm_conflict`), any other 4xx,
+                           401 / 403 / 429 included (`checkout_confirm_ambiguous_4xx`), anything unseen, 408
+                           included (`checkout_confirm_unresolved`): never resent.
+                        -> no task, no hold, no pending write (a later tick; unreachable: the pending-check
+                           hold and the confirm's write-ahead each prevent it): whether the confirm went out
+                           cannot be proven, so HELD (`checkout_paying_without_task`), logged at ERROR, and
+                           NOTHING is sent, not even a cancel. A staged checkout never confirmed lapses at
+                           the provider (about 30 minutes). The cancel-instead-of-confirm exists only in the
+                           step that read the bad confirm-card amount, where the confirm was never sent.
+                        -> a task: poll it (`checkout.await#poll`, a read) for CHECKOUT_POLL_CAP_SECONDS,
+                           then look it up (`checkout.lookup#submit`, a read in a conversation of its own),
+                           held past CHECKOUT_CEILING_SECONDS. The result:
+                             payment-reached + an order id -> completed ONLY on a verified total: it reads
+                                       as a positive amount in the purchase's currency, at most the ceiling.
+                                       Unreadable / another currency / bare number / $0.00: HELD
+                                       (`checkout_total_unverified`); above the ceiling: HELD
+                                       (`checkout_total_over_approved`); an order id that is a Luhn-valid
+                                       13..19 digit run (a card echoed back): HELD, never stored
+                                       (`checkout_order_id_card_shaped`)
+                             payment-reached, no order id  -> HELD `checkout_payment_no_order` (a charge may
+                                       exist: a failed purchase would invite the agent to buy again)
+                             captcha-failed / form-error / pay-disabled with success false -> failed, the
+                                       status as the code (nothing was submitted); with success true or
+                                       missing: a contradiction, HELD (`checkout_result_unrecognised`)
+                             timeout / script-error        -> HELD (`checkout_unknown_*`): whether it was
+                                       submitted is unknown; never retried
+  Dial off: nothing is sent or read for a checkout; it parks (`checkout_step_disabled`), and an approved
+  token ends as before (`pay_step_unavailable`): the worker takes exactly the pre-checkout path.
+  Dial on, a row read without the checkout columns (migrations 287/288 not healed): parked
+  (`checkout_schema_incomplete`), nothing sent. With the dial on `paid` and the await poll go out only
+  through the relay; a purchase whose setup cannot be built fails (`checkout_contact_incomplete`) unsent.
 
 ── TOKENS LEFT ON ENDED PURCHASES ────────────────────────────────────────────────────────────
 
@@ -106,6 +185,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -170,8 +250,9 @@ POLL_APPROVAL = 15
 #: on the rail until it lapses. Bound to its order and its amount it cannot be charged elsewhere, but it
 #: is an orphan, and "no orphans" is a design invariant. Arm this only once a void step exists. With it
 #: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`). IN PRODUCTION
-#: THE DIAL IS IGNORED: the step is refused in code (`token_step_enabled`, a2a_rail rule 6) and purchases
-#: park as `token_step_refused_production`.
+#: THE DIAL ALONE IS NOT ENOUGH: the step is refused in code unless the checkout relay's dial
+#: (A2A_RAIL_CHECKOUT_STEP_ENABLED) is on too (`token_step_enabled`, a2a_rail rule 6), and purchases park as
+#: `token_step_refused_production`.
 A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
 #: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
 #: at create, and the token step refuses them again).
@@ -253,8 +334,11 @@ def _token_active(row: Mapping[str, Any]) -> bool:
 
 def _sticky(row: Mapping[str, Any]) -> bool:
     """A marker no later write may replace: money seen (parked for good), the token ACTIVE, or a VIC order
-    held for a human (`_vic_held`)."""
-    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row) or _vic_held(row)
+    or a checkout held for a human (`_vic_held`, `_checkout_held`)."""
+    return (
+        "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row) or _vic_held(row)
+        or _checkout_held(row)
+    )
 
 
 class _Step:
@@ -272,6 +356,20 @@ class _Step:
         # The token conversation (token-setup -> picker -> approval page -> paid -> result) is its own
         # too: the provider's payment session, separate from the binding and from any order session.
         self.pay_context = client.context_for(str(row["member_id"]), f"{self.id}_p")
+        # The checkout conversation (setup -> confirm -> await) and the lookup's: their own as well. A
+        # repeated confirm in one conversation answers with the same task (measured), and a lookup is
+        # asked in another conversation (the provider's guidance).
+        self.checkout_context = client.context_for(str(row["member_id"]), f"{self.id}_c")
+        self.lookup_context = client.context_for(str(row["member_id"]), f"{self.id}_l")
+
+    async def relay(self, pair: Tuple[str, str], setup: Any):
+        """Send `pair` (`paid` or the await poll) through the transport's checkout relay: when the answer
+        is this purchase's ACTIVE token, the transport sets the checkout up with it in the same call."""
+        return await self.client.relay_token_to_checkout(
+            member_id=str(self.row["member_id"]), context_id=self.pay_context, component=pair[0], action=pair[1],
+            payload={}, expected_token_id=str(self.row.get("payment_token_id") or ""),
+            checkout_context_id=self.checkout_context, setup=setup,
+        )
 
     async def send(
         self, pair: Tuple[str, str], payload: Optional[Mapping[str, Any]] = None, *, context: Optional[str] = None
@@ -430,8 +528,10 @@ async def _start_binding(s: _Step, *, from_state: str) -> str:
     return await _unresolved_write(s, action, result)
 
 
-#: 4xx answers that say nothing about this buyer's binding: our own credentials (401, 403), a timeout
-#: (408), throttling (429). Those are retried; any other 4xx is a refusal of the request itself.
+#: 4xx answers that say nothing about this buyer's binding: our own credentials (401, 403), throttling
+#: (429), and 408. Those are not read as a refusal; any other 4xx is a refusal of the request itself.
+#: 408 only ever reaches this as a READ's answer: on a write the transport classifies a 408 as
+#: `outcome_unknown` (a2a_rail rule 4), so a write answered 408 is never treated as refused or resent here.
 _RETRYABLE_4XX = frozenset({401, 403, 408, 429})
 
 
@@ -609,10 +709,26 @@ async def _token_answer(s: _Step, action: str, result: Any) -> str:
 async def _authorizing(s: _Step) -> str:
     """The buyer is on the approval page. Tell the rail they may be done on a schedule, then read."""
     sent, variant = _paid_state(s.row)
+    setup = _checkout_inputs(s)
+    if setup is None and a2a_rail.checkout_step_enabled():
+        # With the checkout on, the token-receiving steps go only through the relay (in production the
+        # transport refuses them otherwise, a2a_rail rule 6). No setup can be built, so none is sent:
+        # the purchase cannot be paid for.
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_CONTACT_INCOMPLETE)
     if variant == _AWAIT:
         # The rail answered `paid` with its await card: poll it (a read), never `paid` again.
-        result = await s.send(AWAIT_POLL, context=s.pay_context)
-        return await _approval_answer(s, None, result, sent, variant)
+        if setup is None:
+            result = await s.send(AWAIT_POLL, context=s.pay_context)
+            return await _approval_answer(s, None, result, sent, variant)
+        if not _relay_sendable(s, setup):
+            return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
+        # Through the relay the poll may be followed by the setup (a write): recorded first.
+        if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_SETUP_ACTION) is None:
+            return "lost"
+        relay = await _relay_or_refused(s, AWAIT_POLL, setup, CHECKOUT_SETUP_ACTION)
+        if relay is None:
+            return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
+        return await _relayed(s, CHECKOUT_SETUP_ACTION, relay, sent, variant)
     if variant is None:
         # A page this module did not record: nothing is sent, the page's deadline ends the purchase.
         await s.release(POLL_PARKED, "approval_variant_unknown")
@@ -624,14 +740,61 @@ async def _authorizing(s: _Step) -> str:
         return "waiting_on_buyer"
     pair = _PAID_BY_VARIANT[variant]
     action = _action(pair)
+    if setup is not None and not _relay_sendable(s, setup):
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
+    if setup is not None:
+        # Through the relay `paid` is recorded under its own name: a step cut while the relay is out is
+        # then held (`_checkout_pending`), never reconciled by resending `paid` (a second setup).
+        action = CHECKOUT_RELAY_PAID_ACTION
     if await ledger.mark_pending_write(s.id, s.worker, action) is None:
         return "lost"
+    if setup is not None:
+        relay = await _relay_or_refused(s, pair, setup, action)
+        if relay is None:
+            return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
+        return await _relayed(s, action, relay, sent + 1, variant)
     result = await s.send(pair, context=s.pay_context)
     return await _approval_answer(s, action, result, sent + 1, variant)
 
 
-async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: int, variant: str) -> str:
-    """`paid`'s answer (`action` is its pending write) or the await poll's (`action` None, a read)."""
+def _relay_sendable(s: _Step, setup: Any) -> bool:
+    """What the relay would refuse before its first byte, checked BEFORE a write-ahead is recorded."""
+    if not str(s.row.get("payment_token_id") or "").strip() or a2a_rail.checkout_setup_problem(setup) is not None:
+        logger.warning("a2a_rail_worker: checkout relay not sendable purchase=%s; nothing sent", s.id)
+        return False
+    return True
+
+
+async def _relay_or_refused(s: _Step, pair: Tuple[str, str], setup: Any, action: str) -> Optional[Any]:
+    """The relay's outcome, or None when it refused before sending anything (its ValueError /
+    ActionNotAllowed are raised only before the first byte): the write-ahead is then resolved, nothing
+    having gone out, and the caller ends the purchase with a clean code."""
+    try:
+        return await s.relay(pair, setup)
+    except (ValueError, a2a_rail.ActionNotAllowed) as exc:
+        logger.warning("a2a_rail_worker: checkout relay refused before sending purchase=%s error_type=%s",
+                       s.id, type(exc).__name__)
+        await ledger.clear_pending_write(s.id, s.worker, action)
+        return None
+
+
+async def _relayed(s: _Step, action: str, relay: Any, count: int, variant: str) -> str:
+    """The relay's outcome. `action` is the write held across it: `paid`'s, or the await poll's setup
+    marker. No setup sent and nothing to refuse: the token answer is read exactly as without the relay
+    (the marker is resolved first: only a read went out)."""
+    if relay.checkout is None and relay.refused is None:
+        if action == CHECKOUT_SETUP_ACTION:
+            await ledger.clear_pending_write(s.id, s.worker, action)
+            return await _approval_answer(s, None, relay.token, count, variant, relay=relay)
+        return await _approval_answer(s, action, relay.token, count, variant, relay=relay)
+    return await _token_approved(s, resolves=action, relay=relay)
+
+
+async def _approval_answer(
+    s: _Step, action: Optional[str], result: Any, count: int, variant: str, *, relay: Any = None,
+) -> str:
+    """`paid`'s answer (`action` is its pending write) or the await poll's (`action` None, a read).
+    `relay` is the checkout relay's outcome when the step went through it (None: it did not)."""
     token_id = s.row.get("payment_token_id")
     if result.ok:
         token_card = result.card("payment.token-result")
@@ -646,7 +809,7 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
             return await _token_failed(s, "awaiting_authorization", "token_mismatch", resolves=action)
         status = str(((card or page).data.get("status") if (card or page) is not None else "") or "").upper()
         if card is not None and status == "ACTIVE":
-            return await _pay_step_unavailable(s, resolves=action)
+            return await _token_approved(s, resolves=action, relay=relay)
         if status == "FAILED":
             return await _token_failed(s, "awaiting_authorization", "token_failed", resolves=action)
         if card is not None or page is not None:
@@ -793,6 +956,12 @@ async def _reconcile_token(s: _Step, action: str) -> str:
         # ends a row with a pending write) until the dial is on again or a human decides.
         await s.release(POLL_PARKED, _token_step_off_reason())
         return "parked"
+    if state == "awaiting_authorization" and a2a_rail.checkout_step_enabled() and (
+        s.row.get("ceiling_source") or _checkout_setup(s.row) is not None
+    ):
+        # A checkout-path purchase: a resent `paid` would go through the relay and carry the token into a
+        # setup again, while the first one's outcome is unknown. Held, never resent.
+        return await _hold_before_paying(s, action, CHECKOUT_SETUP_UNRESOLVED)
     # `paid` names no new token (the conversation's token is the one the row records): sent again on
     # the schedule. This rests on the payment-conversation invariant in the module docstring.
     await ledger.clear_pending_write(s.id, s.worker, action)
@@ -1209,6 +1378,748 @@ async def _vic_checkout(s: _Step, answer: Any) -> str:
     return "placing"
 
 
+# ── the checkout step ────────────────────────────────────────────────────────────────────────
+
+CHECKOUT_SETUP = ("checkout.setup", "submit")
+CHECKOUT_CONFIRM = ("checkout.confirm", "confirm")
+CHECKOUT_CANCEL = ("checkout.confirm", "cancel")
+CHECKOUT_POLL = ("checkout.await", "poll")
+CHECKOUT_LOOKUP = ("checkout.lookup", "submit")
+#: The await poll's write-ahead while it goes through the relay (the setup may follow it), and the
+#: confirm's (a money write). `paid` keeps its own write-ahead across the relay.
+CHECKOUT_SETUP_ACTION = _action(CHECKOUT_SETUP)
+CHECKOUT_CONFIRM_ACTION = _action(CHECKOUT_CONFIRM)
+#: `paid`'s write-ahead when it goes THROUGH THE RELAY: its own name, not the plain `paid` action, so a step
+#: cut while the relay is out (the setup carrying the token may have gone) is recorded as exactly that, and
+#: is held, never reconciled by resending `paid` (which would relay the token into a second setup).
+CHECKOUT_RELAY_PAID_ACTION = "checkout.relay#paid"
+#: The cancel's write-ahead: a cut or unseen cancel is held, never followed by a confirm.
+CHECKOUT_CANCEL_ACTION = _action(CHECKOUT_CANCEL)
+_CHECKOUT_WRITES = frozenset({
+    CHECKOUT_SETUP_ACTION, CHECKOUT_CONFIRM_ACTION, CHECKOUT_RELAY_PAID_ACTION, CHECKOUT_CANCEL_ACTION,
+})
+#: Seconds between polls of a submitted checkout (the provider's guidance: every 5 s; a tick is coarser).
+POLL_CHECKOUT = 10
+#: The provider's cap on polling one task; after it the task is looked up instead, less often.
+CHECKOUT_POLL_CAP_SECONDS = 300
+POLL_LOOKUP = 60
+#: A submitted checkout with no result this long after entering `paying` is held for a human (`paying` is
+#: never swept: money may be moving).
+CHECKOUT_CEILING_SECONDS = 86400
+
+CHECKOUT_PLACING = "checkout_placing"
+CHECKOUT_DISABLED = "checkout_step_disabled"
+CHECKOUT_CONTACT_INCOMPLETE = "checkout_contact_incomplete"
+CHECKOUT_TOKEN_UNAVAILABLE = "checkout_token_unavailable"
+CHECKOUT_SETUP_INCOMPLETE = "checkout_setup_incomplete"
+CHECKOUT_SETUP_UNRECOGNISED = "checkout_setup_unrecognised"
+#: The confirm card showed a total that is unreadable, in another currency or above the ceiling: the
+#: flow was cancelled before the confirm, so nothing was submitted.
+CHECKOUT_CONFIRM_TOTAL_REFUSED = "checkout_confirm_total_refused"
+#: The relay refused before sending anything (no token id, a setup it will not send): nothing went out.
+CHECKOUT_RELAY_REFUSED = "checkout_relay_refused"
+#: A row on the checkout path whose lock is malformed (an order id without a positive ceiling, or the
+#: reverse): no token is minted for it.
+CHECKOUT_LOCK_INVALID = "checkout_lock_invalid"
+#: A row read without the checkout columns (migrations 287/288 not healed yet): parked, nothing sent.
+CHECKOUT_SCHEMA_INCOMPLETE = "checkout_schema_incomplete"
+#: The columns the checkout path reads and writes. A claimed row without either one stops the path.
+_CHECKOUT_COLUMNS = ("checkout_task_id", "ceiling_source")
+CHECKOUT_ORDER_REFERENCE_INVALID = "checkout_order_reference_invalid"
+#: Codes that hold a checkout for a human: nothing more is read or sent for it, on any tick, dial or not.
+CHECKOUT_CONFIRM_UNRESOLVED = "checkout_confirm_unresolved"
+CHECKOUT_CONFIRM_UNRECOGNISED = "checkout_confirm_unrecognised"
+CHECKOUT_TASK_INVALID = "checkout_task_invalid"
+CHECKOUT_TASK_MISMATCH = "checkout_task_mismatch"
+CHECKOUT_RESULT_UNRECOGNISED = "checkout_result_unrecognised"
+CHECKOUT_RESULT_OVERDUE = "checkout_result_overdue"
+CHECKOUT_TOTAL_OVER_APPROVED = "checkout_total_over_approved"
+CHECKOUT_UNKNOWN_TIMEOUT = "checkout_unknown_timeout"
+CHECKOUT_UNKNOWN_SCRIPT_ERROR = "checkout_unknown_script_error"
+#: The confirm was answered with an error card. What an error card means for a confirm is not measured:
+#: whatever its `recoverable` says, the order may be in, so it is held like an unseen answer.
+CHECKOUT_CONFIRM_ERROR_CARD = "checkout_confirm_error_card"
+#: The checkout reached the payment gateway and named no order: a charge may exist. Held, never `failed`
+#: (a failed purchase invites the agent to buy again).
+CHECKOUT_PAYMENT_NO_ORDER = "checkout_payment_no_order"
+#: The merchant's order id is a Luhn-valid run of 13..19 digits: it may be a card number echoed back.
+#: Never stored; held.
+CHECKOUT_ORDER_ID_CARD_SHAPED = "checkout_order_id_card_shaped"
+#: The confirm window passed and the cancel's answer did not say the flow was cancelled: the order may
+#: be in. Held.
+CHECKOUT_CANCEL_UNRESOLVED = "checkout_cancel_unresolved"
+#: A 409 on the confirm: it may mean the order is already in. Held, the write kept.
+CHECKOUT_CONFIRM_CONFLICT = "checkout_confirm_conflict"
+#: The confirm was answered in prose only. Prose is not a shape to trust (a2a_rail rule 3): "your order
+#: has been placed" is prose too. Held, the write kept.
+CHECKOUT_CONFIRM_TEXT_ONLY = "checkout_confirm_text_only"
+#: The final total is not a readable amount in the purchase's currency (unparsed, another currency, a bare
+#: number): the ceiling cannot be checked. Held, not completed.
+CHECKOUT_TOTAL_UNVERIFIED = "checkout_total_unverified"
+#: The setup that carried the token was answered with a submission (`checkout.await` / `checkout.result`):
+#: the provider may have checked out on its own. Held.
+CHECKOUT_SETUP_SUBMITTED = "checkout_setup_submitted"
+#: The setup's answer was never seen (5xx, timeout, garbled), is an ambiguous 4xx, a 403 or an error card,
+#: or the step was cut while the relay was out: held.
+CHECKOUT_SETUP_UNRESOLVED = "checkout_setup_unresolved"
+#: Written WITH the move to `paying`, before the confirm: the row is held unless the confirm's own answer
+#: replaces it. A step cut (or a lease lost) between the move and the confirm's answer leaves it held,
+#: never in a state a later tick could confirm.
+CHECKOUT_CONFIRM_PENDING_CHECK = "checkout_confirm_pending_check"
+#: The confirm could not be sent: our own token exchange failed twice in the step (nothing went out). Held.
+CHECKOUT_CONFIRM_NOT_SENT = "checkout_confirm_not_sent"
+#: A `paying` checkout found by a later tick with no task, no hold and no pending write. Unreachable by
+#: design (the pending-check hold and the confirm's write-ahead each prevent it), so if it is ever seen,
+#: whether a confirm went out cannot be proven. Held; NOTHING is sent (no confirm, no cancel).
+CHECKOUT_PAYING_WITHOUT_TASK = "checkout_paying_without_task"
+#: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
+CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
+_CHECKOUT_HOLD_CODES = frozenset({
+    CHECKOUT_CONFIRM_UNRESOLVED, CHECKOUT_CONFIRM_UNRECOGNISED, CHECKOUT_TASK_INVALID, CHECKOUT_TASK_MISMATCH,
+    CHECKOUT_RESULT_UNRECOGNISED, CHECKOUT_RESULT_OVERDUE, CHECKOUT_TOTAL_OVER_APPROVED,
+    CHECKOUT_UNKNOWN_TIMEOUT, CHECKOUT_UNKNOWN_SCRIPT_ERROR, CHECKOUT_CONFIRM_ERROR_CARD,
+    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_ORDER_ID_CARD_SHAPED, CHECKOUT_CANCEL_UNRESOLVED,
+    CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX, CHECKOUT_CONFIRM_TEXT_ONLY,
+    CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
+    CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
+})
+#: The confirm is sent again ONLY when nothing was sent: our own token exchange failed (`auth_failed`),
+#: retried once in the same step. Every provider answer that is not a task, a 401 and a 429 included, is
+#: held: the provider makes its own idempotency key per call (a2a_rail rule 4), and no dedupe of a resent
+#: confirm after a 401 / 429 has been measured.
+_CONFIRM_RESEND_4XX: frozenset = frozenset()
+#: The setup's answers that refused it before anything was set up: validation (400, 422), our credentials
+#: (401), throttling (429). A 403 and an error card are HELD, as on the confirm: a provider-side refusal
+#: after a check-out of its own would look the same.
+_SETUP_REFUSED_4XX = frozenset({400, 401, 422, 429})
+#: The confirm card scan's bounds: deeper or larger than this is refused (cancelled), never skipped.
+_CARD_SCAN_MAX_DEPTH = 8
+_CARD_SCAN_MAX_NODES = 2000
+#: Key spellings (lower case, ASCII letters and digits only) that make a field MONEY-ISH: a bare number, or
+#: a numeric string with no currency mark, under such a key (at any depth below it) is an amount we cannot
+#: read, so the card is refused. Elsewhere a bare number (zip, phone, ids, cardLast4) is ignored. NOT
+#: `shipping` / `payment`: the documented confirm card echoes the shipping ADDRESS under `shipping`.
+_MONEY_KEY_PARTS = ("total", "amount", "price", "cost", "charge", "balance", "discount")
+_MONEY_KEY_SUFFIXES = ("due", "fee", "fees", "tax", "taxes")
+_MONEY_KEYS = frozenset({"sum"})
+#: A USD-marked amount inside any string ("$999.00", "US$ 1,234", "USD 23.5", "23.00 USD"); the amount is
+#: then read strictly (`_usd_minor`). "$" right after letters ("CA$") is another country's dollar.
+_USD_MARKED_RE = re.compile(
+    r"(?<![A-Za-z])(?:US\$|\$|USD)\s?(-?\s?[0-9][0-9,]*(?:\.[0-9]+)?)|(-?[0-9][0-9,]*(?:\.[0-9]+)?)\s?USD(?![A-Za-z])")
+_USD_AMOUNT_RE = re.compile(r"^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,9})(?:\.[0-9]{2})?\Z")
+#: Other countries' dollars ("CA$250", "250 A$") and three-letter codes next to a number.
+_FOREIGN_DOLLAR_RE = re.compile(r"(?<![A-Za-z])([A-Za-z]{1,3})\$\s?[0-9]|[0-9]\s?([A-Za-z]{1,3})\$")
+_CURRENCY_CODE_RE = re.compile(r"(?<![A-Za-z])([A-Z]{3})(?![A-Za-z])")
+#: A string that is only a number ("40.00", "1,234"): under a money-ish key it is an amount we cannot read.
+_NUMERIC_STRING_RE = re.compile(r"^\s*-?[0-9][0-9,]*(?:\.[0-9]+)?\s*\Z")
+#: ISO 4217 codes this scan treats as another currency when they stand next to a number.
+_FOREIGN_CODES = frozenset({
+    "EUR", "GBP", "CAD", "AUD", "NZD", "JPY", "CNY", "HKD", "SGD", "INR", "MXN", "CHF", "SEK", "NOK", "DKK",
+    "BRL", "KRW", "ZAR", "TWD", "THB", "MYR", "IDR", "PHP", "PLN", "CZK", "HUF", "ILS", "AED", "SAR", "TRY",
+    "RUB", "ARS", "CLP", "COP", "PEN", "VND",
+})
+#: The ONLY 4xx answers to a confirm that fail the purchase: validation refusals, which say the request
+#: was never accepted. Every other 4xx (409 conflict, 404, 410, 423, 425, ...) may mean "already
+#: confirmed or submitted": when we cannot tell whether an order exists, the rule is HOLD, because a
+#: failed purchase invites a second real one.
+_CONFIRM_NOT_ACCEPTED_4XX = frozenset({400, 422})
+
+_CARD_SHAPED_ORDER_RE = re.compile(r"^\d{13,19}\Z")
+#: Result statuses that say the checkout was NOT submitted to the merchant: the purchase fails.
+_CHECKOUT_NOT_SUBMITTED = frozenset({"captcha-failed", "form-error", "pay-disabled"})
+#: Result statuses that leave the submission unknown: held for a human, never retried.
+_CHECKOUT_UNKNOWN = {"timeout": CHECKOUT_UNKNOWN_TIMEOUT, "script-error": CHECKOUT_UNKNOWN_SCRIPT_ERROR}
+_FIELD_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}\Z")
+#: A display total in US dollars: "$23.00", "US$1,234.50", "USD 23", "23.00 USD". A currency mark is
+#: required (a bare number says nothing about its currency).
+_USD_TOTAL_RE = re.compile(
+    r"^(?P<pre>US\$|\$|USD ?)?(?P<units>\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(?P<cents>\d{2}))?(?P<post> ?USD)?\Z")
+
+
+def checkout_total_minor(value: Any, currency: Any) -> Optional[int]:
+    """The checkout's display total (`total`, a string) in minor units, or None when it does not read
+    as an amount in `currency`. Only USD is read (the token step's only currency); a total in any other
+    spelling or currency is None, never a guess."""
+    if str(currency or "").upper() != "USD" or not isinstance(value, str):
+        return None
+    match = _USD_TOTAL_RE.match(value.strip())
+    if match is None or not (match.group("pre") or match.group("post")):
+        return None
+    return int(match.group("units").replace(",", "")) * 100 + int(match.group("cents") or 0)
+
+
+#: The approval ceiling's allowances, by env (read live). The checkout path has no quote: the buyer
+#: approves, and the token is minted for, an upper bound on what the merchant's checkout can come to.
+A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV = "A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS"
+A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV = "A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR"
+A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV = "A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR"
+CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT = 1500
+CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT = 1000
+CHECKOUT_CEILING_MAX_MINOR_DEFAULT = 20000
+#: How today's ceiling is built (stored in `ceiling_source`): items + the two allowances above.
+CEILING_SOURCE_ALLOWANCE_V1 = "allowance_v1"
+#: The currencies a ceiling is computed in: the token step's (only USD is measured).
+CHECKOUT_CEILING_CURRENCIES = TOKEN_CURRENCIES
+CHECKOUT_PRICE_MISSING = "checkout_price_missing"
+CHECKOUT_CURRENCY_UNSUPPORTED = "checkout_currency_unsupported"
+CHECKOUT_CEILING_OVER_CAP = "checkout_ceiling_over_cap"
+CHECKOUT_CEILING_OVER_RAIL_LIMIT = "checkout_ceiling_over_rail_limit"
+CHECKOUT_ORDER_ID_PREFIX = "pvt-"
+
+
+class CeilingRefused(ValueError):
+    """No ceiling for this row: `code` says why (a ledger code), and whether the purchase is refused or
+    failed (`refused`)."""
+
+    def __init__(self, code: str, *, refused: bool):
+        super().__init__(code)
+        self.code, self.refused = code, refused
+
+
+def _env_int(name: str, default: int, *, low: int, high: int) -> int:
+    """An integer allowance from the env, or `default` (logged) when it is not one in [low, high]."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or not low <= value <= high:
+        logger.warning("a2a_rail_worker: %s is not an integer in [%s, %s]; using %s", name, low, high, default)
+        return default
+    return value
+
+
+def checkout_ceiling(row: Mapping[str, Any]) -> Tuple[int, str]:
+    """THE SEAM: the approval ceiling for a checkout-path purchase, in minor units, and how it was built.
+
+    Today (`allowance_v1`): our price x quantity, plus a tax allowance (A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS,
+    default 1500 = 15%, rounded UP to the cent), plus a shipping allowance
+    (A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR, default 1000), at most A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR
+    (default 20000) and within the rail's own cap for the currency. A merchant's own all-in quote (its UCP
+    checkout) replaces this function and nothing else. Raises `CeilingRefused`; never guesses a price."""
+    currency = str(row.get("currency") or "").upper()
+    if currency not in CHECKOUT_CEILING_CURRENCIES:
+        raise CeilingRefused(CHECKOUT_CURRENCY_UNSUPPORTED, refused=True)
+    price, quantity = row.get("our_price_minor"), row.get("quantity")
+    if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
+        raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
+    bps = _env_int(A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT, low=0, high=10000)
+    shipping = _env_int(A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT,
+                        low=0, high=100_000)
+    cap = _env_int(A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, CHECKOUT_CEILING_MAX_MINOR_DEFAULT, low=1, high=10_000_000)
+    items = price * quantity
+    tax = -(-items * bps // 10000)  # up to the cent
+    ceiling = items + tax + shipping
+    if ceiling > cap:
+        raise CeilingRefused(CHECKOUT_CEILING_OVER_CAP, refused=True)
+    if not rail_router.amount_ok(ceiling, currency):
+        raise CeilingRefused(CHECKOUT_CEILING_OVER_RAIL_LIMIT, refused=True)
+    return ceiling, CEILING_SOURCE_ALLOWANCE_V1
+
+
+def checkout_order_id(purchase_id: str) -> str:
+    """Pivota's order reference for a checkout-path purchase (the token's `external_transaction_id`):
+    deterministic from the purchase id. A dot every 8 characters of the id's hex, so no run of digits
+    is long enough to read as a card number (the ledger refuses one in `order_id`)."""
+    prefix, _, hexpart = str(purchase_id).partition("_")
+    chunks = ".".join(hexpart[i:i + 8] for i in range(0, len(hexpart), 8))
+    return f"{CHECKOUT_ORDER_ID_PREFIX}{prefix}_{chunks}"
+
+
+async def _lock_checkout_order(s: _Step) -> str:
+    """Lock the order for the checkout path (see the module docstring), then run the token step on it."""
+    try:
+        ceiling, source = checkout_ceiling(s.row)
+    except CeilingRefused as refusal:
+        if refusal.refused:
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason=refusal.code)
+            return await _settled(s, moved, "refused")
+        return await _token_failed(s, "quoting", refusal.code)
+    moved = await ledger.lock_checkout_order_as_holder(
+        s.id, s.worker, order_id=checkout_order_id(s.id), quoted_total_minor=ceiling, ceiling_source=source)
+    if moved is None:
+        return await _settled(s, None, "lost")
+    s.row = moved
+    return await _quoting(s)
+
+
+def _checkout_idempotency_key(purchase_id: str) -> str:
+    """Deterministic per purchase: a repeated setup for one purchase is one checkout at the provider."""
+    return f"pvt-{purchase_id}-checkout"
+
+
+def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
+    """What the checkout needs from the row (the address in the door's vocabulary, mapped onto the
+    checkout skill's), or None when it is incomplete. Never logged: it is the buyer's contact."""
+    address = row.get("shipping_address")
+    if not isinstance(address, Mapping) or not row.get("buyer_email") or not row.get("checkout_url"):
+        return None
+    candidate = {
+        "email": row.get("buyer_email"),
+        "first_name": address.get("firstName"),
+        "last_name": address.get("lastName"),
+        "phone": address.get("phone"),
+        "country": str(address.get("country") or "").strip().upper() or None,
+        "address1": address.get("addressLine1"),
+        "address2": address.get("addressLine2"),
+        "city": address.get("city"),
+        "state": address.get("region"),
+        "zip_code": address.get("postalCode"),
+    }
+    shipping = a2a_rail.checkout_shipping({k: v for k, v in candidate.items() if v not in (None, "")})
+    if shipping is None:
+        return None
+    return a2a_rail.CheckoutSetup(
+        checkout_url=str(row["checkout_url"]), shipping=shipping,
+        cardholder_name=f"{shipping['first_name']} {shipping['last_name']}",
+        idempotency_key=_checkout_idempotency_key(str(row["id"])),
+    )
+
+
+def _checkout_inputs(s: _Step) -> Optional[a2a_rail.CheckoutSetup]:
+    """The setup to relay the token with, or None: the checkout dial is off (the token step then runs
+    exactly as it did before the checkout existed), or the contact is incomplete."""
+    if not a2a_rail.checkout_step_enabled():
+        return None
+    return _checkout_setup(s.row)
+
+
+def _checkout_held(row: Mapping[str, Any]) -> bool:
+    return _last_code(row) in _CHECKOUT_HOLD_CODES
+
+
+def _is_checkout_order(row: Mapping[str, Any]) -> bool:
+    """A purchase the checkout step moved to `paying`: a token path row (it has a token id) that is not a
+    VIC order. Only `_setup_answer` moves a token path row to `paying`."""
+    return row.get("state") == "paying" and bool(row.get("payment_token_id")) and _rail_order_id(row) is None
+
+
+def _checkout_schema_ready(row: Mapping[str, Any]) -> bool:
+    """The claimed row carries every checkout column (a row is read with SELECT *): the schema is healed."""
+    return all(column in row for column in _CHECKOUT_COLUMNS)
+
+
+def _definitely_cancelled(result: Any) -> bool:
+    """The cancel's answer says the flow ended with nothing submitted: a card answer with no sign of a
+    submission (no `checkout.await` / `checkout.result` card) and no error card. Prose is NOT definite
+    (a2a_rail rule 3): a text-only answer is held like any other."""
+    if not getattr(result, "ok", False):
+        return False
+    return result.card("checkout.await") is None and result.card("checkout.result") is None
+
+
+def _card_shaped(value: str) -> bool:
+    return bool(_CARD_SHAPED_ORDER_RE.match(value)) and a2a_rail._luhn(value)
+
+
+class _CardTooLarge(Exception):
+    """The confirm card is deeper or larger than the scan reads: refused, never skipped."""
+
+
+def _money_key(key: str) -> bool:
+    canon = "".join(ch for ch in key.lower() if ch.isascii() and ch.isalnum())
+    return canon in _MONEY_KEYS or any(p in canon for p in _MONEY_KEY_PARTS) or canon.endswith(_MONEY_KEY_SUFFIXES)
+
+
+def _usd_minor(text: str) -> Optional[int]:
+    """A USD amount's digits ("1,234.50", "999") in minor units, or None (negative or malformed)."""
+    amount = text.replace(" ", "")
+    if not _USD_AMOUNT_RE.match(amount):
+        return None
+    units, _, cents = amount.partition(".")
+    return int(units.replace(",", "")) * 100 + int(cents or 0)
+
+
+def _foreign_amount(text: str) -> bool:
+    """`text` shows an amount in a currency other than USD."""
+    for index, char in enumerate(text):
+        if char != "$" and unicodedata.category(char) == "Sc":
+            near = text[max(0, index - 2):index] + text[index + 1:index + 3]
+            if any(c.isdigit() for c in near):
+                return True
+    for match in _FOREIGN_DOLLAR_RE.finditer(text):
+        if (match.group(1) or match.group(2) or "").upper() != "US":
+            return True
+    for match in _CURRENCY_CODE_RE.finditer(text):
+        if match.group(1) in _FOREIGN_CODES:
+            near = text[max(0, match.start() - 2):match.start()] + text[match.end():match.end() + 2]
+            if any(c.isdigit() for c in near):
+                return True
+    return False
+
+
+def _bad_money_string(text: str, ceiling: int, money: bool) -> bool:
+    """A string that shows an amount above `ceiling`, a malformed or negative USD amount, an amount in
+    another currency, or (under a money-ish key) a bare number we cannot read."""
+    marked = False
+    for match in _USD_MARKED_RE.finditer(text):
+        marked = True
+        minor = _usd_minor(match.group(1) or match.group(2) or "")
+        # A minus before the mark ("-$5.00") is a negative amount too: malformed for this check.
+        if minor is None or minor > ceiling or text[:match.start()].rstrip().endswith("-"):
+            return True
+    if _foreign_amount(text):
+        return True
+    return money and not marked and bool(_NUMERIC_STRING_RE.match(text))
+
+
+def confirm_card_refused(data: Any, ceiling: Any) -> bool:
+    """True when the confirm card must NOT be confirmed: any monetary amount anywhere in its data (every
+    value and key at any depth, lists included, prose included) is above `ceiling`, malformed, negative, in
+    another currency, or a bare number under a money-ish key; or the card is larger than the scan reads
+    (deeper than _CARD_SCAN_MAX_DEPTH or more than _CARD_SCAN_MAX_NODES values); or there is no ceiling.
+    Non-monetary numbers (zip, phone, ids, cardLast4) are ignored. Pure."""
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+        return True
+    nodes = 0
+
+    def walk(value: Any, depth: int, money: bool) -> bool:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _CARD_SCAN_MAX_NODES or depth > _CARD_SCAN_MAX_DEPTH:
+            raise _CardTooLarge()
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                name = str(key)
+                if _bad_money_string(name, ceiling, False):
+                    return True
+                if walk(item, depth + 1, money or _money_key(name)):
+                    return True
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(walk(item, depth + 1, money) for item in value)
+        if isinstance(value, str):
+            return _bad_money_string(value, ceiling, money)
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return money  # a bare number under a money-ish key: cents or dollars? Not readable.
+        return False
+
+    try:
+        return walk(data, 0, False)
+    except (_CardTooLarge, RecursionError):
+        return True
+
+
+def _lock_valid(row: Mapping[str, Any]) -> bool:
+    """The order lock the token is minted from: a non-empty order reference and a positive ceiling."""
+    order_id, ceiling = row.get("order_id"), row.get("quoted_total_minor")
+    return (
+        isinstance(order_id, str) and bool(order_id.strip())
+        and isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0
+    )
+
+
+async def _hold_before_paying(s: _Step, resolves: Optional[str], code: str) -> str:
+    """Hold a purchase whose setup may have checked out: moved to `paying` (never swept; `_checkout_paying`
+    parks a held row unread) with the hold code, resolving the write held across the relay."""
+    logger.error("a2a_rail_worker: checkout held for a human purchase=%s code=%s", s.id, code)
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["awaiting_authorization"], to_state="paying", resolves_write=resolves,
+        last_error_code=code)
+    await _settled(s, moved, code)
+    return code
+
+
+async def _checkout_hold(s: _Step, code: str) -> str:
+    """Hold a checkout for a human: logged once, and on every later tick parked unread. Any pending write
+    stays (a confirm whose answer nobody saw is never resent)."""
+    logger.error("a2a_rail_worker: checkout held for a human purchase=%s code=%s", s.id, code)
+    await s.release(POLL_PARKED, code)
+    return code
+
+
+async def _checkout_failed(s: _Step, code: str, *, resolves: Optional[str] = None) -> str:
+    if resolves is not None:
+        await ledger.clear_pending_write(s.id, s.worker, resolves)
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["paying"], to_state="failed", last_error_code=code)
+    return await _settled(s, moved, "failed")
+
+
+async def _token_approved(s: _Step, *, resolves: Optional[str], relay: Any) -> str:
+    """The buyer approved: the token is ACTIVE. Without the checkout step, nothing can pay. With it, the
+    relay's setup answer decides. `resolves` is the write held across the relay."""
+    if relay is None:
+        if not a2a_rail.checkout_step_enabled():
+            return await _pay_step_unavailable(s, resolves=resolves)
+        # The dial is on but the setup could not be built (checked again here: the contact may have gone).
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_CONTACT_INCOMPLETE, resolves=resolves)
+    if relay.refused is not None:
+        # This purchase's ACTIVE token, in a shape the checkout card cannot be made from: nothing was sent.
+        logger.warning("a2a_rail_worker: approved token not relayable purchase=%s reason=%s", s.id, relay.refused)
+        return await _token_failed(
+            s, "awaiting_authorization", f"checkout_card_unavailable:{relay.refused}"[:64], resolves=resolves)
+    if relay.checkout is None:
+        # ACTIVE, but not as a token result naming this token (an await card says only its status): there
+        # is no token to relay. The id stays on the row as an orphan for the void.
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_TOKEN_UNAVAILABLE, resolves=resolves)
+    return await _setup_answer(s, resolves, relay.checkout)
+
+
+async def _setup_answer(s: _Step, resolves: Optional[str], setup: Any) -> str:
+    """The checkout's answer to the setup that carried the token. Nothing has been submitted yet."""
+    if getattr(setup, "kind", None) == "money_result":
+        return await _unresolved_write(s, resolves or CHECKOUT_SETUP_ACTION, setup)
+    confirm = setup.card("checkout.confirm") if setup.ok else None
+    if confirm is not None and "confirm" in confirm.action_ids():
+        # The move to `paying` writes a HOLD code: only the confirm's own answer (in this step) replaces it.
+        # A step cut, or a lease lost, from here on leaves the row held: no later tick may confirm it.
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["awaiting_authorization"], to_state="paying", resolves_write=resolves,
+            last_error_code=CHECKOUT_CONFIRM_PENDING_CHECK)
+        if moved is not None and moved.get("claimed_by") == s.worker:
+            # Still held (a live state keeps the lease): checked and confirmed now, with this step's card.
+            s.row = moved
+            return await _checkout_confirm(s, confirm)
+        return await _settled(s, moved, CHECKOUT_CONFIRM_PENDING_CHECK)
+    if setup.ok and (setup.card("checkout.await") is not None or setup.card("checkout.result") is not None):
+        # A submission answering the setup (an idempotency replay, or a provider that checks out on its own):
+        # the order may be in. Held, never failed.
+        return await _hold_before_paying(s, resolves, CHECKOUT_SETUP_SUBMITTED)
+    form = setup.card("checkout.setup") if setup.ok else None
+    if form is not None:
+        # The checkout asks for fields we did not send. The token cannot be had again to send them with.
+        missing = form.data.get("missing_required")
+        names = sorted(str(n) for n in missing if _FIELD_NAME_RE.match(str(n)))[:10] if isinstance(missing, list) else []
+        logger.warning("a2a_rail_worker: checkout setup incomplete purchase=%s missing=%s", s.id, ",".join(names))
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_SETUP_INCOMPLETE, resolves=resolves)
+    if setup.ok:
+        # Cards, with no confirm card and no sign of a submission: nothing was set up to confirm.
+        return await _token_failed(s, "awaiting_authorization", CHECKOUT_SETUP_UNRECOGNISED, resolves=resolves)
+    kind, status = setup.kind, getattr(setup, "http_status", None)
+    if kind == "auth_failed" or (kind == "http_error" and status in _SETUP_REFUSED_4XX):
+        # A definite refusal before anything was set up (validation, credentials, throttle; or nothing sent).
+        return await _token_failed(s, "awaiting_authorization", _code("checkout_setup_refused", setup), resolves=resolves)
+    # Unseen (5xx, timeout, garbled, text only), an error card, a 403 or another ambiguous 4xx (409, ...):
+    # whether the provider went on to check out is unknown. Held, never failed (a failed purchase invites a
+    # second real one).
+    return await _hold_before_paying(s, resolves, CHECKOUT_SETUP_UNRESOLVED)
+
+
+async def _cancel_checkout(s: _Step, fail_code: str) -> str:
+    """Cancel a checkout that must not be confirmed, ONLY in the step that read the bad confirm-card amount
+    (the confirm was never sent). Recorded first (`checkout.confirm#cancel`): a cancel cut or unseen is held,
+    never followed by a confirm. Failed with `fail_code` only on a definite cancel."""
+    if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_CANCEL_ACTION) is None:
+        return "lost"
+    cancelled = await s.send(CHECKOUT_CANCEL, context=s.checkout_context)
+    if getattr(cancelled, "kind", None) == "money_result":
+        return await _unresolved_write(s, CHECKOUT_CANCEL_ACTION, cancelled)
+    if _definitely_cancelled(cancelled):
+        return await _checkout_failed(s, fail_code, resolves=CHECKOUT_CANCEL_ACTION)
+    # Already submitted, unseen, an error, prose: the order may be in. Held, the write kept.
+    return await _checkout_hold(s, CHECKOUT_CANCEL_UNRESOLVED)
+
+
+async def _checkout_confirm(s: _Step, confirm_card: Any) -> str:
+    """Submit the merchant's checkout, IN THE SETUP'S OWN STEP, after checking THIS step's confirm card. A
+    MONEY WRITE: recorded first, never resent on an answer from the provider."""
+    if confirm_card_refused(confirm_card.data, s.row.get("quoted_total_minor")):
+        # An amount on the confirm card we cannot verify against the ceiling (above it, malformed, foreign, a
+        # bare number under a money key; or a card too large to read): never confirmed. Cancelled instead;
+        # nothing has been submitted yet.
+        logger.error("a2a_rail_worker: confirm card amount not within the ceiling purchase=%s; cancelling", s.id)
+        return await _cancel_checkout(s, CHECKOUT_CONFIRM_TOTAL_REFUSED)
+    # NO MONETARY AMOUNT on the card (the provider's documented confirm card has none: merchant, shipping,
+    # cardLast4, cardBrand), or every one within the ceiling: confirm. This rests on the token having been
+    # minted for EXACTLY the ceiling (`amount_cents == quoted_total_minor`, `_start_token`): the provider
+    # fixes the token's amount at mint and the scheme enforces it, so a merchant total above it cannot be
+    # charged to this token. Pinned by tests/test_a2a_rail_checkout.py::
+    # test_the_mint_carries_exactly_the_locked_ceiling_and_the_order_reference.
+    if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_CONFIRM_ACTION) is None:
+        return "lost"
+    # The documented body: {} (no field of ours rides on the money write).
+    result = await s.send(CHECKOUT_CONFIRM, context=s.checkout_context)
+    if getattr(result, "kind", None) == "auth_failed":
+        # Our own token exchange failed: NOTHING was sent (the transport returns before the request). Once
+        # more, in this step, with the same card check; the write-ahead still stands.
+        result = await s.send(CHECKOUT_CONFIRM, context=s.checkout_context)
+    if getattr(result, "kind", None) == "auth_failed":
+        # Still nothing sent: the write is resolved (nothing went out), the purchase held for a human.
+        await ledger.clear_pending_write(s.id, s.worker, CHECKOUT_CONFIRM_ACTION)
+        return await _checkout_hold(s, CHECKOUT_CONFIRM_NOT_SENT)
+    return await _confirm_answer(s, result)
+
+
+async def _confirm_answer(s: _Step, result: Any) -> str:
+    action = CHECKOUT_CONFIRM_ACTION
+    if getattr(result, "kind", None) == "money_result":
+        return await _unresolved_write(s, action, result)
+    if result.ok:
+        final, waiting = result.card("checkout.result"), result.card("checkout.await")
+        card = final or waiting
+        task_id = card.data.get("task_id") if card is not None else None
+        if not (isinstance(task_id, str) and task_id):
+            # An answer that names no task: the order may be in. Held, the write kept.
+            return await _checkout_hold(s, CHECKOUT_CONFIRM_UNRECOGNISED)
+        try:
+            moved = await ledger.record_checkout_task_as_holder(
+                s.id, s.worker, checkout_task_id=task_id, resolves_write=action)
+        except ValueError:
+            return await _checkout_hold(s, CHECKOUT_TASK_INVALID)
+        if moved is None:
+            # Not held any more, or the write is not ours: the confirm stays pending for a human.
+            return await _settled(s, None, "placing")
+        s.row = moved
+        if final is not None:
+            return await _checkout_result(s, final)
+        await s.release(POLL_CHECKOUT, CHECKOUT_PLACING)
+        return "placing"
+    # ONLY ONE ANSWER SAYS "NOT SUBMITTED": a validation 4xx (400, 422). Everything else that is not a task
+    # is held, a 401 and a 429 included (`_CONFIRM_RESEND_4XX` is empty: the provider makes its own
+    # idempotency key per call, and no dedupe of a resent confirm is measured). Text only is held: prose is
+    # not a shape to trust (a2a_rail rule 3), and "your order has been placed" is prose too.
+    kind, status = result.kind, getattr(result, "http_status", None)
+    if kind == "unexpected_text":
+        return await _checkout_hold(s, CHECKOUT_CONFIRM_TEXT_ONLY)
+    if kind == "error_card":
+        # Not measured for a confirm: `recoverable` either way, the order may be in. The write is kept.
+        return await _checkout_hold(s, CHECKOUT_CONFIRM_ERROR_CARD)
+    if kind == "http_error" and status in _CONFIRM_NOT_ACCEPTED_4XX:
+        # A validation refusal: the request was never accepted, so nothing was submitted.
+        return await _checkout_failed(s, _code("checkout_confirm_refused", result), resolves=action)
+    if kind == "http_error" and isinstance(status, int) and 400 <= status < 500:
+        # A conflict or any other 4xx: it may mean the order is already in. Held, the write kept.
+        logger.error("a2a_rail_worker: confirm answered http_status=%s purchase=%s; held", status, s.id)
+        return await _checkout_hold(s, CHECKOUT_CONFIRM_CONFLICT if status == 409 else CHECKOUT_CONFIRM_AMBIGUOUS_4XX)
+    # Unseen (a 408 included: the transport reads it as outcome_unknown on a write): the order may be in. Never resent, and the poll and the lookup both need the task id that
+    # this answer would have carried: held for a human, the write kept.
+    return await _checkout_hold(s, CHECKOUT_CONFIRM_UNRESOLVED)
+
+
+async def _checkout_pending(s: _Step) -> str:
+    """A checkout write nobody saw the answer to (the row holds it)."""
+    row = s.row
+    # Held rows stay unread, EXCEPT the placeholder hold of a move to `paying`: with a write outstanding it is
+    # replaced below by the write's own hold code (still a hold, never a send).
+    if _checkout_held(row) and _last_code(row) != CHECKOUT_CONFIRM_PENDING_CHECK:
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "checkout_held"
+    action = str(row["pending_write"])
+    if _last_code(row) == "worker_error":
+        logger.error("a2a_rail_worker: pending write %s left by a crashed step purchase=%s", action, s.id)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "pending_write_unreconcilable"
+    if action in (CHECKOUT_SETUP_ACTION, CHECKOUT_RELAY_PAID_ACTION) and row.get("state") == "awaiting_authorization":
+        # A relay whose step ended unseen (cut by the scheduler's deadline, an instance kill, a lost lease):
+        # the setup carrying the token may have gone out, and the provider may have checked out. Held,
+        # never resent, never failed.
+        return await _hold_before_paying(s, action, CHECKOUT_SETUP_UNRESOLVED)
+    if action == CHECKOUT_CANCEL_ACTION:
+        return await _checkout_hold(s, CHECKOUT_CANCEL_UNRESOLVED)
+    return await _checkout_hold(s, CHECKOUT_CONFIRM_UNRESOLVED)
+
+
+async def _checkout_paying(s: _Step) -> str:
+    """A checkout in `paying` with no write pending: confirm it (not yet confirmed), or read its progress."""
+    row = s.row
+    if _checkout_held(row):
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "checkout_held"
+    if not a2a_rail.checkout_step_enabled():
+        # The kill switch: nothing sent or read. `paying` is never swept, so nothing ends it meanwhile.
+        await s.release(POLL_PARKED, CHECKOUT_DISABLED)
+        return "parked"
+    if not _checkout_schema_ready(row):
+        # Without the task column a recorded task would read as "not confirmed yet": nothing is sent.
+        logger.error("a2a_rail_worker: checkout columns missing purchase=%s; parked", s.id)
+        await s.release(POLL_PARKED, CHECKOUT_SCHEMA_INCOMPLETE)
+        return "parked"
+    entered = _aware(row.get("state_entered_at"))
+    elapsed = (_now() - entered).total_seconds() if entered else 0.0
+    task_id = row.get("checkout_task_id")
+    if not task_id:
+        # No task, no hold, no pending write: unreachable by design. Whether a confirm went out cannot be
+        # proven here, and a cancel's answer is too weak to end the purchase on: HELD, nothing sent.
+        logger.error("a2a_rail_worker: checkout in paying with no task, hold or pending write purchase=%s", s.id)
+        return await _checkout_hold(s, CHECKOUT_PAYING_WITHOUT_TASK)
+    if elapsed > CHECKOUT_CEILING_SECONDS:
+        return await _checkout_hold(s, CHECKOUT_RESULT_OVERDUE)
+    if elapsed <= CHECKOUT_POLL_CAP_SECONDS:
+        result, wait = await s.send(CHECKOUT_POLL, {"task_id": task_id}, context=s.checkout_context), POLL_CHECKOUT
+    else:
+        result, wait = await s.send(CHECKOUT_LOOKUP, {"task_id": task_id}, context=s.lookup_context), POLL_LOOKUP
+    return await _checkout_progress(s, result, wait)
+
+
+async def _checkout_progress(s: _Step, result: Any, wait: int) -> str:
+    if getattr(result, "kind", None) == "money_result":
+        return await _unresolved_write(s, _action(CHECKOUT_POLL), result)
+    if not result.ok:
+        await s.release(wait, _code("checkout_read", result))
+        return "rail_read_failed"
+    final, waiting = result.card("checkout.result"), result.card("checkout.await")
+    if final is not None:
+        return await _checkout_result(s, final)
+    if waiting is not None:
+        if waiting.data.get("task_id") not in (None, s.row.get("checkout_task_id")):
+            return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
+        await s.release(wait, CHECKOUT_PLACING)
+        return "placing"
+    await s.release(POLL_RETRY, "checkout_answer_unrecognised")
+    return "rail_read_failed"
+
+
+async def _checkout_result(s: _Step, card: Any) -> str:
+    """The merchant's answer, as the provider reports it. Only `payment-reached` with an order id completes."""
+    data = card.data
+    if data.get("task_id") != s.row.get("checkout_task_id"):
+        return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
+    status = str(data.get("status") or "").strip().lower()
+    raw_order = data.get("order_id")
+    order_id = str(raw_order).strip() if isinstance(raw_order, (str, int)) and not isinstance(raw_order, bool) else ""
+    # A store's order NAME is often its number with a leading "#": the number is what is kept.
+    order_id = order_id[1:].strip() if order_id.startswith("#") else order_id
+    if status == "payment-reached":
+        if data.get("success") is not True:
+            return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+        if not order_id:
+            # The checkout reached the payment gateway but the merchant gave no order: a declined card
+            # looks like this, and so might a charge whose order page failed. Not completed; a human checks.
+            logger.error("a2a_rail_worker: checkout reached payment with no order id purchase=%s errors=%s",
+                         s.id, len(data.get("errors") or []) if isinstance(data.get("errors"), list) else 0)
+            return await _checkout_hold(s, CHECKOUT_PAYMENT_NO_ORDER)
+        if _card_shaped(order_id):
+            # A card number in the order id's place (the provider echoing the card): never stored.
+            return await _checkout_hold(s, CHECKOUT_ORDER_ID_CARD_SHAPED)
+        total = checkout_total_minor(data.get("total"), s.row.get("currency"))
+        approved = s.row.get("quoted_total_minor")
+        if total is None or total <= 0 or not isinstance(approved, int) or isinstance(approved, bool):
+            # COMPLETED ONLY ON A VERIFIED TOTAL. Unreadable, another currency ("€230.00", "CA$250.00",
+            # "$250.00 CAD"), a bare "250.00", or $0.00 (on a positive ceiling more likely a misread than a
+            # free order): the ceiling cannot be checked. Held for a human.
+            return await _checkout_hold(s, CHECKOUT_TOTAL_UNVERIFIED)
+        if total > approved:
+            # The scheme holds the token to its amount, but a merchant total above it must be noticed.
+            return await _checkout_hold(s, CHECKOUT_TOTAL_OVER_APPROVED)
+        code = None
+        try:
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["paying"], to_state="completed",
+                merchant_order_id=order_id, final_total_minor=total, last_error_code=code)
+        except ValueError:
+            # An order reference we will not store. The order is in: completed, without it, and said so.
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["paying"], to_state="completed",
+                final_total_minor=total, last_error_code=CHECKOUT_ORDER_REFERENCE_INVALID)
+        return await _settled(s, moved, "completed")
+    if status in _CHECKOUT_NOT_SUBMITTED:
+        if data.get("success") is not False:
+            # "Not submitted" with `success` true (or missing): a contradictory answer. Held.
+            return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+        return await _checkout_failed(s, f"checkout_{status.replace('-', '_')}")
+    if status in _CHECKOUT_UNKNOWN:
+        return await _checkout_hold(s, _CHECKOUT_UNKNOWN[status])
+    return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+
+
 #: The park reason when the token step is refused because this is production (not just dialled off).
 TOKEN_STEP_REFUSED_PRODUCTION = "token_step_refused_production"
 #: The refusal is logged at ERROR at most this often (per process) while the dial is on in production.
@@ -1221,9 +2132,10 @@ def _token_step_dial_on() -> bool:
 
 
 def token_step_enabled() -> bool:
-    """The token step may run: its dial is on AND this is not production. In production the step is
-    REFUSED in code (a2a_rail rule 6), whatever A2A_RAIL_TOKEN_STEP_ENABLED says: it would make Pivota
-    receive a network token and cryptogram. Every caller of this gate then behaves as with the dial off."""
+    """The token step may run: its dial is on AND it is not refused for production. In production the
+    step is REFUSED in code (a2a_rail rule 6) unless the checkout relay's dial is on too, whatever
+    A2A_RAIL_TOKEN_STEP_ENABLED says: it hands Pivota a network token and cryptogram, allowed only to be
+    relayed into the provider's checkout. Every caller of this gate then behaves as with the dial off."""
     global _token_step_refusal_logged_at
     if a2a_rail.token_step_refused_in_production():
         if _token_step_dial_on():
@@ -1235,8 +2147,10 @@ def token_step_enabled() -> bool:
                 _token_step_refusal_logged_at = now
                 logger.error(
                     "a2a_rail_worker: %s is set but the A2A token step is REFUSED in production "
-                    "(it would hand Pivota a network token and cryptogram); purchases park as %s",
-                    A2A_RAIL_TOKEN_STEP_ENABLED_ENV, TOKEN_STEP_REFUSED_PRODUCTION,
+                    "(it hands Pivota a network token and cryptogram, allowed only for the checkout relay, "
+                    "and %s is off); purchases park as %s",
+                    A2A_RAIL_TOKEN_STEP_ENABLED_ENV, a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV,
+                    TOKEN_STEP_REFUSED_PRODUCTION,
                 )
         return False
     return _token_step_dial_on()
@@ -1250,10 +2164,33 @@ async def _quoting(s: _Step) -> str:
     row = s.row
     if _vic_on(s) and not row.get("payment_token_id"):
         return await _start_vic_order(s)
+    checkout_path = a2a_rail.checkout_step_enabled() and token_step_enabled()
+    if checkout_path and not _checkout_schema_ready(row):
+        # The checkout path on a half-healed schema (migrations 287/288): it must never place an order.
+        # Parked, nothing sent; the next tick after the heal goes on.
+        logger.error("a2a_rail_worker: checkout columns missing purchase=%s; parked", s.id)
+        await s.release(POLL_PARKED, CHECKOUT_SCHEMA_INCOMPLETE)
+        return "parked"
+    if (
+        checkout_path and not row.get("payment_token_id")
+        and (row.get("order_id") or row.get("quoted_total_minor") is not None) and not _lock_valid(row)
+    ):
+        # Half a lock, or a ceiling that is not a positive amount: the token would be minted for the wrong
+        # amount or reference. Never minted.
+        return await _token_failed(s, "quoting", CHECKOUT_LOCK_INVALID)
     if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
         if not token_step_enabled():
             return await _parked(s, _token_step_off_reason())
+        if a2a_rail.checkout_step_enabled() and _checkout_setup(row) is None:
+            # The token would be relayed into a checkout that cannot be filled: no token is minted.
+            return await _token_failed(s, "quoting", CHECKOUT_CONTACT_INCOMPLETE)
         return await _start_token(s)
+    if (
+        a2a_rail.checkout_step_enabled() and token_step_enabled() and row.get("payment_method_id")
+        and not row.get("order_id") and row.get("quoted_total_minor") is None and not row.get("payment_token_id")
+    ):
+        # The checkout path: no quote exists before ordering, so Pivota locks the order itself.
+        return await _lock_checkout_order(s)
     # Not locked yet (the quote and the lock are the order protocol's), or a token is already recorded
     # (a re-quote must void it first): nothing here may act.
     return await _parked(s)
@@ -1296,6 +2233,9 @@ async def step(client: Any, row: Mapping[str, Any], worker: str, *, vic: Optiona
         # Before `_reconcile`: a VIC order's pending write is resolved by READING the rail's order (its
         # status), which is safe after any crash; nothing here resends a VIC write.
         return await _vic_pending(s)
+    if row.get("pending_write") in _CHECKOUT_WRITES:
+        # Before `_reconcile`: a checkout write is never resent (the confirm submits the order).
+        return await _checkout_pending(s)
     if row.get("pending_write"):
         return await _reconcile(s)
     state = str(row.get("state") or "")
@@ -1312,6 +2252,8 @@ async def step(client: Any, row: Mapping[str, Any], worker: str, *, vic: Optiona
         if _is_vic_order(row):
             stopped = await _vic_gate(s)
             return stopped if stopped is not None else await _vic_paying(s)
+        if _is_checkout_order(row):
+            return await _checkout_paying(s)
         return await _parked(s)
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover - claims only return non-terminal states
