@@ -240,7 +240,7 @@ _ADD_CEILING_SOURCE_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
 )
 _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_source VARCHAR(32)"
-# Migration 289: how many times a held checkout was looked up, counted BEFORE each lookup goes out
+# Migration 290: how many times a held checkout was looked up, counted BEFORE each lookup goes out
 # (`count_checkout_lookup_as_holder`), so a crash mid-lookup still counts. Nullable, no default, like 287.
 _ADD_CHECKOUT_LOOKUPS_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
@@ -266,7 +266,7 @@ _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchas
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288 and 289. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287, 288 and 290. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)

@@ -1,4 +1,4 @@
--- 289: HOW MANY TIMES A HELD A2A CHECKOUT WAS LOOKED UP (payment orchestration, the checkout relay).
+-- 290: HOW MANY TIMES A HELD A2A CHECKOUT WAS LOOKED UP (payment orchestration, the checkout relay).
 --
 -- A checkout held because an answer was never seen is looked up, read-only, by Pivota's idempotency key
 -- (a2a_rail_worker._checkout_lookup). Each lookup is counted HERE, write-ahead, before it is sent

@@ -2110,7 +2110,7 @@ def _lookup_eligible(row: Mapping[str, Any]) -> bool:
         and code not in _CHECKOUT_PAYMENT_REACHED_CODES
         and a2a_rail.checkout_step_enabled() and _checkout_schema_ready(row)
         and _paying_seconds(row) <= CHECKOUT_LOOKUP_WINDOW_SECONDS
-        # Counted write-ahead (migration 289); a row read without the column is never looked up.
+        # Counted write-ahead (migration 290); a row read without the column is never looked up.
         and "checkout_lookups" in row and int(row.get("checkout_lookups") or 0) < CHECKOUT_LOOKUP_MAX_TRIES
     )
 

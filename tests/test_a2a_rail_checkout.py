@@ -888,7 +888,7 @@ def test_no_provider_or_store_name_is_in_the_new_code():
         "services/payment_orchestration/a2a_purchase_view.py", "db/a2a_rail_ledger.py", "db/agent_purchase_ledger.py",
         "db/migrations/287_a2a_rail_checkout_task_id.sql", "db/migrations/down/287_a2a_rail_checkout_task_id_down.sql",
         "db/migrations/288_a2a_rail_ceiling_source.sql", "db/migrations/down/288_a2a_rail_ceiling_source_down.sql",
-        "db/migrations/289_a2a_rail_checkout_lookups.sql", "db/migrations/down/289_a2a_rail_checkout_lookups_down.sql",
+        "db/migrations/290_a2a_rail_checkout_lookups.sql", "db/migrations/down/290_a2a_rail_checkout_lookups_down.sql",
         "routes/agent_internal_commerce_purchases.py", "tests/test_agent_internal_commerce_purchases.py",
         "tests/test_agent_internal_commerce_purchases_postgres.py",
         "tests/test_a2a_rail_checkout.py", "tests/test_a2a_rail_checkout_postgres.py", "tests/test_a2a_rail_client.py",
@@ -1069,16 +1069,16 @@ async def test_with_either_dial_off_an_unlocked_purchase_parks_exactly_as_before
     assert "ceiling_source" not in view.build_view(row)["totals"]
 
 
-def test_migration_289_holds_the_columns_ddl():
+def test_migration_290_holds_the_columns_ddl():
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[1]
-    up = (repo / "db/migrations/289_a2a_rail_checkout_lookups.sql").read_text("utf-8")
+    up = (repo / "db/migrations/290_a2a_rail_checkout_lookups.sql").read_text("utf-8")
     squash = lambda text: " ".join(text.split())  # noqa: E731
     assert squash(ledger._ADD_CHECKOUT_LOOKUPS_PG) in squash(up)
     assert "ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER" in ledger._HEAL_CHECKOUT_COLUMNS_PG
     assert "schema-guard-exempt:" in up
-    down = (repo / "db/migrations/down/289_a2a_rail_checkout_lookups_down.sql").read_text("utf-8")
+    down = (repo / "db/migrations/down/290_a2a_rail_checkout_lookups_down.sql").read_text("utf-8")
     assert "DROP COLUMN IF EXISTS checkout_lookups" in down
 
 
@@ -3152,7 +3152,7 @@ async def test_a_row_read_without_the_lookup_counter_is_never_looked_up():
     if row is None:
         await _ago("next_poll_at", 1, pid)
         [row] = [r for r in await ledger.claim_due_purchases(W, limit=5) if r["id"] == pid]
-    row = {k: v for k, v in row.items() if k != "checkout_lookups"}  # a half-healed schema (migration 289)
+    row = {k: v for k, v in row.items() if k != "checkout_lookups"}  # a half-healed schema (migration 290)
     rail = Rail().on("checkout.lookup#submit", _checkout_result())
     assert await worker.step(_client(rail), row, W) == "checkout_held" and rail.sent == []
 

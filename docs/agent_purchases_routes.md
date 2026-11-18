@@ -167,7 +167,7 @@ the pending check, paying without a task, a prose / unrecognised / error-card co
 asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purchase id>-checkout`), read-only,
 in its own conversation. The first lookup comes when the hold's own park ends, about 10 minutes after the
 hold (`POLL_PARKED`); then again each time the time in `paying` has doubled, within 4 hours, and at most 9
-times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 289), so a
+times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 290), so a
 crash in the middle of one still counts. A definite result goes through the ordinary result rules
 (completed only on a verified total; a held code stays held), EXCEPT that a "not submitted" answer on a task
 the purchase never recorded keeps the hold (nothing yet ties a lookup's answer to our checkout); an await
