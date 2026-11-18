@@ -56,6 +56,10 @@ steps:
     entrypoint: python3
     args: [/workspace/release/scripts/ops/seed_batch_launch.py, web, --release, "${_RELEASE}", --digest, "${_DIGEST}",
            --named-sha256, "${_NAMED_SHA256}"]
+  - id: lock
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, lock, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}"]
   - id: deploy
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: python3

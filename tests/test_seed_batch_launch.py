@@ -148,3 +148,43 @@ def test_summary_is_ok_only_for_one_clean_batch_line():
         result = launch.summarise(job.parse_result_lines(_lines(*rows)), mode="apply", execution="x")
         assert not result["ok"] and result["decision"] is None
     assert not launch.summarise([], mode="plan", execution=None)["ok"]
+
+
+def _fake_gcloud(monkeypatch, *, cp_rc=0, generation="17"):
+    calls = []
+
+    def fake(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["gcloud", "storage", "cp"] and "--if-generation-match=0" in args:
+            return launch.subprocess.CompletedProcess(args, cp_rc, stdout="", stderr="precondition failed" if cp_rc else "")
+        if args[:4] == ["gcloud", "storage", "objects", "describe"]:
+            return launch.subprocess.CompletedProcess(args, 0, stdout=json.dumps({"generation": generation}), stderr="")
+        return launch.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    return calls
+
+
+def test_lock_is_created_only_if_absent_and_released_by_its_generation(monkeypatch, tmp_path):
+    monkeypatch.setattr(launch, "WORK", tmp_path)
+    calls = _fake_gcloud(monkeypatch)
+    launch.cmd_lock(type("A", (), {"batch_id": "batch-one", "mode": "apply"})())
+    create = calls[0]
+    assert "--if-generation-match=0" in create and create[-1] == "gs://pivota-prod-ops-locks/seed-batch.lock"
+    assert launch.release_lock() == "lock 17 released"
+    assert calls[-1] == ["gcloud", "storage", "rm", "--if-generation-match=17", "gs://pivota-prod-ops-locks/seed-batch.lock"]
+
+
+def test_a_held_lock_refuses_the_batch(monkeypatch, tmp_path):
+    monkeypatch.setattr(launch, "WORK", tmp_path)
+    _fake_gcloud(monkeypatch, cp_rc=1)
+    with pytest.raises(launch.LaunchRefused, match="another seed batch holds the lock"):
+        launch.cmd_lock(type("A", (), {"batch_id": "batch-one", "mode": "apply"})())
+    assert launch.release_lock() == "no lock held by this build"
+
+
+def test_lock_step_runs_after_gate_and_web_and_before_deploy():
+    import yaml
+
+    steps = [s["id"] for s in yaml.safe_load(open("infra/gcp/cloudbuild.seed_batch.yaml"))["steps"]]
+    assert steps == ["release-scripts", "digest-is-the-release-tag", "gate", "web", "lock", "deploy", "execute", "publish"]

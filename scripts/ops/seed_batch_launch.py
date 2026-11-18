@@ -5,6 +5,9 @@ by the build's first step, so the launcher is always the reviewed release's own 
 
   gate      run scripts/ops/oneoff_gate.py; write gate.json only on a literal last line GATE_OPEN
   web       web's single 100% revision runs the release (tag or its digest) with the named-referral mount + pin
+  lock      take the batch lock: create gs://<lock bucket>/seed-batch.lock with ifGenerationMatch=0 (the gate is
+            not a lock; two batches must never overlap). Released by `publish`; a build that fails between lock
+            and publish leaves it held (fail closed) until an operator removes it by its generation
   deploy    create/replace the reviewed-seed-batch-<batch> job spec (no execution)
   execute   run it once and wait, then read its SEED_BATCH_RESULT lines from Cloud Logging
   publish   write log.txt, rows.json and LAST result.json to gs://<receipts bucket>/seed-batch/<batch>/<build>/
@@ -36,6 +39,8 @@ NAMED_FILE = "named_referral_variants.json"
 BATCH_MOUNT = "/var/run/pivota-seed-batch"
 WORK = Path(os.getenv("SEED_BATCH_WORKDIR", "/workspace/seed-batch"))
 MODES = ("plan", "apply", "rollback")
+LOCK_BUCKET = "pivota-prod-ops-locks"
+LOCK_OBJECT = "seed-batch.lock"
 
 
 class LaunchRefused(RuntimeError):
@@ -151,6 +156,33 @@ def cmd_web(args) -> None:
     print("web revision:", check_web(service, release=args.release, digest=args.digest, named_sha256=args.named_sha256))
 
 
+def lock_url() -> str:
+    return f"gs://{LOCK_BUCKET}/{LOCK_OBJECT}"
+
+
+def cmd_lock(args) -> None:
+    body = {"build": os.getenv("BUILD_ID"), "batch_id": args.batch_id, "mode": args.mode,
+            "at": datetime.now(timezone.utc).isoformat()}
+    (WORK / "lock.json").write_text(json.dumps(body))
+    done = subprocess.run(["gcloud", "storage", "cp", "--if-generation-match=0", str(WORK / "lock.json"), lock_url()],
+                          capture_output=True, text=True, timeout=120, check=False)
+    require(done.returncode == 0, f"another seed batch holds the lock ({done.stderr.strip()[-200:]})")
+    described = json.loads(run(["gcloud", "storage", "objects", "describe", lock_url(), "--format", "json"]))
+    generation = str(described.get("generation") or "")
+    require(re.fullmatch(r"[0-9]+", generation), "lock object has no generation")
+    (WORK / "lock.generation").write_text(generation)
+    print("lock held:", generation)
+
+
+def release_lock() -> str:
+    path = WORK / "lock.generation"
+    if not path.exists():
+        return "no lock held by this build"
+    generation = path.read_text().strip()
+    run(["gcloud", "storage", "rm", f"--if-generation-match={generation}", lock_url()])
+    return f"lock {generation} released"
+
+
 def cmd_deploy(args) -> None:
     secrets = {name: tuple(json.loads(value)) for name, value in (
         ("MANIFEST", args.manifest), ("PLAN", args.plan), ("APPROVAL", args.approval), ("RECEIPTS", args.receipts),
@@ -188,12 +220,13 @@ def cmd_publish(args) -> None:
         (WORK / name).write_text(content)
         run(["gcloud", "storage", "cp", "--no-clobber", str(WORK / name), f"{prefix}/{name}"])
     print(json.dumps(result, indent=1))
+    print(release_lock())
     require(result["ok"], "batch did not finish cleanly; read result.json")
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("gate", "web", "deploy", "execute", "publish"))
+    parser.add_argument("command", choices=("gate", "web", "lock", "deploy", "execute", "publish"))
     parser.add_argument("--scripts", default="/workspace/release/scripts")
     for name in ("mode", "batch-id", "release", "digest", "named-sha256", "manifest", "plan", "receipts", "named",
                  "approval", "bucket"):
@@ -201,7 +234,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     WORK.mkdir(parents=True, exist_ok=True)
     try:
-        {"gate": cmd_gate, "web": cmd_web, "deploy": cmd_deploy, "execute": cmd_execute, "publish": cmd_publish}[
+        {"gate": cmd_gate, "web": cmd_web, "lock": cmd_lock, "deploy": cmd_deploy, "execute": cmd_execute,
+         "publish": cmd_publish}[
             args.command](args)
     except (LaunchRefused, subprocess.TimeoutExpired, OSError, ValueError, KeyError) as error:
         print(f"LAUNCH_REFUSED {args.command}: {type(error).__name__}: {error}", flush=True)
