@@ -78,8 +78,18 @@ def load(path: Path = REGISTRY_PATH) -> Dict[str, Dict[str, Any]]:
 MARKETS: Dict[str, Dict[str, Any]] = load()
 
 
+_ASCII_MARKET_CODE = re.compile(r"[A-Za-z]{2}")
+
+
 def normalize_market(code: Any) -> str:
-    return str(code or "").strip().upper()
+    """`code` trimmed, upper-cased when it is two ASCII letters. The shape is checked BEFORE upcasing:
+    Unicode case mapping turns lookalikes into ASCII ('uſ' -> 'US', the ligature 'ﬁ' -> 'FI'), which then
+    matched a listed market. Any other value is returned trimmed, upcased only when it is ASCII ('usa' ->
+    'USA', as before), so it is reported as itself and matches no market (every key is two ASCII letters)."""
+    text = str(code or "").strip()
+    if _ASCII_MARKET_CODE.fullmatch(text) or text.isascii():
+        return text.upper()
+    return text
 
 
 def market(code: Any) -> Dict[str, Any]:

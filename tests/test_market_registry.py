@@ -84,3 +84,33 @@ def test_generator_writes_and_checks(tmp_path):
     assert gen.main(["--check", str(target)]) == 0
     target.write_text(target.read_text().replace('"SGD"', '"XXX"'))
     assert gen.main(["--check", str(target)]) == 1
+
+
+# UNICODE LOOKALIKES ARE NOT MARKETS. The shape is checked BEFORE upcasing: case mapping turned 'uſ' (long s) into
+# 'US' and the ligature 'ﬁ' into 'FI', which then matched a listed market.
+_LOOKALIKES = ["uſ", "ﬁ", "ＵＳ", "ｕｓ", "УС", "ЅG", "ıt", "İT", "ſg", "Uſ"]
+_PRICED = ["US", "SG", "GB", "JP", "FR", "HR", "FI", "AU", "SE", "KR", "HK", "CA"]
+
+
+@pytest.mark.parametrize("raw", _LOOKALIKES)
+def test_a_unicode_lookalike_is_no_listed_market(raw):
+    assert reg.normalize_market(raw) == raw.strip(), "returned as itself, never folded to ASCII"
+    assert reg.market_or_none(raw) is None
+    with pytest.raises(ValueError):
+        reg.market(raw)
+
+
+@pytest.mark.parametrize("raw, code", [("us", "US"), (" US ", "US"), ("\tsg\n", "SG"), ("Gb", "GB")])
+def test_two_ascii_letters_are_trimmed_and_upcased_as_before(raw, code):
+    assert reg.normalize_market(raw) == code
+    assert reg.market_or_none(raw) is not None
+
+
+@pytest.mark.parametrize("raw, out", [("usa", "USA"), ("eu-de", "EU-DE"), ("", ""), (None, ""), (" ", "")])
+def test_other_ascii_values_normalise_exactly_as_before(raw, out):
+    assert reg.normalize_market(raw) == out
+
+
+def test_the_twelve_priced_markets_still_normalise_to_themselves():
+    for code in _PRICED:
+        assert reg.normalize_market(code.lower()) == code and reg.market_or_none(code) is not None, code
