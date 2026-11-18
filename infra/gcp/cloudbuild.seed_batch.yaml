@@ -1,0 +1,74 @@
+# Reviewed seed batch launcher (pivota-prod). Runs ENTIRELY in Google Cloud; nothing runs on a laptop.
+#
+#   gcloud builds submit --no-source --async --project pivota-prod --region us-west1 \
+#     --config infra/gcp/cloudbuild.seed_batch.yaml \
+#     --service-account projects/pivota-prod/serviceAccounts/sa-ops-launcher@pivota-prod.iam.gserviceaccount.com \
+#     --substitutions=_MODE=plan,_BATCH_ID=<slug>,_RELEASE=<40-hex>,_DIGEST=sha256:<64-hex>,_NAMED_SHA256=<64-hex>,\
+#       _MANIFEST='["<secret>",<version>,"<sha256>"]',_NAMED='["named-referral-variants-manifest",<version>,"<sha256>"]'
+#   (apply adds _PLAN and _APPROVAL; rollback adds _RECEIPTS)
+#
+# Step 1 copies scripts/ out of the RELEASE IMAGE (by digest), so every launcher step runs the reviewed release's
+# own code, and checks the digest is the release tag's digest. Every step fails closed. `publish` writes
+# log.txt, rows.json and result.json (LAST) to the receipts bucket; result.json is the one object to verify from.
+substitutions:
+  _MODE: ""
+  _BATCH_ID: ""
+  _RELEASE: ""
+  _DIGEST: ""
+  _NAMED_SHA256: ""
+  _MANIFEST: ""
+  _PLAN: ""
+  _RECEIPTS: ""
+  _NAMED: ""
+  _APPROVAL: ""
+  _BUCKET: pivota-prod-ops-receipts
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: false
+timeout: 3600s
+steps:
+  - id: release-scripts
+    name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        test "$(cat /app/.image_commit_sha)" = "${_RELEASE}"
+        mkdir -p /workspace/release /workspace/seed-batch
+        cp -r /app/scripts /workspace/release/scripts
+        cp -r /app/services /workspace/release/services
+  - id: digest-is-the-release-tag
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        tag_digest="$(gcloud artifacts docker images describe us-west1-docker.pkg.dev/pivota-shared/pivota/backend:${_RELEASE} --format 'value(image_summary.digest)')"
+        test "$tag_digest" = "${_DIGEST}"
+  - id: gate
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, gate]
+  - id: web
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, web, --release, "${_RELEASE}", --digest, "${_DIGEST}",
+           --named-sha256, "${_NAMED_SHA256}"]
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, deploy, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}",
+           --release, "${_RELEASE}", --digest, "${_DIGEST}", --manifest, "${_MANIFEST}", --plan, "${_PLAN}",
+           --receipts, "${_RECEIPTS}", --named, "${_NAMED}", --approval, "${_APPROVAL}"]
+  - id: execute
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, execute]
+    allowFailure: true
+  - id: publish
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: python3
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, publish, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}",
+           --release, "${_RELEASE}", --bucket, "${_BUCKET}"]
