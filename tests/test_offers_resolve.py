@@ -4511,6 +4511,316 @@ def test_catalog_offers_arm_sources_only_retailer_offers(
     assert all(o["merchant_id"] != "cosrx_direct" for o in offers)
 
 
+# --- catalog_offers arm: a merchant-scoped (merchant_id, source product id) ref -------------------
+#
+# Search hands out `canonical_product_ref` as (merchant_id, product_id = the listing's
+# source_product_id). The arm matched only a signature, content_key or product_key, so that ref found
+# no catalog offer at all. The ONE live listing the merchant holds under that source id now joins by
+# its product_key. Made-up ids and placeholder hosts throughout.
+
+_SCOPED_MERCHANT = "merch_obs_0a1b2c3d4e5f6071"
+_SCOPED_OTHER_MERCHANT = "merch_obs_8f7e6d5c4b3a2910"
+_SCOPED_HEX = "c0ffee00" * 4
+_SCOPED_SOURCE_ID = f"retailer:{_SCOPED_HEX}"
+_SCOPED_LISTING_KEY = f"ext:retailer:{_SCOPED_HEX}"
+_SCOPED_OFFER_ROW = {
+    **_CATALOG_OFFER_ROW,
+    "offer_id": "of_scoped_1",
+    "product_key": _SCOPED_LISTING_KEY,
+    "merchant_id": _SCOPED_MERCHANT,
+    "merchant_name": "Placeholder Retailer",
+    "currency": "USD",
+    "price_amount": 12.50,
+    "destination_url": "https://retailer.example.test/products/lip-tint",
+    "content_key": "ck_" + "d00d" * 8,
+}
+
+
+def _is_scoped_listing_lookup(query: str, values=None) -> bool:
+    """Routed on the statement's own binds, never on its text."""
+    v = values or {}
+    return "FROM catalog_products" in str(query) and {"merchant_id", "platforms", "aliases"} <= set(v)
+
+
+def _scoped_fetch_all(*, listings, lookup_error=None, honour_market=True, seen=None):
+    """`listings`: (merchant_id, source_product_id, product_key[, platform]) rows the lookup can find
+    (platform defaults to the seed platform). The fake applies the merchant, platform and source id
+    filters as the database would. The catalog statement answers the US/USD offer only when its listing
+    key is among the bound aliases and, with `honour_market`, only as its `o.market` conjunct would."""
+
+    async def fake_fetch_all(query: str, values=None):
+        values = values or {}
+        if seen is not None:
+            seen.append((str(query), dict(values)))
+        if _is_scoped_listing_lookup(query, values):
+            if lookup_error is not None:
+                raise lookup_error
+            rows = []
+            for listing in listings:
+                merchant, source_id, key = listing[:3]
+                platform = listing[3] if len(listing) > 3 else "external_seed"
+                if (merchant == values["merchant_id"] and platform in values["platforms"]
+                        and source_id in values["aliases"]):
+                    rows.append({"product_key": key})
+            return rows[:2]
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            if _SCOPED_LISTING_KEY not in (values.get("aliases") or []):
+                return []
+            if honour_market and values.get("market") not in (None, "US"):
+                return []
+            return [dict(_SCOPED_OFFER_ROW)]
+        return []
+
+    return fake_fetch_all
+
+
+def _post_scoped(client, *, merchant_id=_SCOPED_MERCHANT, product_id=_SCOPED_SOURCE_ID, market="US"):
+    product = {"product_id": product_id, **({"merchant_id": merchant_id} if merchant_id else {})}
+    payload = {"product": product, "limit": 10, "tool": "*", "commerce_surface": "agent_api",
+               **({"market": market} if market is not None else {})}
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload, "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    return res.json()
+
+
+def _scoped_setup(monkeypatch, fake_fetch_all):
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(
+        gateway, "_make_external_redirect_url",
+        AsyncMock(return_value="https://example.com/r?token=catalog"))
+
+
+def _catalog_binds(seen):
+    return [v for q, v in seen if "FROM catalog_products" in q and "JOIN catalog_offers" in q]
+
+
+def test_a_merchant_scoped_source_product_ref_serves_its_listings_catalog_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
+    body = _post_scoped(client)
+    offers = body.get("offers") or []
+    assert [o["source"]["offer_id"] for o in offers] == ["of_scoped_1"]
+    assert offers[0]["merchant_id"] == _SCOPED_MERCHANT
+    assert offers[0]["url"] == "https://retailer.example.test/products/lip-tint"
+    assert offers[0]["price"] == 12.5 and offers[0]["currency"] == "USD"
+    # The lookup is merchant-exact and bounded, and the listing key is ADDED to the caller's aliases.
+    lookups = [v for q, v in seen if _is_scoped_listing_lookup(q, v)]
+    assert len(lookups) == 1
+    assert lookups[0]["merchant_id"] == _SCOPED_MERCHANT
+    assert lookups[0]["platforms"] == ["external_seed"]
+    assert lookups[0]["aliases"] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
+    lookup_sql = next(q for q, v in seen if _is_scoped_listing_lookup(q, v))
+    assert "LIMIT 2" in lookup_sql
+    assert "merchant_id = :merchant_id" in lookup_sql and "platform = ANY(:platforms)" in lookup_sql
+    assert "source_product_id = ANY(:aliases)" in lookup_sql
+    assert "suppressed_at IS NULL" in lookup_sql and "suppression_reason IS NULL" in lookup_sql
+    (binds,) = _catalog_binds(seen)
+    assert binds["aliases"][:-1] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
+    assert binds["aliases"][-1] == _SCOPED_LISTING_KEY
+    assert binds["market"] == "US" and binds["buyer_currency"] == "USD"
+
+
+def test_a_source_product_ref_under_another_merchant_finds_no_listing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
+    body = _post_scoped(client, merchant_id=_SCOPED_OTHER_MERCHANT)
+    assert (body.get("offers") or []) == []
+    (binds,) = _catalog_binds(seen)
+    assert _SCOPED_LISTING_KEY not in binds["aliases"]
+
+
+def test_a_source_product_ref_naming_two_listings_names_none(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(listings=[
+        (_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY),
+        (_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, f"ext:retailer:{'beef0000' * 4}"),
+    ], seen=seen))
+    body = _post_scoped(client)
+    assert (body.get("offers") or []) == []
+    (binds,) = _catalog_binds(seen)
+    assert _SCOPED_LISTING_KEY not in binds["aliases"]
+
+
+def test_a_failed_listing_lookup_leaves_the_answer_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    def shape(body):
+        return {
+            "offers": body.get("offers"),
+            "offers_count": body.get("offers_count"),
+            "resolution_mode": body.get("resolution_mode"),
+            "sources": [
+                (s.get("source"), s.get("status"), s.get("reason_code"), s.get("row_count"))
+                for s in (body.get("metadata") or {}).get("sources") or []
+            ],
+        }
+
+    _scoped_setup(monkeypatch, _scoped_fetch_all(listings=[]))
+    baseline = shape(_post_scoped(client))
+    for error in (RuntimeError("db down"), asyncio.TimeoutError()):
+        _scoped_setup(monkeypatch, _scoped_fetch_all(
+            listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], lookup_error=error))
+        with caplog.at_level(logging.WARNING, logger="routes.agent_shop_gateway"):
+            failed = shape(_post_scoped(client))
+        assert failed == baseline, type(error).__name__
+        assert any("merchant_listing_lookup.failed" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+    # The catalog arm itself still ran (its own source entry, not an error).
+    assert ("catalog_offers", "empty", "no_candidates", 0) in baseline["sources"]
+
+
+def test_a_gb_request_gets_no_us_dollar_offer_through_a_merchant_scoped_ref(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Even with the market conjunct ignored (the fake hands back the US/USD offer whatever market is
+    bound), the buyer-currency rule withholds it from a GB buyer."""
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], honour_market=False, seen=seen))
+    body = _post_scoped(client, market="GB")
+    assert (body.get("offers") or []) == []
+    (binds,) = _catalog_binds(seen)
+    assert binds["market"] == "GB" and binds["buyer_currency"] == "GBP"
+    assert binds["aliases"][-1] == _SCOPED_LISTING_KEY, "the listing was found; the market withheld its offer"
+
+
+@pytest.mark.parametrize("market", ["US", "SG", "GB", "DE", None, "ZZ"])
+def test_every_market_cell_answers_the_merchant_scoped_ref_as_the_listing_key_itself(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    """The merchant-scoped ref is answered exactly as the listing's own product_key is, market by
+    market: same offers, same binds (the market and its currency are never defaulted or rewritten)."""
+
+    def answer(**kwargs):
+        seen: list = []
+        _scoped_setup(monkeypatch, _scoped_fetch_all(
+            listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
+        body = _post_scoped(client, market=market, **kwargs)
+        (binds,) = _catalog_binds(seen)
+        return [(o["source"]["offer_id"], o["price"], o["currency"]) for o in body.get("offers") or []], binds
+
+    scoped, scoped_binds = answer()
+    direct, direct_binds = answer(merchant_id=None, product_id=_SCOPED_LISTING_KEY)
+    assert scoped == direct
+    for key in ("market", "buyer_currency", "limit", "unavailable"):
+        assert scoped_binds[key] == direct_binds[key], key
+    assert scoped_binds["market"] == market
+    expected_currency = {"US": "USD", "SG": "SGD", "GB": "GBP"}.get(market)
+    assert scoped_binds["buyer_currency"] == expected_currency
+    # Served only where the offer's own market and currency can be: US, or no market stated.
+    assert bool(scoped) is (market in ("US", None))
+
+
+def test_the_merchant_listing_lookup_never_runs_without_a_merchant_scope(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
+    body = _post_scoped(client, merchant_id=None)
+    assert (body.get("offers") or []) == []
+    assert not any(_is_scoped_listing_lookup(q, v) for q, v in seen)
+
+
+def test_the_merchant_listing_lookup_reads_product_refs_only_never_sku_aliases(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, "48000000000001", f"ext:retailer:{'beef0000' * 4}")], seen=seen))
+    res = client.post("/agent/shop/v1/invoke", json={
+        "operation": "offers.resolve",
+        "payload": {"product": {"product_id": _SCOPED_SOURCE_ID, "sku_id": "48000000000001",
+                                "merchant_id": _SCOPED_MERCHANT},
+                    "limit": 10, "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+        "metadata": {"source": "creator-agent-ui"},
+    })
+    assert res.status_code == 200
+    (lookup,) = [v for q, v in seen if _is_scoped_listing_lookup(q, v)]
+    assert lookup["aliases"] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
+    assert not any("48000000000001" in str(a) for a in lookup["aliases"]), "a variant id is never a listing ref"
+    (binds,) = _catalog_binds(seen)
+    assert f"ext:retailer:{'beef0000' * 4}" not in binds["aliases"]
+
+
+@pytest.mark.parametrize("ref", ["sig_" + "a1" * 16, "ck_" + "b2" * 16, "SIG_" + "C3" * 16])
+def test_the_merchant_listing_lookup_never_runs_for_a_signature_or_content_key(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, ref
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, ref, _SCOPED_LISTING_KEY)], seen=seen))
+    _post_scoped(client, product_id=ref)
+    assert not any(_is_scoped_listing_lookup(q, v) for q, v in seen), ref
+    (binds,) = _catalog_binds(seen)
+    assert binds["aliases"][0] == ref, "the arm still asks by the id itself"
+
+
+def test_a_listing_on_a_platform_outside_the_lookup_set_is_not_widened(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A connected merchant's own product is answered by the internal lane: its scoped ref is not
+    widened to the retailer offers on its content key (today's answer)."""
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY, "placeholder_platform")], seen=seen))
+    body = _post_scoped(client)
+    assert (body.get("offers") or []) == []
+    (binds,) = _catalog_binds(seen)
+    assert _SCOPED_LISTING_KEY not in binds["aliases"]
+
+
+def test_the_lookup_platform_is_the_seed_platform_the_catalog_writes():
+    import routes.agent_shop_gateway as gateway
+    import scripts.mirror_external_seeds_to_catalog_products as mirror
+    from services.external_seed_servability import EXTERNAL_SEED_PLATFORM
+
+    assert gateway._MERCHANT_SCOPED_LISTING_PLATFORMS == (EXTERNAL_SEED_PLATFORM,) == (mirror.PLATFORM,)
+
+
+def test_the_merchant_listing_lookup_is_bounded_at_one_second_and_never_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lookup that never answers is given up after at most 1 s, even when the seed-query budget is
+    larger, and answers None (the arm then runs without it). Bounded from outside so a regression fails
+    instead of hanging the suite."""
+    import time
+
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS", 30.0)
+
+    class _NeverAnswers:
+        async def fetch_all(self, query, values=None):
+            await asyncio.Event().wait()
+
+    async def go():
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            gateway._merchant_scoped_listing_product_key(
+                _NeverAnswers(), merchant_id=_SCOPED_MERCHANT, aliases=[_SCOPED_SOURCE_ID]),
+            timeout=3.0,
+        )
+        return result, time.monotonic() - started
+
+    result, elapsed = asyncio.run(go())
+    assert result is None
+    assert 0.9 <= elapsed < 2.0, elapsed
+
+
 def test_a_sku_matched_seed_offer_outranks_a_catalog_offer(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
