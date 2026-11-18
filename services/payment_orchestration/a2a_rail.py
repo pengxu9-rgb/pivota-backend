@@ -576,7 +576,8 @@ _CARD_CODE_RE = re.compile(
 def _fold(text: str) -> str:
     """What a card-code match is made on: HTML entities and %-escapes decoded ("&#55;", "cvv%20715"), NFKC,
     invisible characters removed, lower case, every decimal digit (Arabic-Indic, full-width, ...) read as its
-    ASCII digit, a dotted word joined ("c.v.v" -> "cvv"), and runs of whitespace collapsed to one space."""
+    ASCII digit, dotted letters joined ("c.v.v" -> "cvv"; never digits: "7.1.5" stays a version, not a code),
+    and runs of whitespace collapsed to one space."""
     text = html.unescape(text)
     if "%" in text:
         text = urllib.parse.unquote(text)
@@ -587,8 +588,9 @@ def _fold(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text)
 
 
-#: A word spelt with dots between single letters ("c.v.v", "c.v.v.2").
-_DOTTED_WORD_RE = re.compile(r"(?<![a-z0-9])(?:[a-z0-9]\.){2,}[a-z0-9](?![a-z0-9])")
+#: A word spelt with dots between single LETTERS ("c.v.v", "c.v.v.2"). Digits are never joined: "Version 7.1.5"
+#: must not read as the code 715.
+_DOTTED_WORD_RE = re.compile(r"(?<![a-z0-9])(?:[a-z]\.){2,}[a-z0-9](?![a-z0-9])")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 

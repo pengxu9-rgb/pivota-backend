@@ -3438,6 +3438,17 @@ async def test_after_the_confirm_any_three_digit_code_near_a_card_word_still_hol
     assert await _step(Rail().on("checkout.await#poll", poll), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
 
 
+@pytest.mark.parametrize("text", ["Version 7.1.5 supports CVV", "CVV checks run on v.2.1.5 and 7.1.5"])
+async def test_after_the_confirm_a_dotted_version_number_is_not_a_card_code_and_is_not_held(text):
+    # N6: only dotted LETTERS are joined ("c.v.v" -> "cvv"); "7.1.5" is never read as the code 715.
+    assert not a2a_rail.has_card_code(text)
+    assert a2a_rail.has_card_code("c.v.v 715") and a2a_rail._fold("c.v.v.2 715") == "cvv2 715"
+    pid = await _placing()
+    poll = _task({"kind": "text", "text": text}, _card("checkout.await", {"task_id": "ckout_abc123"}))
+    assert await _step(Rail().on("checkout.await#poll", poll), pid) != worker.CHECKOUT_ANSWER_SCRUBBED
+    assert (await _row(pid))["last_error_code"] != worker.CHECKOUT_ANSWER_SCRUBBED
+
+
 async def test_after_the_confirm_a_code_in_other_digits_is_folded_and_held():
     # No amount scan runs after the confirm, so only the digit folding catches "٧١٥".
     assert a2a_rail.has_card_code("cvv ٧١٥") and a2a_rail.has_card_code("security code ٤٤٥")
