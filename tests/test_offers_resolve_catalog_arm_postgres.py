@@ -185,25 +185,38 @@ def test_the_arm_matches_by_content_key_and_product_key_too(pg_engine):
         assert (res.get("offers") or []), f"{ident} must resolve through the same arm"
 
 
-@pytest.mark.parametrize("cohort_name", ["cohort_a", "cohort_b", "cohort_b_bare"])
+@pytest.mark.parametrize("cohort_name", ["cohort_a", "cohort_b", "cohort_b_bare", "no_cohort"])
 def test_a_marked_exact_listing_cannot_fall_back_to_any_generic_offer(pg_engine, monkeypatch, cohort_name):
     from sqlalchemy import text
 
-    from services.exact_retailer_cohorts import COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B, PROOF_KEY, RETAILER_COHORT_A
+    from services.exact_retailer_cohorts import (
+        COHORT_B_BARE_LISTING_KEY, EXACT_ONLY_LISTING_KEYS, RETAILER_COHORT_B, PROOF_KEY, RETAILER_COHORT_A, RETAILERS,
+    )
 
     cohort = RETAILER_COHORT_A if cohort_name == "cohort_a" else RETAILER_COHORT_B
     monkeypatch.delenv(cohort.flag, raising=False)
     _seed(pg_engine)
     key = COHORT_B_BARE_LISTING_KEY if cohort_name == "cohort_b_bare" else next(iter(cohort.listings))
+    if cohort_name == "no_cohort":
+        # A proof-bearing listing outside every cohort (e.g. cohort C on a runtime without its
+        # private manifest): the proof alone keeps it out of the generic arm.
+        key = "ext:retailer:" + "e" * 32
+        assert key not in RETAILERS and key not in EXACT_ONLY_LISTING_KEYS
     with pg_engine.begin() as conn:
         for table in ("catalog_offers", "catalog_skus", "catalog_products"):
             conn.execute(text(f"UPDATE {table} SET product_key=:new WHERE product_key=:old"), {"new": key, "old": _PK})
-        if cohort_name == "cohort_a":
+        if cohort_name in ("cohort_a", "no_cohort"):
             conn.execute(text(
                 "UPDATE catalog_offers SET offer_payload=offer_payload || jsonb_build_object(CAST(:proof_key AS text), 'null'::jsonb), "
                 "suppressed_at=NOW() WHERE offer_id='of_retailer_cheap'"
             ), {"proof_key": PROOF_KEY})
     assert _resolve(_SIG)["offers"] == []
+    if cohort_name == "no_cohort":
+        # Positive control: the same listing without the proof serves through the generic arm.
+        with pg_engine.begin() as conn:
+            conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload - CAST(:proof_key AS text) "
+                              "WHERE product_key=:key"), {"proof_key": PROOF_KEY, "key": key})
+        assert _resolve(_SIG)["offers"]
 
 
 def test_an_unknown_identity_returns_no_offers_and_says_so(pg_engine):
