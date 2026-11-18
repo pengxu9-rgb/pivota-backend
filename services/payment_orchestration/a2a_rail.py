@@ -208,7 +208,7 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
     # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
-    "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
+    "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode", "davv",
     # a card's or token's expiry (the checkout's `card.expiry`, echoed back): no digit rule sees "11/29"
     "expiry", "expirydate", "expdate", "expirationdate", "cardexpiry", "tokenexpiry",
 })
@@ -594,29 +594,51 @@ CHECKOUT_SHIPPING_OPTIONAL: Tuple[str, ...] = ("address2", "state")
 _CHECKOUT_SHIPPING_MAX = 256
 _TOKEN_NUMBER_RE = re.compile(r"^\d{13,19}\Z")
 _TOKEN_EXPIRY_RE = re.compile(r"^(0[1-9]|1[0-2])(\d{2})\Z")
-_CRYPTOGRAM_RE = re.compile(r"^[A-Za-z0-9+/=_-]{4,128}\Z")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}\Z")
 _COUNTRY_RE = re.compile(r"^[A-Z]{2}\Z")
+
+
+#: THE ONE NAME of the token-result field that carries the DAVV, inside `networkToken`. PENDING THE PROVIDER'S
+#: A2A UPDATE AND SANDBOX MEASUREMENT: the A2A skill does not return a DAVV yet (the provider is adding it), so
+#: no real answer carries this field today and every checkout fails closed (`davv_missing`, nothing sent).
+#: When the provider names the field, this constant changes and nothing else. NEVER the cryptogram: that is
+#: the TAVV, for gateway token transactions, and a card form cannot take it.
+DAVV_FIELD = "davv"
+#: The DAVV: exactly three ASCII digits (a dynamic CVV).
+_DAVV_RE = re.compile(r"^[0-9]{3}\Z")
+
+
+def davv_from_network_token(network_token: Any) -> Optional[str]:
+    """The token's DAVV (`networkToken[DAVV_FIELD]`), or None unless it is exactly 3 ASCII digits. Pure; never
+    logs. There is no fallback to any other field."""
+    if not isinstance(network_token, Mapping):
+        return None
+    value = network_token.get(DAVV_FIELD)
+    return value if isinstance(value, str) and _DAVV_RE.match(value) else None
 
 
 def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: Any) -> Optional[Dict[str, str]]:
     """THE ONE PLACE the approved network token becomes the checkout skill's `card`. Pure: no I/O, no
     logging, never raises; None when any field is missing or malformed (the caller sees only that).
 
-    OPEN QUESTION WITH THE PROVIDER: which card field takes the token cryptogram. Until it is answered
-    the mapping is: number = `networkToken.value` (the DPAN), expiry = `networkToken.expiryDate` read as
-    MMYY and sent as "MM/YY", cvv = `networkToken.cryptogram`, brand = the card's brand, name = the
-    cardholder name the caller gives. Changing that answer changes this function and nothing else."""
+    THE PROVIDER'S ANSWER (11-18): `checkout.setup` has no network-token field; the card is filled as a
+    normal card, EXACTLY these five keys (their example: {"number", "expiry", "cvv", "name", "brand"}):
+      number = `networkToken.value` (the DPAN); expiry = `networkToken.expiryDate` read as MMYY and sent as
+      "MM/YY"; cvv = the 3-digit DAVV (`davv_from_network_token`, minted with `dynamic_data_type: "DAVV"`);
+      name = the buyer's first + last name from the purchase's shipping contact (no cardholder name is
+      received); brand = the card's brand (visa).
+    The cryptogram and the ECI (the TAVV, for gateway token transactions) are NEVER sent. No DAVV: None (the
+    relay says `davv_missing`); any other field missing or malformed, an empty name included: None."""
     if not isinstance(network_token, Mapping):
         return None
     number = network_token.get("value")
-    cryptogram = network_token.get("cryptogram")
+    davv = davv_from_network_token(network_token)
     expiry = network_token.get("expiryDate")
     card_brand = str(brand or "").strip().lower()
     holder = " ".join(str(name or "").split())
     if not (isinstance(number, str) and _TOKEN_NUMBER_RE.match(number)):
         return None
-    if not (isinstance(cryptogram, str) and _CRYPTOGRAM_RE.match(cryptogram)):
+    if davv is None:
         return None
     match = _TOKEN_EXPIRY_RE.match(expiry) if isinstance(expiry, str) else None
     if match is None or card_brand not in CHECKOUT_CARD_BRANDS or not 0 < len(holder) <= _CHECKOUT_SHIPPING_MAX:
@@ -624,7 +646,7 @@ def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: An
     return {
         "number": number,
         "expiry": f"{match.group(1)}/{match.group(2)}",
-        "cvv": cryptogram,
+        "cvv": davv,
         "name": holder,
         "brand": card_brand,
     }
@@ -706,7 +728,7 @@ class TokenRelay:
     token     the answer to the token step that was sent (`paid` or the await poll)
     checkout  the answer to `checkout.setup#submit`, or None when it was not sent
     refused   why it was not sent although the answer was THIS purchase's ACTIVE token (a code:
-              `network_token_missing`, `card_unmappable`); None otherwise
+              `network_token_missing`, `davv_missing`, `card_unmappable`); None otherwise
     """
 
     token: A2AResult
@@ -719,17 +741,13 @@ class TokenRelay:
 _SCRUB_SUBSTRING_MIN = 8
 
 
-#: The token-result field that will carry the DAVV (the 3-digit dynamic CVV the checkout card is filled with:
-#: the provider's 11-18 answer; the mapping lands with the DAVV change). Read here already so a DAVV that
-#: arrives under it is scrubbed from the setup answer BY VALUE, like the expiry: as a WHOLE value only
-#: ("715" alone), never inside another value ("$715.00", "Suite 715"), and in prose only as a whole token in
-#: card context. PENDING THE PROVIDER'S A2A UPDATE AND SANDBOX MEASUREMENT of the field's name.
-DAVV_FIELD = "davv"
 
 
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
-    expiry (raw and as "MM/YY") and its DAVV only as a whole value."""
+    expiry (raw and as "MM/YY") and its DAVV (`DAVV_FIELD`) only as a WHOLE value: "715" alone, never inside
+    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context. (The DAVV is
+    also scrubbed under a card-shaped key by `_card_only_needles`, now a subset of this.)"""
     contains: List[str] = []
     exact = set()
     for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
@@ -748,10 +766,32 @@ def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], F
     return tuple(contains), frozenset(exact)
 
 
-def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], depth: int = 0) -> Tuple[Any, int]:
-    """`value` with every string (or number) that is, or carries, a known credential removed WHOLE."""
+def _card_only_needles(network_token: Any) -> FrozenSet[str]:
+    """Values scrubbed only under a card-shaped key: the 3-digit DAVV."""
+    davv = davv_from_network_token(network_token)
+    return frozenset({davv}) if davv else frozenset()
+
+
+#: Keys (canonical) under which a card's security code would sit: the DAVV is scrubbed by value only here
+#: (and anywhere inside a card-shaped object), never in an address, an amount or prose.
+_CARD_SHAPED_KEYS = frozenset({
+    "card", "cards", "cardinfo", "carddetails", "carddata", "paymentcard", "paymentmethod", "cvv", "cvc", "cvv2",
+    "cvc2", "cvn", "csc", "securitycode", "cardsecuritycode", "cardcode", "cardcvv", "cardcvc", "davv", "dcvv",
+    "dcvv2", "dynamiccvv", "dynamicdata", "cryptogram", "networktoken",
+})
+
+
+def _card_shaped_key(key: Any) -> bool:
+    canon = _canon(key)
+    return canon in _CARD_SHAPED_KEYS or canon.startswith("card") or "cvv" in canon or "cvc" in canon
+
+
+def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], depth: int = 0,
+                 card_only: FrozenSet[str] = frozenset(), in_card: bool = False) -> Tuple[Any, int]:
+    """`value` with every string (or number) that is, or carries, a known credential removed WHOLE. A
+    `card_only` value (the DAVV) counts only under a card-shaped key (`in_card`)."""
     def hit(text: str) -> bool:
-        return text in exact or any(needle in text for needle in contains)
+        return text in exact or any(needle in text for needle in contains) or (in_card and text in card_only)
 
     if depth > _MAX_STRIP_DEPTH:
         return None, 1
@@ -759,16 +799,17 @@ def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], d
         out: Dict[str, Any] = {}
         removed = 0
         for key, item in value.items():
-            if hit(str(key)):
+            if str(key) in exact or any(needle in str(key) for needle in contains):
                 removed += 1
                 continue
-            out[key], count = _scrub_value(item, contains, exact, depth + 1)
+            out[key], count = _scrub_value(item, contains, exact, depth + 1, card_only,
+                                           in_card or _card_shaped_key(key))
             removed += count
         return out, removed
     if isinstance(value, list):
         items, removed = [], 0
         for item in value:
-            cleaned, count = _scrub_value(item, contains, exact, depth + 1)
+            cleaned, count = _scrub_value(item, contains, exact, depth + 1, card_only, in_card)
             items.append(cleaned)
             removed += count
         return items, removed
@@ -784,7 +825,8 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
     if result is None or not isinstance(network_token, Mapping):
         return
     contains, exact = _scrub_needles(network_token)
-    if not contains and not exact:
+    card_only = _card_only_needles(network_token)
+    if not contains and not exact and not card_only:
         return
     def hit(text: Optional[str]) -> bool:
         return bool(text) and (text in exact or any(n in text for n in contains))
@@ -794,7 +836,7 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
         result.credential_fields_stripped += 1
     cards: List[Card] = []
     for card in result.cards:
-        data, removed = _scrub_value(card.data, contains, exact)
+        data, removed = _scrub_value(card.data, contains, exact, card_only=card_only)
         component, kind = card.component, card.kind
         for name in (component, kind or ""):
             if name and (name in exact or any(n in name for n in contains)):
@@ -1080,6 +1122,11 @@ class A2ARailClient:
                 return relay
             if not isinstance(network_token, Mapping):
                 relay.refused = "network_token_missing"
+                return relay
+            if davv_from_network_token(network_token) is None:
+                # No DAVV (the A2A skill does not return one yet), or not exactly 3 ASCII digits: the card form
+                # cannot be filled. Never the cryptogram instead. Nothing goes to the checkout.
+                relay.refused = "davv_missing"
                 return relay
             brand = approved.get("paymentBrand") or network_token.get("brand")
             card = checkout_card_from_network_token(network_token, brand=brand, name=setup.cardholder_name)

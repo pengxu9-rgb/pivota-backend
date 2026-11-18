@@ -161,7 +161,15 @@ The A2A rail's checkout step HOLDS a purchase whenever it cannot prove what happ
 a setup or confirm whose answer nobody saw (`checkout_setup_unresolved`, `checkout_confirm_unresolved`),
 a `paid` sent through the relay whose step was cut, a total it cannot verify, and the other codes in
 `a2a_rail_worker._CHECKOUT_HOLD_CODES`. A held purchase stays in `paying` (the agent sees `placing`) for
-good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human does:
+good: no sweep ends `paying`, and **nothing ends a hold automatically** except one READ: for a hold whose
+cause is an answer nobody saw (`a2a_rail_worker._CHECKOUT_LOOKUP_CODES`: setup / confirm / cancel unresolved,
+the pending check, paying without a task, a prose / unrecognised / error-card confirm answer), the worker
+asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purchase id>-checkout`), read-only,
+in its own conversation, when the time in `paying` has doubled (1, 2, 4 ... minutes, at most 9 times in
+4 hours). A definite result goes through the ordinary result rules (completed only on a verified total; a
+held code stays held); an await records the task and the poll goes on; anything else leaves it held. It never
+resends a setup or a confirm, and never looks up a hold written after payment was reported. A 409 on the
+confirm (the same key with another body: our own bug) is held and never looked up. Otherwise a human does:
 
 1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
    its id, its hold code, whether a write is pending, whether a checkout task id is recorded.

@@ -233,6 +233,8 @@ _LIST_ALL = "ACTIVE,PENDING,DISABLED,FAILED,EXPIRED"
 _DEAD_METHOD_STATUSES = {"FAILED", "DISABLED", "EXPIRED"}
 
 TOKEN_SETUP = ("payment.token-setup", "submit")
+#: On the checkout path the token is minted with a DAVV (the provider's answer, 11-18).
+DYNAMIC_DATA_TYPE = "DAVV"
 SELECT_METHOD = ("payment.method-list", "select-method")
 VISA_PAID = ("payment.visa-action-required", "paid")
 SCHEME_PAID = ("payment.action-required", "paid")
@@ -655,6 +657,10 @@ async def _start_token(s: _Step) -> str:
         if not name or not account:
             return await _token_failed(s, "quoting", "token_payer_missing")
         payload.update(recipient_name=name, recipient_account=str(account))
+    if a2a_rail.checkout_step_enabled():
+        # The checkout fills a card form: the provider mints a DAVV (a 3-digit dynamic CVV) for it, not a TAVV
+        # (a gateway cryptogram no form takes). Off the checkout path the mint is exactly as before.
+        payload["dynamic_data_type"] = DYNAMIC_DATA_TYPE
     action = _action(TOKEN_SETUP)
     if await ledger.mark_pending_write(s.id, s.worker, action) is None:
         return "lost"
@@ -668,7 +674,12 @@ async def _start_token(s: _Step) -> str:
         action = _action(SELECT_METHOD)
         if await ledger.mark_pending_write(s.id, s.worker, action) is None:
             return "lost"
-        result = await s.send(SELECT_METHOD, {"id": str(method["id"]), "payment_brand": brand}, context=s.pay_context)
+        select: Dict[str, Any] = {"id": str(method["id"]), "payment_brand": brand}
+        if a2a_rail.checkout_step_enabled():
+            # The picker mints the credential too. Whether it reads `dynamic_data_type` is NOT measured; sent
+            # the same way. If it is ignored and a TAVV comes back, the card is unmappable: nothing is sent.
+            select["dynamic_data_type"] = DYNAMIC_DATA_TYPE
+        result = await s.send(SELECT_METHOD, select, context=s.pay_context)
     return await _token_answer(s, action, result)
 
 
@@ -1423,6 +1434,22 @@ POLL_LOOKUP = 60
 CHECKOUT_CEILING_SECONDS = 86400
 
 CHECKOUT_PLACING = "checkout_placing"
+#: RESOLVING BY LOOKUP (the provider, 11-18: `checkout.lookup#submit` with `{task_id: <our idempotency key>}`
+#: answers `checkout.await` while not done and `checkout.result` when done). A checkout held because an
+#: answer was NOT SEEN is looked up, READ-ONLY, in its own conversation: a definite result is mapped by the
+#: result rules (completed only on a verified total), an await records the task and the poll goes on,
+#: anything else leaves it held. Never a confirm or a setup from this path.
+_CHECKOUT_LOOKUP_CODES = frozenset({
+    "checkout_confirm_unresolved", "checkout_setup_unresolved", "checkout_confirm_pending_check",
+    "checkout_paying_without_task", "checkout_cancel_unresolved", "checkout_confirm_text_only",
+    "checkout_confirm_unrecognised", "checkout_confirm_error_card",
+})
+#: The first lookup no sooner than this after the move to `paying`; each next one when the time in `paying`
+#: has doubled (60 s, 2 min, 4 min, ... ); none after CHECKOUT_LOOKUP_WINDOW_SECONDS: at most
+#: CHECKOUT_LOOKUP_MAX_TRIES per row, then it stays held for a human.
+CHECKOUT_LOOKUP_FIRST_SECONDS = 60
+CHECKOUT_LOOKUP_WINDOW_SECONDS = 4 * 3600
+CHECKOUT_LOOKUP_MAX_TRIES = 9
 CHECKOUT_DISABLED = "checkout_step_disabled"
 CHECKOUT_CONTACT_INCOMPLETE = "checkout_contact_incomplete"
 CHECKOUT_TOKEN_UNAVAILABLE = "checkout_token_unavailable"
@@ -1971,7 +1998,9 @@ async def _confirm_answer(s: _Step, result: Any) -> str:
         # A validation refusal: the request was never accepted, so nothing was submitted.
         return await _checkout_failed(s, _code("checkout_confirm_refused", result), resolves=action)
     if kind == "http_error" and isinstance(status, int) and 400 <= status < 500:
-        # A conflict or any other 4xx: it may mean the order is already in. Held, the write kept.
+        # A conflict or any other 4xx: it may mean the order is already in. Held, the write kept. A 409 means
+        # (the provider, 11-18) the same idempotency key with a DIFFERENT body: our own bug, since the confirm is
+        # deterministic per purchase. Holding is right; it is never resent and never looked up away.
         logger.error("a2a_rail_worker: confirm answered http_status=%s purchase=%s; held", status, s.id)
         return await _checkout_hold(s, CHECKOUT_CONFIRM_CONFLICT if status == 409 else CHECKOUT_CONFIRM_AMBIGUOUS_4XX)
     # Unseen (a 408 included: the transport reads it as outcome_unknown on a write): the order may be in. Never resent, and the poll and the lookup both need the task id that
@@ -1985,7 +2014,9 @@ async def _checkout_pending(s: _Step) -> str:
     # Held rows stay unread, EXCEPT the placeholder hold of a move to `paying`: with a write outstanding it is
     # replaced below by the write's own hold code (still a hold, never a send).
     if _checkout_held(row) and _last_code(row) != CHECKOUT_CONFIRM_PENDING_CHECK:
-        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        if _lookup_due(row):
+            return await _checkout_lookup(s)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
         return "checkout_held"
     action = str(row["pending_write"])
     if _last_code(row) == "worker_error":
@@ -2006,7 +2037,9 @@ async def _checkout_paying(s: _Step) -> str:
     """A checkout in `paying` with no write pending: confirm it (not yet confirmed), or read its progress."""
     row = s.row
     if _checkout_held(row):
-        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        if _lookup_due(row):
+            return await _checkout_lookup(s)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
         return "checkout_held"
     if not a2a_rail.checkout_step_enabled():
         # The kill switch: nothing sent or read. `paying` is never swept, so nothing ends it meanwhile.
@@ -2033,6 +2066,78 @@ async def _checkout_paying(s: _Step) -> str:
     else:
         result, wait = await s.send(CHECKOUT_LOOKUP, {"task_id": task_id}, context=s.lookup_context), POLL_LOOKUP
     return await _checkout_progress(s, result, wait)
+
+
+def _paying_seconds(row: Mapping[str, Any]) -> float:
+    entered = _aware(row.get("state_entered_at"))
+    return (_now() - entered).total_seconds() if entered else 0.0
+
+
+def _lookup_eligible(row: Mapping[str, Any]) -> bool:
+    """A held checkout whose cause is an answer not seen (never one written after payment was reported:
+    that outcome already says money moved), on the checkout path, in `paying`."""
+    code = str(row.get("last_error_code") or "")
+    return (
+        row.get("state") == "paying" and code in _CHECKOUT_LOOKUP_CODES
+        and code not in _CHECKOUT_PAYMENT_REACHED_CODES
+        and a2a_rail.checkout_step_enabled() and _checkout_schema_ready(row)
+        and _paying_seconds(row) <= CHECKOUT_LOOKUP_WINDOW_SECONDS
+    )
+
+
+def _lookup_due(row: Mapping[str, Any]) -> bool:
+    """Eligible, and the backoff has run: the row is only claimed when `next_poll_at` (set by
+    `_lookup_wait`) has passed, so a claim of an eligible row past the first delay is a due lookup."""
+    return _lookup_eligible(row) and _paying_seconds(row) >= CHECKOUT_LOOKUP_FIRST_SECONDS
+
+
+def _lookup_wait(row: Mapping[str, Any]) -> int:
+    """Seconds until the next look at a held row: the backoff (the time in `paying` again, so lookups go at
+    roughly 1, 2, 4, 8 ... minutes) while it is eligible, else the ordinary held park."""
+    if not _lookup_eligible(row):
+        return POLL_PARKED
+    elapsed = _paying_seconds(row)
+    if elapsed < CHECKOUT_LOOKUP_FIRST_SECONDS:
+        return max(1, int(CHECKOUT_LOOKUP_FIRST_SECONDS - elapsed) + 1)
+    return int(max(CHECKOUT_LOOKUP_FIRST_SECONDS, elapsed))
+
+
+async def _checkout_lookup(s: _Step) -> str:
+    """ONE read-only lookup of a held checkout by our idempotency key, in the lookup conversation. Never
+    sends a write (`checkout.lookup#submit` is a read on the provider's side; no write-ahead is marked)."""
+    row = s.row
+    code = str(row.get("last_error_code") or "")
+    result = await s.send(CHECKOUT_LOOKUP, {"task_id": _checkout_idempotency_key(s.id)}, context=s.lookup_context)
+    final = result.card("checkout.result") if getattr(result, "ok", False) else None
+    waiting = result.card("checkout.await") if getattr(result, "ok", False) else None
+    card = final or waiting
+    task_id = card.data.get("task_id") if card is not None else None
+    if card is None or not (isinstance(task_id, str) and task_id):
+        # Not found, an error, prose, a money-result card, or an answer that names no task: still held,
+        # unchanged, and looked up again on the backoff (or left for a human past the window).
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
+        return "checkout_held"
+    known = row.get("checkout_task_id")
+    if known and known != task_id:
+        return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
+    if not known:
+        try:
+            adopted = await ledger.adopt_checkout_task_as_holder(s.id, s.worker, checkout_task_id=task_id)
+        except ValueError:
+            return await _checkout_hold(s, CHECKOUT_TASK_INVALID)
+        if adopted is None:
+            return await _settled(s, None, "checkout_held")
+        s.row = adopted
+    elif row.get("pending_write"):
+        # The lookup answered for the write nobody saw: it is resolved (never resent).
+        await ledger.clear_pending_write(s.id, s.worker, str(row["pending_write"]))
+    logger.warning("a2a_rail_worker: held checkout looked up purchase=%s code=%s found=%s",
+                   s.id, code, "result" if final is not None else "await")
+    if final is not None:
+        return await _checkout_result(s, final)
+    # Not done yet: no longer held; the poll (by the recorded task id) goes on.
+    await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_CHECKOUT), last_error_code=CHECKOUT_PLACING)
+    return "placing"
 
 
 async def _checkout_progress(s: _Step, result: Any, wait: int) -> str:
