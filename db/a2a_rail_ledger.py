@@ -1019,6 +1019,114 @@ async def operator_fail_held_checkout(
     return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE, values))
 
 
+# ── the buyer's shipping address, when the agent did not send it (AgenPas asks the buyer) ──────────
+#
+# NO NEW COLUMN, NO NEW STATE. A row waits in `opened` with `last_error_code` = 'shipping_address_required'
+# and its deadline in `buyer_action_expires_at` (no `buyer_action_kind` / `_url`: there is no rail page). The
+# worker parks it (`park_for_shipping_address_as_holder`); the gateway's write (`submit_shipping_address`)
+# fills the email and the address ONLY while the row waits and the part it fills is still empty; the expiry
+# sweep ends a row past its deadline as 'shipping_address_expired'. Nothing here logs a value.
+SHIPPING_ADDRESS_REQUIRED_CODE = "shipping_address_required"
+SHIPPING_ADDRESS_EXPIRED_CODE = "shipping_address_expired"
+
+_PARK_FOR_SHIPPING_ADDRESS_SQL = """
+    UPDATE a2a_rail_purchases
+       SET claimed_by = NULL,
+           claimed_at = NULL,
+           buyer_action_expires_at = COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)),
+           last_error_code = 'shipping_address_required',
+           next_poll_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                THEN clock_timestamp() ELSE CAST(:next_poll_at AS TIMESTAMPTZ) END,
+           updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'opened' AND pending_write IS NULL
+    RETURNING *
+"""
+_PARK_FOR_SHIPPING_ADDRESS_SQL_SQLITE = (
+    _PARK_FOR_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:expires_at AS TIMESTAMPTZ)", ":expires_at")
+    .replace("CAST(:next_poll_at AS TIMESTAMPTZ)", ":next_poll_at")
+)
+
+
+async def park_for_shipping_address_as_holder(
+    purchase_id: str, worker_id: str, *, expires_at: Any, next_poll_at: Any
+) -> Optional[Dict[str, Any]]:
+    """Park an `opened` row the worker holds until the buyer's contact arrives: the claim given back, the
+    deadline set once (never moved later), the park code written. When the contact landed meanwhile, the
+    row is due at once. None when the row is not held, not `opened`, or has a pending write."""
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "expires_at": _bind_dt(expires_at),
+        "next_poll_at": _bind_dt(next_poll_at),
+    }
+    if values["expires_at"] is None or values["next_poll_at"] is None:
+        raise ValueError("expires_at and next_poll_at are required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_PARK_FOR_SHIPPING_ADDRESS_SQL, values))
+    return _purchase(await database.fetch_one(_PARK_FOR_SHIPPING_ADDRESS_SQL_SQLITE, values))
+
+
+# THE COMPARE-AND-SWAP. Only while the row waits (`opened`, a part of the contact empty, the deadline not
+# passed, the contact never purged, no write pending), and only into an EMPTY part: a stored email (compared
+# case-insensitively) or address that differs is never overwritten. Owner-scoped like every agent read.
+_SUBMIT_SHIPPING_ADDRESS_SQL = """
+    UPDATE a2a_rail_purchases
+       SET buyer_email = COALESCE(buyer_email, CAST(:buyer_email AS TEXT)),
+           shipping_address = COALESCE(shipping_address, CAST(:shipping_address AS JSONB)),
+           last_error_code = CASE WHEN last_error_code = 'shipping_address_required'
+                THEN NULL ELSE last_error_code END,
+           buyer_action_expires_at = CASE WHEN buyer_action_kind IS NULL
+                THEN NULL ELSE buyer_action_expires_at END,
+           next_poll_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+       AND state = 'opened' AND pending_write IS NULL AND contact_purged_at IS NULL
+       AND (buyer_email IS NULL OR shipping_address IS NULL)
+       AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
+       AND (buyer_email IS NOT NULL OR CAST(:email_sent AS TEXT) IS NOT NULL)
+       AND (shipping_address IS NOT NULL OR CAST(:address_sent AS TEXT) IS NOT NULL)
+       AND (CAST(:email_sent AS TEXT) IS NULL OR buyer_email IS NULL
+            OR lower(buyer_email) = lower(CAST(:buyer_email AS TEXT)))
+       AND (CAST(:address_sent AS TEXT) IS NULL OR shipping_address IS NULL
+            OR shipping_address = CAST(:shipping_address AS JSONB))
+    RETURNING *
+"""
+_SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE = (
+    _SUBMIT_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:shipping_address AS JSONB)", ":shipping_address")
+)
+
+
+async def submit_shipping_address(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str, *,
+    buyer_email: Optional[str], shipping_address: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fill the waiting row's empty email and/or address (the compare-and-swap above) and make it due now.
+    None when the row is not this owner's, does not wait, or a part sent differs from the stored one: the
+    caller re-reads to tell an identical resubmission (idempotent) from a conflict."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    if buyer_email is None and not shipping_address:
+        raise ValueError("nothing to submit")
+    if shipping_address is not None and not isinstance(shipping_address, Mapping):
+        raise ValueError("shipping_address must be an object")
+    values = {
+        "id": purchase_id,
+        "agent_id": str(agent_id or "").strip(),
+        "agent_user_ref_hash": str(agent_user_ref_hash or "").strip(),
+        "buyer_email": (str(buyer_email).strip() or None) if buyer_email is not None else None,
+        # The door's own encoding (create_purchase): one canonical text, so equal addresses compare equal.
+        "shipping_address": json.dumps(dict(shipping_address), sort_keys=True) if shipping_address else None,
+    }
+    # Whether each part was sent, as its own TEXT parameter: one placeholder is never cast two ways.
+    values["email_sent"] = "1" if values["buyer_email"] is not None else None
+    values["address_sent"] = "1" if values["shipping_address"] is not None else None
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL, values))
+    return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE, values))
+
+
 async def get_paying_checkout(purchase_id: str) -> Optional[Dict[str, Any]]:
     """ONE `paying` checkout row by id (the preview's read), or None. PII-free columns only."""
     if not _ID_RE.match(str(purchase_id or "")):
@@ -1188,6 +1296,9 @@ _EXPIRE_SQL = """
     UPDATE a2a_rail_purchases
        SET state = 'expired',
            last_error_code = CASE WHEN buyer_action_expires_at IS NOT NULL
+                AND buyer_action_expires_at < clock_timestamp() AND last_error_code = 'shipping_address_required'
+                THEN 'shipping_address_expired'
+                WHEN buyer_action_expires_at IS NOT NULL
                 AND buyer_action_expires_at < clock_timestamp() THEN 'buyer_action_expired' ELSE 'stale' END,
            buyer_action_kind = NULL, buyer_action_url = NULL, buyer_action_expires_at = NULL,
            buyer_email = NULL, shipping_address = NULL,
@@ -1217,6 +1328,9 @@ _EXPIRE_SQL_SQLITE = """
     UPDATE a2a_rail_purchases
        SET state = 'expired',
            last_error_code = CASE WHEN buyer_action_expires_at IS NOT NULL
+                AND buyer_action_expires_at < CURRENT_TIMESTAMP AND last_error_code = 'shipping_address_required'
+                THEN 'shipping_address_expired'
+                WHEN buyer_action_expires_at IS NOT NULL
                 AND buyer_action_expires_at < CURRENT_TIMESTAMP THEN 'buyer_action_expired' ELSE 'stale' END,
            buyer_action_kind = NULL, buyer_action_url = NULL, buyer_action_expires_at = NULL,
            buyer_email = NULL, shipping_address = NULL,

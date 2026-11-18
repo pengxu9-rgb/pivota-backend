@@ -80,6 +80,45 @@ does not exist. Turning it on needs a restart.
 - A ledger or view fault: 503 `temporarily_unavailable`. Read-only. Not exempt from the rate limiter
   (only the introspect key is): page reads count as anonymous traffic and can 429 under a burst.
 
+## `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address` (server to server, AgenPas)
+
+The partner agent sends the buyer's shipping address; when it does not, AgenPas asks the buyer for
+it. Same router as the read above: the same dial (`AGENPAS_INTERNAL_READ_ENABLED`, at startup), the same
+key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read and ignored.
+
+- **Capture.** While the dial is on, `POST /agent/v2/commerce/purchases` on the A2A rail accepts a body
+  without `buyer.email` and/or `buyer.shipping_address`. One that is given is read by the Reap rules, plus,
+  for the US, a real state or DC in `region` and a ZIP (12345 or 12345-6789) in `postalCode`
+  (`invalid_address`). Off: both stay required, exactly as before. A request the router hands to Reap is
+  parsed by Reap's own model, which still requires both.
+- **Waiting.** The purchase stays `opened` (unified `routing`), and the worker sends NOTHING for it, not even
+  a card read, until its email and address are complete. The email is listed first: the card binding needs
+  it. `last_error_code` is `shipping_address_required`, and the deadline is 30 minutes from creation
+  (`a2a_rail_worker.SHIPPING_ADDRESS_SECONDS`). Then it is `expired` with `shipping_address_expired`, by the
+  worker or the expiry sweep. There is no new state and no migration: the deadline sits in
+  `buyer_action_expires_at`, with no `buyer_action_kind` / URL.
+- **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
+  has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
+  NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
+  `country`), never a stored value. The same names sit in `detail.shipping_address_required`.
+- **Body.** Flat JSON: `email, firstName, lastName, phone, addressLine1, addressLine2, city, region,
+  postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
+  in `fields_missing`); a part that is sent is read whole. US only. Region is one of the 50 states or DC.
+- **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
+  deadline not passed, the contact never purged) and fills only an empty part. The purchase is then due
+  at once.
+- **Answers.**
+  - 200: the unified view (as the read).
+  - The same contact sent again: 200.
+  - 409 `shipping_address_conflict`: the purchase no longer waits and holds something else, the
+    email or address sent differs from the stored one, or it is not an A2A-rail purchase.
+  - 422 `{"status": "error", "error": "invalid_shipping_address", "field_errors": {field: code}}`.
+    The codes are `required`, `invalid`, `too_long` and `unsupported`; a submitted value is never
+    echoed.
+  - 404 `purchase_not_found`: another agent's purchase, or none.
+  - 400 `agent_id_required`. 401. 503.
+  - Nothing of the body is logged.
+
 ## `GET /agent/v2/commerce/purchases?limit=N`
 
 The caller's purchases, newest first, each in the shape above. `limit` is 1..100 (default 20);

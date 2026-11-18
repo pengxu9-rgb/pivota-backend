@@ -656,8 +656,22 @@ async def test_an_approved_token_that_cannot_make_a_card_fails_without_a_setup(a
     assert (await _row(pid))["last_error_code"] == code
 
 
+async def _set_address(pid, address):
+    cast = "CAST(:a AS JSONB)" if IS_POSTGRES else ":a"
+    await database.execute(f"UPDATE a2a_rail_purchases SET shipping_address = {cast} WHERE id = :i",
+                           {"a": json.dumps(address, sort_keys=True) if address is not None else None, "i": pid})
+
+
 async def test_an_incomplete_contact_mints_no_token_at_all():
-    pid = await _locked({k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    # Incomplete from the start: parked in `opened`, NOTHING sent (AgenPas asks the buyer for the address).
+    pid = await _open({k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert rail.sent == [] and (await _row(pid))["state"] == "opened"
+    # Incomplete only after the card step (an edited row): still never minted, and failed as before.
+    await database.execute("DELETE FROM a2a_rail_purchases")
+    pid = await _locked()
+    await _set_address(pid, {k: v for k, v in ADDRESS.items() if k != "postalCode"})
     rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
     assert await _step(rail, pid) == "failed"
     assert rail.sent == []
@@ -3464,3 +3478,174 @@ async def test_an_unbound_not_submitted_status_without_success_false_goes_throug
     answer = _checkout_result("form-error", task="ckout_B", success=True, order_id=None, total=None)
     assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == worker.CHECKOUT_RESULT_UNRECOGNISED
     assert (await _row(pid))["state"] == "paying"
+
+
+# ── the buyer's shipping address, asked for when the agent did not send it (AgenPas) ───────────
+
+from services.payment_orchestration import a2a_shipping_address as shipping_capture  # noqa: E402
+from services.payment_orchestration import purchase_view as unified_view  # noqa: E402
+
+OWNER = "h" * 64
+
+
+async def _open_without(*, email=None, address=None):
+    row = await ledger.create_purchase(
+        agent_id="agent_w", agent_user_ref_hash=OWNER, merchant_domain="merchant.example",
+        checkout_url="https://merchant.example/cart/40000000001:1", currency="USD", our_price_minor=4650,
+        buyer_email=email, shipping_address=address)
+    return row["id"]
+
+
+async def test_a_checkout_purchase_without_its_contact_parks_sending_nothing():
+    pid = await _open_without()
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    row = await _row(pid)
+    assert rail.sent == []  # not even the card read
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("opened", worker.SHIPPING_ADDRESS_REQUIRED, None)
+    assert (row["buyer_action_kind"], row["buyer_action_url"]) == (None, None)
+    created, deadline = row["created_at"], row["buyer_action_expires_at"]
+    assert abs((deadline - created).total_seconds() - worker.SHIPPING_ADDRESS_SECONDS) < 5
+    # A second park never moves the deadline.
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert (await _row(pid))["buyer_action_expires_at"] == deadline
+
+
+async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
+    assert shipping_capture.fields_missing(None, None) == [
+        "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode", "country"]
+    assert shipping_capture.fields_missing(None, ADDRESS) == ["email"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == ["region"]
+    assert shipping_capture.fields_missing(EMAIL, ADDRESS) == []
+    # An address alone still waits for the email: the card binding needs it before anything is sent.
+    pid = await _open_without(address=ADDRESS)
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED and rail.sent == []
+
+
+async def test_past_its_deadline_a_waiting_purchase_expires_and_its_contact_is_gone():
+    pid = await _open_without(email=EMAIL)
+    await _ago("created_at", worker.SHIPPING_ADDRESS_SECONDS + 5, pid)
+    assert await _step(Rail(), pid) == "expired"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["buyer_email"]) == ("expired", worker.SHIPPING_ADDRESS_EXPIRED, None)
+
+
+async def test_the_expiry_sweep_names_a_passed_shipping_address_deadline():
+    pid = await _open_without()
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    await _ago("buyer_action_expires_at", 5, pid)
+    assert await ledger.expire_overdue_purchases() >= 1
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("expired", ledger.SHIPPING_ADDRESS_EXPIRED_CODE)
+    # Any other passed deadline keeps its own code.
+    other = await _open()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'bound_sent:1' WHERE id = :i", {"i": other})
+    await _ago("buyer_action_expires_at", 5, other)
+    await ledger.expire_overdue_purchases()
+    assert (await _row(other))["last_error_code"] == "buyer_action_expired"
+
+
+async def test_the_submitted_contact_fills_only_an_empty_part_and_makes_the_row_due():
+    pid = await _open_without()
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    moved = await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS)
+    assert moved is not None
+    assert (moved["buyer_email"], moved["shipping_address"]) == (EMAIL, ADDRESS)
+    assert (moved["last_error_code"], moved["buyer_action_expires_at"]) == (None, None)
+    # Due at once: the next claim takes it, and the purchase goes on to the card step.
+    assert [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)] == [pid]
+    await ledger.release_claim(pid, W)
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA)), pid) == "method_ready"
+    # Nothing waits any more: the same contact again changes nothing (the route answers it 200), another one
+    # is never written over it.
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    other = {**ADDRESS, "addressLine1": "2 Other St"}
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=other) is None
+    assert (await _row(pid))["shipping_address"] == ADDRESS
+
+
+async def test_a_stored_part_is_never_overwritten_and_another_owner_never_writes():
+    pid = await _open_without(email=EMAIL)
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email="other@example.test",
+                                                shipping_address=ADDRESS) is None  # a different email
+    assert await ledger.submit_shipping_address(pid, "agent_other", OWNER, buyer_email=None,
+                                                shipping_address=ADDRESS) is None  # another agent
+    assert await ledger.submit_shipping_address(pid, "agent_w", "g" * 64, buyer_email=None,
+                                                shipping_address=ADDRESS) is None  # another buyer
+    # The stored email may be left out, or sent again in another case.
+    moved = await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL.upper(), shipping_address=ADDRESS)
+    assert moved is not None and moved["buyer_email"] == EMAIL
+
+
+async def test_two_submits_at_once_write_exactly_one_contact():
+    pid = await _open_without()
+    first, second = {**ADDRESS, "addressLine1": "1 First St"}, {**ADDRESS, "addressLine1": "2 Second St"}
+    results = await asyncio.gather(
+        ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=first),
+        ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=second))
+    assert sum(r is not None for r in results) == 1
+    winner = next(r for r in results if r is not None)
+    assert (await _row(pid))["shipping_address"] == winner["shipping_address"]
+
+
+async def test_a_row_that_does_not_wait_takes_no_contact():
+    pid = await _open_without()
+    await _ago("buyer_action_expires_at", 5, pid)  # the deadline passed (the sweep not yet run)
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    purged = await _open_without(email=EMAIL)
+    await database.execute("UPDATE a2a_rail_purchases SET contact_purged_at = CURRENT_TIMESTAMP WHERE id = :i", {"i": purged})
+    assert await ledger.submit_shipping_address(purged, "agent_w", OWNER, buyer_email=None, shipping_address=ADDRESS) is None
+    # Complete already (still `opened`, the worker about to read the cards): nothing waits, nothing is touched.
+    complete = await _open_without(email=EMAIL, address=ADDRESS)
+    before = await _row(complete)
+    assert await ledger.submit_shipping_address(complete, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    assert (await _row(complete))["next_poll_at"] == before["next_poll_at"]
+    moved_on = await _open_without()
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'quoting' WHERE id = :i", {"i": moved_on})
+    assert await ledger.submit_shipping_address(moved_on, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+
+
+async def test_the_park_written_after_the_contact_landed_makes_the_row_due_at_once():
+    pid = await _open_without()
+    [row] = [r for r in await ledger.claim_due_purchases(W, limit=5) if r["id"] == pid]
+    # The gateway's write lands while the worker holds the row (between its read and its park).
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS)
+    parked = await ledger.park_for_shipping_address_as_holder(
+        pid, W, expires_at=worker._later(1800), next_poll_at=worker._later(600))
+    assert parked is not None and parked["claimed_by"] is None
+    assert [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)] == [pid]
+
+
+async def test_with_the_checkout_path_off_an_emailless_purchase_is_refused_as_before(monkeypatch):
+    monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0")
+    pid = await _open_without(address=ADDRESS)
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, pid) == "refused"
+    assert (await _row(pid))["refusal_reason"] == "buyer_email_required"
+
+
+def test_the_view_names_the_missing_fields_and_never_a_stored_value():
+    from datetime import datetime, timedelta, timezone
+
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
+    partial = {**ADDRESS}
+    partial.pop("postalCode")
+    row = {"id": "ap_" + "0" * 24, "state": "opened", "buyer_email": EMAIL, "shipping_address": partial,
+           "buyer_action_expires_at": deadline, "last_error_code": worker.SHIPPING_ADDRESS_REQUIRED,
+           "currency": "USD", "our_price_minor": 4650, "merchant_domain": "merchant.example"}
+    detail = view.build_view(row)
+    assert detail["shipping_address_required"] == {"fields_missing": ["postalCode"], "expires_at": deadline}
+    parent = {"id": "pp_" + "0" * 24, "rail": "a2a", "executor": "rail_managed", "rail_purchase_id": row["id"]}
+    body = unified_view.unified_body(parent, detail)
+    assert body["state"] == "routing"
+    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["postalCode"], "expires_at": deadline}
+    assert "url" not in body["next_action"] and "prefill" not in body["next_action"]
+    text = json.dumps(body, default=str)
+    for value in (EMAIL, *partial.values()):
+        if len(value) > 3:  # not "US" / "TX", which "USD" and other words contain
+            assert value not in text, value
+    # No deadline yet (the worker has not looked): no `expires_at`. Complete, or past `opened`: no action.
+    assert "expires_at" not in view.build_view({**row, "buyer_action_expires_at": None})["shipping_address_required"]
+    assert "shipping_address_required" not in view.build_view({**row, "shipping_address": ADDRESS})
+    assert "shipping_address_required" not in view.build_view({**row, "state": "quoting"})

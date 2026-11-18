@@ -42,6 +42,13 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
             "url": detail["hosted_url"],
             "expires_at": detail.get("approval_deadline") or detail.get("hosted_url_expires_at"),
         }
+    # The A2A rail asks the buyer for the shipping address / email the agent did not send: a form the
+    # gateway shows, no URL. Field NAMES only (services/payment_orchestration/a2a_purchase_view).
+    required = detail.get("shipping_address_required")
+    if "next_action" not in body and isinstance(required, Mapping) and required.get("fields_missing"):
+        body["next_action"] = {"kind": "shipping_address", "fields_missing": list(required["fields_missing"])}
+        if required.get("expires_at") is not None:
+            body["next_action"]["expires_at"] = required["expires_at"]
     if state == "completed" and detail.get("order_reference"):
         body["order_reference"] = detail["order_reference"]
     body["detail"] = dict(detail)
