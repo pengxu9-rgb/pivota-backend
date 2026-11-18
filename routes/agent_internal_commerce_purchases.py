@@ -69,6 +69,7 @@ from fastapi.responses import JSONResponse
 
 import db.agent_purchase_consents as consents_db
 import db.agent_purchase_ledger as purchases
+import db.reap_continuation as continuation
 from routes import agent_commerce_purchases as public
 from services.payment_orchestration import purchase_consent
 from services.payment_orchestration.rails import RAIL_ID_PREFIX
@@ -121,12 +122,14 @@ def mount(app: Any) -> bool:
     """Register the read on `app` only while its dial is on, and the consent write only while ITS dial is
     on (both read now, at build). Returns whether anything was registered. Both dials off: nothing is, so
     the app is exactly what it was without this module."""
+    global _CONSENT_WRITE_MOUNTED
     mounted = False
     if is_enabled():
         app.include_router(router)
         mounted = True
     if purchase_consent.write_enabled():
         app.include_router(consent_router)
+        _CONSENT_WRITE_MOUNTED = True
         mounted = True
     return mounted
 
@@ -186,7 +189,9 @@ async def get_purchase_for_gateway(
             if error is None:
                 block = purchase_consent.consent_block(
                     rail=str(parent["rail"]), rail_purchase_id=str(parent["rail_purchase_id"]),
-                    unified=str(body.get("state") or ""), consents=consents)
+                    unified=str(body.get("state") or ""), consents=consents, write_ready=consent_write_ready(),
+                    # Reap asks the agent for the buyer's contact again first: no consent until it is back.
+                    blocked=(body.get("detail") or {}).get("contact_reentry_required") is True)
                 if block is not None:
                     body["consent"] = block
     except Exception as exc:  # noqa: BLE001 - a rail read or view fault is "try again", never a 500
@@ -203,6 +208,8 @@ INTERNAL_CONSENT_KEY_MIN_LENGTH = 32
 _CONSENT_BODY_KEYS = frozenset({"step", "offer_id", "issued_at", "terms_version", "privacy_version"})
 _CONSENT_BODY_MAX_BYTES = 1024
 _OFFER_ID_RE = re.compile(r"^[0-9a-f]{64}\Z")
+#: The Reap states in which a purged contact means "re-enter it first" (routes/agent_commerce_reap).
+_REAP_CONTACT_REENTRY_STATES = frozenset({"resolving", "needs_enrollment", "quoting"})
 
 
 def _write_enabled() -> None:
@@ -211,11 +218,29 @@ def _write_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 
-def _require_consent_key(x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key")) -> None:
+def _configured_consent_key() -> Optional[str]:
+    """The write's key, or None when it is missing, shorter than 32 characters, or the read key itself."""
     expected = str(os.getenv(CONSENT_KEY_ENV) or "").strip()
     read_key = str(os.getenv(INTERNAL_KEY_ENV) or "").strip()
     if len(expected) < INTERNAL_CONSENT_KEY_MIN_LENGTH or (read_key and hmac.compare_digest(
             expected.encode("utf-8"), read_key.encode("utf-8"))):
+        return None
+    return expected
+
+
+#: Set by `mount` when the consent write is registered on the app (at build).
+_CONSENT_WRITE_MOUNTED = False
+
+
+def consent_write_ready() -> bool:
+    """Whether a consent POST could succeed now: the route is registered, its dial is on, its key is valid.
+    The read offers a consent only then (`consent.available`)."""
+    return _CONSENT_WRITE_MOUNTED and purchase_consent.write_enabled() and _configured_consent_key() is not None
+
+
+def _require_consent_key(x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key")) -> None:
+    expected = _configured_consent_key()
+    if expected is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={"error": "internal_key_not_configured"})
     provided = str(x_internal_key or "").strip()
@@ -317,6 +342,10 @@ async def record_purchase_consent(
     step = body["step"]
     # Not final and in this step, in one check: a final (or unmapped) state asks for no step at all.
     if purchase_consent.step_for(rail, row.get("state")) != step:
+        return _refusal(409, "consent_stale")
+    # Reap asks the agent for the buyer's contact again first (the read shows no offer then): the same rule
+    # as routes/agent_commerce_reap._owner_public_body's `contact_reentry_required`.
+    if rail == "reap" and row.get("state") in _REAP_CONTACT_REENTRY_STATES and continuation.contact_required(row):
         return _refusal(409, "consent_stale")
     epoch = purchase_consent.approval_epoch(rail, step)
     if not purchase_consent.offer_matches(cfg, body["offer_id"], rail=rail, rail_purchase_id=rail_id, step=step,

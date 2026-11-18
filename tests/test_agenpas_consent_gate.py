@@ -18,7 +18,6 @@ you can show, never to make a red run green.
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -107,6 +106,8 @@ def _mounted(request):
     app.include_router(internal_routes.router)
     # The consent write as an app built with ITS dial on registers it; its own dial still answers per request.
     app.include_router(internal_routes.consent_router)
+    was_mounted = internal_routes._CONSENT_WRITE_MOUNTED
+    internal_routes._CONSENT_WRITE_MOUNTED = True  # what `mount` records when it includes the write
     added = [r for r in app.router.routes if r not in before]
     app.router.routes[:] = added + before
     app.openapi_schema = None
@@ -114,6 +115,7 @@ def _mounted(request):
         yield
     finally:
         app.router.routes[:] = before
+        internal_routes._CONSENT_WRITE_MOUNTED = was_mounted
         app.openapi_schema = None
 
 
@@ -798,67 +800,46 @@ def test_nothing_updates_or_deletes_a_consent():
         if pattern.search(text):
             hits.append(rel)
     assert hits == []
-    statements = [v for k, v in vars(consents_db).items() if k.isupper() and isinstance(v, str) and k.endswith("_SQL")
-                  or k.endswith("_SQL_SQLITE")]
-    assert statements and all(not re.search(r"\b(UPDATE|DELETE)\b", sql, re.I) for sql in statements)
+    # ... nor an upsert that rewrites one.
+    upsert = re.compile(r"INSERT\s+INTO\s+agent_purchase_consents\b(?:(?!\"\"\"|;).)*?DO\s+UPDATE", re.I | re.S)
+    assert [p.relative_to(_REPO).as_posix() for p in _source_files()
+            if not p.relative_to(_REPO).as_posix().startswith("tests/")
+            and upsert.search(p.read_text("utf-8", errors="replace"))] == []
+    assert upsert.search("INSERT INTO agent_purchase_consents (id) VALUES (:id) ON CONFLICT (id) DO UPDATE SET id = 1")
+    statements = [v for k, v in vars(consents_db).items()
+                  if isinstance(v, str) and k.isupper() and k.endswith(("_SQL", "_SQL_SQLITE"))]
+    assert len(statements) >= 6
+    assert all(not re.search(r"\b(UPDATE|DELETE)\b|DO\s+UPDATE", sql, re.I) for sql in statements)
     down = (_REPO / "db/migrations/down/289_agent_purchase_consents_down.sql").read_text("utf-8")
     assert "DROP TABLE IF EXISTS agent_purchase_consents" in down
 
 
-def _may_be_quoting(tree: ast.AST, expr: ast.AST) -> bool:
-    """A non-literal `to_state` is safe only as `NAME[...]` / `NAME[...][i]` over a dict literal bound to NAME
-    whose values are all literals, none of them "quoting" (e.g. the worker's `ended = {...}[status]`)."""
-    while isinstance(expr, ast.Subscript):
-        expr = expr.value
-    if not isinstance(expr, ast.Name):
-        return True
-    bound = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
-             and any(isinstance(t, ast.Name) and t.id == expr.id for t in n.targets)]
-    if not bound:
-        return True
-    for value in bound:
-        while isinstance(value, ast.Subscript):
-            value = value.value
-        if not isinstance(value, ast.Dict):
-            return True
-        leaves = [n for v in value.values for n in ast.walk(v) if not isinstance(n, (ast.Tuple, ast.List, ast.Load))]
-        if not all(isinstance(n, ast.Constant) for n in leaves) or "quoting" in [n.value for n in leaves]:
-            return True
-    return False
+#: A raw-SQL writer of A2A `state = 'quoting'` inside an UPDATE's SET (bounded by WHERE, a string's end or `;`,
+#: so a WHERE `state = 'quoting'` of the next statement in the same file is not mistaken for one).
+_RAW_QUOTING_WRITE = re.compile(
+    r"UPDATE\s+a2a_rail_purchases\s+SET\b(?:(?!\bWHERE\b|\"\"\"|'''|;).)*?\bstate\s*=\s*'quoting'", re.I | re.S)
 
 
-def test_no_writer_of_the_a2a_re_quote_edge_exists():
-    """THE APPROVAL EPOCH RESTS ON THIS (services/payment_orchestration/purchase_consent.approval_epoch).
-    The A2A ledger permits `awaiting_authorization -> quoting`; nothing writes it, so every A2A purchase
-    enters `quoting` once and its approval epoch is 1. A writer appearing makes that false: an approval
-    consent would then carry over to a re-quoted price. Add a quoting-entry counter to a2a_rail_purchases,
-    return it from approval_epoch, then change this test."""
-    offenders = []
+async def test_the_a2a_re_quote_edge_is_closed_and_nothing_writes_it_in_raw_sql():
+    """THE APPROVAL EPOCH RESTS ON THIS (services/payment_orchestration/purchase_consent.approval_epoch): every
+    A2A purchase enters `quoting` once, so its approval consent binds to its one approval. The ledger refuses
+    `awaiting_authorization -> quoting` before any SQL; re-adding it needs an approval epoch on
+    agent_purchase_consents. Test fixtures that set a state by hand (tests/) are not writers."""
+    assert "quoting" not in a2a_ledger.ALLOWED_TRANSITIONS["awaiting_authorization"]
+    with pytest.raises(ValueError, match="illegal transition"):
+        await a2a_ledger.transition_as_holder("ap_" + "0" * 24, "w1", from_states=["awaiting_authorization"],
+                                              to_state="quoting")
+    hits = []
     for path in _source_files():
         rel = path.relative_to(_REPO).as_posix()
-        if path.suffix != ".py" or rel.startswith("tests/"):
+        if rel.startswith("tests/"):
             continue
         text = path.read_text("utf-8", errors="replace")
-        if "a2a_rail" not in text or "quoting" not in text:
-            continue
-        tree = ast.parse(text)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            kwargs = {k.arg: k.value for k in node.keywords if k.arg}
-            to_state = kwargs.get("to_state")
-            if not (isinstance(to_state, ast.Constant) and to_state.value == "quoting"):
-                if (to_state is not None and not isinstance(to_state, ast.Constant) and rel != "db/a2a_rail_ledger.py"
-                        and _may_be_quoting(tree, to_state)):
-                    offenders.append(f"{rel}:{node.lineno} (to_state not a literal)")
-                continue
-            sources = kwargs.get("from_states")
-            if not isinstance(sources, (ast.List, ast.Tuple)) or not all(isinstance(e, ast.Constant) for e in sources.elts):
-                offenders.append(f"{rel}:{node.lineno} (from_states not a literal list)")
-            elif "awaiting_authorization" in [e.value for e in sources.elts]:
-                offenders.append(f"{rel}:{node.lineno}")
-    assert offenders == []
-    assert "quoting" in a2a_ledger.ALLOWED_TRANSITIONS["awaiting_authorization"]  # the edge this guards
+        hits += [f"{rel}:{text[:m.start()].count(chr(10)) + 1}" for m in _RAW_QUOTING_WRITE.finditer(text)]
+    assert hits == []
+    # The scan sees what it is for, and not a WHERE.
+    assert _RAW_QUOTING_WRITE.search("UPDATE a2a_rail_purchases\n   SET updated_at = now(), state='quoting' WHERE id = :i")
+    assert not _RAW_QUOTING_WRITE.search("UPDATE a2a_rail_purchases SET x = 1 WHERE id = :i AND state = 'quoting'")
 
 
 async def test_pii_scrubs_and_expiry_sweeps_leave_the_consents(gate):
@@ -950,3 +931,178 @@ def test_the_prepare_gate_collects_the_postgres_statements():
                       consents_db._SELECT_REAP_FOR_AGENT_SQL, consents_db._SELECT_A2A_FOR_AGENT_SQL,
                       consents_db._CREATE_TABLE_PG):
         assert " ".join(statement.split()) in collected, statement.strip().splitlines()[0]
+
+
+# ── review round: `available` means the POST can succeed; Reap contact re-entry; events; recover / resume ──
+
+
+async def _offered(ids, name: str) -> Dict[str, Any]:
+    return (await _internal(ids[name])).json()["consent"]
+
+
+async def test_available_is_true_only_when_the_write_can_succeed(gate):
+    ids = await _fixtures()
+    ready = await _offered(ids, "R_approve")
+    assert ready["available"] is True and "offer" in ready
+
+    def _not_ready(consent):
+        assert consent["available"] is False and "offer" not in consent, consent
+
+    # the write route not registered on this app (its dial was off at startup)
+    gate.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", False)
+    _not_ready(await _offered(ids, "R_approve"))
+    gate.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", True)
+    # its dial turned off since
+    gate.delenv(purchase_consent.WRITE_ENABLED_ENV)
+    _not_ready(await _offered(ids, "R_approve"))
+    gate.setenv(purchase_consent.WRITE_ENABLED_ENV, "1")
+    # its key missing, short, or the read key itself
+    for value in (None, "k" * 31, READ_KEY):
+        if value is None:
+            gate.delenv(internal_routes.CONSENT_KEY_ENV)
+        else:
+            gate.setenv(internal_routes.CONSENT_KEY_ENV, value)
+        _not_ready(await _offered(ids, "R_approve"))
+    gate.setenv(internal_routes.CONSENT_KEY_ENV, WRITE_KEY)
+    assert (await _offered(ids, "R_approve"))["available"] is True
+    assert internal_routes.consent_write_ready() is True
+
+
+def test_mount_records_that_the_write_is_registered(monkeypatch):
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", False)
+    monkeypatch.delenv(purchase_consent.WRITE_ENABLED_ENV, raising=False)
+    internal_routes.mount(FastAPI())
+    assert internal_routes._CONSENT_WRITE_MOUNTED is False
+    monkeypatch.setenv(purchase_consent.WRITE_ENABLED_ENV, "1")
+    internal_routes.mount(FastAPI())
+    assert internal_routes._CONSENT_WRITE_MOUNTED is True
+
+
+async def test_reap_contact_re_entry_offers_no_consent_and_refuses_the_write(gate):
+    ids = await _fixtures()
+    for column, value in (("contact_purged_at", FIXED), ("last_error_code", "contact_retention_elapsed")):
+        await database.execute(f"UPDATE reap_agentic_purchases SET {column} = :v WHERE id IN (:a, :b)",
+                               {"v": value, "a": ids["R_enroll"], "b": ids["R_quoting"]})
+        for name, step in (("R_enroll", "card_binding"), ("R_quoting", "approval")):
+            body = (await _internal(ids[name])).json()
+            assert body["detail"]["contact_reentry_required"] is True
+            assert body["consent"]["available"] is False and "offer" not in body["consent"]
+            await _refused(ids[name], _offer(ids[name], step), 409, "consent_stale")
+        await database.execute(f"UPDATE reap_agentic_purchases SET {column} = NULL WHERE id IN (:a, :b)",
+                               {"a": ids["R_enroll"], "b": ids["R_quoting"]})
+    # Reap does not ask for re-entry on its approval page (its exposed-checkout scrub purges the contact there):
+    # the consent is still offered and accepted.
+    await database.execute("UPDATE reap_agentic_purchases SET contact_purged_at = :v WHERE id = :i",
+                           {"v": FIXED, "i": ids["R_approve"]})
+    assert (await _offered(ids, "R_approve"))["available"] is True
+    assert (await _post(ids["R_approve"], _offer(ids["R_approve"], "approval"))).status_code == 201
+
+
+async def test_an_event_recorded_before_the_gate_is_handed_over_without_the_url(gate, monkeypatch):
+    from services import agent_webhook_service, webhook_delivery_gate
+
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    sent: List[Dict[str, Any]] = []
+
+    async def _recorder(agent_id, *, event_type, payload, request_id=None, event_id=None):
+        sent.append({"event_type": event_type, "payload": payload, "event_id": event_id})
+        return {"status": "delivered", "delivery_id": "whd_x"}
+
+    monkeypatch.setattr(agent_webhook_service, "emit_agent_webhook_event", _recorder)
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    await purchase_events.detect()  # recorded while the gate was off: the stored payloads hold the URLs
+    stored = {r["rail_purchase_id"]: json.loads(r["payload"]) for r in await database.fetch_all(
+        "SELECT p.rail_purchase_id, e.payload FROM agent_purchase_events e JOIN agent_purchases p ON p.id = e.purchase_id")}
+    for name in GATED:
+        assert stored[ids[name]]["next_action"]["url"] == URLS[name]
+    await _consent(ids, "A_approve")
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+    await purchase_events.hand_over(worker="w_consent")
+    by_id = {e["payload"]["rail_purchase_id"]: e for e in sent}
+    everything = json.dumps([e["payload"] for e in sent if e["payload"]["rail_purchase_id"] != ids["A_approve"]])
+    for name in ("R_enroll", "R_approve", "A_bind"):
+        payload = by_id[ids[name]]["payload"]
+        assert URLS[name] not in json.dumps(payload) and URLS[name] not in everything
+        assert payload["next_action"] == {"kind": GATED[name], "consent_required": True,
+                                          "expires_at": stored[ids[name]]["next_action"]["expires_at"]}
+        assert payload["detail"]["buyer_step"]["consent_required"] is True and "hosted_url" not in payload["detail"]
+    # consented: sent as stored; and nothing else is touched
+    assert by_id[ids["A_approve"]]["payload"] == stored[ids["A_approve"]]
+    for name in ("R_completed", "A_completed"):
+        assert by_id[ids[name]]["payload"] == stored[ids[name]]
+    # the stored rows are not rewritten
+    again = {r["rail_purchase_id"]: json.loads(r["payload"]) for r in await database.fetch_all(
+        "SELECT p.rail_purchase_id, e.payload FROM agent_purchase_events e JOIN agent_purchases p ON p.id = e.purchase_id")}
+    assert again == stored
+
+
+async def test_with_the_gate_off_a_stored_payload_is_handed_over_as_the_same_object():
+    payload = {"state": "awaiting_buyer_authorization", "rail": "reap", "rail_purchase_id": "rp_" + "1" * 24,
+               "next_action": {"kind": "approval", "url": URLS["R_approve"]}, "detail": {"hosted_url": URLS["R_approve"]}}
+    assert await purchase_consent.gate_stored_payload(payload, agent_id=AGENT) is payload
+
+
+async def test_a_stored_payload_whose_consent_read_fails_is_gated(gate, monkeypatch):
+    async def _broken(*a, **k):
+        raise RuntimeError("consent table unreadable")
+
+    monkeypatch.setattr(consents_db, "consents_for", _broken)
+    payload = {"state": "needs_payment_method", "rail": "a2a", "rail_purchase_id": "ap_" + "1" * 24,
+               "next_action": {"type": "open_url", "kind": "card_binding", "url": URLS["A_bind"], "expires_at": "x"},
+               "detail": {"hosted_url": URLS["A_bind"], "hosted_url_expires_at": "x"}}
+    gated = await purchase_consent.gate_stored_payload(payload, agent_id=AGENT)
+    assert URLS["A_bind"] not in json.dumps(gated) and gated["next_action"]["consent_required"] is True
+
+
+def _create_body(key: str) -> Dict[str, Any]:
+    return {"item_source": "cart_link", "merchant_domain": "merchant.example", "product_key": "pk_1", "quantity": 1,
+            "buyer": {"email": EMAIL, "consent_version": "terms-2026-10",
+                      "shipping_address": {"firstName": "Pat", "lastName": "Placeholder", "phone": "+15550100",
+                                           "addressLine1": STREET, "city": "Placeholder City", "country": "US",
+                                           "postalCode": "00000"}},
+            "idempotency_key": key, "expected_unit_price_minor": 4250, "expected_currency": "USD"}
+
+
+async def _recover_and_resume(ids, monkeypatch) -> Dict[str, str]:
+    """name -> the recover and resume bodies (both answer with the Reap owner view verbatim)."""
+    import routes.agent_commerce_reap as reap_routes
+
+    target = {}
+
+    async def _replayed(**kwargs):
+        return target["id"]
+
+    monkeypatch.setattr(reap_routes, "_replayed_purchase_id", _replayed)
+    # resume's early answer: a contact already re-entered on an attempt that was never dispatched
+    await database.execute("UPDATE reap_agentic_purchases SET dispatch_tracking_version = 1, contact_revision = 1")
+    out = {}
+    for name in ("R_enroll", "R_approve"):
+        target["id"] = ids[name]
+        recovered = await _request("POST", f"{REAP}/recover", json=_create_body(f"key-{name}"))
+        resumed = await _request("POST", f"{REAP}/{ids[name]}/resume", json=_create_body(f"key-{name}"))
+        assert recovered.status_code == 200 and resumed.status_code == 200, (recovered.text, resumed.text)
+        got = (await _request("GET", f"{REAP}/{ids[name]}")).json()
+        assert recovered.json() == got and resumed.json() == got  # the same builder as the GET
+        out[name] = recovered.text + resumed.text
+    return out
+
+
+async def test_recover_and_resume_answer_the_reap_get_body_with_the_gate_off(monkeypatch):
+    ids = await _fixtures()
+    bodies = await _recover_and_resume(ids, monkeypatch)
+    for name in ("R_enroll", "R_approve"):
+        assert URLS[name] in bodies[name]
+
+
+async def test_gate_on_recover_and_resume_carry_no_card_or_approval_url(gate, monkeypatch):
+    ids = await _fixtures()
+    bodies = await _recover_and_resume(ids, monkeypatch)
+    everything = json.dumps(bodies)
+    for url in _gated_urls():
+        assert url not in everything and url.split("/", 3)[3] not in everything
+    for name in ("R_enroll", "R_approve"):
+        recovered = json.loads(bodies[name][:len(bodies[name]) // 2])
+        assert recovered["buyer_step"]["consent_required"] is True and "hosted_url" not in recovered

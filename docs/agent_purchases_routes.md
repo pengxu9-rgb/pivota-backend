@@ -135,6 +135,21 @@ partner requires that acceptance before a card is stored and before every approv
 
 Any refusal writes nothing. The write calls no rail.
 
+**A version change after a consent does not ask again.** A consent covers its step as it was offered: once
+recorded for (rail purchase, step, approval epoch), that step is satisfied even if `AGENPAS_TERMS_VERSION`
+or `AGENPAS_PRIVACY_VERSION` changes later in the same purchase. A re-POST with the new versions (and an
+offer minted under them) answers 200 `created: false`, echoing the STORED row's versions, not the new ones.
+The next step (or the next purchase) is offered under the new versions.
+
+**Reap's contact re-entry.** While a Reap purchase asks the agent for the buyer's contact again
+(`detail.contact_reentry_required`), the read's block is `available: false` with no offer, and a POST
+answers 409 `consent_stale`.
+
+**`available` is true only when the POST can succeed now**: the write route is registered (its dial was on
+at startup), `AGENPAS_CONSENT_WRITE_ENABLED` is still on, `AGENPAS_INTERNAL_CONSENT_KEY` is valid (>= 32
+characters, not the read key), the configuration and offer secret are set, and the consent table could be
+read.
+
 **What the record proves, and what it does not.** `evidence = link_holder_on_pivota_page`: whoever held
 the AgenPas link ticked "I agree" on Pivota's page. The agent holds that link too. The dwell, and the
 gateway's `Origin` / `Sec-Fetch-Site` / JSON checks, stop naive automation only; they do not prove a
@@ -157,7 +172,8 @@ every page (fail closed). List pages read the consents once per page.
 
 The approval consent may be given while the rail is still pricing (`locking`) or on the approval page,
 and binds to that purchase's single approval (`approval_epoch` 1 on both rails: a Reap re-quote fails the
-purchase, and nothing writes the A2A re-quote edge; a test fails if something starts to).
+purchase, and the A2A ledger has no re-quote edge: `awaiting_authorization -> quoting` is refused; a test
+fails if it is re-added or a raw SQL writer appears, and re-adding it needs an approval epoch on the consents).
 
 Configuration (all on the backend; none is read by the browser):
 
@@ -173,7 +189,11 @@ Configuration (all on the backend; none is read by the browser):
 
 **Turn on, in this order**: the gateway's consent UI and rails first (`AGENPAS_CONSENT_ENABLED`,
 `AGENPAS_RAILS`), then the backend configuration above and `AGENPAS_CONSENT_WRITE_ENABLED` (a restart),
-then `AGENPAS_CONSENT_GATE`. Gate on before the rest: every card / approval page is withheld and the
+then `AGENPAS_CONSENT_GATE`. **Events recorded before the gate went on** still hold the hosted URL in their
+stored payload: the hand-over re-applies the gate (the payload is sent without the URL, and with
+`next_action.consent_required`, while no consent exists for that step), so a pending
+`purchase.action_required` backlog never carries a card or approval URL past the gate. The stored rows are
+not rewritten. Gate on before the rest: every card / approval page is withheld and the
 AgenPas page says "not available right now". **Precondition for scripts/ops/reap_local_e2e.py and the
 Reap staging preflight**: the gate is off (they open the hosted page directly), or the run records the
 consent step first.

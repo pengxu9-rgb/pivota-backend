@@ -29,11 +29,11 @@ Origin / Sec-Fetch-Site checks stop naive automation only: the agent holds the A
 record says exactly that (`evidence = link_holder_on_pivota_page`).
 
 APPROVAL EPOCH. An approval consent binds to the purchase's single approval. Reap: 1 (a re-quote fails the
-purchase; there is no edge back to quoting). A2A: the number of entries into `quoting`, which is 1 for
-every purchase today: the ledger allows `awaiting_authorization -> quoting` but NOTHING WRITES IT
-(tests/test_agenpas_consent_gate.py fails the build if a writer appears; whoever adds one must add a
-quoting-entry counter to a2a_rail_purchases and return it here, or an approval consent would carry over
-to a re-quoted price).
+purchase; there is no edge back to quoting). A2A: 1 as well, because the ledger has NO
+`awaiting_authorization -> quoting` edge (db/a2a_rail_ledger.ALLOWED_TRANSITIONS; it was allowed but never
+written, and was closed for this). tests/test_agenpas_consent_gate.py fails if the edge is re-added or a raw
+SQL writer of `state = 'quoting'` appears; re-adding it needs an approval epoch here, or an approval consent
+would carry over to a re-quoted price.
 """
 
 from __future__ import annotations
@@ -233,6 +233,29 @@ async def gate(
     return gated_detail(detail, step)
 
 
+async def gate_stored_payload(payload: Any, *, agent_id: Any) -> Any:
+    """A purchase.* payload written BEFORE the gate went on (or before its consent lapsed) carries the hosted
+    URL; the hand-over re-applies the gate so it is not sent. `payload` itself (the same object) unless the
+    gate withholds its page; then a gated copy: no url, `detail.buyer_step`, `next_action.consent_required`.
+    The stored event is not rewritten (its id and row stay as they are)."""
+    if not gate_on() or not isinstance(payload, dict):
+        return payload
+    action, detail = payload.get("next_action"), payload.get("detail")
+    if not isinstance(action, dict) or not action.get("url") or not isinstance(detail, dict):
+        return payload
+    step = GATED_PAGE_FOR_STATE.get(str(payload.get("state") or ""))
+    if step is None or action.get("kind") != step:
+        return payload
+    rail, rail_purchase_id = str(payload.get("rail") or ""), str(payload.get("rail_purchase_id") or "")
+    consents = await snapshot(str(agent_id), [(rail, rail_purchase_id)]) if agent_id and rail_purchase_id else FAILED
+    if _satisfied(consents, rail, rail_purchase_id, step):
+        return payload
+    gated = dict(payload)
+    gated["detail"] = gated_detail(detail, step)
+    gated["next_action"] = {"kind": step, "expires_at": action.get("expires_at"), "consent_required": True}
+    return gated
+
+
 # ── the offer ────────────────────────────────────────────────────────────────────────────────
 
 
@@ -265,13 +288,15 @@ def offer_matches(cfg: ConsentConfig, provided: str, **fields: Any) -> bool:
 
 
 def consent_block(
-    *, rail: str, rail_purchase_id: str, unified: str, consents: Any, now: Optional[datetime] = None,
+    *, rail: str, rail_purchase_id: str, unified: str, consents: Any, write_ready: bool,
+    blocked: bool = False, now: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """The internal read's `consent` block for a state that asks for a consent, else None. Writes nothing.
 
-    `available` is false (and no offer is made) when the terms / privacy configuration or the offer secret
-    is missing, the write is not switched on, or the consent read failed: the page then says "not available
-    right now", and the gate keeps the hosted page withheld."""
+    `available` is true only when the POST could succeed now: the terms / privacy configuration and the offer
+    secret are set, `write_ready` (the write route is registered, its dial is on and its key is valid; the
+    route module decides), the consent read worked, and nothing `blocked` the step (Reap's contact re-entry).
+    Otherwise there is no offer: the page says "not available right now", and the hosted page stays withheld."""
     step = STEP_FOR_STATE.get(unified)
     if step is None:
         return None
@@ -281,7 +306,7 @@ def consent_block(
         "required": True,
         "step": step,
         "satisfied": satisfied,
-        "available": cfg is not None and write_enabled() and consents is not FAILED,
+        "available": cfg is not None and write_ready and not blocked and consents is not FAILED,
         # How long the page must wait after `offer.issued_at` before the write accepts it (0..120).
         "min_dwell_seconds": min_dwell_seconds(),
     }

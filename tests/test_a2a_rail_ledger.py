@@ -332,7 +332,9 @@ async def test_a_transition_leaves_the_schedule_alone_and_does_not_keep_a_stale_
     assert moved["last_error_code"] is None
 
 
-async def test_a_requote_replaces_the_quote_order_and_token_rather_than_keeping_them():
+async def test_there_is_no_re_quote_edge_and_a_recorded_token_is_forgotten_only_by_name():
+    """`awaiting_authorization -> quoting` is closed (the AgenPas approval consent binds to a purchase's one
+    approval; re-adding the edge needs an approval epoch on agent_purchase_consents)."""
     pid = await _in_state("awaiting_authorization", quote_id="q_1", quoted_total_minor=4650,
                           buyer_action_kind="approval", buyer_action_url=PAGE)
     await _claimed({"id": pid})
@@ -340,23 +342,16 @@ async def test_a_requote_replaces_the_quote_order_and_token_rather_than_keeping_
     assert row["quote_id"] == "q_1"
     await database.execute("UPDATE a2a_rail_purchases SET order_id = 'o_1', payment_token_id = 'ptk_1' WHERE id = :i",
                            {"i": pid})
-    # the buyer may have approved ptk_1: no re-quote may lose its id before it is voided
-    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
-                                             to_state="quoting") is None
+    with pytest.raises(ValueError, match="illegal transition"):
+        await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"], to_state="quoting")
     assert await ledger.forget_voided_token(pid, "w1", "ptk_other") is None   # must name the token
     assert await ledger.forget_voided_token(pid, "w2", "ptk_1") is None       # must hold the row
     await ledger.mark_pending_write(pid, "w1", "payment.token-revoke#submit")
     assert await ledger.forget_voided_token(pid, "w1", "ptk_1") is None       # the void's answer unseen
     await ledger.clear_pending_write(pid, "w1", "payment.token-revoke#submit")
     assert (await ledger.forget_voided_token(pid, "w1", "ptk_1"))["payment_token_id"] is None
-    requoted = await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"], to_state="quoting",
-                                                 last_error_code="price_changed")
-    for column in ("quote_id", "quoted_total_minor", "order_id", "payment_token_id", "buyer_action_url"):
-        assert requoted[column] is None, column
-    again = await ledger.transition_as_holder(pid, "w1", from_states=["quoting"], to_state="awaiting_authorization",
-                                              quote_id="q_2", quoted_total_minor=4900,
-                                              buyer_action_kind="approval", buyer_action_url=PAGE)
-    assert (again["quote_id"], again["quoted_total_minor"]) == ("q_2", 4900)
+    after = await ledger.get_purchase_internal(pid)
+    assert (after["state"], after["quote_id"]) == ("awaiting_authorization", "q_1")
 
 
 async def test_a_dead_workers_unseen_write_survives_the_requeue():
@@ -472,16 +467,17 @@ async def test_a_requoting_purchase_still_expires_at_its_lifetime_ceiling():
     assert (await ledger.get_purchase_internal(pid))["state"] == "expired"
 
 
-async def test_a_purged_purchase_cannot_be_requoted():
-    pid = await _in_state("awaiting_authorization", buyer_action_kind="approval", buyer_action_url=PAGE)
+async def test_a_purged_purchase_cannot_enter_quoting():
+    """The quote needs the address. (The re-quote edge from `awaiting_authorization` is closed altogether.)"""
+    pid = await _in_state("needs_payment_method", buyer_action_kind="card_binding", buyer_action_url=PAGE)
     await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-4 days') WHERE id = :i",
                            {"i": pid})
     assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) == 1
     await _claimed({"id": pid})
-    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["needs_payment_method"],
                                              to_state="quoting") is None
     # other edges are unaffected
-    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["needs_payment_method"],
                                              to_state="failed", last_error_code="contact_purged")
 
 

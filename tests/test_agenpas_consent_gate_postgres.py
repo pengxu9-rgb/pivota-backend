@@ -201,7 +201,12 @@ async def test_the_rail_reads_are_agent_scoped_and_carry_no_pii(_db):
 
     reap_id, a2a_id = await _reap(), await _a2a()
     reap_row = await consents_db.rail_purchase_for_agent("reap", reap_id, AGENT)
-    assert reap_row == {"id": reap_id, "state": "needs_enrollment", "rail_buyer_ref": "re_consent_pg_1"}
+    assert reap_row == {"id": reap_id, "state": "needs_enrollment", "rail_buyer_ref": "re_consent_pg_1",
+                        "contact_purged_at": None, "last_error_code": None}
+    await _db.execute("UPDATE reap_agentic_purchases SET contact_purged_at = now(), "
+                      "last_error_code = 'contact_retention_elapsed' WHERE id = :i", {"i": reap_id})
+    purged = await consents_db.rail_purchase_for_agent("reap", reap_id, AGENT)
+    assert purged["contact_purged_at"] is not None and purged["last_error_code"] == "contact_retention_elapsed"
     a2a_row = await consents_db.rail_purchase_for_agent("a2a", a2a_id, AGENT)
     assert a2a_row["state"] == "awaiting_authorization" and a2a_row["rail_buyer_ref"].startswith("pvm_")
     assert await consents_db.rail_purchase_for_agent("reap", reap_id, OTHER_AGENT) is None

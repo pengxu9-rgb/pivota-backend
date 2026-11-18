@@ -182,7 +182,8 @@ async def consents_for(agent_id: str, rail_purchase_ids: Iterable[str]) -> Froze
 # reads: the gateway holds no owner hash. Neither statement returns PII.
 
 _SELECT_REAP_FOR_AGENT_SQL = """
-    SELECT id, state, enrollment_id AS rail_buyer_ref FROM reap_agentic_purchases
+    SELECT id, state, enrollment_id AS rail_buyer_ref, contact_purged_at, last_error_code
+      FROM reap_agentic_purchases
      WHERE id = :id AND agent_id = :agent_id
 """
 _SELECT_A2A_FOR_AGENT_SQL = """
@@ -192,7 +193,7 @@ _SELECT_A2A_FOR_AGENT_SQL = """
 
 
 async def rail_purchase_for_agent(rail: str, rail_purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
-    """{id, state, rail_buyer_ref} of this agent's rail purchase, or None ("not this agent's" and "does not
+    """{id, state, rail_buyer_ref[, contact_purged_at, last_error_code (Reap)]} of this agent's rail purchase, or None ("not this agent's" and "does not
     exist" are the same None)."""
     params = {"id": rail_purchase_id, "agent_id": agent_id}
     if rail == "reap":

@@ -317,14 +317,12 @@ async def test_the_new_statements_run_with_real_parameters_on_postgres():
     assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) >= 1
     row = await ledger.get_purchase_internal(pid)
     assert row["buyer_email"] is None and row["contact_purged_at"] is not None and row["state"] == "paying"
-    # the re-quote edge with typed NULLs on Postgres, after a voided token is forgotten
+    # no re-quote edge (the AgenPas approval consent binds to one approval); a voided token is forgotten by name
     other = await _stale_awaiting_authorization()
     await database.execute("UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_1' WHERE id = :i", {"i": other})
-    assert await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"],
-                                             to_state="quoting") is None
+    with pytest.raises(ValueError, match="illegal transition"):
+        await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"], to_state="quoting")
     assert (await ledger.forget_voided_token(other, "w1", "ptk_1"))["payment_token_id"] is None
-    requoted = await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"], to_state="quoting")
-    assert requoted["quote_id"] is None and requoted["quoted_total_minor"] is None
     # the lifetime ceiling on Postgres
     await database.execute("UPDATE a2a_rail_purchases SET created_at = now() - interval '3 days', "
                            "state_entered_at = now() WHERE id = :i", {"i": other})
