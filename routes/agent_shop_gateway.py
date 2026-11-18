@@ -4957,10 +4957,11 @@ async def _handle_offers_resolve(
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
     # THE BUYER MARKET, read as the gateway's get_offers reads one (trimmed, upper-cased: 'us' is US) and
-    # refused by name, before any read, when it is not a market this registry lists: `market_invalid` for a
-    # value that is not a two-letter code ('USA', 'EU-DE', 123), `market_not_priced` for a well-formed code the
-    # registry does not list (DE, ZZ). Never defaulted and never answered as another market. Absent, null or
-    # blank names no market (the gateway's rule, D-10's marketIsUnnamed): no market, exactly as before.
+    # refused by name, before any read, when it is not a market this registry prices: `market_invalid` for a
+    # value that is not a two-letter code ('USA', 'EU-DE', 123), `market_not_priced` for a well-formed code that
+    # is not a registry pricing region (DE, ZZ; NZ, listed but not priced). Never defaulted and never answered
+    # as another market. Absent, null or blank names no market (the gateway's rule, D-10's marketIsUnnamed):
+    # no market, exactly as before.
     market_refusal = _offers_resolve_market_refusal(payload.market)
     if market_refusal is not None:
         return market_refusal
@@ -9980,7 +9981,8 @@ def _offers_resolve_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
     """offers.resolve's named refusal for a market it cannot answer for, or None (unnamed, or listed).
 
     The vocabulary is the gateway get_offers door's: `market_invalid` (not a two-letter code; the value is
-    never echoed) and `market_not_priced` (a well-formed code the market registry does not list)."""
+    never echoed) and `market_not_priced` (a well-formed code that is not one of the market registry's
+    pricing regions: not listed (DE, ZZ), or listed without pricing (NZ))."""
     if _offers_resolve_market_unnamed(raw):
         return None
     code = market_registry.normalize_market(raw) if isinstance(raw, str) else ""
@@ -9996,7 +9998,11 @@ def _offers_resolve_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
                            "Send the buyer's country as two letters; a market is never guessed.",
             },
         }
-    if market_registry.market_or_none(code) is None:
+    # PRICED = a measured pricing region of the registry (pricing_region_currency, the gateway's
+    # BUYER_REGION_CURRENCY map), not merely listed: NZ is listed with pricing_region false, the gateway
+    # prices nothing there, and this door answers it as the gateway does. Read here only; the registry and
+    # its other readers are unchanged.
+    if code not in market_registry.pricing_region_currency():
         return {
             "status": "error",
             "offers": [],

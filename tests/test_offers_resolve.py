@@ -6463,7 +6463,8 @@ def test_a_market_that_is_not_a_country_code_is_refused_by_name_before_any_read(
         assert market not in res.text
 
 
-@pytest.mark.parametrize("market, code", [("DE", "DE"), ("ZZ", "ZZ"), ("de", "DE"), (" zz ", "ZZ")])
+@pytest.mark.parametrize("market, code", [("DE", "DE"), ("ZZ", "ZZ"), ("de", "DE"), (" zz ", "ZZ"),
+                                          ("NZ", "NZ"), ("nz", "NZ")])
 def test_a_country_code_the_registry_does_not_list_is_refused_by_name_before_any_read(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, market, code
 ) -> None:
@@ -6505,3 +6506,22 @@ def test_a_request_that_names_no_market_is_answered_as_before(
     [binds] = [v for q, v in reads if "FROM catalog_products" in q and "JOIN catalog_offers" in q]
     assert binds["market"] is None and binds["buyer_currency"] is None, "never defaulted"
     assert len(body["offers"]) == 3
+
+
+def test_offers_resolve_prices_exactly_the_registry_pricing_regions_and_nz_is_not_one(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The markets this door answers are the registry's pricing regions -- the gateway's own priced map -- not
+    every listed market: NZ is listed with pricing_region false and is refused as the gateway refuses it."""
+    from services import market_registry
+
+    assert market_registry.market_or_none("NZ") is not None and "NZ" not in market_registry.pricing_region_currency()
+    for code in sorted(market_registry.MARKETS):
+        res, reads = _market_resolve(monkeypatch, client, code)
+        body = res.json()
+        if code in market_registry.pricing_region_currency():
+            assert body["status"] != "error", code
+            assert reads, code
+        else:
+            assert (body["status"], body["error"]["reason"], body["market"], reads) == ("error", "market_not_priced", code, []), code
+
