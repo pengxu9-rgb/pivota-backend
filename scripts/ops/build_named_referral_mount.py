@@ -5,9 +5,12 @@ serving loader disables shade pinning for EVERY seed, the live ones included. So
 script has passed on the very bytes that go up:
 
     python3 -I scripts/ops/build_named_referral_mount.py --current <file web mounts now> \\
+        --current-sha256 <web's live NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256> --web-release <web's 40-hex release> \\
         --batch <batch manifest> --out <file to upload>
 
 It prints `NAMED_MOUNT_OK size=<n> sha256=<hex>` and exits 0 only when:
+- the current file is byte-for-byte the one web mounts (its sha256 is web's live pin);
+- this tree is web's release (it verifies with this tree's loader, so it must be the loader web runs);
 - the current file loads (non-empty) through the serving loader;
 - no batch seed is already in it (extending a live seed is not supported: the plan pins each entry's additions
   exactly);
@@ -18,6 +21,9 @@ It prints `NAMED_MOUNT_OK size=<n> sha256=<hex>` and exits 0 only when:
 Otherwise it prints `NAMED_MOUNT_REFUSED: <reason>` and exits 3. It reads only local files; it never calls a
 network service. Upload exactly the written file (`gcloud secrets versions add ... --data-file <out>`), then check
 the printed sha against the new version's.
+
+There is no --remove mode yet: undoing a batch means re-mounting the pre-batch version (after the job rollback).
+It is needed before a second batch is merged on top of a first.
 """
 from __future__ import annotations
 
@@ -27,6 +33,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import re
+import subprocess
 import tempfile
 
 if __package__ in (None, ""):
@@ -117,7 +125,29 @@ def verify(out: bytes, current: bytes, entries, listings) -> None:
             "the merged mount pins a seed that is neither live nor in the batch")
 
 
-def build(current: bytes, batch_manifest: bytes, listings=None) -> bytes:
+def release_of_this_tree() -> str:
+    """The release this loader is: the image's commit file, else a CLEAN git checkout's HEAD."""
+    root = Path(__file__).resolve().parents[2]
+    stamp = root / ".image_commit_sha"
+    if stamp.is_file():
+        return stamp.read_text().strip()
+    run = lambda *args: subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,  # noqa: E731
+                                       timeout=60, check=False)
+    head, dirty = run("rev-parse", "HEAD"), run("status", "--porcelain", "--", "services", "scripts", "routes")
+    require(head.returncode == 0 and dirty.returncode == 0, "cannot tell which release this tree is")
+    require(not dirty.stdout.strip(), "this tree has local changes to the loader or the writer")
+    return head.stdout.strip()
+
+
+def build(current: bytes, batch_manifest: bytes, listings=None, *, current_sha256: str, web_release: str) -> bytes:
+    require(isinstance(current_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", current_sha256),
+            "--current-sha256 must be web's live 64-hex manifest pin")
+    require(hashlib.sha256(current).hexdigest() == current_sha256,
+            "the current file is not the one web mounts (its sha256 is not web's live pin)")
+    require(isinstance(web_release, str) and re.fullmatch(r"[0-9a-f]{40}", web_release),
+            "--web-release must be web's 40-hex release")
+    require(release_of_this_tree() == web_release,
+            "this tree is not web's release: build from a checkout of the release web serves")
     listings = pilot.LISTINGS if listings is None else listings
     try:
         _, entries = batch.parse_manifest(batch_manifest)
@@ -131,12 +161,15 @@ def build(current: bytes, batch_manifest: bytes, listings=None) -> bytes:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--current", required=True, help="the named-referral manifest web mounts now")
+    parser.add_argument("--current-sha256", required=True, help="web's live NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256")
+    parser.add_argument("--web-release", required=True, help="the 40-hex release web serves (and will serve)")
     parser.add_argument("--batch", required=True, help="the batch manifest")
     parser.add_argument("--out", required=True, help="where to write the bytes to upload (must not exist)")
     args = parser.parse_args(argv)
     try:
         require(not Path(args.out).exists(), "the output file already exists")
-        out = build(Path(args.current).read_bytes(), Path(args.batch).read_bytes())
+        out = build(Path(args.current).read_bytes(), Path(args.batch).read_bytes(),
+                    current_sha256=args.current_sha256, web_release=args.web_release)
         with open(args.out, "xb") as target:
             target.write(out)
         require(Path(args.out).read_bytes() == out, "the written file differs from the verified bytes")
