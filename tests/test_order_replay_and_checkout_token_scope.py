@@ -809,6 +809,12 @@ def _v2_order_harness(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_v2.QuoteService, "load_active_quote_or_raise", load_quote)
     monkeypatch.setattr(agent_v2, "agent_v1_create_order", create_order)
     monkeypatch.setattr(agent_v2, "get_order", get_order)
+
+    # The order create is doubled above; its governance step now runs in the v2 route itself.
+    async def governance_passes(_context: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_v2, "validate_order_create_governance", governance_passes)
     body = agent_v2.CreateOrderBody(
         quote_id="q_1",
         buyer_context={

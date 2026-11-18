@@ -32,9 +32,11 @@ from mvp.idempotency import PostgresIdempotencyStore
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import (
+    OrderQuoteClaimUnavailable,
     find_replayable_order_for_create,
     get_order,
     get_orders_by_merchant,
+    read_quote_claim_holder,
     update_order,
     update_payment_info,
 )
@@ -142,7 +144,9 @@ from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 from utils.transient_errors import (
+    ORDER_QUOTE_GUARD_UNAVAILABLE,
     ORDER_REPLAY_LOOKUP_UNAVAILABLE,
+    commerce_path_unknown_http_exception_fields,
     db_busy_http_exception,
     is_asyncpg_busy_error,
     order_existence_unknown_http_exception_fields,
@@ -758,6 +762,83 @@ async def _load_replayable_agent_order_create_response_with_backoff(
     if last_poll_failure is not None:
         raise last_poll_failure
     return None
+
+
+#: Set on the caller's context once an order create's governance ran, so it runs once per create
+#: when a route validates before calling agent_create_order (its rate counts requests).
+ORDER_CREATE_GOVERNANCE_VALIDATED = "order_create_governance_validated"
+
+
+async def validate_order_create_governance(context: Any) -> None:
+    """An agent order create's governance: the agent's status (`blocked` or `suspended`: 403) and
+    its request rate (429). Neither answer is a listed refusal. It runs before anything of the
+    create is answered, an order the quote already holds included."""
+    from services.agent_governance import agent_governance
+
+    await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+    try:
+        setattr(context, ORDER_CREATE_GOVERNANCE_VALIDATED, True)
+    except Exception:  # noqa: BLE001 - a context that takes no attribute is validated again below
+        pass
+
+
+async def answer_for_a_quote_that_holds_its_order(
+    holder: Any,
+    order_request: Any,
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """What a create answers when its quote already holds an order (`holder`, the result of
+    `read_quote_claim_holder`, or the exception it raised). None when there is no holder.
+
+    The order is answered only inside this caller's ordinary replay scope (its agent, a checkout
+    token's intent, the provider choice): `_replay_order_that_holds_quote`. Outside it the answer is
+    409 QUOTE_CONSUMED (OrderForQuoteExists), never a refusal that says nothing was ordered. A read
+    that failed is the retriable 503 ORDER_QUOTE_GUARD_UNAVAILABLE.
+    """
+    if isinstance(holder, OrderQuoteClaimUnavailable):
+        raise HTTPException(**order_existence_unknown_http_exception_fields(ORDER_QUOTE_GUARD_UNAVAILABLE)) from holder
+    if isinstance(holder, BaseException):
+        raise holder
+    if not holder:
+        return None
+    replay_response = await _replay_order_that_holds_quote(
+        order_request, str(holder), agent_id=agent_id, intent_id=intent_id
+    )
+    if replay_response:
+        return replay_response
+    raise order_routes_module.OrderForQuoteExists(str(holder))
+
+
+async def answer_for_a_create_whose_quote_holds_its_order(
+    context: Any,
+    *,
+    merchant_id: str,
+    quote_id: Optional[str],
+    idempotency_key: Optional[str],
+    preferred_psp: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """For a route that validates a create before it reaches agent_create_order (POST
+    /agent/v2/orders): read the quote's claim for this caller and answer it as
+    `answer_for_a_quote_that_holds_its_order` does, with the replay key agent_create_order uses."""
+    try:
+        holder: Any = await read_quote_claim_holder(agent_id=getattr(context, "agent_id", None), quote_id=quote_id)
+    except Exception as exc:  # noqa: BLE001 - answered by the function below
+        holder = exc
+    replay_request = SimpleNamespace(
+        merchant_id=merchant_id,
+        quote_id=quote_id,
+        idempotency_key=idempotency_key
+        or (
+            _default_order_create_idempotency_key(merchant_id=merchant_id, quote_id=quote_id, preferred_psp=preferred_psp)
+            if quote_id
+            else None
+        ),
+        agent_session_id=None,
+        preferred_psp=preferred_psp,
+    )
+    return await answer_for_a_quote_that_holds_its_order(holder, replay_request, **_order_create_replay_owner(context))
 
 
 async def _replay_order_that_holds_quote(
@@ -8792,11 +8873,13 @@ async def agent_create_order(
     if order_request.merchant_id == EXTERNAL_SEED_MERCHANT_ID:
         raise HTTPException(status_code=400, detail="EXTERNAL_PRODUCT_CHECKOUT_DISABLED")
 
-    # STEP 1: Governance validation (before main logic)
+    # STEP 1: Governance validation (before main logic), once per create: POST /agent/v2/orders
+    # runs it itself before it answers anything (validate_order_create_governance).
     from services.agent_governance import agent_governance
     _t = time.perf_counter()
     try:
-        await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+        if getattr(context, ORDER_CREATE_GOVERNANCE_VALIDATED, False) is not True:
+            await validate_order_create_governance(context)
     finally:
         logger.info(
             "[AgentAPI][PERF] step=validate_request_compat duration_ms=%d order=%s",
@@ -8985,10 +9068,13 @@ async def agent_create_order(
             return replay
 
         _parallel_started = time.perf_counter()
-        store_info_for_policy, idempotency_cache, replay_response = await asyncio.gather(
+        store_info_for_policy, idempotency_cache, replay_response, quote_holder = await asyncio.gather(
             _timed_get_primary_store_for_policy(),
             _timed_idempotency_get(),
             _timed_load_replayable_agent_order_create_response(),
+            # Does this caller's quote already hold an order (read only, no provider, intent or key
+            # in it)? Acted on right after this create's own replay, before any refusal below.
+            read_quote_claim_holder(agent_id=getattr(context, "agent_id", None), quote_id=order_request.quote_id),
             return_exceptions=True,
         )
         logger.info(
@@ -8996,6 +9082,49 @@ async def agent_create_order(
             int((time.perf_counter() - _parallel_started) * 1000),
             _agent_order_id_for_perf,
         )
+
+        # Quote-first idempotency: scope the default replay key by preferred_psp as well.
+        # This prevents a first PSP-specific checkout attempt from silently replaying into
+        # later attempts that reuse the same quote with a different explicit provider choice.
+        if order_request.quote_id and not order_request.idempotency_key:
+            order_request.idempotency_key = order_create_idempotency_key
+
+        # An order this create already made is answered FIRST, before anything below can refuse
+        # the request: the commerce-path decision reads the store live, and a resend after a store
+        # change (or while the policy read cannot tell) must get its order, not a refusal that says
+        # nothing was ordered. The cached answer, then the replay lookup's. A lookup that failed is
+        # the retriable 503 (raised here); a cache read that failed is raised where it always was,
+        # below the commerce-path decision (the lookup, which reads the table, found no order).
+        # Idempotency replay: if provided and already processed, replay the cached response.
+        idempotency_cache_value = None if isinstance(idempotency_cache, BaseException) else getattr(idempotency_cache, "value", None)
+        if idempotency_cache and isinstance(idempotency_cache_value, dict):
+            if (
+                idempotency_cache_value.get("status") == "success"
+                and idempotency_cache_value.get("order_id")
+                and (idempotency_cache_value.get("merchant_id") in (None, order_request.merchant_id))
+            ):
+                _agent_order_id_for_perf = idempotency_cache_value.get("order_id")
+                return idempotency_cache_value
+
+        if isinstance(replay_response, BaseException):
+            raise replay_response
+        if replay_response:
+            _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
+            await _cache_agent_order_create_response_best_effort(
+                getattr(order_request, "idempotency_key", None),
+                replay_response,
+                **replay_owner,
+            )
+            return replay_response
+
+        # Another create for a quote that already holds its order: that order (inside this caller's
+        # replay scope) or 409 QUOTE_CONSUMED, never a listed refusal below.
+        held_quote_response = await answer_for_a_quote_that_holds_its_order(
+            quote_holder, order_request, **replay_owner
+        )
+        if held_quote_response is not None:
+            _agent_order_id_for_perf = held_quote_response.get("order_id") if isinstance(held_quote_response, dict) else None
+            return held_quote_response
 
         if isinstance(store_info_for_policy, BaseException):
             raise store_info_for_policy
@@ -9029,8 +9158,16 @@ async def agent_create_order(
                         **({"details": e.details} if getattr(e, "details", None) else {}),
                     },
                 )
-            except Exception:
-                platform_for_policy = None
+            except Exception as policy_read_failed:
+                # Could not tell which commerce path serves this merchant: a retriable 503, never
+                # the listed "unsupported" refusal (that says the path was decided). Logged at ERROR
+                # with its type, so a failure that is not transient does not hide behind the retry.
+                logger.error(
+                    "[agent_orders_create] commerce path unknown: the policy quote read failed (%s) for merchant %s",
+                    type(policy_read_failed).__name__,
+                    order_request.merchant_id,
+                )
+                raise HTTPException(**commerce_path_unknown_http_exception_fields()) from policy_read_failed
 
         commerce_policy = resolve_commerce_execution_policy(
             platform=platform_for_policy,
@@ -9046,36 +9183,8 @@ async def agent_create_order(
                 },
             )
 
-        # Quote-first idempotency: scope the default replay key by preferred_psp as well.
-        # This prevents a first PSP-specific checkout attempt from silently replaying into
-        # later attempts that reuse the same quote with a different explicit provider choice.
-        if order_request.quote_id and not order_request.idempotency_key:
-            order_request.idempotency_key = order_create_idempotency_key
-
         if isinstance(idempotency_cache, BaseException):
             raise idempotency_cache
-
-        # Idempotency replay: if provided and already processed, replay the cached response.
-        idempotency_cache_value = getattr(idempotency_cache, "value", None)
-        if idempotency_cache and isinstance(idempotency_cache_value, dict):
-            if (
-                idempotency_cache_value.get("status") == "success"
-                and idempotency_cache_value.get("order_id")
-                and (idempotency_cache_value.get("merchant_id") in (None, order_request.merchant_id))
-            ):
-                _agent_order_id_for_perf = idempotency_cache_value.get("order_id")
-                return idempotency_cache_value
-
-        if isinstance(replay_response, BaseException):
-            raise replay_response
-        if replay_response:
-            _agent_order_id_for_perf = replay_response.get("order_id") if isinstance(replay_response, dict) else None
-            await _cache_agent_order_create_response_best_effort(
-                getattr(order_request, "idempotency_key", None),
-                replay_response,
-                **replay_owner,
-            )
-            return replay_response
 
         precomputed_loaded_quote = None
 
