@@ -704,15 +704,41 @@ async def _unconfirmed_paying(code="worker_error"):
     return pid
 
 
-async def test_a_later_tick_never_confirms_it_cancels_and_fails_only_on_a_definite_cancel():
+def _answers_everything():
+    return Rail().on("checkout.confirm#cancel", CANCELLED, CANCELLED, CANCELLED).on(
+        "checkout.confirm#confirm", _checkout_await(), _checkout_await(), _checkout_await()).on(
+        "checkout.await#poll", _checkout_result(), _checkout_result(), _checkout_result())
+
+
+async def test_a_later_tick_finding_paying_without_a_task_holds_and_sends_nothing(caplog):
     pid = await _unconfirmed_paying()
-    rail = Rail().on("checkout.confirm#cancel", CANCELLED).on("checkout.confirm#confirm", _checkout_await())
-    assert await _step(rail, pid) == "failed"
-    assert rail.actions() == ["checkout.confirm#cancel"]
-    assert rail.sent[0]["pending"] == worker.CHECKOUT_CANCEL_ACTION  # recorded first
+    rail = _answers_everything()
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(rail, pid) == "checkout_paying_without_task"
+    assert any(r.levelno == logging.ERROR and "no task" in r.getMessage() for r in caplog.records)
+    for _ in range(3):
+        assert await _step(rail, pid) == "checkout_held"
+    assert rail.sent == []  # no confirm, no cancel, no read
     row = await _row(pid)
-    assert (row["state"], row["pending_write"], row["last_error_code"]) == (
-        "failed", None, "checkout_confirm_not_verified")
+    assert (row["state"], row["pending_write"], row["last_error_code"], row["terminal_at"]) == (
+        "paying", None, "checkout_paying_without_task", None)
+    assert worker._sticky(row)
+
+
+async def test_a_lease_taken_over_from_a_dead_worker_on_paying_without_a_task_holds_and_sends_nothing():
+    pid = await _unconfirmed_paying()
+    # A worker died holding the row: its lease outlives the run deadline, then the requeue frees it.
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_by = 'w-dead', next_poll_at = CURRENT_TIMESTAMP "
+                           "WHERE id = :i", {"i": pid})
+    await _ago("claimed_at", worker.STALE_LEASE_SECONDS + 60, pid)
+    rail = _answers_everything()
+    counts = await worker.run_tick(_client(rail), W, limit=5)
+    assert counts.get("requeued") == 1 and counts.get("checkout_paying_without_task") == 1
+    for _ in range(3):
+        await _ago("next_poll_at", 1, pid)
+        assert (await worker.run_tick(_client(rail), W, limit=5)).get("checkout_held") == 1
+    assert rail.sent == []
+    assert (await _row(pid))["last_error_code"] == "checkout_paying_without_task"
 
 
 async def test_a_submitted_checkout_with_no_result_for_a_day_is_held():
@@ -1176,8 +1202,11 @@ def test_both_checkout_columns_heal_in_one_guarded_statement_on_postgres():
     httpx.ConnectError("reset"),
 ])
 async def test_a_cancel_that_does_not_say_cancelled_is_held(answer):
-    pid = await _unconfirmed_paying()
-    assert await _step(Rail().on("checkout.confirm#cancel", answer), pid) == worker.CHECKOUT_CANCEL_UNRESOLVED
+    # The one cancel there is: in the step that read a bad confirm-card amount (the confirm never sent).
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with({"total": "$999.00"})).on("checkout.confirm#cancel", answer)
+    assert await _step(rail, pid) == worker.CHECKOUT_CANCEL_UNRESOLVED
+    assert "checkout.confirm#confirm" not in rail.actions()
     row = await _row(pid)
     assert (row["state"], row["last_error_code"], row["pending_write"]) == (
         "paying", worker.CHECKOUT_CANCEL_UNRESOLVED, worker.CHECKOUT_CANCEL_ACTION)  # the write kept

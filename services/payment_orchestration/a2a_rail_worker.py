@@ -116,8 +116,12 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            (`checkout_confirm_error_card`), 409 (`checkout_confirm_conflict`), any other 4xx,
                            401 / 403 / 429 included (`checkout_confirm_ambiguous_4xx`), anything unseen, 408
                            included (`checkout_confirm_unresolved`): never resent.
-                        -> no task, not held (a later tick): never confirmed (no card to check): cancelled,
-                           `checkout_confirm_not_verified` on a definite cancel, else HELD.
+                        -> no task, no hold, no pending write (a later tick; unreachable: the pending-check
+                           hold and the confirm's write-ahead each prevent it): whether the confirm went out
+                           cannot be proven, so HELD (`checkout_paying_without_task`), logged at ERROR, and
+                           NOTHING is sent, not even a cancel. A staged checkout never confirmed lapses at
+                           the provider (about 30 minutes). The cancel-instead-of-confirm exists only in the
+                           step that read the bad confirm-card amount, where the confirm was never sent.
                         -> a task: poll it (`checkout.await#poll`, a read) for CHECKOUT_POLL_CAP_SECONDS,
                            then look it up (`checkout.lookup#submit`, a read in a conversation of its own),
                            held past CHECKOUT_CEILING_SECONDS. The result:
@@ -1409,9 +1413,6 @@ CHECKOUT_CONTACT_INCOMPLETE = "checkout_contact_incomplete"
 CHECKOUT_TOKEN_UNAVAILABLE = "checkout_token_unavailable"
 CHECKOUT_SETUP_INCOMPLETE = "checkout_setup_incomplete"
 CHECKOUT_SETUP_UNRECOGNISED = "checkout_setup_unrecognised"
-#: A `paying` row with no task and no hold: it was never confirmed, and no later tick may confirm it (the
-#: confirm card's check belongs to the step that saw the card). Cancelled; failed on a definite cancel.
-CHECKOUT_CONFIRM_NOT_VERIFIED = "checkout_confirm_not_verified"
 #: The confirm card showed a total that is unreadable, in another currency or above the ceiling: the
 #: flow was cancelled before the confirm, so nothing was submitted.
 CHECKOUT_CONFIRM_TOTAL_REFUSED = "checkout_confirm_total_refused"
@@ -1467,6 +1468,10 @@ CHECKOUT_SETUP_UNRESOLVED = "checkout_setup_unresolved"
 CHECKOUT_CONFIRM_PENDING_CHECK = "checkout_confirm_pending_check"
 #: The confirm could not be sent: our own token exchange failed twice in the step (nothing went out). Held.
 CHECKOUT_CONFIRM_NOT_SENT = "checkout_confirm_not_sent"
+#: A `paying` checkout found by a later tick with no task, no hold and no pending write. Unreachable by
+#: design (the pending-check hold and the confirm's write-ahead each prevent it), so if it is ever seen,
+#: whether a confirm went out cannot be proven. Held; NOTHING is sent (no confirm, no cancel).
+CHECKOUT_PAYING_WITHOUT_TASK = "checkout_paying_without_task"
 #: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
 CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 _CHECKOUT_HOLD_CODES = frozenset({
@@ -1476,7 +1481,7 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_ORDER_ID_CARD_SHAPED, CHECKOUT_CANCEL_UNRESOLVED,
     CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX, CHECKOUT_CONFIRM_TEXT_ONLY,
     CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
-    CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT,
+    CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
 })
 #: The confirm is sent again ONLY when nothing was sent: our own token exchange failed (`auth_failed`),
 #: retried once in the same step. Every provider answer that is not a task, a 401 and a 429 included, is
@@ -1899,8 +1904,9 @@ async def _setup_answer(s: _Step, resolves: Optional[str], setup: Any) -> str:
 
 
 async def _cancel_checkout(s: _Step, fail_code: str) -> str:
-    """Cancel a checkout that must not be confirmed. Recorded first (`checkout.confirm#cancel`): a cancel cut
-    or unseen is held, never followed by a confirm. Failed with `fail_code` only on a definite cancel."""
+    """Cancel a checkout that must not be confirmed, ONLY in the step that read the bad confirm-card amount
+    (the confirm was never sent). Recorded first (`checkout.confirm#cancel`): a cancel cut or unseen is held,
+    never followed by a confirm. Failed with `fail_code` only on a definite cancel."""
     if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_CANCEL_ACTION) is None:
         return "lost"
     cancelled = await s.send(CHECKOUT_CANCEL, context=s.checkout_context)
@@ -2030,9 +2036,10 @@ async def _checkout_paying(s: _Step) -> str:
     elapsed = (_now() - entered).total_seconds() if entered else 0.0
     task_id = row.get("checkout_task_id")
     if not task_id:
-        # Never confirmed, not held: a confirm may only follow its own step's card check, so no later tick
-        # confirms. The provider's flow is cancelled (recorded first); failed only on a definite cancel.
-        return await _cancel_checkout(s, CHECKOUT_CONFIRM_NOT_VERIFIED)
+        # No task, no hold, no pending write: unreachable by design. Whether a confirm went out cannot be
+        # proven here, and a cancel's answer is too weak to end the purchase on: HELD, nothing sent.
+        logger.error("a2a_rail_worker: checkout in paying with no task, hold or pending write purchase=%s", s.id)
+        return await _checkout_hold(s, CHECKOUT_PAYING_WITHOUT_TASK)
     if elapsed > CHECKOUT_CEILING_SECONDS:
         return await _checkout_hold(s, CHECKOUT_RESULT_OVERDUE)
     if elapsed <= CHECKOUT_POLL_CAP_SECONDS:
