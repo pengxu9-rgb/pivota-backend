@@ -1,15 +1,15 @@
-"""Scope a verified retailer plan to exact, seller-owned Surratt referral offers."""
+"""Scope a verified retailer plan to exact, seller-owned reviewed referral offers."""
 
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from services.catalog_identity import validated_source_gtin
-from services.surratt_retailer_pilot import PROOF_KEY, SURRATT_RETAILER_COHORT
+from services.exact_retailer_cohorts import PROOF_KEY, RETAILER_COHORT_A
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 
-def scope_reviewed_plan(plan: dict, *, cohort=SURRATT_RETAILER_COHORT) -> dict:
+def scope_reviewed_plan(plan: dict, *, cohort=RETAILER_COHORT_A) -> dict:
     """Retain catalog lineage and the refresh anchor without creating a routed seed."""
     pdps = plan.get("pdps") or []
     if len(pdps) != 1 or pdps[0].get("product_key") not in cohort.listings:

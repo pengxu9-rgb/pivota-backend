@@ -24,7 +24,7 @@ def _brand_response(listing):
     ("shop.surrattbeauty.com", False), ("different.example", False),
 ])
 async def test_www_storefront_session_accepts_only_its_existing_host_equivalence(response_host, accepted):
-    listing = pilot.LISTINGS[pilot.SURRATT_SEED_ID]
+    listing = pilot.LISTINGS[pilot.SEED_A_ID]
     path = "/products/lipslique.js?country=US"
     response = httpx.Response(200, request=httpx.Request("GET", f"https://{response_host}{path}"),
                               headers={"set-cookie": "cart_currency=USD"}, json=_brand_response(listing))

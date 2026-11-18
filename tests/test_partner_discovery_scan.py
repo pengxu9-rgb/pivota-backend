@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from scripts.ops.meitu_discovery import manifest, scan
+from scripts.ops.partner_discovery import manifest, scan
 
 
 HOST = "brand.example"
@@ -13,9 +13,15 @@ ORIGIN = f"https://{HOST}"
 PDP = f"{ORIGIN}/products/exact-lipstick"
 
 
+@pytest.fixture(autouse=True)
+def placeholder_vendor_aliases(monkeypatch):
+    """A brand and its storefront vendor spelling differ; a placeholder alias family stands in."""
+    monkeypatch.setattr(scan, "BRAND_VENDOR_ALIASES", ({"A.B.C", "ABC Cosmetics"},))
+
+
 def query(**changes):
     return {
-        "line": 1, "meitu_id": "fixture-lipstick", "brand": "M.A.C", "name": "Exact Lipstick",
+        "line": 1, "meitu_id": "fixture-lipstick", "brand": "A.B.C", "name": "Exact Lipstick",
         "search_names": [], "platform": "shopify", "host": HOST, "anchor_url": PDP, **changes,
     }
 
@@ -24,7 +30,7 @@ def payload(row, batch="fixture-round-one"):
     return {"schema_version": 1, "market": "US", "batch_id": batch, "queries": [row]}
 
 
-def native_product(handle="exact-lipstick", vendor="MAC Cosmetics", country="US", variants=None):
+def native_product(handle="exact-lipstick", vendor="ABC Cosmetics", country="US", variants=None):
     headers = Message()
     headers.add_header("Set-Cookie", "cart_currency=USD; Path=/")
     headers.add_header("Set-Cookie", f"localization={country}; Path=/")

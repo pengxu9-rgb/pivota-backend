@@ -112,18 +112,18 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
     assert await _snapshot(admin) == before
 
 
-async def test_kiokii_localized_plan_detects_live_unlocalized_listing_owner(catalog):
+async def test_cohort_b_localized_plan_detects_live_unlocalized_listing_owner(catalog):
     from services.catalog_enrichment_agent import apply as writer
-    from services.surratt_retailer_pilot import KIOKII_BARE_FAMILY_URL, KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT
+    from services.exact_retailer_cohorts import COHORT_B_BARE_FAMILY_URL, COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B
 
     database, admin = catalog
-    (key, listing), = KIOKII_RETAILER_COHORT.listings.items()
+    (key, listing), = RETAILER_COHORT_B.listings.items()
     plan = {"pdps": [{"product_key": key, "canonical_url": listing.family_url, "source_domain": listing.host}]}
-    await _insert(admin, KIOKII_BARE_LISTING_KEY, f"{KIOKII_BARE_FAMILY_URL}/?variant=51896079974720")
+    await _insert(admin, COHORT_B_BARE_LISTING_KEY, f"{COHORT_B_BARE_FAMILY_URL}/?variant=51896079974720")
     assert await writer.find_legacy_retailer_listing_owners(plan, database) == []
-    aliases = {KIOKII_BARE_FAMILY_URL.removeprefix("https://"): key}
+    aliases = {COHORT_B_BARE_FAMILY_URL.removeprefix("https://"): key}
     [conflict] = await writer.find_legacy_retailer_listing_owners(plan, database, listing_aliases=aliases)
-    assert conflict["kind"] == "conflict" and conflict["legacy_product_key"] == KIOKII_BARE_LISTING_KEY
+    assert conflict["kind"] == "conflict" and conflict["legacy_product_key"] == COHORT_B_BARE_LISTING_KEY
 
 async def _seed(admin, key, status, *, attached=True):
     """attached=False: the seed that CREATED the row (catalog_products.source_ref) but was never attached to it."""

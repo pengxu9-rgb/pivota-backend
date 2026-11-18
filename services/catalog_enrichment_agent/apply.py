@@ -2611,13 +2611,13 @@ async def apply_ingest_plan(
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
-    from services.surratt_retailer_pilot import KIOKII_BARE_LISTING_KEY, KIOKII_RETAILER_COHORT, SURRATT_RETAILER_COHORT
+    from services.exact_retailer_cohorts import COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B, RETAILER_COHORT_A
 
     planned_keys = {row.get("product_key") for section in ("pdps", "skus", "offers") for row in plan.get(section) or []}
     planned_keys.update(row.get("attached_product_key") for row in plan.get("seeds") or [])
-    if KIOKII_BARE_LISTING_KEY in planned_keys:
-        raise ValueError("the unlocalized Kiokii listing is reserved for the observed US product")
-    for scope in (SURRATT_RETAILER_COHORT, KIOKII_RETAILER_COHORT):
+    if COHORT_B_BARE_LISTING_KEY in planned_keys:
+        raise ValueError("the unlocalized cohort B listing is reserved for the observed US product")
+    for scope in (RETAILER_COHORT_A, RETAILER_COHORT_B):
         if planned_keys.intersection(scope.listings) and plan.get("reviewed_secondary_group") != scope.canonical_group_id:
             raise ValueError("reviewed listings require the scoped retailer writer")
 
@@ -3143,7 +3143,7 @@ def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
                                      allow_moves: Any = (), planner: Any = None,
-                                     include_reviewed_surratt: bool = False,
+                                     include_reviewed_cohort_a: bool = False,
                                      reviewed_retailer_keys: tuple[str, ...] = ()) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
@@ -3157,8 +3157,8 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     planner = planner or ingest_validated_jsonl
     records = list(records)
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
-    if include_reviewed_surratt:
-        given["include_reviewed_surratt"] = True
+    if include_reviewed_cohort_a:
+        given["include_reviewed_cohort_a"] = True
     if reviewed_retailer_keys:
         given["reviewed_retailer_keys"] = reviewed_retailer_keys
     first = planner(records, **given)
