@@ -3058,3 +3058,120 @@ def test_the_lookup_is_a_read_the_transport_never_counts_as_a_write():
     assert ("checkout.lookup", "submit") == worker.CHECKOUT_LOOKUP
     assert worker._action(worker.CHECKOUT_LOOKUP) not in worker._TOKEN_WRITES
     assert ("checkout.lookup", "submit") not in a2a_rail.CHECKOUT_WRITE_ACTIONS
+
+
+# ── a card security code echoed in prose or a card string (the DAVV is token data) ─────────────
+
+CARD_CODE_PHRASES = ["cvv 715", "CVV: 715", "security code is 715", "715 (cvv)", "davv=715", "Dynamic CVV 715",
+                     "card verification value 715", "verification code: 715", "CVV2 715", "ＣＶＶ 715", "cv​v 715",
+                     "Card code - 715", "CSC 715", "cid: 715"]
+NOT_CARD_CODES = ["order verification 123", "card ending 123", "Suite 715", "verification sent to 555", "card 1 of 3",
+                  "$715.00", "qty 715", "decided 715", "ascvv 715", "cid 4821"]
+
+
+@pytest.mark.parametrize("text", CARD_CODE_PHRASES)
+def test_each_card_code_phrasing_is_found_case_folded_after_nfkc(text):
+    assert a2a_rail.has_card_code(text)
+    result = a2a_rail.parse_response(_task({"kind": "text", "text": f"Thanks. {text}."},
+                                           _card("checkout.confirm", {"merchant": "merchant.example", "note": text})))
+    assert result.card_codes_scrubbed == 2 and result.credential_fields_stripped >= 2
+    assert result.card("checkout.confirm").data["note"] is None  # the string removed whole
+    assert text not in repr(result)
+
+
+@pytest.mark.parametrize("text", NOT_CARD_CODES)
+def test_an_ordinary_number_away_from_a_card_code_word_is_neither_mangled_nor_counted(text):
+    assert not a2a_rail.has_card_code(text)
+    result = a2a_rail.parse_response(_task({"kind": "text", "text": text},
+                                           _card("checkout.confirm", {"merchant": "merchant.example", "note": text})))
+    assert (result.card_codes_scrubbed, result.card("checkout.confirm").data["note"]) == (0, text)
+
+
+def test_the_window_is_three_words_and_either_order():
+    assert a2a_rail.has_card_code("cvv for your order 715")           # three words between
+    assert not a2a_rail.has_card_code("cvv for your new order 715")   # four
+    assert a2a_rail.has_card_code("715 is the cvv")
+    assert not a2a_rail.has_card_code("715 is not at all the cvv")
+
+
+async def test_before_the_confirm_a_setup_answer_with_a_card_code_is_cancelled_not_confirmed():
+    answer = _task({"kind": "text", "text": "Your CVV: 715 was used."},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=answer).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"  # a definite cancel: nothing was submitted
+    assert "checkout.confirm#confirm" not in rail.actions() and "checkout.confirm#cancel" in rail.actions()
+    # A cancel answer that itself echoes a code is not definite: held, never failed.
+    await database.execute("DELETE FROM a2a_rail_purchases")
+    pid = await _approving()
+    echo_cancel = _task({"kind": "text", "text": "cvv 715"}, _card("checkout.cancelled", {"state": "cancelled"}))
+    rail = _approved(Rail(), setup_answer=answer).on("checkout.confirm#cancel", echo_cancel)
+    assert await _step(rail, pid) == "checkout_cancel_unresolved"
+    assert (await _row(pid))["state"] == "paying"
+
+
+async def _assert_held_scrubbed(pid, pending):
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"], row["terminal_at"]) == (
+        "paying", worker.CHECKOUT_ANSWER_SCRUBBED, pending, None)
+    assert worker.CHECKOUT_ANSWER_SCRUBBED in worker._CHECKOUT_HOLD_CODES
+    assert worker.CHECKOUT_ANSWER_SCRUBBED not in worker._CHECKOUT_PAYMENT_REACHED_CODES
+
+
+async def test_after_the_confirm_a_confirm_answer_with_a_card_code_is_held_with_the_write_kept():
+    pid = await _approving()
+    confirm = _task({"kind": "text", "text": "security code is 715"}, _card("checkout.await", {"task_id": "ckout_abc123"}))
+    assert await _step(_approved(Rail(), confirm_answer=confirm), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+    await _assert_held_scrubbed(pid, worker.CHECKOUT_CONFIRM_ACTION)
+
+
+async def test_after_the_confirm_a_poll_with_a_card_code_is_held():
+    pid = await _placing()
+    poll = _task({"kind": "text", "text": "715 (cvv)"}, _card("checkout.await", {"task_id": "ckout_abc123"}))
+    assert await _step(Rail().on("checkout.await#poll", poll), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+    await _assert_held_scrubbed(pid, None)
+
+
+async def test_after_the_confirm_a_result_with_a_card_code_is_held_never_completed_or_failed():
+    for status, success in (("payment-reached", True), ("form-error", False)):
+        await database.execute("DELETE FROM a2a_rail_purchases")
+        pid = await _placing()
+        result = _task(_card("checkout.result", {
+            "task_id": "ckout_abc123", "state": "completed", "success": success, "status": status,
+            "total": "$51.49", "order_id": "1001", "note": "davv=715"}))
+        assert await _step(Rail().on("checkout.await#poll", result), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+        await _assert_held_scrubbed(pid, None)
+
+
+async def test_a_lookup_with_a_card_code_is_held_never_completed_or_failed():
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    answer = _task({"kind": "text", "text": "CVV2 715"}, _card("checkout.result", {
+        "task_id": "ckout_abc123", "state": "failed", "success": False, "status": "form-error"}))
+    assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+    await _assert_held_scrubbed(pid, worker.CHECKOUT_CONFIRM_ACTION)
+
+
+async def test_an_echoed_card_code_never_reaches_a_log_a_row_an_exception_or_the_view(caplog, monkeypatch):
+    phrase = "Your CVV: 715 is on file"
+    with caplog.at_level(logging.DEBUG):
+        pid = await _placing()
+        poll = _task({"kind": "text", "text": phrase}, _card("checkout.await", {"task_id": "ckout_abc123", "m": phrase}))
+        assert await _step(Rail().on("checkout.await#poll", poll), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+        # The prose check raising (with the text in its message) is swallowed: refused, nothing of it logged.
+        def _boom(text, ceiling):
+            raise ValueError(text)
+        from services.payment_orchestration import checkout_amounts
+
+        monkeypatch.setattr(checkout_amounts, "text_refused", _boom)
+        answer = _task({"kind": "text", "text": phrase}, _card("checkout.confirm", {"merchant": "merchant.example"},
+                                                                ("confirm",), kind="confirm"))
+        relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+        assert relay.checkout.text_amounts_refused is True and phrase not in repr(relay)
+    logged = "\n".join(r.getMessage() + " " + str(r.exc_info or "") for r in caplog.records
+                       if not r.name.startswith(("databases", "aiosqlite", "asyncpg")))
+    stored = await _stored_text()
+    shown = json.dumps(view.build_view(await _row(pid)), default=str)
+    for text in (logged, stored, shown):
+        assert phrase not in text and "CVV: 715" not in text
+    assert DAVV not in _string_values(await _row(pid)) and DAVV not in _string_values(view.build_view(await _row(pid)))

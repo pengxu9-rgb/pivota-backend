@@ -355,6 +355,11 @@ class A2AResult:
     recoverable: Optional[bool] = None
     http_status: Optional[int] = None
     credential_fields_stripped: int = 0
+    #: How many card-code echoes (a 3-digit run next to a card-code word, `_CARD_CODE_RE`) the answer had, in
+    #: its prose or its card strings. Each card string is removed WHOLE; prose is never returned anyway. Also
+    #: counted in `credential_fields_stripped`. Before a confirm the setup's answer is then not confirmed; after
+    #: a confirm the worker HOLDS on it (money may have moved), never fails it.
+    card_codes_scrubbed: int = 0
     #: The conversation id the provider answered under (validated), to check it kept ours.
     context_id: Optional[str] = None
     #: Whether the action sent may have changed state on the provider's side.
@@ -539,6 +544,52 @@ def _artifacts_report_money(task: Mapping[str, Any]) -> bool:
     return False
 
 
+#: A card security code echoed in text: a standalone 3-digit run beside a card-code word, with at most three
+#: words or separators between them, either order ("cvv 715", "CVV: 715", "security code is 715",
+#: "715 (cvv)", "davv=715"). Read case-insensitively after NFKC and the invisible-character strip. ANY such
+#: code counts, ours or not: the DAVV is token data. Bare "card" and bare "verification" are NOT words here
+#: ("card ending 123", "order verification 123", "card 1 of 3" never match).
+_CARD_CODE_WORDS = (
+    r"cvv2|cvc2|cvv|cvc|cid|csc|davv|dynamic[\W_]*cvv|security[\W_]*code|card[\W_]*code|verification[\W_]*code"
+    r"|card[\W_]*verification(?:[\W_]*(?:value|number|code))?"
+)
+_CARD_CODE_GAP = r"(?:[\W_]+[a-z]+){0,3}[\W_]*"
+_CARD_CODE_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _CARD_CODE_WORDS + r")(?![a-z])" + _CARD_CODE_GAP + r"(?<![0-9])[0-9]{3}(?![0-9])"
+    r"|(?<![0-9.,$])[0-9]{3}(?![0-9])[\W_]*(?:[a-z]+[\W_]+){0,3}?(?:" + _CARD_CODE_WORDS + r")(?![a-z])"
+)
+
+
+def has_card_code(text: Any) -> bool:
+    """Whether `text` shows a card security code (`_CARD_CODE_RE`). Pure; never logs."""
+    if not isinstance(text, str) or not text:
+        return False
+    return _CARD_CODE_RE.search(checkout_amounts.normalise(text).lower()) is not None
+
+
+def _scrub_card_codes(value: Any, depth: int = 0) -> Tuple[Any, int]:
+    """`value` with every string that shows a card code removed WHOLE (None), and how many."""
+    if depth > _MAX_STRIP_DEPTH:
+        return value, 0
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        total = 0
+        for key, item in value.items():
+            out[key], count = _scrub_card_codes(item, depth + 1)
+            total += count
+        return out, total
+    if isinstance(value, list):
+        items, total = [], 0
+        for item in value:
+            cleaned, count = _scrub_card_codes(item, depth + 1)
+            items.append(cleaned)
+            total += count
+        return items, total
+    if isinstance(value, str) and has_card_code(value):
+        return None, 1
+    return value, 0
+
+
 def parse_response(body: Any) -> A2AResult:
     """Classify one JSON-RPC response body. Pure: no I/O, no logging."""
     if not isinstance(body, dict):
@@ -564,6 +615,11 @@ def parse_response(body: Any) -> A2AResult:
         if part.get("kind") == "data" and isinstance(part.get("data"), dict):
             card, removed = _card_from(part["data"])
             result.credential_fields_stripped += removed
+            scrubbed_data, codes = _scrub_card_codes(card.data)
+            if codes:
+                card = Card(component=card.component, kind=card.kind, data=scrubbed_data, actions=card.actions)
+                result.card_codes_scrubbed += codes
+                result.credential_fields_stripped += codes
             if card.component == "error":
                 code = str(card.data.get("code") or "")
                 result.kind = "error_card"
@@ -573,6 +629,9 @@ def parse_response(body: Any) -> A2AResult:
             result.cards.append(card)
         elif part.get("kind") == "text":
             result.text_parts += 1
+            if has_card_code(part.get("text")):
+                result.card_codes_scrubbed += 1
+                result.credential_fields_stripped += 1
     # Artifacts are never returned, but a money-result card there is still a money flow.
     money = money or _artifacts_report_money(task)
     if money:

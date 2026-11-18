@@ -1527,6 +1527,11 @@ CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 #: know that speaks of payment or completion (`paid`, `payment_reached`, `completed`): a charge may exist.
 #: Held, as a payment-reached code.
 CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
+#: An answer AFTER the confirm went out (the confirm's own answer, a poll, a lookup, the result) echoed a card
+#: security code (a2a_rail.has_card_code: prose or a card string, scrubbed in the transport). Money may have
+#: moved, so it is HELD, the write kept: never failed, never not-charged. (Before the confirm, the setup's
+#: answer with such an echo is simply not confirmed: cancelled, failed only on a definite cancel.)
+CHECKOUT_ANSWER_SCRUBBED = "checkout_answer_scrubbed"
 _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_UNRESOLVED, CHECKOUT_CONFIRM_UNRECOGNISED, CHECKOUT_TASK_INVALID, CHECKOUT_TASK_MISMATCH,
     CHECKOUT_RESULT_UNRECOGNISED, CHECKOUT_RESULT_OVERDUE, CHECKOUT_TOTAL_OVER_APPROVED,
@@ -1535,7 +1540,7 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX, CHECKOUT_CONFIRM_TEXT_ONLY,
     CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
     CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
-    CHECKOUT_PAYMENT_REACHED_UNCONFIRMED,
+    CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
 })
 #: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`): our own
 #: ledger then records that the order may have been placed and paid. The operator path can NEVER mark these
@@ -1767,8 +1772,8 @@ def _definitely_cancelled(result: Any) -> bool:
     """The cancel's answer says the flow ended with nothing submitted: a card answer with no sign of a
     submission (no `checkout.await` / `checkout.result` card) and no error card. Prose is NOT definite
     (a2a_rail rule 3): a text-only answer is held like any other."""
-    if not getattr(result, "ok", False):
-        return False
+    if not getattr(result, "ok", False) or _card_code_echoed(result):
+        return False  # an answer that echoed a card code is not a definite cancel: held
     return result.card("checkout.await") is None and result.card("checkout.result") is None
 
 
@@ -1959,10 +1964,17 @@ async def _checkout_confirm(s: _Step, setup: Any) -> str:
     return await _confirm_answer(s, result)
 
 
+def _card_code_echoed(result: Any) -> bool:
+    return int(getattr(result, "card_codes_scrubbed", 0) or 0) > 0
+
+
 async def _confirm_answer(s: _Step, result: Any) -> str:
     action = CHECKOUT_CONFIRM_ACTION
     if getattr(result, "kind", None) == "money_result":
         return await _unresolved_write(s, action, result)
+    if _card_code_echoed(result):
+        # After the confirm: held, the write kept (never resent, never failed).
+        return await _checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)
     if result.ok:
         final, waiting = result.card("checkout.result"), result.card("checkout.await")
         card = final or waiting
@@ -2108,6 +2120,8 @@ async def _checkout_lookup(s: _Step) -> str:
     row = s.row
     code = str(row.get("last_error_code") or "")
     result = await s.send(CHECKOUT_LOOKUP, {"task_id": _checkout_idempotency_key(s.id)}, context=s.lookup_context)
+    if _card_code_echoed(result):
+        return await _checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)
     final = result.card("checkout.result") if getattr(result, "ok", False) else None
     waiting = result.card("checkout.await") if getattr(result, "ok", False) else None
     card = final or waiting
@@ -2143,6 +2157,8 @@ async def _checkout_lookup(s: _Step) -> str:
 async def _checkout_progress(s: _Step, result: Any, wait: int) -> str:
     if getattr(result, "kind", None) == "money_result":
         return await _unresolved_write(s, _action(CHECKOUT_POLL), result)
+    if _card_code_echoed(result):
+        return await _checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)
     if not result.ok:
         await s.release(wait, _code("checkout_read", result))
         return "rail_read_failed"
