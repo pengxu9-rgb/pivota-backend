@@ -97,7 +97,13 @@ LISTINGS = {row["seed_id"]: _listing(row) for row in _CONFIG["listings"].values(
 # log; only this shade pinning is disabled (links fall back to the family page).
 NAMED_REFERRAL_VARIANTS_MANIFEST = "NAMED_REFERRAL_VARIANTS_MANIFEST_PATH"
 NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256 = "NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256"
-_MANIFEST_LIMIT = 131072
+# The mount is a Secret Manager secret, whose payload limit is 64 KiB, and it carries every batch's seeds at
+# once (a v2 seed with its listing and ~30 shades is ~4 KiB). The old 32 KiB cap fits ~8 such seeds.
+_MANIFEST_LIMIT = 65536
+# A Shopify product page exactly: lower-case host, one non-empty handle, nothing else (no userinfo, port,
+# params, query, fragment, escapes or whitespace).
+_PRODUCT_URL = re.compile(r"https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+"
+                          r"/products/[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
 _SELLER_REF = re.compile(r"merch_obs_[0-9a-f]{16}\Z")
 _NATIVE_VARIANT_ID = re.compile(r"[1-9][0-9]{0,23}\Z")
 _SKU = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}\Z")
@@ -111,12 +117,16 @@ def _unique_object(pairs):
     return dict(pairs)
 
 
+def is_product_page_url(url) -> bool:
+    """The one rule for a reviewed listing url (the batch writer uses it too): an exact https product page."""
+    return (isinstance(url, str) and url.isascii() and len(url) <= 300 and bool(_PRODUCT_URL.fullmatch(url))
+            and urlunsplit(urlsplit(url)) == url)
+
+
 def _private_listing(raw) -> PilotListing:
     if not isinstance(raw, dict) or raw.keys() != {"url", "seller_ref", "native_product_id", "variants"}:
         raise ValueError("manifest listing must be {url, seller_ref, native_product_id, variants}")
-    url = urlsplit(raw["url"]) if isinstance(raw["url"], str) else None
-    if (url is None or url.scheme != "https" or not url.hostname or url.query or url.fragment
-            or not url.path.startswith("/products/") or url.path.count("/") != 2 or len(raw["url"]) > 300):
+    if not is_product_page_url(raw["url"]):
         raise ValueError("manifest listing url is not an https product page")
     if not isinstance(raw["seller_ref"], str) or not _SELLER_REF.fullmatch(raw["seller_ref"]):
         raise ValueError("manifest listing seller_ref is invalid")
@@ -149,6 +159,8 @@ def validate_named_referral_manifest(config, listings):
     if not isinstance(entries, dict) or not entries:
         raise ValueError("manifest lists no seeds")
     result, private = {}, {}
+    # Native variant ids and GTINs are global identities: one may belong to one seed only. (SKUs are per store.)
+    owner_of_id, owner_of_gtin = {}, {}
     for seed_id, entry in entries.items():
         listing = listings.get(seed_id)
         if version == 1:
@@ -188,6 +200,13 @@ def validate_named_referral_manifest(config, listings):
             seen_gtins.add(gtin)
             seen_skus.add(sku)
             checked[native_id] = (gtin, sku)
+        identities = [(variant_id, validated_source_gtin(barcode)) for variant_id, barcode, *_ in listing.variants]
+        for native_id, (gtin, _sku) in checked.items():
+            identities.append((native_id, gtin))
+        for native_id, gtin in identities:
+            if owner_of_id.setdefault(native_id, seed_id) != seed_id or (
+                    gtin and owner_of_gtin.setdefault(gtin, seed_id) != seed_id):
+                raise ValueError("manifest variant id or GTIN belongs to another seed")
         result[seed_id] = checked
     return result, private
 
