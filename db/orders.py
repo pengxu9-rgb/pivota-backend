@@ -149,6 +149,11 @@ _QUOTE_CLAIM_SELECT_SQL = (
 )
 # Soft-deleted rows count: the question is whether the id is taken, not whether the order shows.
 _QUOTE_CLAIM_ORDER_EXISTS_SQL = "SELECT order_id FROM orders WHERE order_id = :order_id"
+# Read only, before any write: the order that already holds a claim (the claim AND its row).
+_QUOTE_CLAIM_HOLDER_SQL = (
+    "SELECT c.order_id FROM order_quote_claims c JOIN orders o ON o.order_id = c.order_id "
+    "WHERE c.agent_id = :agent_id AND c.quote_id = :quote_id"
+)
 
 
 class OrderQuoteAlreadyClaimed(Exception):
@@ -274,6 +279,33 @@ async def _claim_quote_for_order(claim_key: Dict[str, str], order_id: str) -> Op
         claimed_order_id,
     )
     return claimed_order_id
+
+
+async def read_quote_claim_holder(*, agent_id: Optional[str], quote_id: Optional[str]) -> Optional[str]:
+    """READ ONLY. The order that already holds this caller's quote, under the key the claim is taken
+    with (`_quote_claim_key`: the caller the agent acts as, and the quote id), or None: no quote, no
+    claim, a claim whose order row was never written (the create then writes it under that id), or
+    no claims table yet.
+
+    Raises OrderQuoteClaimUnavailable when it could not be read, so a caller can never read "could
+    not tell" as "no order". Lets a create answer the quote's order before any refusal of its own.
+    """
+    quote_id = str(quote_id or "").strip()
+    if not quote_id:
+        return None
+    claim_key = {"agent_id": caller_identity(agent_id), "quote_id": quote_id}
+    try:
+        row = await database.fetch_one(_QUOTE_CLAIM_HOLDER_SQL, claim_key)
+    except Exception as exc:
+        if _is_missing_quote_claims_table(exc):
+            return None
+        logger.warning(
+            "[orders] one-order-per-quote guard could not be read for quote %s: %s; no order written",
+            quote_id,
+            type(exc).__name__,
+        )
+        raise OrderQuoteClaimUnavailable(str(exc)) from exc
+    return str((row["order_id"] if row else "") or "").strip() or None
 
 
 # ============================================================================
