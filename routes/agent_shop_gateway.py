@@ -12402,23 +12402,36 @@ def _named_seed_variant_pdp_url(
     ):
         return family_url
 
-    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_VARIANTS
+    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_LISTINGS, NAMED_REFERRAL_VARIANTS
 
     additions = NAMED_REFERRAL_VARIANTS.get(seed_id, {}) if listing is None else {}
-    listing = listing or LISTINGS.get(seed_id)
+    # A private (manifest v2) listing never went through code or draft review, so its "existing" variants
+    # are held to the same live GTIN + SKU match as additions.
+    private = False
+    if listing is None:
+        listing = LISTINGS.get(seed_id)
+        if listing is None:
+            listing = NAMED_REFERRAL_LISTINGS.get(seed_id)
+            private = listing is not None
     if (
         listing is None
         or seller_ref != listing.seller_ref
         or family_url != listing.url
     ):
         return family_url
-    if not any(native_id == variant_id for variant_id, *_ in listing.variants):
+    existing = next((row for row in listing.variants if row[0] == native_id), None)
+    if existing is None:
         reviewed_identity = additions.get(native_id)
         if reviewed_identity is None:
             return family_url
         gtin, sku = reviewed_identity
         if validated_source_gtin(variant.get("barcode")) != gtin or variant.get("sku") != sku:
             return family_url
+    elif private and (
+        validated_source_gtin(variant.get("barcode")) != validated_source_gtin(existing[1])
+        or variant.get("sku") != existing[3]
+    ):
+        return family_url
     selected_url = f"{listing.url}?variant={native_id}"
     return selected_url if variant.get("url") == selected_url else family_url
 
