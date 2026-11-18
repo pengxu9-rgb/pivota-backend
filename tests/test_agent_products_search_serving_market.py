@@ -10,7 +10,7 @@ keeps the SGD rows. A request naming no serving market is byte-identical to befo
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
 import pytest
@@ -422,3 +422,148 @@ async def test_the_async_cache_refresh_carries_the_serving_market(monkeypatch: p
     assert task is not None
     await asyncio.wait_for(task, timeout=5)
     assert seen and seen[-1]["serving_market"] == "SG" and seen[-1]["market"] == "US" and seen[-1]["request_market"] is None
+
+
+
+# --- Callers that call a search route as a plain function -------------------------------------------------
+# Omitting `serving_market` there leaves FastAPI's Query(...) default object in place. It is not a value the
+# buyer sent: read with str() it was refused as market_invalid on every call, and /products/resolve lost its
+# search fallback, /agent/v2 search lost every named-market request and the SDK beauty route lost everything.
+
+
+def test_a_query_default_object_is_no_serving_market() -> None:
+    from fastapi import Query
+
+    import routes.agent_api as agent_api_module
+
+    assert agent_api_module._serving_market_refusal(Query(default=None)) is None
+    for not_sent in (None, 7, ["SG"], {"code": "SG"}, True):
+        assert agent_api_module._serving_market_refusal(not_sent) is None, not_sent
+    assert agent_api_module._serving_market_refusal("ſg") == {"reason_code": "market_invalid"}
+
+
+def _spy_loader(agent_api_module: Any, monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, Any]]:
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_loader(**kwargs: Any) -> List[Dict[str, Any]]:
+        seen.append(kwargs)
+        return []
+
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_with_cache", fake_loader)
+    return seen
+
+
+def test_the_resolve_search_fallback_reaches_the_seed_loader(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    import routes.agent_api as agent_api_module
+
+    _silent_database(agent_api_module, monkeypatch)
+    seen = _spy_loader(agent_api_module, monkeypatch)
+    passed: List[Dict[str, Any]] = []
+    real_search = agent_api_module.agent_search_products
+
+    async def spy_search(**kwargs: Any) -> Any:
+        passed.append(kwargs)
+        return await real_search(**kwargs)
+
+    monkeypatch.setattr(agent_api_module, "agent_search_products", spy_search)
+    response = client.get(
+        "/agent/v1/products/resolve", params={"query": "sunscreen", "limit": 10}, headers={"X-API-Key": "test-api-key"}
+    )
+    assert response.status_code == 200, response.text
+    assert seen, "the search fallback ran and read seeds"
+    assert seen[-1]["serving_market"] is None
+    assert "market_invalid" not in response.text
+    # Passed explicitly, never left as FastAPI's Query default object.
+    assert passed and all(k.get("market", "omitted") is None and k.get("serving_market", "omitted") is None for k in passed)
+
+
+@pytest.mark.parametrize("market", ["SG", "US"])
+def test_a_v2_search_naming_a_market_is_searched_not_refused(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    # agent_v2 leaves serving_market out of its call when a market is named (tests/test_agent_v2_contract.py
+    # pins "nothing is added to the call"), so the route sees the Query default object: it must read as absent.
+    _silent_database(agent_api_module, monkeypatch)
+    seen = _spy_loader(agent_api_module, monkeypatch)
+    response = client.post(
+        "/agent/v2/products/search",
+        json={"query": "sunscreen", "market": market, "limit": 10},
+        headers={"X-API-Key": "test-api-key"},
+    )
+    assert response.status_code == 200, response.text
+    assert seen, "the seed loader is reached"
+    assert seen[-1]["market"] == market
+    assert seen[-1]["serving_market"] is None
+    assert "market_invalid" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_the_sdk_beauty_wrapper_passes_no_serving_market(monkeypatch: pytest.MonkeyPatch) -> None:
+    # routes/agent_sdk_fixed.search_products_beauty is not routed today, but it calls the SDK search route as a
+    # plain function; it must not hand that route a Query default object as the serving market.
+    from fastapi import BackgroundTasks
+
+    import routes.agent_sdk_fixed as sdk
+
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_search_products(**kwargs: Any) -> Dict[str, Any]:
+        seen.append(kwargs)
+        return {"status": "success", "products": []}
+
+    monkeypatch.setattr(sdk, "search_products", fake_search_products)
+    await sdk.search_products_beauty(req=None, background_tasks=BackgroundTasks(), query="sunscreen", context=None)
+    assert seen and seen[-1]["market"] is None and seen[-1]["serving_market"] is None
+
+
+# --- The SDK door's merchant-scoped legacy fallback ------------------------------------------------------
+# The production /agent/v1/products/search handler (routes/agent_sdk_fixed.search_products) replaces an empty
+# merchant-scoped page with a legacy lane that has no market or currency filter. A page refused for its
+# serving market is the answer: before, DE or 'ſg' came back as the legacy page, priced in USD, reason "ok".
+
+
+def _legacy_probe(agent_api_module: Any, monkeypatch: pytest.MonkeyPatch) -> List[Any]:
+    import routes.agent_sdk_fixed as sdk
+
+    legacy: List[Any] = []
+
+    async def fake_fetch_one(query: Any, values: Any = None) -> Optional[Dict[str, Any]]:
+        if "FROM merchant_onboarding WHERE merchant_id = :mid" in str(query):
+            legacy.append(values)
+        return None
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one, raising=False)
+    monkeypatch.setattr(sdk.database, "fetch_one", fake_fetch_one, raising=False)
+    return legacy
+
+
+@pytest.mark.parametrize("serving_market, reason", [("DE", "market_not_priced"), ("ſg", "market_invalid"), ("USA", "market_invalid")])
+def test_a_merchant_scoped_search_refused_for_its_market_never_falls_back_to_the_legacy_lane(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, serving_market, reason
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    _silent_database(agent_api_module, monkeypatch)
+    legacy = _legacy_probe(agent_api_module, monkeypatch)
+    response = _search(client, merchant_id="m_scoped", search_all_merchants="false", serving_market=serving_market)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert legacy == [], "the legacy lane was not asked"
+    assert body["products"] == []
+    assert body["metadata"]["reason_code"] == reason
+
+
+@pytest.mark.parametrize("params", [{"serving_market": "US"}, {}])
+def test_a_merchant_scoped_search_with_a_served_or_absent_market_still_falls_back(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, params
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    _silent_database(agent_api_module, monkeypatch)
+    legacy = _legacy_probe(agent_api_module, monkeypatch)
+    response = _search(client, merchant_id="m_scoped", search_all_merchants="false", **params)
+    assert response.status_code == 200, response.text
+    assert legacy, "an empty scoped page still gets the legacy lane, as before"
+    assert response.json()["metadata"].get("reason_code") not in {"market_invalid", "market_not_priced"}

@@ -5360,15 +5360,26 @@ def _normalize_serving_market_param(raw: Any) -> Optional[str]:
     return code if code and expected_currency_for_market(code) else None
 
 
+#: The `metadata.reason_code`s of a search page refused for its serving market (`_serving_market_refusal`). A
+#: caller that replaces an empty page with another lane's (the SDK door's merchant-scoped legacy fallback)
+#: must pass these through: the other lane has no market filter and would serve the market that was refused.
+SERVING_MARKET_REFUSAL_REASONS = frozenset({"market_invalid", "market_not_priced"})
+
+
 def _serving_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
     """Why a SENT `serving_market` cannot be served, or None (absent, blank, or a market Pivota prices).
+
+    Only a string is a sent value. Anything else is ABSENT: over HTTP FastAPI hands this a str or None, and a
+    route that calls `agent_search_products` as a plain function and omits the argument leaves FastAPI's
+    `Query(...)` default object in place (the `isinstance(..., str)` coercion routes/merchant_products.py
+    uses for the same reason). Read with `str()`, that object was refused as market_invalid on every call.
 
     `market_invalid`: not two ASCII letters (a locale, a list, 'USA', a Unicode look-alike such as 'ſg', which
     case-folding would read as SG); the value is never repeated back. `market_not_priced`: a well-formed code
     nothing is priced in (DE, ZZ); the code is named. The cross-door tokens offers.resolve and get_offers use.
     Before, either was ignored and the page held to the partition's currency: a buyer who named a market was
     silently served another one's."""
-    text = raw.strip() if isinstance(raw, str) else ("" if raw is None else str(raw).strip())
+    text = raw.strip() if isinstance(raw, str) else ""
     if not text:
         return None
     code = iso2_market(text)
@@ -7983,6 +7994,10 @@ async def agent_resolve_products(
                         in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
+                        # Called as a plain function: every argument the search reads is passed, never left
+                        # as FastAPI's Query default object. This lookup names no market.
+                        market=None,
+                        serving_market=None,
                         context=context,
                     ),
                     timeout=search_timeout_s,

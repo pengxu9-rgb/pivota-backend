@@ -749,7 +749,9 @@ def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domain
 
 
 def _normalize_market_key(market: str) -> str:
-    return str(market or "").strip().upper() or "US"
+    # The serving market's own rule (normalize_market): ASCII-first, so a look-alike ('ſg') no longer keys SG's
+    # allowlist the way upcasing first did; absent still keys US. One rule, one default, not a second copy.
+    return normalize_market(market)
 
 
 async def _fetch_allowed_domains_for_market(cache_market: str) -> List[str]:
