@@ -71,15 +71,15 @@ def test_web_refusals(change, message):
 
 
 SECRETS = {"MANIFEST": ("seed-batch-manifest", 3, "1" * 64), "PLAN": ("seed-batch-plan", 1, "2" * 64),
+           "APPROVAL": ("seed-batch-approval", 1, "4" * 64),
            "RECEIPTS": ("seed-batch-receipts", 1, "3" * 64), "NAMED": ("named-referral-variants-manifest", 2, NAMED_SHA)}
 
 
 def _args(mode, **kwargs):
-    needed = {"plan": ("MANIFEST", "NAMED"), "apply": ("MANIFEST", "PLAN", "NAMED"),
-              "rollback": ("MANIFEST", "PLAN", "RECEIPTS", "NAMED")}[mode]
+    needed = {"plan": ("MANIFEST", "NAMED"), "apply": ("MANIFEST", "PLAN", "APPROVAL", "NAMED"),
+              "rollback": ("MANIFEST", "PLAN", "APPROVAL", "RECEIPTS", "NAMED")}[mode]
     params = dict(mode=mode, batch_id="batch-one", release=RELEASE, digest=DIGEST,
                   gate={"verdict": "GATE_OPEN", "observed_at": NOW.isoformat()},
-                  approval=None if mode == "plan" else json.dumps({"mode": mode, "go_reference": "a, b"}),
                   secrets={k: SECRETS[k] for k in needed})
     params.update(kwargs)
     return launch.deploy_args(**params)
@@ -94,7 +94,7 @@ def _env(args):
 def test_plan_spec_has_no_write_flag_and_runs_the_digest():
     args = _args("plan")
     env = _env(args)
-    assert "REVIEWED_SEED_BATCH_WRITE_ENABLED" not in env and "REVIEWED_SEED_BATCH_APPROVAL" not in env
+    assert "REVIEWED_SEED_BATCH_WRITE_ENABLED" not in env and "REVIEWED_SEED_BATCH_APPROVAL_PATH" not in env
     assert args[args.index("--image") + 1] == f"{launch.REPO}@{DIGEST}"
     assert args[args.index("--max-retries") + 1] == "0" and args[args.index("--subnet") + 1] == "default"
     assert env["REVIEWED_SEED_BATCH_RELEASE_COMMIT"] == RELEASE
@@ -104,18 +104,21 @@ def test_plan_spec_has_no_write_flag_and_runs_the_digest():
     assert not any(s.endswith(":latest") for s in secrets if not s.startswith("DATABASE_URL="))
 
 
-def test_apply_spec_sets_the_write_flag_and_crawl_egress_and_keeps_json_commas():
+def test_apply_spec_sets_the_write_flag_and_crawl_egress_and_mounts_the_pinned_approval():
     args = _args("apply")
     env = _env(args)
     assert env["REVIEWED_SEED_BATCH_WRITE_ENABLED"] == "1"
-    assert json.loads(env["REVIEWED_SEED_BATCH_APPROVAL"])["go_reference"] == "a, b"
+    assert "REVIEWED_SEED_BATCH_APPROVAL" not in env and env["REVIEWED_SEED_BATCH_APPROVAL_SHA256"] == "4" * 64
+    assert "/var/run/pivota-seed-batch-approval/approval.json=seed-batch-approval:1" in \
+        args[args.index("--set-secrets") + 1].split(",")
     assert json.loads(env["REVIEWED_SEED_BATCH_GATE"])["verdict"] == "GATE_OPEN"
     assert args[args.index("--subnet") + 1] == "pivota-crawl"
 
 
 @pytest.mark.parametrize(("mode", "change", "message"), [
-    ("plan", {"approval": "{}"}, "plan takes none"),
-    ("apply", {"approval": None}, "need an approval"),
+    ("plan", {"secrets": {**{k: SECRETS[k] for k in ("MANIFEST", "NAMED")}, "APPROVAL": SECRETS["APPROVAL"]}},
+     "needs exactly"),
+    ("apply", {"secrets": {k: SECRETS[k] for k in ("MANIFEST", "PLAN", "NAMED")}}, "needs exactly"),
     ("apply", {"secrets": {"MANIFEST": SECRETS["MANIFEST"], "NAMED": SECRETS["NAMED"]}}, "needs exactly"),
     ("plan", {"secrets": {"MANIFEST": ("seed-batch-manifest", "latest", "1" * 64), "NAMED": SECRETS["NAMED"]}},
      "numbered version"),
@@ -126,7 +129,7 @@ def test_apply_spec_sets_the_write_flag_and_crawl_egress_and_keeps_json_commas()
 def test_deploy_args_refusals(mode, change, message):
     with pytest.raises((launch.LaunchRefused, KeyError), match=message):
         _args(mode, **change) if mode != "delete" else launch.deploy_args(
-            mode="delete", batch_id="batch-one", release=RELEASE, digest=DIGEST, gate={}, approval=None, secrets={})
+            mode="delete", batch_id="batch-one", release=RELEASE, digest=DIGEST, gate={}, secrets={})
 
 
 def _lines(*rows):

@@ -5,7 +5,7 @@
 #     --service-account projects/pivota-prod/serviceAccounts/sa-ops-launcher@pivota-prod.iam.gserviceaccount.com \
 #     --substitutions=_MODE=plan,_BATCH_ID=<slug>,_RELEASE=<40-hex>,_DIGEST=sha256:<64-hex>,_NAMED_SHA256=<64-hex>,\
 #       _MANIFEST='["<secret>",<version>,"<sha256>"]',_NAMED='["named-referral-variants-manifest",<version>,"<sha256>"]'
-#   (apply adds _PLAN and _APPROVAL; rollback adds _RECEIPTS)
+#   (apply adds _PLAN and _APPROVAL, each '["<secret>",<version>,"<sha256>"]'; rollback adds _RECEIPTS)
 #
 # Step 1 copies scripts/ out of the RELEASE IMAGE (by digest), so every launcher step runs the reviewed release's
 # own code, and checks the digest is the release tag's digest. Every step fails closed. `publish` writes

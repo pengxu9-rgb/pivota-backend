@@ -85,16 +85,15 @@ def job_name(batch_id: str) -> str:
     return JOB_PREFIX + batch_id
 
 
-def deploy_args(*, mode: str, batch_id: str, release: str, digest: str, gate: dict, approval: str | None,
-                secrets: dict) -> list[str]:
-    """`gcloud run jobs deploy` args. secrets: name -> (secret id, version, sha256) for manifest/plan/receipts/named."""
+def deploy_args(*, mode: str, batch_id: str, release: str, digest: str, gate: dict, secrets: dict) -> list[str]:
+    """`gcloud run jobs deploy` args. secrets: name -> (secret id, version, sha256) for manifest/plan/approval/
+    receipts/named. The plan and approval are numbered secret versions the operator adds at the apply go."""
     require(mode in MODES, "mode must be plan, apply or rollback")
     require(re.fullmatch(r"[0-9a-f]{40}", release) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest),
             "release must be a commit and digest a sha256 digest")
-    needed = {"plan": {"MANIFEST", "NAMED"}, "apply": {"MANIFEST", "PLAN", "NAMED"},
-              "rollback": {"MANIFEST", "PLAN", "RECEIPTS", "NAMED"}}[mode]
+    needed = {"plan": {"MANIFEST", "NAMED"}, "apply": {"MANIFEST", "PLAN", "APPROVAL", "NAMED"},
+              "rollback": {"MANIFEST", "PLAN", "APPROVAL", "RECEIPTS", "NAMED"}}[mode]
     require(set(secrets) == needed, f"{mode} needs exactly the secrets {sorted(needed)}")
-    require((approval is None) == (mode == "plan"), "apply/rollback need an approval; plan takes none")
     mounts = [f"{NAMED_MOUNT}/{NAMED_FILE}={secrets['NAMED'][0]}:{secrets['NAMED'][1]}"]
     env = {"PIVOTA_ENV": "production", "DB_AUTO_MIGRATE": "false", "DB_STATEMENT_TIMEOUT_SECONDS": "30",
            "DB_COMMAND_TIMEOUT_SECONDS": "120", "REVIEWED_SEED_BATCH_RELEASE_COMMIT": release,
@@ -110,7 +109,6 @@ def deploy_args(*, mode: str, batch_id: str, release: str, digest: str, gate: di
         env[f"REVIEWED_SEED_BATCH_{name}_SHA256"] = sha
     if mode != "plan":
         env["REVIEWED_SEED_BATCH_WRITE_ENABLED"] = "1"
-        env["REVIEWED_SEED_BATCH_APPROVAL"] = approval
     # ^@^ makes gcloud split on @ (JSON values contain commas).
     return ["gcloud", "run", "jobs", "deploy", job_name(batch_id), "--project", PROJECT, "--region", REGION,
             "--image", f"{REPO}@{digest}", "--service-account", SERVICE_ACCOUNT,
@@ -155,10 +153,11 @@ def cmd_web(args) -> None:
 
 def cmd_deploy(args) -> None:
     secrets = {name: tuple(json.loads(value)) for name, value in (
-        ("MANIFEST", args.manifest), ("PLAN", args.plan), ("RECEIPTS", args.receipts), ("NAMED", args.named)) if value}
+        ("MANIFEST", args.manifest), ("PLAN", args.plan), ("APPROVAL", args.approval), ("RECEIPTS", args.receipts),
+        ("NAMED", args.named)) if value}
     gate = json.loads((WORK / "gate.json").read_text())
     run(deploy_args(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest, gate=gate,
-                    approval=args.approval or None, secrets=secrets))
+                    secrets=secrets))
     (WORK / "job.txt").write_text(job_name(args.batch_id))
 
 
