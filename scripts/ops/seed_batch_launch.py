@@ -308,18 +308,24 @@ def wait_for_execution(name: str, *, sleep=None, monotonic=None) -> str | None:
         sleep(EXECUTION_POLL_SECONDS)
 
 
-def find_started_execution(job: str, armed_at: str) -> str | None:
-    """After a failed execute call: the ONE execution of this job created since this build armed it, else None.
-    The lock is held, so no other build can have executed it in that window."""
-    rows = json.loads(run(["gcloud", "run", "jobs", "executions", "list", "--job", job, "--project", PROJECT,
+def list_executions(job: str) -> list[dict]:
+    return json.loads(run(["gcloud", "run", "jobs", "executions", "list", "--job", job, "--project", PROJECT,
                            "--region", REGION, "--format", "json"], timeout=120))
-    since = [r["metadata"]["name"] for r in rows
-             if str(r.get("metadata", {}).get("creationTimestamp", ""))[:19] >= armed_at[:19]]
-    return since[0] if len(since) == 1 else None
+
+
+def unfinished(rows: list[dict]) -> list[str]:
+    return sorted(r["metadata"]["name"] for r in rows if not r.get("status", {}).get("completionTime"))
+
+
+def find_started_execution(job: str, before: list[str]) -> str | None:
+    """After a failed execute call: the ONE execution of this job that did not exist just before the call, else None.
+    Names, not timestamps, so no clock skew can matter."""
+    new = sorted(r["metadata"]["name"] for r in list_executions(job) if r["metadata"]["name"] not in set(before))
+    return new[0] if len(new) == 1 else None
 
 
 def cmd_run(args) -> None:
-    state = {"execution": None, "state": None, "error": None, "execute_attempted": False}
+    state = {"execution": None, "state": None, "error": None, "execute_attempted": False, "armed": False}
     path = WORK / "run.json"
     path.write_text(json.dumps(state))
     job = job_name(args.batch_id) if args.batch_id else ""
@@ -333,9 +339,16 @@ def cmd_run(args) -> None:
         print(gate_run.stdout, end="")
         gate = gate_json(gate_run.stdout, gate_run.returncode, datetime.now(timezone.utc))
         common = dict(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest, secrets=secrets)
+        # No execution of this job may be running (a hand-started one would write alongside ours).
+        busy = unfinished(list_executions(job)) if job else []
+        require(not busy, f"an execution of this job is already running: {', '.join(busy)}")
+        state["armed"] = True          # set before the deploy: a deploy that fails half-way is still disarmed
+        path.write_text(json.dumps(state))
         run(job_spec_args(**common, gate=gate, armed=True))
+        before = [r["metadata"]["name"] for r in list_executions(job)]
+        require(not unfinished(list_executions(job)), "an execution started while the job was being armed")
         # From here an execution may exist even if the call below fails: record that BEFORE calling.
-        state.update(execute_attempted=True, armed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+        state.update(execute_attempted=True, executions_before=before)
         path.write_text(json.dumps(state))
         try:
             out = run(["gcloud", "run", "jobs", "execute", job, "--project", PROJECT, "--region", REGION,
@@ -344,7 +357,7 @@ def cmd_run(args) -> None:
             state["execution"] = out[-1]
         except Exception as error:  # noqa: BLE001 - the server may have created it anyway
             state["execute_error"] = f"{type(error).__name__}: {error}"[:300]
-            state["execution"] = find_started_execution(job, state["armed_at"])
+            state["execution"] = find_started_execution(job, state["executions_before"])
             path.write_text(json.dumps(state))
             require(state["execution"] is not None,
                     "execute failed and exactly one execution since arming could not be found: lock stays held")
@@ -358,7 +371,7 @@ def cmd_run(args) -> None:
         raise
     finally:
         # Disarm once nothing can still be running: execute never attempted, or the execution is terminal.
-        if not state["execute_attempted"] or state["state"] is not None:
+        if state["armed"] and (not state["execute_attempted"] or state["state"] is not None):
             try:
                 run(job_spec_args(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest,
                                   secrets=parse_secrets(args.mode, {"MANIFEST": args.manifest, "PLAN": args.plan,
@@ -378,7 +391,7 @@ def lock_decision(state: dict) -> str | None:
         return "HELD: execute was attempted and no execution could be identified; check before removing the lock"
     if state.get("execution") and state.get("state") not in TERMINAL:
         return "HELD: the execution's state is not terminal; do not remove the lock"
-    if state.get("disarmed") is False:
+    if state.get("armed") and state.get("disarmed") is False:
         return "HELD: the job is still ARMED (disarm failed); disarm it before removing the lock"
     return None
 
@@ -419,12 +432,22 @@ def cmd_publish(args) -> None:
     rows, bad = parse_lines(log)
     put(prefix, "rows.json", json.dumps(rows, indent=1))
     held = lock_decision(state)
+    if held is None and state.get("armed"):
+        # Nothing but our own (finished) execution may be running when the lock goes.
+        try:
+            others = [n for n in unfinished(list_executions(job_name(args.batch_id))) if n != state.get("execution")]
+        except Exception as error:  # noqa: BLE001
+            others, held = [], f"HELD: could not list the job's executions: {error}"[:300]
+        if others:
+            held = f"HELD: a FOREIGN execution of this job is still running: {', '.join(others)}"
     lock = held or "to be released after result.json (outcome in lock.json)"
     result = summarise(rows, mode=args.mode, run_state=state, bad_lines=bad, lock=lock)
-    if state.get("disarmed") is False:
+    if state.get("armed") and state.get("disarmed") is False:
+        result["ok"], result["decision"] = False, None
+    if held and held.startswith("HELD: a FOREIGN"):
         result["ok"], result["decision"] = False, None
     result.update(build=build_id(), batch_id=args.batch_id, release=args.release, log_error=log_error,
-                  job_armed=state.get("disarmed") is False)
+                  job_armed=bool(state.get("armed")) and state.get("disarmed") is False)
     # result.json first, so a failure in the release below cannot lose it.
     put(prefix, "result.json", json.dumps(result, indent=1))
     print(json.dumps(result, indent=1))
