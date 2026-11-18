@@ -1283,14 +1283,18 @@ async def test_an_echoed_card_never_reaches_the_ledger_logs_or_view(caplog):
     _no_credential_in(json.loads(json.dumps(view.build_view(row), default=str)))
 
 
-async def test_a_card_shaped_order_id_is_never_stored():
+async def test_a_card_shaped_order_id_is_never_stored_and_the_order_still_completes(caplog):
+    # v6 (P2-H): the merchant placed the order, so it completes; only its reference is withheld, with a
+    # code the operator sees. Never a hold for this.
     pid = await _placing()
-    assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=DPAN)), pid) == (
-        worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=DPAN)), pid) == "completed"
     row = await _row(pid)
     assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == (
-        "paying", None, worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+        "completed", None, worker.CHECKOUT_ORDER_REFERENCE_WITHHELD)
     assert DPAN not in await _stored_text()
+    [line] = [r for r in caplog.records if "order reference withheld" in r.getMessage()]
+    assert line.levelno == logging.ERROR and "rule=luhn_run" in line.getMessage() and f"length={len(DPAN)}" in line.getMessage()
 
 
 def test_a_long_order_number_that_fails_luhn_is_not_card_shaped():
@@ -2211,10 +2215,12 @@ DISCOUNTED_CARDS = {
     "coupon_amount": {"subtotal": "$45.00", "coupon": {"amount": "-$5.00", "code": "SAVE10"}, "total": "$40.00"},
     "coupon_code_with_digits": {"subtotal": "$45.00", "couponCode": "SAVE10", "total": "$45.00"},
     "percent_off": {"subtotal": "$45.00", "discount": "10% off", "total": "$40.50"},
-    # The sign rule: a negative amount under a pure discount key is taken off, whatever its size (it can
-    # never be a hidden charge). Only an explicit slot (a discount's own amount, the sum of the discounts)
-    # is capped at the ceiling, since a positive there is not summed.
-    "negative_discount_of_any_size": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
+    # v6 (P2-G): many cards show the discount as a positive number; under a plain discount key it is taken
+    # off, never summed as a charge.
+    "positive_discount": {"subtotal": "$50.00", "discount": "$5.00", "total": "$45.00"},
+    "positive_discount_amount": {"subtotal": "$50.00", "discountAmount": "$5.00", "total": "$45.00"},
+    "positive_savings_beside_its_subtotal": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
+    "positive_shipping_discount": {"subtotal": "$45.00", "shippingDiscount": "$5.00", "total": "$40.00"},
 }
 REFUSED_WITH_A_DISCOUNT = {
     "discount_in_eur_symbol": {"subtotal": "$45.00", "discount": "-€5.00", "total": "$40.00"},
@@ -2232,9 +2238,12 @@ REFUSED_WITH_A_DISCOUNT = {
     # A bare number under a discount key: its units are unknown, exactly as under a money key (v5: -500 used
     # to be read as cents and confirm).
     "bare_negative_number": {"subtotal": "$45.00", "discount": -500, "total": "$40.00"},
-    # A POSITIVE amount under a pure discount key outside an explicit slot is money and is summed (v5: it
-    # used to be ignored): $45 + $10 is past the ceiling.
-    "positive_savings_summed": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
+    # v6: a discount (either sign) larger than the ceiling is unreadable, and so is one larger than what
+    # the object it sits in charges.
+    "negative_discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
+    "positive_discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "$51.50", "total": "$40.00"},
+    "discount_larger_than_its_object": {"subtotal": "$10.00", "discount": "-$20.00"},
+    "two_discounts_larger_than_their_object": {"subtotal": "$10.00", "discount": "-$6.00", "savings": "$6.00"},
 }
 
 
@@ -2371,9 +2380,9 @@ EMBEDDED_WORD_DISCOUNTS = [
 
 
 def test_a_word_that_only_contains_a_money_word_is_not_money():
-    # "multiple" holds "tip", "residue" holds "due", "costume" holds "cost": none is a money word, so a
-    # bare number under them is the buyer's data, not an amount with unknown units.
-    assert worker.confirm_card_refused({"multiplePacks": 3, "residue": 2, "costume": "Size 12"}, TOTAL) is False
+    # In a key the tokeniser SPLITS, "multiple" holds "tip", "residue" holds "due", "costume" holds "cost":
+    # none is a money word, so a bare number under them is the buyer's data, not an amount.
+    assert worker.confirm_card_refused({"multiplePacks": 3, "residueLevel": 2, "costumeSize": "Size 12"}, TOTAL) is False
     assert worker.confirm_card_refused({"tipAmount": 3}, TOTAL) is True  # the whole word: money
 
 
@@ -2496,7 +2505,6 @@ CHARGES_UNDER_A_DISCOUNT_WORD = {
     "promo_item": {"subtotal": "$45.00", "promoItem": "$10.00"},
     "promotional_items": {"promotionalItems": ["$30.00", "$30.00"]},
     "promo_items_prices": {"promoItems": [{"price": "$30.00"}, {"price": "$30.00"}]},
-    "positive_discount_word": {"subtotal": "$45.00", "discount": "$10.00"},
     "promo_lines_amounts": {"promo": {"lines": [{"amount": "$30.00"}, {"amount": "$30.00"}]}},
 }
 
@@ -2590,32 +2598,71 @@ async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
     assert relay.checkout.text_amounts_refused is False
 
 
-@pytest.mark.parametrize("order_id", [
-    CRYPTO, CRYPTO.rstrip("="), f"ORD-{CRYPTO.rstrip('=')}", f"ORD-{DPAN}", f"#{DPAN}",
-], ids=["cryptogram", "cryptogram_unpadded", "contains_cryptogram", "contains_dpan", "hash_dpan"])
-async def test_an_order_id_that_is_or_holds_the_cryptogram_or_the_token_is_held_never_stored(order_id):
-    # The worker refuses the shape itself (it never sees the token's values: only the relay held them).
-    assert worker._card_shaped(order_id)
+#: A 13-digit Luhn-valid run (the transport's own card-number strip starts at 14 digits, so this one reaches
+#: the worker), and the cryptogram without its padding (the padded form never gets past the transport).
+LUHN_13 = "4222222222222"
+
+
+@pytest.mark.parametrize("order_id,rule", [
+    (CRYPTO.rstrip("="), "cryptogram_shape"), (LUHN_13, "luhn_run"), (f"ORD-{LUHN_13}", "luhn_run"), (DPAN, "luhn_run"),
+], ids=["cryptogram_unpadded", "luhn_13", "contains_luhn_13", "dpan"])
+async def test_an_order_id_that_may_echo_the_card_or_token_completes_without_its_reference(order_id, rule, caplog):
+    assert worker._credential_rule(order_id) == rule
     pid = await _placing()
-    outcome = await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid)
-    # The transport already strips a padded cryptogram and a card number from any answer (the order then
-    # names no order id: held as such); what it lets through, the worker holds as card-shaped.
-    expected = (worker.CHECKOUT_ORDER_ID_CARD_SHAPED if "=" not in order_id and DPAN not in order_id
-                else worker.CHECKOUT_PAYMENT_NO_ORDER)
-    assert outcome == expected
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid) == "completed"
     row = await _row(pid)
-    assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == ("paying", None, expected)
-    assert expected in worker._CHECKOUT_PAYMENT_REACHED_CODES
+    assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == (
+        "completed", None, worker.CHECKOUT_ORDER_REFERENCE_WITHHELD)
+    assert worker.CHECKOUT_ORDER_REFERENCE_WITHHELD not in worker._CHECKOUT_HOLD_CODES  # not a hold
+    # Log hygiene: the line names the rule and the length; the value, the order id and the token are nowhere
+    # in the log or the stored row.
+    logged = "\n".join(r.getMessage() for r in caplog.records)
     stored = await _stored_text()
-    assert CRYPTO.rstrip("=") not in stored and DPAN not in stored
+    assert f"rule={rule}" in logged and f"length={len(order_id)}" in logged
+    for needle in {order_id, LUHN_13, DPAN, CRYPTO, CRYPTO.rstrip("=")}:
+        assert needle not in logged, needle
+        assert needle not in stored, needle
+
+
+async def test_a_padded_cryptogram_or_a_card_number_inside_an_order_id_never_reaches_the_row():
+    # The transport strips them from the answer: the order then names no id, which is held as such.
+    for order_id in (CRYPTO, f"ORD-{DPAN}", f"#{DPAN}"):
+        await database.execute("DELETE FROM a2a_rail_purchases")
+        pid = await _placing()
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid) == (
+            worker.CHECKOUT_PAYMENT_NO_ORDER)
+        stored = await _stored_text()
+        assert CRYPTO.rstrip("=") not in stored and DPAN not in stored
 
 
 def test_an_ordinary_order_id_is_not_card_or_cryptogram_shaped():
     import uuid
 
+    import random
+    import string
+
+    rng = random.Random(7)
+    base62 = string.ascii_letters + string.digits
     for order_id in ("1001", "ORD-12345", "112-1234567-1234567", str(uuid.uuid4()), uuid.uuid4().hex,
-                     "pvt-ap_01234567.89abcdef.01234567", "SHOP-2026-ABCDEF"):
+                     "pvt-ap_01234567.89abcdef.01234567", "SHOP-2026-ABCDEF", "48953700120034781234"):
         assert not worker._card_shaped(order_id), order_id
+    # v6 (P2-H): modern alphanumeric ids are never taken for a cryptogram (the old rule held ~97% of them).
+    for _ in range(500):
+        for order_id in ("".join(rng.choice(base62) for _ in range(20)),                    # base62, 20
+                         "ord_" + "".join(rng.choice(base62) for _ in range(24)),           # prefixed, 28
+                         "".join(rng.choice(base62 + "_-") for _ in range(21)),             # nanoid, 21
+                         "-".join("".join(rng.choice(string.digits) for _ in range(n)) for n in (3, 7, 7))):
+            assert not worker._card_shaped(order_id), order_id
+
+
+@pytest.mark.parametrize("status", ["unpaid", "payment_failed", "payment-declined", "incomplete", "not_paid",
+                                    "unpaid_balance", "not_completed", "payment-pending", "awaiting-payment",
+                                    "repayment", "payment_cancelled"])
+async def test_a_negated_payment_status_is_unrecognised_never_payment_reached(status):
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_RESULT_UNRECOGNISED)
 
 
 @pytest.mark.parametrize("status", ["paid", "payment_reached", "completed", "payment-completed"])
@@ -2632,3 +2679,76 @@ async def test_an_unknown_status_that_does_not_speak_of_payment_stays_unrecognis
     pid = await _placing()
     assert await _step(Rail().on("checkout.await#poll", _checkout_result("queued-elsewhere")), pid) == (
         worker.CHECKOUT_RESULT_UNRECOGNISED)
+
+
+# ── controller review v5 (P1-D, P2-G, P2-E): sibling totals add up; positive discounts; opaque keys ──
+
+#: Sibling objects each holding a total are PARTS, like list items: they add up past the $51.49 ceiling.
+SIBLING_TOTALS = {
+    "items_and_shipping_objects": {"items": {"total": "$40.00"}, "shipping": {"total": "$15.00"}},
+    "merchandise_and_shipping_objects": {"merchandise": {"total": "$40.00"}, "shipping": {"total": "$15.00"}},
+    "shipments_keyed_by_id": {"shipments": {"A": {"total": "$30.00"}, "B": {"total": "$30.00"}}},
+    "digit_keys": {"1": {"total": "$30.00"}, "2": {"total": "$30.00"}},
+    "three_levels_deep": {"a": {"b": {"c": {"total": "$30.00"}}}, "d": {"e": {"f": {"total": "$30.00"}}}},
+    "grand_totals_two_levels_down": {"order": {"items": {"grandTotal": "$30.00"}, "fees": {"total": "$30.00"}}},
+    "money_objects_with_totals": {"items": {"total": {"amount": "$40.00", "currency": "USD"}},
+                                  "shipping": {"total": {"amount": "$15.00", "currency": "USD"}}},
+    "embedded_json_children": {"a": json.dumps({"total": "$30.00"}), "b": json.dumps({"total": "$30.00"})},
+}
+
+
+@pytest.mark.parametrize("name", sorted(SIBLING_TOTALS))
+def test_sibling_objects_totals_are_summed_not_maxed(name):
+    assert worker.confirm_card_refused(SIBLING_TOTALS[name], TOTAL) is True
+
+
+def test_a_summary_object_still_stands_for_its_parent_and_siblings_within_the_ceiling_confirm():
+    # A summary child (`summary`, `totals`, `order`, `pricing`, `cart`, `checkout`) holding a grand total is
+    # the object's own total: not added to the line items beside it.
+    assert worker.confirm_card_refused({"items": [{"price": "$30.00"}], "summary": {"total": "$30.00"}}, TOTAL) is False
+    assert worker.confirm_card_refused({"lines": [{"price": "$51.49"}], "totals": {"grandTotal": "$51.49"}}, TOTAL) is False
+    # Sibling parts within the ceiling add up and confirm.
+    assert worker.confirm_card_refused({"items": {"total": "$30.00"}, "shipping": {"total": "$15.00"}}, TOTAL) is False
+    # Three levels deep, within the ceiling.
+    assert worker.confirm_card_refused({"a": {"b": {"c": {"total": "$25.00"}}}, "d": {"e": {"total": "$25.00"}}}, TOTAL) is False
+
+
+@pytest.mark.parametrize("key", ["discount", "discounts", "discountAmount", "savings", "promoAmount", "couponDiscount",
+                                 "shippingDiscount", "orderDiscount"])
+def test_a_positive_amount_under_a_plain_discount_key_is_taken_off_not_summed(key):
+    assert worker.confirm_card_refused({"subtotal": "$50.00", key: "$5.00", "total": "$45.00"}, TOTAL) is False
+    assert worker.confirm_card_refused({"subtotal": "$45.00", key: "$51.50", "total": "$40.00"}, TOTAL) is True  # cap
+    assert worker.confirm_card_refused({"subtotal": "$10.00", key: "$20.00"}, TOTAL) is True  # more than its object
+    # Alone (nothing charged beside it): within the ceiling it is read, past it it cancels.
+    assert worker.confirm_card_refused({key: "$5.00"}, TOTAL) is False
+    assert worker.confirm_card_refused({key: "$51.50"}, TOTAL) is True
+    assert worker.confirm_card_refused({key: "-$51.50"}, TOTAL) is True
+
+
+#: Keys the tokeniser cannot split (one run, out of the vocabulary) that hold a money word: money.
+OPAQUE_MONEY_KEYS = {
+    "saleprice_times_qty": {"items": [{"qty": 2, "saleprice": "$30.00"}]},
+    "SALEPRICE_times_qty": {"items": [{"qty": 2, "SALEPRICE": "$30.00"}]},
+    "listprice_times_qty": {"items": [{"qty": 2, "listprice": "$30.00"}]},
+    "amountpaid_unmarked": {"amountpaid": "999.00"},
+    "amountpaid_bare": {"amountpaid": 99900},
+    "totalpaid_bare": {"totalpaid": 99900},
+    "AMOUNTDUE_bare": {"AMOUNTDUE": 99900},
+    "shippingandhandling_unmarked": {"shippingandhandling": "999.00"},
+}
+
+
+@pytest.mark.parametrize("name", sorted(OPAQUE_MONEY_KEYS))
+def test_an_unsplittable_key_with_a_money_word_in_it_is_money(name):
+    assert worker.confirm_card_refused(OPAQUE_MONEY_KEYS[name], TOTAL) is True
+
+
+def test_the_opaque_rule_never_touches_a_splittable_key_or_relaxes_anything():
+    # The v4 substring false cancels stay fixed: these keys split, so their embedded words are not words.
+    for key in EMBEDDED_WORD_DISCOUNTS:
+        assert worker.confirm_card_refused({key: "-$5.00", "total": "$40.00"}, TOTAL) is False, key
+    # Within the ceiling an opaque money key confirms; the rule only ever reads more as money.
+    assert worker.confirm_card_refused({"items": [{"qty": 1, "saleprice": "$30.00"}]}, TOTAL) is False
+    assert worker.confirm_card_refused({"amountpaid": "$40.00"}, TOTAL) is False
+    # A lower-case run with a discount word is never read as a discount by substring (fail closed: plain).
+    assert worker.confirm_card_refused({"internetdiscount": "-$5.00", "total": "$40.00"}, TOTAL) is True

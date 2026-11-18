@@ -194,7 +194,9 @@ check the gate itself.
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
 `checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
-written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`) is refused, whatever the flags
+written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
+for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id
+that may echo the card or the token now COMPLETES without its reference, as `checkout_order_reference_withheld`) is refused, whatever the flags
 (`payment_reached_recorded`): our own ledger says the order may be placed and paid. **Escalate; the merchant
 refunds.**
 
