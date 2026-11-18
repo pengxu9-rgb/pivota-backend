@@ -26,7 +26,6 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import re
-from urllib.parse import urlsplit
 
 SCHEMA_VERSION = 1
 MAX_ENTRIES = 5
@@ -128,10 +127,10 @@ def _entry(raw) -> Entry:
     parts = raw["product_key"].split("::") if isinstance(raw["product_key"], str) else []
     require(len(parts) == 4 and parts[0] == "prod" and parts[1] == raw["seller_ref"] and parts[2] == "external_seed"
             and _EXTERNAL.fullmatch(parts[3]), "entry product_key is not this seller's external seed product")
-    url = urlsplit(listing["url"]) if isinstance(listing["url"], str) else None
-    require(url is not None and url.scheme == "https" and url.hostname and not url.query and not url.fragment
-            and url.path.startswith("/products/") and url.path.count("/") == 2 and len(listing["url"]) <= 300,
-            "entry listing url is not an https product page")
+    # The serving loader's own rule, so a plan never passes a url web would refuse to mount.
+    from services.external_seed_review_pilot import is_product_page_url
+
+    require(is_product_page_url(listing["url"]), "entry listing url is not an https product page")
     require(type(listing["native_product_id"]) is int and 0 < listing["native_product_id"] < 10 ** 20,
             "entry listing native_product_id is invalid")
     require(type(listing["price_minor"]) is int and 0 < listing["price_minor"] < 10 ** 7, "entry listing price is invalid")

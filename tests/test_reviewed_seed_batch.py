@@ -128,6 +128,19 @@ def test_parse_manifest_refusals(case, message):
         batch.parse_manifest(data(_mutate(case)))
 
 
+@pytest.mark.parametrize("url", [
+    "https://user@shop1.example/products/tinted-balm", "https://shop1.example:8443/products/tinted-balm",
+    "https://SHOP1.example/products/tinted-balm", "https://shop1.example/products/",
+    "https://shop1.example/products/tinted-balm;x=1", "https://shop1.example/products/tinted-balm\n",
+    "https://shop1.example\\@other.example/products/tinted-balm",
+], ids=["userinfo", "port", "upper_host", "empty_handle", "params", "newline", "backslash_at"])
+def test_parse_manifest_refuses_any_url_the_serving_loader_refuses(url):
+    raw = manifest()
+    raw["entries"][0]["listing"]["url"] = url
+    with pytest.raises(batch.Refused, match="https product page"):
+        batch.parse_manifest(data(raw))
+
+
 def test_parse_manifest_refuses_duplicate_keys_and_oversize():
     good = data(manifest())
     with pytest.raises(batch.Refused, match="duplicate manifest key"):
