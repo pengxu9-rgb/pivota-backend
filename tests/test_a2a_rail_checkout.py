@@ -2214,7 +2214,6 @@ DISCOUNTED_CARDS = {
     "percent_off": {"subtotal": "$45.00", "discount": "10% off", "total": "$40.50"},
     # Large positive savings would push a naive component sum past the ceiling: not summed, so it confirms.
     "savings_not_summed": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
-    "discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
 }
 REFUSED_WITH_A_DISCOUNT = {
     "discount_in_eur_symbol": {"subtotal": "$45.00", "discount": "-€5.00", "total": "$40.00"},
@@ -2227,11 +2226,13 @@ REFUSED_WITH_A_DISCOUNT = {
     # A discount never lowers a sum: items past the ceiling still cancel whatever the discount says.
     "discount_does_not_rescue_an_over_sum": {"items": [{"price": "$30.00"}, {"price": "$30.00"}],
                                              "discount": "-$10.00"},
+    # A discount larger than the ceiling is more likely a mislabelled total.
+    "discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
 }
 
 
 @pytest.mark.parametrize("name", sorted(DISCOUNTED_CARDS))
-def test_a_discount_never_cancels_for_its_sign_or_size(name):
+def test_a_discount_within_the_ceiling_never_cancels_for_its_sign(name):
     assert worker.confirm_card_refused(DISCOUNTED_CARDS[name], TOTAL) is False
 
 
@@ -2245,3 +2246,88 @@ async def test_a_discounted_checkout_within_the_ceiling_confirms_end_to_end():
     rail = _approved(Rail(), setup_answer=_confirm_with(DISCOUNTED_CARDS["subtotal_discount_total"]))
     assert await _step(rail, pid) == "placing"
     assert "checkout.confirm#confirm" in rail.actions()
+
+
+
+# ── discount keys that carry the charge, nested discounts, and a discount's size ───────────────
+
+#: Keys with a discount word that name what is CHARGED: money, read strictly ($999.00 over the ceiling).
+CHARGED_WITH_A_DISCOUNT_WORD = [
+    "totalAfterDiscount", "discountedTotal", "discounted_price", "priceAfterDiscount", "totalWithCoupon",
+    "couponFee", "voucherFee", "promoShipping", "netOfDiscount", "amountAfterSavings", "subtotal_after_discount",
+]
+#: Pure discounts (the amount taken off): -$5.00 within the ceiling confirms.
+PURE_DISCOUNT_SPELLINGS = [
+    "discount", "discounts", "discountAmount", "total_discounts", "totalDiscounts", "discount_total", "savings",
+    "promoAmount", "couponDiscount",
+]
+
+
+@pytest.mark.parametrize("key", CHARGED_WITH_A_DISCOUNT_WORD)
+def test_a_discount_word_beside_a_money_word_is_money_and_cancels_over_the_ceiling(key):
+    assert worker.confirm_card_refused({key: "$999.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({key: 99900}, TOTAL) is True  # a bare number under money: units unknown
+
+
+@pytest.mark.parametrize("key", PURE_DISCOUNT_SPELLINGS)
+def test_each_pure_discount_spelling_within_the_ceiling_confirms(key):
+    assert worker.confirm_card_refused({"subtotal": "$45.00", key: "-$5.00", "total": "$40.00"}, TOTAL) is False
+
+
+def test_a_total_after_discount_is_the_grand_total_not_a_second_component():
+    card = {"subtotal": "$45.00", "discount": "-$5.00", "totalAfterDiscount": "$40.00"}
+    assert worker.confirm_card_refused(card, TOTAL) is False
+    assert worker.confirm_card_refused({**card, "totalAfterDiscount": "$51.50"}, TOTAL) is True
+    # A discounted unit price still counts for quantity x price.
+    assert worker.confirm_card_refused({"items": [{"qty": 2, "discounted_price": "$30.00"}]}, TOTAL) is True
+
+
+@pytest.mark.parametrize("card,refused", [
+    ({"discount": {"amount": "-$5.00", "total": "$999.00"}}, True),
+    ({"coupon": {"value": "-$5.00", "finalPrice": "$999.00"}}, True),
+    ({"discount": {"amount": "-$5.00", "unknown": 99900}}, True),   # anything but its amount: money
+    ({"promos": [{"coupon": {"amount": "-$5.00", "net": "$999.00"}}]}, True),  # at every depth
+    ({"discount": {"amount": "-$5.00", "currency": "USD", "code": "SAVE5"}}, False),
+    ({"coupon": {"value": "-$5.00"}}, False),
+    ({"discounts": [{"amount": "-$5.00"}, {"savings": {"amount": "-$1.00"}}]}, False),
+], ids=["discount.total", "coupon.finalPrice", "discount.unknown", "deep_net", "amount_currency_code",
+        "coupon.value", "nested_discounts"])
+def test_under_a_discount_only_its_amount_is_a_discount(card, refused):
+    assert worker.confirm_card_refused(card, TOTAL) is refused
+
+
+@pytest.mark.parametrize("card,refused", [
+    ({"discount_total": "$999.00"}, True),
+    ({"discount_total": "-$5.00"}, False),
+    ({"total_discounts": "$999.00"}, True),  # the only money field: a mislabelled total cannot pass
+    ({"totalDiscounts": "-$999.00"}, True),
+    ({"discount": -99900}, True),            # a bare integer is read in cents: $999.00
+    ({"discount": -500}, False),             # $5.00
+    ({"discount": -5.5}, False),             # a fraction is read in dollars: $5.50
+    ({"discount": -999.5}, True),
+], ids=["discount_total_999", "discount_total_minus_5", "total_discounts_only", "totalDiscounts_minus_999",
+        "bare_cents_over", "bare_cents_within", "fraction_within", "fraction_over"])
+def test_a_discount_larger_than_the_ceiling_cancels(card, refused):
+    assert worker.confirm_card_refused(card, TOTAL) is refused
+
+
+#: Within the ceiling, where reading a key as a discount and reading it as money DISAGREE (a negative, a
+#: small bare number, a component): the magnitude cap cannot stand in for the classification here.
+@pytest.mark.parametrize("card", [
+    {"discountedTotal": "-$5.00"},                      # a negative TOTAL: money, cancels
+    {"discountedTotal": 500},                           # a bare number under a total: units unknown
+    {"totalAfterDiscount": "-$5.00"},
+    {"subtotal": "$45.00", "discountedTotal": "$40.00", "couponFee": "$10.00"},  # a fee is a component
+], ids=["discountedTotal_negative", "discountedTotal_bare", "totalAfterDiscount_negative", "couponFee_component"])
+def test_a_total_named_discount_key_within_the_ceiling_is_still_read_as_money(card):
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+@pytest.mark.parametrize("card", [
+    {"discount": {"amount": "-$5.00", "total": "-$5.00"}},       # a negative total under a discount
+    {"discount": {"amount": "-$5.00", "total": 4000}},            # a bare number under a total
+    {"subtotal": "$45.00", "coupon": {"value": "-$5.00", "fee": "$10.00"}},  # a fee under a coupon is summed
+    {"promos": [{"coupon": {"amount": "-$5.00", "finalPrice": "-$1.00"}}]},
+], ids=["nested_total_negative", "nested_total_bare", "nested_fee_component", "deep_final_price_negative"])
+def test_a_money_child_of_a_discount_within_the_ceiling_is_still_read_as_money(card):
+    assert worker.confirm_card_refused(card, TOTAL) is True

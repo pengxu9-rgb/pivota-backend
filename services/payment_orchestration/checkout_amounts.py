@@ -64,6 +64,18 @@ _CONTACT_STRONG = (
 #: ("-$5.00", -500) is therefore allowed, and so is one above the ceiling. It must still be READABLE: an
 #: unmarked string, a malformed amount or another currency under a discount key refuses like anywhere else.
 _DISCOUNT_PARTS = ("discount", "saving", "promo", "coupon", "rebate", "voucher")
+#: A key with a discount word is a PURE discount only when it carries none of these too: `totalAfterDiscount`,
+#: `discountedTotal`, `couponFee`, `promoShipping`, `netOfDiscount` are what is CHARGED, not what is taken off,
+#: so they are money (read strictly, summed as a component, a grand total when they are a total). When in
+#: doubt, money: cancelling on doubt is safe, ignoring on doubt is not.
+_NOT_A_PURE_DISCOUNT = (
+    "total", "price", "amountdue", "fee", "charge", "cost", "shipping", "tax", "net", "after", "with", "final",
+    "pay", "subtotal", "due",
+)
+#: Under a discount object, the children that are ITS amount (anything else there is money: doubt is money).
+_DISCOUNT_AMOUNT_KEYS = frozenset({"amount", "value", "amt"})
+#: The sum OF the discounts, spelled with "total": still a pure discount.
+_DISCOUNT_TOTAL_KEYS = frozenset({"totaldiscounts", "discounttotal", "totaldiscount", "discountstotal"})
 #: Money spellings, matched as parts of the canonical key ...
 _MONEY_PARTS = (
     "total", "amount", "price", "cost", "charge", "balance", "vat", "duty", "money", "shipping",
@@ -148,14 +160,39 @@ def canon_key(name: str) -> str:
 CONTACT, MONEY, PLAIN, DISCOUNT = "contact", "money", "plain", "discount"
 
 
+def is_pure_discount(canon: str) -> bool:
+    """A key (canonical) that names only an amount TAKEN OFF: a discount word and no money word, or the sum of
+    the discounts (`total_discounts`)."""
+    if canon in _DISCOUNT_TOTAL_KEYS:
+        return True
+    return any(part in canon for part in _DISCOUNT_PARTS) and not any(word in canon for word in _NOT_A_PURE_DISCOUNT)
+
+
+def _is_grand_total_key(canon: str) -> bool:
+    """A grand total: an exact spelling, or a total qualified as what is finally charged (`totalAfterDiscount`,
+    `discountedTotal`, `totalWithCoupon`, `finalTotal`). Never a subtotal, never the sum of the discounts."""
+    if canon in _GRAND_TOTAL_KEYS:
+        return True
+    if "total" not in canon or "subtotal" in canon or canon in _DISCOUNT_TOTAL_KEYS:
+        return False
+    return any(word in canon for word in ("after", "with", "final", "discounted", "grand", "payable", "net"))
+
+
+def _is_unit_price_key(canon: str) -> bool:
+    return (canon in _UNIT_PRICE_KEYS or "unitprice" in canon or "unitcost" in canon
+            or ("price" in canon and "total" not in canon))
+
+
 def key_kind(name: str, parent: str, sibling_currency: bool = False) -> str:
     """CONTACT, MONEY or PLAIN for the value under `name`, inside a parent read as `parent`."""
     canon = canon_key(name)
     if any(part in canon for part in _CONTACT_STRONG):
         return CONTACT
-    if any(part in canon for part in _DISCOUNT_PARTS):
+    if is_pure_discount(canon):
         return DISCOUNT
-    if parent == DISCOUNT and not (canon in _CONTACT_EXACT or any(p in canon for p in _CONTACT_PARTS)):
+    if any(part in canon for part in _DISCOUNT_PARTS):
+        return MONEY  # a discount word beside a money word: what is charged (`totalAfterDiscount`)
+    if parent == DISCOUNT and canon in _DISCOUNT_AMOUNT_KEYS:
         return DISCOUNT  # `{"discount": {"amount": "-$5.00"}}`: the amount of a discount
     if (canon in _MONEY_EXACT or any(part in canon for part in _MONEY_PARTS)
             or canon.endswith(_MONEY_SUFFIXES)):
@@ -165,7 +202,8 @@ def key_kind(name: str, parent: str, sibling_currency: bool = False) -> str:
         return CONTACT
     if canon == "value" and sibling_currency:
         return MONEY
-    return MONEY if parent == MONEY else PLAIN
+    # Under money, or under a discount (anything there but its amount is what is charged, or unknown): money.
+    return MONEY if parent in (MONEY, DISCOUNT) else PLAIN
 
 
 def _quantity(value: Any) -> Optional[int]:
@@ -243,7 +281,12 @@ def string_amounts(raw: str, ceiling: int, kind: str) -> List[int]:
         if right[:1] in ("e", "E") or not _STRICT_AMOUNT_RE.match(token):
             raise _Refused("a malformed amount")
         if kind == DISCOUNT:
-            continue  # readable USD; a negative or a large one only lowers the charge; never summed
+            units_, _, cents_ = token.partition(".")
+            if int(units_.replace(",", "")) * 100 + int(cents_ or 0) > ceiling:
+                # A real discount is never larger than what the buyer approved: an amount that big under a
+                # discount key is more likely a mislabelled total. Cancel.
+                raise _Refused("a discount larger than the ceiling")
+            continue  # readable USD and within the ceiling; it only lowers the charge; never summed
         if _LEFT_NEGATIVE_RE.search(left):
             raise _Refused("a negative amount")
         units, _, cents = token.partition(".")
@@ -321,11 +364,11 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
                     contribution, is_total = walk(item, depth + 1, child)
                 if not contribution:
                     continue
-                if canon in _GRAND_TOTAL_KEYS or is_total:
+                if _is_grand_total_key(canon) or is_total:
                     totals.append(contribution)
                 else:
                     components.append(contribution)
-                if canon in _UNIT_PRICE_KEYS or "unitprice" in canon or "unitcost" in canon:
+                if _is_unit_price_key(canon):
                     units.append(contribution)
             if sum(components) > ceiling:
                 raise _Refused("parts add up past the ceiling")
@@ -356,7 +399,13 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
             return 0, False
         if isinstance(value, (int, float)) and kind == MONEY:
             raise _Refused("a bare number under a money key: units unknown")
-        return 0, False  # a bare number under a DISCOUNT key (-500) only lowers the charge: not summed
+        if isinstance(value, (int, float)) and kind == DISCOUNT:
+            # A bare number under a discount key: an integer is read in cents (-500 is $5.00), a fraction in
+            # dollars (-5.5 is $5.50). Larger than the ceiling either way: more likely a mislabelled total.
+            magnitude = abs(value) if isinstance(value, int) else abs(value) * 100
+            if magnitude > ceiling:
+                raise _Refused("a discount larger than the ceiling")
+        return 0, False  # a discount within the ceiling only lowers the charge: not summed
 
     try:
         walk(data if isinstance(data, Mapping) else {"card": data}, 0, PLAIN)
