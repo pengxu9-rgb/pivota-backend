@@ -200,7 +200,8 @@ check the gate itself.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
-`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`, and
+`checkout_answer_scrubbed`, written only after the confirm went out, when an answer echoed a card code; the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
 written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
 for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id

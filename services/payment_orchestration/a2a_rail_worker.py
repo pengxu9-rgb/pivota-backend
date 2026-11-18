@@ -1529,7 +1529,8 @@ CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
 #: An answer AFTER the confirm went out (the confirm's own answer, a poll, a lookup, the result) echoed a card
 #: security code (a2a_rail.has_card_code: prose or a card string, scrubbed in the transport). Money may have
-#: moved, so it is HELD, the write kept: never failed, never not-charged. (Before the confirm, the setup's
+#: moved, so it is HELD, the write kept: never failed, and never "not charged" by an operator either (it is one
+#: of `_CHECKOUT_PAYMENT_REACHED_CODES`: resolve-held refuses it as `payment_reached_recorded`). (Before the confirm, the setup's
 #: answer with such an echo is simply not confirmed: cancelled, failed only on a definite cancel.)
 CHECKOUT_ANSWER_SCRUBBED = "checkout_answer_scrubbed"
 _CHECKOUT_HOLD_CODES = frozenset({
@@ -1542,14 +1543,17 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
     CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
 })
-#: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`): our own
-#: ledger then records that the order may have been placed and paid. The operator path can NEVER mark these
-#: "not charged": they need a human and the merchant (a refund), not a `failed`. Every hold code is either
-#: here or in `_OPERATOR_RESOLVABLE_HOLD_CODES` (a test holds the partition, and that every hold written in
-#: `_checkout_result`'s payment-reached branch is here).
+#: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`), and
+#: `checkout_answer_scrubbed`, written only AFTER the confirm went out (its result may have said payment-reached
+#: before the echo was scrubbed): our own ledger then records that the order may have been placed and paid.
+#: The operator path can NEVER mark these "not charged" (refused as `payment_reached_recorded`): they need a
+#: human and the merchant (a refund), not a `failed`. Every hold code is either here or in
+#: `_OPERATOR_RESOLVABLE_HOLD_CODES` (a test holds the partition, that every hold written in
+#: `_checkout_result`'s payment-reached branch is here, and that `checkout_answer_scrubbed` is written only
+#: by the post-confirm readers).
 _CHECKOUT_PAYMENT_REACHED_CODES = frozenset({
     CHECKOUT_TOTAL_OVER_APPROVED, CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_ORDER_ID_CARD_SHAPED,
-    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED,
+    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
 })
 #: The holds a human may end as `operator_confirmed_not_charged`, after checking the provider's side: the
 #: outcome at the provider is unknown to us, and no payment was reported.

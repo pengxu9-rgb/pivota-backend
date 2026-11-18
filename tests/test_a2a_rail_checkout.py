@@ -2073,12 +2073,24 @@ def test_every_hold_code_is_classified_and_the_payment_reached_branch_writes_onl
     assert {getattr(worker, name) for name in held} <= worker._CHECKOUT_PAYMENT_REACHED_CODES
     # The three codes the review named are among them.
     assert {"checkout_total_over_approved", "checkout_total_unverified", "checkout_order_id_card_shaped",
-            "checkout_payment_no_order", "checkout_payment_reached_unconfirmed"} <= worker._CHECKOUT_PAYMENT_REACHED_CODES
+            "checkout_payment_no_order", "checkout_payment_reached_unconfirmed",
+            "checkout_answer_scrubbed"} <= worker._CHECKOUT_PAYMENT_REACHED_CODES
+    # `checkout_answer_scrubbed` is written ONLY by the readers of answers that come after the confirm, and it is
+    # on the refused side of the partition.
+    full = inspect.getsource(worker)
+    writers = {name for name, fn in inspect.getmembers(worker, inspect.iscoroutinefunction)
+               if "_checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)" in inspect.getsource(fn)}
+    assert writers == {"_confirm_answer", "_checkout_progress", "_checkout_lookup"}
+    assert full.count("_checkout_hold(s, CHECKOUT_ANSWER_SCRUBBED)") == 3
+    # No other use writes it: its name appears only where it is defined, in the two code sets, and in those holds.
+    uses = [line.strip() for line in full.splitlines() if "CHECKOUT_ANSWER_SCRUBBED" in line and not line.strip().startswith("#")]
+    assert len(uses) == 1 + 2 + 3, uses
+    assert worker.CHECKOUT_ANSWER_SCRUBBED not in worker._OPERATOR_RESOLVABLE_HOLD_CODES
 
 
 @pytest.mark.parametrize("code", sorted([
     "checkout_total_over_approved", "checkout_total_unverified", "checkout_order_id_card_shaped",
-    "checkout_payment_no_order", "checkout_payment_reached_unconfirmed"]))
+    "checkout_payment_no_order", "checkout_payment_reached_unconfirmed", "checkout_answer_scrubbed"]))
 async def test_the_operator_never_marks_a_recorded_payment_not_charged(code):
     pid = await _placing()
     await database.execute("UPDATE a2a_rail_purchases SET last_error_code = :c, claimed_by = NULL WHERE id = :i",
@@ -3115,8 +3127,8 @@ async def _assert_held_scrubbed(pid, pending):
     row = await _row(pid)
     assert (row["state"], row["last_error_code"], row["pending_write"], row["terminal_at"]) == (
         "paying", worker.CHECKOUT_ANSWER_SCRUBBED, pending, None)
-    assert worker.CHECKOUT_ANSWER_SCRUBBED in worker._CHECKOUT_HOLD_CODES
-    assert worker.CHECKOUT_ANSWER_SCRUBBED not in worker._CHECKOUT_PAYMENT_REACHED_CODES
+    assert worker.CHECKOUT_ANSWER_SCRUBBED in worker._CHECKOUT_HOLD_CODES  # held for the worker and the gateway
+    assert worker.CHECKOUT_ANSWER_SCRUBBED in worker._CHECKOUT_PAYMENT_REACHED_CODES  # never "not charged"
 
 
 async def test_after_the_confirm_a_confirm_answer_with_a_card_code_is_held_with_the_write_kept():
