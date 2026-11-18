@@ -14,8 +14,8 @@ WHAT IS DOUBLED. Everything around the order row: the agent context, governance,
 and the payment surface, telemetry.
 
 HOW A DATABASE FAILURE IS INJECTED. `db.orders.database` is wrapped (`FaultyDatabase`): each
-statement `db.orders` sends is named by what it is (`replay_lookup`, `claim_insert`, `claim_select`,
-`claim_order_exists`, `order_insert`) and a fault raises a busy error either BEFORE the statement
+statement `db.orders` sends is named by what it is (`replay_lookup`, `claim_read`, `claim_insert`,
+`claim_select`, `claim_order_exists`, `order_insert`) and a fault raises a busy error either BEFORE the statement
 runs (it never reached the database) or AFTER it ran (it committed and the answer was lost). Every
 statement is its own autocommit transaction, so "after the insert, before the commit" and "after
 the commit" are the same point: AFTER. Gates (asyncio events) hold one request at a named
@@ -72,6 +72,8 @@ def classify_statement(query: Any) -> str:
         flat = " ".join(query.split()).lower()
         if flat.startswith("insert into order_quote_claims"):
             return "claim_insert"
+        if flat.startswith("select c.order_id from order_quote_claims c join orders"):
+            return "claim_read"
         if flat.startswith("select order_id from order_quote_claims"):
             return "claim_select"
         if flat.startswith("select order_id from orders where order_id"):
@@ -527,13 +529,18 @@ class World:
         tag: str,
         headers: Optional[Dict[str, str]] = None,
         content: Optional[bytes] = None,
+        real_auth: bool = False,
     ) -> Answer:
+        """`real_auth`: the route's real auth dependency runs (the case doubles what it reads)."""
         from routes.agent_auth import get_agent_context
 
         async def context() -> _Context:
             return _Context(_REQUEST_AGENT.get())
 
-        self.app.dependency_overrides[get_agent_context] = context
+        if real_auth:
+            self.app.dependency_overrides.pop(get_agent_context, None)
+        else:
+            self.app.dependency_overrides[get_agent_context] = context
         tag_token = _REQUEST_TAG.set(tag)
         agent_token = _REQUEST_AGENT.set(agent)
         try:
@@ -913,7 +920,9 @@ async def test_v2_resend_after_the_consume_landed_is_refused_and_writes_nothing(
 
 async def test_the_consume_failing_is_not_what_keeps_the_quote_single_use(world: World) -> None:
     """The quote stays `active` (the consume never lands) and every lookup is made to find nothing
-    it could replay (another provider choice): only the database guard is left, and it holds."""
+    it could replay (another provider choice): only the database guard is left, and it holds. Its
+    read, before any refusal of the create, answers the second create; the write step is never
+    entered for it."""
     w = world
     w.quotes.consume_lands = False
     quote = w.quotes.add()
@@ -925,7 +934,8 @@ async def test_the_consume_failing_is_not_what_keeps_the_quote_single_use(world:
     assert first.status == 200 and len(rows) == 1
     assert w.quotes.quotes[quote]["status"] == "active"
     assert second.status == 409 and second.code == "QUOTE_CONSUMED", second.body
-    assert w.create_runs == ["r1", "r2"]
+    assert w.create_runs == ["r1"]
+    assert w.db.count("claim_read", "r2") >= 1
     assert w.db.count("order_insert", "r2") == 0, "the guard must refuse before the order is written"
 
 
@@ -1263,7 +1273,8 @@ async def test_a_claims_table_with_a_column_missing_refuses_the_order_it_does_no
             answer = await w.create(route, quote, key="key-1")
 
         assert_retriable_503(answer, "ORDER_QUOTE_GUARD_UNAVAILABLE")
-        assert w.create_runs == ["r1"]
+        # The guard's read, before the write step, is the one that meets the broken table.
+        assert w.create_runs == []
         assert w.db.count("order_insert") == 0
         assert await w.orders_for(quote) == []
         messages = [r.getMessage() for r in caplog.records if r.name == "db.orders"]

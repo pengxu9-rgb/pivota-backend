@@ -26,7 +26,7 @@ from models.order import (
 )
 from db.orders import (
     OrderQuoteAlreadyClaimed, OrderQuoteClaimUnavailable,
-    create_order, get_order, get_orders_by_merchant, get_orders_by_customer,
+    create_order, read_quote_claim_holder, get_order, get_orders_by_merchant, get_orders_by_customer,
     update_order_status, update_payment_info, mark_order_paid, 
     update_fulfillment_info, mark_order_shipped, get_order_stats, update_order as update_order_row
 )
@@ -3708,6 +3708,18 @@ async def create_new_order(
         # It is NOT the only way to create an order in this codebase, and this
         # gate does not claim to be. See the PR for the paths that reach a
         # charge without passing here.
+        #
+        # Read first, before the merchant refusal (and before any write): does this caller's quote
+        # already hold its order? Then that is the answer (agent order create replays it to its
+        # owner, or the 409 QUOTE_CONSUMED stands), never a refusal that says nothing was ordered.
+        # The claim itself is taken later, inside create_order. A read that fails is the 503.
+        quote_holder = await read_quote_claim_holder(
+            agent_id=order_request.metadata.get("agent_id") if isinstance(order_request.metadata, dict) else None,
+            quote_id=order_request.quote_id,
+        )
+        if quote_holder:
+            raise OrderForQuoteExists(quote_holder)
+
         merchant_status = str(merchant.get("status") or "").strip().lower()
         if merchant_status in SUPPRESSED_ONBOARDING_STATUSES:
             raise HTTPException(
