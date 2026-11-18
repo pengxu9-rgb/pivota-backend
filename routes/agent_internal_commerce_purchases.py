@@ -43,9 +43,9 @@ THE WRITE is a SECOND router with its OWN key and its OWN dial, so the read key 
          keyed on (rail, rail purchase id, step, approval epoch) and the rail row is read agent-scoped,
          so the write does not need the parent row (it heals it best effort, after every check passed).
   BODY   exactly `{step, offer_id, issued_at, terms_version, privacy_version}` (strings, <= 1 KiB): the offer
-         the GET showed. Accepted only when the versions are the configured ones (else 409 consent_stale),
-         the purchase is not final and is in that step (else 409 consent_stale), the offer's HMAC verifies
-         (else 400 consent_offer_invalid) and it is at least AGENPAS_CONSENT_MIN_DWELL_SECONDS old (else
+         the GET showed (not exactly that shape: 400 consent_refused). Accepted only when the versions are
+         the configured ones (else 409 consent_stale), the purchase is not final and is in that step (else
+         409 consent_stale), the offer's HMAC verifies (else 400 consent_refused) and it is at least AGENPAS_CONSENT_MIN_DWELL_SECONDS old (else
          409 consent_too_soon) and at most 1800 s (else 409 consent_stale). Configuration or offer secret
          missing: 503 consent_unavailable. Any refusal writes nothing. A repeat is the same one row
          (201 when this call wrote it, 200 when it already existed). Calls no rail.
@@ -299,7 +299,7 @@ async def record_purchase_consent(
         return _not_found()
     body = _consent_body(await request.body())
     if body is None:
-        return _refusal(400, "invalid_consent")
+        return _refusal(400, "consent_refused")
     cfg = purchase_consent.config()
     if cfg is None:
         return _refusal(503, "consent_unavailable")
@@ -321,7 +321,7 @@ async def record_purchase_consent(
     epoch = purchase_consent.approval_epoch(rail, step)
     if not purchase_consent.offer_matches(cfg, body["offer_id"], rail=rail, rail_purchase_id=rail_id, step=step,
                                           epoch=epoch, issued_at=body["issued_at"]):
-        return _refusal(400, "consent_offer_invalid")
+        return _refusal(400, "consent_refused")
     issued = purchase_consent.parse_issued_at(body["issued_at"])
     age = (datetime.now(timezone.utc) - issued).total_seconds()
     if age < purchase_consent.min_dwell_seconds():

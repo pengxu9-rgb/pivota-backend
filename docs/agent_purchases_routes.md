@@ -87,12 +87,14 @@ does not exist. Turning it on needs a restart.
 
 ```json
 "consent": {
-  "required": true, "step": "approval", "satisfied": false, "available": true,
+  "required": true, "step": "approval", "satisfied": false, "available": true, "min_dwell_seconds": 3,
   "terms_version": "…", "privacy_version": "…", "terms_url": "https://…", "privacy_url": "https://…",
   "offer": {"id": "<64 hex>", "issued_at": "2026-11-18T12:00:00Z"}
 }
 ```
 
+  `offer.id` is 64 hex characters; `offer.issued_at` is ISO-8601 UTC to the second ending in `Z`, and must be
+  echoed byte for byte. `min_dwell_seconds` (0..120) is how long after `issued_at` the write accepts it.
   `available` is false (and there is no `offer`) when the terms / privacy URL or version, or the offer
   secret, is not configured, when the consent write is off, or when the consent table could not be read:
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
@@ -124,11 +126,10 @@ partner requires that acceptance before a card is stored and before every approv
 |---|---|
 | 201 `{"created": true, "consent": {step, approval_epoch, terms_version, privacy_version, evidence, accepted_at}}` | recorded |
 | 200 `{"created": false, "consent": {…}}` | already recorded for this step (a double click is one row) |
-| 400 `invalid_consent` | not exactly that body |
-| 400 `consent_offer_invalid` | the offer's HMAC does not verify for this purchase, step, approval and the current terms |
+| 400 `consent_refused` | not exactly that body, or the offer's HMAC does not verify for this purchase, step, approval and the current terms |
 | 404 `purchase_not_found` | no such purchase for this agent |
 | 409 `consent_stale` | the versions are not the configured ones, the purchase is final or not in that step, or the offer is older than 1800 s: re-read and show the fresh offer |
-| 409 `consent_too_soon` | the offer is younger than `AGENPAS_CONSENT_MIN_DWELL_SECONDS` (default 3) |
+| 409 `consent_too_soon` | the offer is younger than `consent.min_dwell_seconds` (`AGENPAS_CONSENT_MIN_DWELL_SECONDS`, default 3) |
 | 503 `consent_unavailable` | terms / privacy configuration or offer secret missing |
 | 503 `temporarily_unavailable` | a ledger fault |
 
@@ -168,7 +169,7 @@ Configuration (all on the backend; none is read by the browser):
 | `AGENPAS_TERMS_URL`, `AGENPAS_TERMS_VERSION` | Pivota's buyer terms of service: https URL, version tag (printable ASCII, <= 32) |
 | `AGENPAS_PRIVACY_URL`, `AGENPAS_PRIVACY_VERSION` | Pivota's buyer privacy policy: the same shapes |
 | `AGENPAS_CONSENT_OFFER_SECRET` | the offer HMAC key, >= 32 characters, backend only |
-| `AGENPAS_CONSENT_MIN_DWELL_SECONDS` | default 3 |
+| `AGENPAS_CONSENT_MIN_DWELL_SECONDS` | a whole number 0..120, default 3 (anything else: 3); stated to the page as `consent.min_dwell_seconds` |
 
 **Turn on, in this order**: the gateway's consent UI and rails first (`AGENPAS_CONSENT_ENABLED`,
 `AGENPAS_RAILS`), then the backend configuration above and `AGENPAS_CONSENT_WRITE_ENABLED` (a restart),

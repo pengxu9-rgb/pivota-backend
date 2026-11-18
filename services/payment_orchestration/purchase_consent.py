@@ -64,6 +64,8 @@ MIN_DWELL_ENV = "AGENPAS_CONSENT_MIN_DWELL_SECONDS"
 #: A configured offer secret shorter than this counts as missing: the gate then offers nothing (fail closed).
 OFFER_SECRET_MIN_LENGTH = 32
 MIN_DWELL_SECONDS_DEFAULT = 3
+#: The dwell a configuration may ask for: a whole number of seconds, 0..120 (the gateway's contract).
+MIN_DWELL_SECONDS_MAX = 120
 #: An offer older than this is stale: the page re-reads and shows a fresh one.
 MAX_OFFER_AGE_SECONDS = 1800
 
@@ -126,7 +128,7 @@ def min_dwell_seconds() -> int:
         value = int(raw)
     except ValueError:
         return MIN_DWELL_SECONDS_DEFAULT
-    return value if 0 <= value <= MAX_OFFER_AGE_SECONDS else MIN_DWELL_SECONDS_DEFAULT
+    return value if 0 <= value <= MIN_DWELL_SECONDS_MAX else MIN_DWELL_SECONDS_DEFAULT
 
 
 def valid_version(value: Any) -> bool:
@@ -280,6 +282,8 @@ def consent_block(
         "step": step,
         "satisfied": satisfied,
         "available": cfg is not None and write_enabled() and consents is not FAILED,
+        # How long the page must wait after `offer.issued_at` before the write accepts it (0..120).
+        "min_dwell_seconds": min_dwell_seconds(),
     }
     if cfg is not None:
         block.update({"terms_version": cfg.terms_version, "privacy_version": cfg.privacy_version,

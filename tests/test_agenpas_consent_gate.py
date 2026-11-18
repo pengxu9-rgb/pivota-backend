@@ -62,7 +62,13 @@ INTERNAL = "/agent/internal/commerce/purchases"
 READ_KEY = "agenpas_read_test_key_0123456789abcdef"
 AGENT = "agent_consent_gate"
 USER_REF = "user-consent-gate"
-OWNER = hash_agent_user_ref(USER_REF)
+
+
+def _owner() -> str:
+    """The owner hash AT CALL TIME: it is keyed by env (BUYER_IDENTITY_LINK_SECRET and its fallbacks), which
+    other test files set and unset, so a hash taken at import can differ from what the route computes."""
+    return hash_agent_user_ref(USER_REF)
+
 EMAIL = "buyer@example.test"
 STREET = "1 Placeholder Way"
 A2A_HOST = "pay.rail.example"
@@ -189,7 +195,7 @@ async def _fix_timestamps(table: str, row_id: str, keep: tuple) -> None:
 
 async def _reap(name: str, state: str, **columns: Any) -> str:
     purchase = await reap_ledger.create_purchase(
-        buyer_ref="bref_consent_gate", agent_id=AGENT, agent_user_ref_hash=OWNER,
+        buyer_ref="bref_consent_gate", agent_id=AGENT, agent_user_ref_hash=_owner(),
         merchant_domain="merchant.example", product_key="pk_1", product_name="Placeholder Serum", quantity=1,
         currency="USD", our_price_minor=4250, buyer_email=EMAIL,
         shipping_address={"addressLine1": STREET, "city": "Placeholder City"},
@@ -204,7 +210,7 @@ async def _reap(name: str, state: str, **columns: Any) -> str:
 
 async def _a2a(state: str, **columns: Any) -> str:
     row = await a2a_ledger.create_purchase(
-        agent_id=AGENT, agent_user_ref_hash=OWNER, merchant_domain="merchant.example",
+        agent_id=AGENT, agent_user_ref_hash=_owner(), merchant_domain="merchant.example",
         checkout_url="https://merchant.example/cart/40000000001:1", currency="USD", our_price_minor=4650,
         buyer_email=EMAIL, shipping_address={"addressLine1": STREET, "city": "Placeholder City"})
     updates = {"state": state, **columns}
@@ -440,6 +446,9 @@ async def test_gate_on_and_unconsented_no_card_or_approval_url_appears_on_any_su
         assert {k: v for k, v in internal.items() if k != "consent"} == door
         assert internal["consent"]["step"] == step and internal["consent"]["satisfied"] is False
         assert internal["consent"]["available"] is True and set(internal["consent"]["offer"]) == {"id", "issued_at"}
+        assert internal["consent"]["min_dwell_seconds"] == 3
+        assert re.fullmatch(r"[0-9a-f]{64}", internal["consent"]["offer"]["id"])
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", internal["consent"]["offer"]["issued_at"])
         if name.startswith("R_"):
             assert _body(surfaces[f"reap:{name}"]) == door["detail"]
     for name, step in LOCKING.items():
@@ -643,7 +652,7 @@ async def test_the_offer_the_read_shows_records_a_consent_once_and_opens_the_pag
     assert by_rail_id[ids["R_approve"]]["rail_buyer_ref"] is None
     # No PII in any row.
     text = json.dumps([{k: str(v) for k, v in r.items()} for r in rows])
-    for leaked in (EMAIL, STREET, OWNER):
+    for leaked in (EMAIL, STREET, _owner()):
         assert leaked not in text
 
 
@@ -708,14 +717,14 @@ async def test_refusals_write_nothing(gate):
     await _refused(approve, {**good, "terms_version": "terms-2026-10"}, 409, "consent_stale")
     await _refused(approve, {**good, "privacy_version": "privacy-2026-10"}, 409, "consent_stale")
     # a bad HMAC: forged, for another purchase, another step's, another epoch's, a shifted issued_at
-    await _refused(approve, {**good, "offer_id": "0" * 64}, 400, "consent_offer_invalid")
+    await _refused(approve, {**good, "offer_id": "0" * 64}, 400, "consent_refused")
     await _refused(approve, {**_offer(ids["A_approve"], "approval"), "offer_id": _offer(ids["A_approve"], "approval")["offer_id"]},
-                   400, "consent_offer_invalid")
-    await _refused(approve, _offer(approve, "approval", epoch=2), 400, "consent_offer_invalid")
+                   400, "consent_refused")
+    await _refused(approve, _offer(approve, "approval", epoch=2), 400, "consent_refused")
     shifted = dict(good)
     shifted["issued_at"] = purchase_consent.issued_at_text(
         purchase_consent.parse_issued_at(good["issued_at"]) - timedelta(seconds=60))
-    await _refused(approve, shifted, 400, "consent_offer_invalid")
+    await _refused(approve, shifted, 400, "consent_refused")
     # dwell too short, and an offer too old
     await _refused(approve, _offer(approve, "approval", age=1), 409, "consent_too_soon")
     await _refused(approve, _offer(approve, "approval", age=-30), 409, "consent_too_soon")
@@ -724,9 +733,9 @@ async def test_refusals_write_nothing(gate):
     for bad in ({**good, "extra": "x"}, {k: v for k, v in good.items() if k != "step"}, {**good, "step": "pay"},
                 {**good, "offer_id": "ZZ"}, {**good, "issued_at": "2026-11-18 00:00:00"}, {**good, "step": 1},
                 {**good, "terms_version": "has space"}, [good], "x"):
-        await _refused(approve, bad, 400, "invalid_consent")
-    await _refused(approve, None, 400, "invalid_consent", raw=b"{not json")
-    await _refused(approve, None, 400, "invalid_consent", raw=json.dumps({**good, "pad": "y" * 1100}).encode())
+        await _refused(approve, bad, 400, "consent_refused")
+    await _refused(approve, None, 400, "consent_refused", raw=b"{not json")
+    await _refused(approve, None, 400, "consent_refused", raw=json.dumps({**good, "pad": "y" * 1100}).encode())
 
 
 async def test_missing_configuration_or_secret_refuses_the_write(gate):
@@ -905,7 +914,8 @@ def test_the_offer_hmac_binds_every_field():
     assert SECRET not in repr(cfg)
 
 
-@pytest.mark.parametrize("raw,expected", [("", 3), ("0", 0), ("10", 10), ("-1", 3), ("abc", 3), ("99999", 3)])
+@pytest.mark.parametrize("raw,expected", [("", 3), ("0", 0), ("10", 10), ("120", 120), ("121", 3), ("-1", 3),
+                                          ("abc", 3), ("1.5", 3), ("99999", 3)])
 def test_the_dwell_setting(monkeypatch, raw, expected):
     monkeypatch.setenv(purchase_consent.MIN_DWELL_ENV, raw)
     assert purchase_consent.min_dwell_seconds() == expected
