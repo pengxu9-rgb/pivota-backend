@@ -75,3 +75,13 @@ def test_variant_expansion_proposer_source_and_evidence_prefix_are_unchanged():
     assert expansion.RETAILER_EVIDENCE_PREFIX == "kiokii_us"
     assert expansion.ENABLE_FLAG == "MEITU_US_KIOKII_SIX_EXPANSION_ENABLED"
     assert expansion.EXTERNAL_ID == "ext_51577f22556c1f3aeb091391"
+
+
+def test_cohort_c_stored_strings_and_env_names_are_unchanged():
+    # Neutral literals carried by cohort C rows and runtime env; the cohort's data stays private.
+    assert cohorts.COHORT_C_REVIEW_LABEL == "reviewed_retailer_c_referrals_v1"
+    assert cohorts.COHORT_C_SKIP_REASON == "reviewed_retailer_c_scope"
+    assert cohorts.COHORT_C_MANIFEST == "REVIEWED_RETAILER_MANIFEST_PATH"
+    assert cohorts.COHORT_C_MANIFEST_SHA256 == "REVIEWED_RETAILER_MANIFEST_SHA256"
+    assert cohorts.COHORT_C_FLAG == "REVIEWED_RETAILER_EXACT_ENABLED"
+    assert cohorts.COHORT_C_WRITE_FLAG == "REVIEWED_RETAILER_REFRESH_WRITE_ENABLED"

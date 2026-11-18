@@ -40,10 +40,9 @@ from config.settings import resolve_public_api_base_url, settings
 from services.catalog_identity import validated_source_gtin
 from services.seed_variant_options import seed_variant_options_as_mapping
 from services.exact_retailer_cohorts import (
-    COHORT_B_PROTECTED_LISTING_KEYS,
-    RETAILER_COHORT_B,
+    EXACT_ONLY_LISTING_KEYS,
     PROOF_KEY as EXACT_RETAILER_SHADE_PROOF_KEY,
-    RETAILER_COHORT_A,
+    RETAILER_COHORT_A, RETAILER_COHORT_C,
 )
 from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
@@ -7327,7 +7326,7 @@ async def _handle_offers_resolve(
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         catalog_rows = []
-        cohort_b_offer_ids = set()
+        supplemental_exact_offer_ids = set()
         # FRESH PRICE FIRST, in a merged group only (see `_catalog_price_freshness_sql`): empty
         # fragments and no extra bind otherwise, so every other statement is the one main sends.
         _price_select, _price_order, _price_params = (
@@ -7343,6 +7342,8 @@ async def _handle_offers_resolve(
                 cohort=exact_retailer_cohort,
             )
         elif ident_aliases:
+            # A failed generic lookup raises for every cohort: swallowing it would answer with the
+            # exact rows alone and silently drop every other seller.
             catalog_rows = await asyncio.wait_for(
                 database.fetch_all(
                     # The statement text is built by `_catalog_offers_statement`, which the group
@@ -7358,16 +7359,16 @@ async def _handle_offers_resolve(
             )
             if _group_flag == "shadow":
                 _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
-        if exact_retailer_cohort is RETAILER_COHORT_B:
+        if exact_retailer_cohort is not None and not cohort_a_exact_referrals:
             try:
                 exact_rows = await exact_retailer_shades.read_offers(
                     database, sku_id, timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
-                    cohort=RETAILER_COHORT_B,
+                    cohort=exact_retailer_cohort,
                 )
             except Exception:
-                logger.warning("Cohort B exact retailer offer lookup failed", exc_info=True)
+                logger.warning("Supplemental exact retailer offer lookup failed", exc_info=True)
             else:
-                cohort_b_offer_ids = {row["offer_id"] for row in exact_rows}
+                supplemental_exact_offer_ids = {row["offer_id"] for row in exact_rows}
                 catalog_rows = [*exact_rows, *(catalog_rows or [])]
 
         # Hosts the seed lane already claimed. Read from `source`, which carries the raw
@@ -7394,8 +7395,8 @@ async def _handle_offers_resolve(
         deduped = 0
         for row in catalog_rows or []:
             r = dict(row)
-            cohort_b_exact_referral = r.get("offer_id") in cohort_b_offer_ids
-            exact_referral = cohort_a_exact_referrals or cohort_b_exact_referral
+            supplemental_exact_referral = r.get("offer_id") in supplemental_exact_offer_ids
+            exact_referral = cohort_a_exact_referrals or supplemental_exact_referral
             destination = str(r.get("destination_url") or "").strip()
             if not destination.startswith(("http://", "https://")):
                 continue
@@ -7427,7 +7428,7 @@ async def _handle_offers_resolve(
                     **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if exact_referral else {}),
                     **({
                         "canonicalNativeVariantId": r["variant_id"], "retailerNativeVariantId": r["retailer_variant_id"],
-                    } if cohort_b_exact_referral else {}),
+                    } if supplemental_exact_referral else {}),
                 },
                 merchant_id=offer_merchant,
                 product_id=str(r.get("product_key") or "") or None,
@@ -7442,7 +7443,7 @@ async def _handle_offers_resolve(
             )
             if not redirect_url:
                 unattributed += 1
-                if cohort_b_exact_referral:
+                if supplemental_exact_referral:
                     continue
 
             if _group_mode:
@@ -10585,8 +10586,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
-    pilot_listing_keys = ", ".join(f"'{key}'" for key in RETAILER_COHORT_A.listings)
-    cohort_b_listing_keys = ", ".join(f"'{key}'" for key in sorted(COHORT_B_PROTECTED_LISTING_KEYS))
+    exact_only_listing_keys = ", ".join(f"'{key}'" for key in sorted(EXACT_ONLY_LISTING_KEYS))
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10688,13 +10688,14 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND o.offer_type = 'retailer'
                        AND o.offer_mode = 'redirect'
                        AND o.suppressed_at IS NULL
-                       AND p.product_key NOT IN ({cohort_b_listing_keys})
-                       -- A reviewed listing only serves through the exact pilot reader once marked.
-                       AND (p.product_key NOT IN ({pilot_listing_keys}) OR NOT EXISTS (
+                       AND p.product_key NOT IN ({exact_only_listing_keys})
+                       -- A listing carrying any reviewed exact-shade proof serves only through the
+                       -- exact reader, whatever cohort config or private manifest this runtime has.
+                       AND NOT EXISTS (
                            SELECT 1 FROM catalog_offers pilot
                            WHERE pilot.product_key = p.product_key
                              AND pilot.offer_payload->'{EXACT_RETAILER_SHADE_PROOF_KEY}' IS NOT NULL
-                       ))
+                       )
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0
                        -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY

@@ -8,17 +8,40 @@ from services.catalog_enrichment_agent import apply as enrichment
 from services.catalog_enrichment_agent.reviewed_retailer_offers import scope_reviewed_plan
 from services.catalog_identity import validated_source_gtin
 from services.exact_retailer_cohorts import (
-    COHORT_A_CONFIG, COHORT_B_CONFIG,
+    COHORT_A_CONFIG, COHORT_B_CONFIG, COHORT_C_REVIEW_LABEL,
     COHORT_B_BARE_FAMILY_URL, COHORT_B_EXPANSION_FLAG, COHORT_B_INITIAL_OFFER_IDS, RETAILER_COHORT_B_INITIAL,
     COHORT_B_PROTECTED_FAMILY_URLS, COHORT_B_PROTECTED_LISTING_KEYS, RETAILER_COHORT_B, PROOF_KEY,
-    RETAILER_COHORT_A,
+    RETAILER_COHORT_A, RETAILER_COHORT_C,
 )
+from services.exact_retailer_shades import require_canonical_shades
+
+
+# Distinct from cohort B expansion (…, 2) and from the private bundles' session lock (…, 3).
+COHORT_C_LOCK = (1160308171, 5)
+
+
+async def require_open_serializable_transaction(db) -> None:
+    """Refuse unless the caller holds an explicit serializable transaction.
+
+    SHOW transaction_isolation alone also reads 'serializable' from a session default in
+    autocommit mode. Two statements report the same assigned transaction id only when they run
+    inside one transaction block; in autocommit each statement is its own transaction, so the
+    second reads NULL.
+    """
+    if await db.fetch_val("SHOW transaction_isolation") != "serializable":
+        raise ValueError("cohort C writes require a serializable transaction")
+    assigned = await db.fetch_val("SELECT txid_current()::text")
+    if not assigned or await db.fetch_val("SELECT txid_current_if_assigned()::text") != assigned:
+        raise ValueError("cohort C writes require an open transaction")
 
 
 async def apply_reviewed_retailer(db, record, *, write: bool, cohort=RETAILER_COHORT_A, expand_cohort_b=False):
     """Confirm identity and ownership within the caller's transaction before writing."""
+    if cohort is None:
+        raise ValueError("private retailer manifest is required")
     is_cohort_a = cohort is RETAILER_COHORT_A
     is_cohort_b = cohort is RETAILER_COHORT_B or cohort is RETAILER_COHORT_B_INITIAL
+    is_cohort_c = cohort is RETAILER_COHORT_C
     if expand_cohort_b:
         if cohort is not RETAILER_COHORT_B:
             raise ValueError("the exact cohort B expansion cohort is required")
@@ -26,7 +49,12 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=RETAILER_CO
             if os.getenv(COHORT_B_EXPANSION_FLAG) != "1" or await db.fetch_val("SHOW transaction_isolation") != "serializable":
                 raise ValueError("cohort B expansion requires its opt-in and serializable transaction")
             await db.execute("SELECT pg_advisory_xact_lock(1160308171, 2)")
+    if is_cohort_c and write:
+        await require_open_serializable_transaction(db)
+        await db.execute(f"SELECT pg_advisory_xact_lock({COHORT_C_LOCK[0]}, {COHORT_C_LOCK[1]})")
     label = (COHORT_A_CONFIG if is_cohort_a else COHORT_B_CONFIG)["review_label"]
+    if is_cohort_c:
+        label = COHORT_C_REVIEW_LABEL
     scope = {"include_reviewed_cohort_a": True} if is_cohort_a else {"reviewed_retailer_keys": tuple(cohort.listings)}
     plan = scope_reviewed_plan(
         await enrichment.plan_with_current_listings(
@@ -61,6 +89,17 @@ async def apply_reviewed_retailer(db, record, *, write: bool, cohort=RETAILER_CO
     )
     if not observed:
         raise ValueError("reviewed observed retailer is missing")
+    if is_cohort_c:
+        marked = await db.fetch_all(
+            """
+            SELECT merchant_id FROM catalog_merchants m
+            WHERE m.metadata_json->'seller_identity'->>'kind' = 'retailer'
+              AND m.metadata_json->'seller_identity'->>'etld1' = :host
+            """,
+            {"host": retailer.host},
+        )
+        if [row["merchant_id"] for row in marked] != [retailer.merchant_id]:
+            raise ValueError("exactly one retailer-marked merchant record must own the host")
     if await db.fetch_val(
         """
         SELECT EXISTS (SELECT 1 FROM brand_claims
@@ -197,6 +236,8 @@ async def canonical_witness(db, retailer, *, cohort=RETAILER_COHORT_A):
     observed = {(row["source_variant_id"], validated_source_gtin(row["barcode"])) for row in rows}
     if len(rows) != len(retailer.variants) or observed != set(retailer.variants.values()):
         raise ValueError("canonical product, index or exact UPC identities are missing")
+    if cohort.canonical_signature_id is not None:
+        await require_canonical_shades(db, cohort=cohort)
     return [dict(row) for row in rows]
 
 
