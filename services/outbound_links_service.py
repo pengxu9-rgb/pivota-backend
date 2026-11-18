@@ -92,7 +92,10 @@ def normalize_tool(tool: Optional[str]) -> str:
 
 
 def normalize_market(market: Optional[str]) -> str:
-    m = str(market or "").strip().upper()
+    # ABSENT (None / blank) serves as US, by design (see MARKET PROVENANCE below). A SENT value is kept: only an
+    # ASCII value is upper-cased, since case mapping reads a look-alike ('ſg') as a real market ('SG').
+    m = str(market or "").strip()
+    m = m.upper() if m.isascii() else m
     return m or "US"
 
 

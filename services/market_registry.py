@@ -87,9 +87,23 @@ def normalize_market(code: Any) -> str:
     matched a listed market. Any other value is returned trimmed, upcased only when it is ASCII ('usa' ->
     'USA', as before), so it is reported as itself and matches no market (every key is two ASCII letters)."""
     text = str(code or "").strip()
-    if _ASCII_MARKET_CODE.fullmatch(text) or text.isascii():
-        return text.upper()
-    return text
+    return text.upper() if text.isascii() else text
+
+
+_ECHO_CAP = 16
+
+
+def market_echo(code: Any) -> str:
+    """How a refusal names a market it was sent. A well-formed code (two ASCII letters) is named bare, as
+    before ('ZZ'); anything else is quoted with repr and cut to its first 16 characters, so a look-alike
+    shows as itself ('ſg' -> "'ſg'") and an over-long or control-character value cannot fill a log line
+    or an error detail."""
+    text = str(code if code is not None else "")
+    if _ASCII_MARKET_CODE.fullmatch(text):
+        return text
+    if len(text) > _ECHO_CAP:
+        return f"{text[:_ECHO_CAP]!r}..."
+    return f"{text!r}"
 
 
 def market(code: Any) -> Dict[str, Any]:

@@ -133,13 +133,77 @@ def test_route_threads_serving_market_to_the_seed_loader_and_keeps_market_as_the
     assert seen[-1]["serving_market"] == "SG"
     assert currencies[-1] == "SG"
 
-    # unpriceable or malformed: ignored, the request reads as if it named none.
+    # unpriceable or malformed: answered with no products, its reason named, nothing read (see below).
     for junk in ("ZZ", "USA", "en-US"):
         seen.clear(); currencies.clear()
         response = _search(client, serving_market=junk)
         assert response.status_code == 200, response.text
-        assert seen[-1]["serving_market"] is None, junk
-        assert currencies[-1] is None, junk
+        assert seen == [], junk
+        assert response.json()["metadata"]["reason_code"] in {"market_invalid", "market_not_priced"}, junk
+
+
+# A SENT serving_market that cannot be served is never read as the partition's market. Before, it was ignored and the
+# page held to the partition's currency: 'ſg' (a long-s look-alike) went from SGD to USD, 'ﬁ' from EUR to USD, and
+# 'DE' was served the partition's USD. Absent stays exactly as before.
+@pytest.mark.parametrize("serving_market, reason, named", [
+    ("ſg", "market_invalid", None), ("ﬁ", "market_invalid", None), ("uſ", "market_invalid", None),
+    ("ＵＳ", "market_invalid", None), ("УС", "market_invalid", None), ("USA", "market_invalid", None),
+    ("en-US", "market_invalid", None), ("US,SG", "market_invalid", None),
+    ("DE", "market_not_priced", "DE"), ("de", "market_not_priced", "DE"), ("ZZ", "market_not_priced", "ZZ"),
+])
+def test_a_sent_serving_market_that_cannot_be_served_is_a_named_empty_page(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, serving_market, reason, named
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    _silent_database(agent_api_module, monkeypatch)
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_loader(**kwargs: Any) -> List[Dict[str, Any]]:
+        seen.append(kwargs)
+        return [{"product_id": "p_any", "currency": "USD", "price": 10}]
+
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_with_cache", fake_loader)
+    response = _search(client, market="US", serving_market=serving_market)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert seen == [], "nothing is read for a market that cannot be served"
+    assert body["products"] == []
+    assert body["status"] == "success"
+    assert body["metadata"]["reason_code"] == reason
+    assert body["metadata"].get("serving_market") == named
+    if named is None:
+        assert serving_market not in response.text, "an unreadable value is never repeated back"
+
+
+@pytest.mark.parametrize("serving_market, currency", [("US", "USD"), ("SG", "SGD"), ("GB", "GBP"), (None, "USD"), ("", "USD"), ("  ", "USD")])
+def test_a_served_or_absent_serving_market_is_read_as_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, serving_market, currency
+) -> None:
+    import routes.agent_api as agent_api_module
+
+    _silent_database(agent_api_module, monkeypatch)
+    seen: List[Dict[str, Any]] = []
+
+    async def fake_loader(**kwargs: Any) -> List[Dict[str, Any]]:
+        seen.append(kwargs)
+        return []
+
+    monkeypatch.setattr(agent_api_module, "_load_external_seed_products_with_cache", fake_loader)
+    currencies: List[Any] = []
+    real_expected = agent_api_module.expected_currency_for_market
+
+    def spy_expected(value: Any) -> Any:
+        currencies.append(real_expected(value))
+        return real_expected(value)
+
+    monkeypatch.setattr(agent_api_module, "expected_currency_for_market", spy_expected)
+    params = {"market": "US", **({} if serving_market is None else {"serving_market": serving_market})}
+    response = _search(client, **params)
+    assert response.status_code == 200, response.text
+    assert seen, "the seed loader is reached"
+    assert "reason_code" not in response.json()["metadata"] or response.json()["metadata"]["reason_code"] != "market_invalid"
+    assert currencies[-1] == currency
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,7 @@ import logging
 from typing import Any, FrozenSet, Iterable, Mapping, Optional
 
 from services.external_seed_search import seed_serving_currency
-from services.market_registry import acquisition_markets, market_or_none, normalize_market
+from services.market_registry import acquisition_markets, market_echo, market_or_none, normalize_market
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
     market_for_pricing_currency,
@@ -140,7 +140,7 @@ def seed_buyer_market_refusal(buyer_market: Optional[str]) -> Optional[str]:
     if code in _served_regions():
         return None
     if market_or_none(code) is None:
-        return f"unknown_market:{code}"
+        return f"unknown_market:{market_echo(code)}"
     return f"market_not_served:{code}"
 
 

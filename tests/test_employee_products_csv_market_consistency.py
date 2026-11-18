@@ -131,3 +131,16 @@ def test_market_domain_permissive_on_invalid_url() -> None:
     assert validate_market_domain("US", "") is None
     assert validate_market_domain("US", None) is None
     assert validate_market_domain("US", "not-a-url") is None
+
+
+def test_the_import_market_reads_absent_as_us_and_never_folds_a_lookalike():
+    from routes.employee_products import _normalize_market
+
+    for absent in (None, "", "   "):
+        assert _normalize_market(absent) == "US"
+    assert _normalize_market(" sg ") == "SG"
+    for raw in ("ſg", "uſ", "ﬁ", "ＵＳ"):
+        assert _normalize_market(raw) == raw, "kept as sent, never read as a listed market"
+    # So an SGD row under a look-alike is not checked against SG's currency, and a USD row is not called SG's.
+    assert validate_market_currency("ſg", "USD") is None
+    assert validate_market_currency("sg", "USD") == "market_currency_mismatch_market_SG_currency_USD"
