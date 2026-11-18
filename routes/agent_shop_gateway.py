@@ -12353,11 +12353,16 @@ def _named_seed_variant_pdp_url(
         gtin, sku = reviewed_identity
         if validated_source_gtin(variant.get("barcode")) != gtin or variant.get("sku") != sku:
             return family_url
-    elif private and (
-        validated_source_gtin(variant.get("barcode")) != validated_source_gtin(existing[1])
-        or variant.get("sku") != existing[3]
-    ):
-        return family_url
+    elif private:
+        # Never None == None: an unreadable reviewed GTIN or a missing SKU is a mismatch (the loader also refuses it).
+        reviewed_gtin = validated_source_gtin(existing[1])
+        if (
+            reviewed_gtin is None
+            or not existing[3]
+            or validated_source_gtin(variant.get("barcode")) != reviewed_gtin
+            or variant.get("sku") != existing[3]
+        ):
+            return family_url
     selected_url = f"{listing.url}?variant={native_id}"
     return selected_url if variant.get("url") == selected_url else family_url
 

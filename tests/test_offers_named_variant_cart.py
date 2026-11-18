@@ -1121,3 +1121,38 @@ def test_v2_moving_every_shade_into_existing_skips_no_live_check(tmp_path, monke
     _v2_install(tmp_path, monkeypatch, payload)
     assert not any(_v2_pinned(monkeypatch, client, seed, v, rows)[0] for v in variants[:15])
     assert _v2_pinned(monkeypatch, client, seed, variants[15], rows) == (True, V2_FAMILY)   # the honest addition
+
+
+@pytest.mark.parametrize("hole", ["gtin", "sku"])
+def test_v2_private_existing_variant_with_no_reviewed_identity_never_matches_a_live_row_lacking_one(
+        tmp_path, monkeypatch, client, hole):
+    """None == None is not a match: a private listing row whose GTIN or SKU is unreadable pins nothing, even
+    against a live shade that has no barcode or SKU either (the loader refuses such rows; this guards serving)."""
+    from dataclasses import replace
+
+    from services import external_seed_review_pilot as pilot
+
+    seed, variants, rows = _v2_live_seed()
+    _v2_install(tmp_path, monkeypatch, _v2_manifest(variants))
+    listing = pilot.NAMED_REFERRAL_LISTINGS[V2_SEED]
+    first = list(listing.variants[0])
+    first[1 if hole == "gtin" else 3] = "" if hole == "sku" else "not-a-gtin"
+    monkeypatch.setitem(pilot.NAMED_REFERRAL_LISTINGS, V2_SEED,
+                        replace(listing, variants=(tuple(first), *listing.variants[1:])))
+    variants[0].pop("barcode" if hole == "gtin" else "sku")
+    if hole == "sku":
+        variants[0]["sku"] = ""
+    assert _v2_pinned(monkeypatch, client, seed, variants[0], rows) == (False, V2_FAMILY)
+    assert _v2_pinned(monkeypatch, client, seed, variants[1], rows) == (True, V2_FAMILY)
+
+
+def test_named_referral_manifest_cap_is_secret_managers_64_kib(tmp_path, monkeypatch):
+    """65536 bytes load, 65537 do not: the mount is a Secret Manager secret (64 KiB payload limit)."""
+    from services import external_seed_review_pilot as pilot
+
+    assert pilot._MANIFEST_LIMIT == 65536
+    body = json.dumps(_v2_payload()).encode()
+    _write_manifest(tmp_path, monkeypatch, body + b" " * (65536 - len(body)))
+    assert pilot.load_named_referral_manifest({"eps_x": _manifest_listing()})[0]
+    _write_manifest(tmp_path, monkeypatch, body + b" " * (65537 - len(body)))
+    assert pilot.load_named_referral_manifest({"eps_x": _manifest_listing()}) == ({}, {})
