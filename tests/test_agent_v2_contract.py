@@ -539,8 +539,13 @@ async def test_agent_v2_create_order_returns_conflict_for_expired_quote(
             details={"quote_id": quote_id},
         )
 
+    async def governance_passes(_context: Any) -> None:
+        return None
+
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     monkeypatch.setattr(agent_v2.QuoteService, "load_active_quote_or_raise", fake_load_active_quote_or_raise)
+    # The agent's governance runs first on v2 (before any quote read); this case is the quote's.
+    monkeypatch.setattr(agent_v2, "validate_order_create_governance", governance_passes)
 
     transport = httpx.ASGITransport(app=app)
     try:

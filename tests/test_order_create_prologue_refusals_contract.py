@@ -1,17 +1,26 @@
 """The order-create refusals that are answered before any order can exist: a contract with the gateway.
 
 The agent gateway holds a guard on a quote while it creates the order, and gives the guard back only
-when the backend answers one of nine exact (status, code) pairs. That is safe only while each pair
-is answered from the request's PROLOGUE, strictly before the order write step (`create_new_order`)
-is first entered, and while nothing that can run after an order row is written answers one of them.
+when the backend answers one of ten exact (status, code) pairs. That is safe only while each pair
+is answered before any order row of the request can be written, and while nothing that can run
+after an order row is written answers one of them. Nine are answered from the request's PROLOGUE,
+strictly before the order write step (`create_new_order`) is first entered. One,
+MERCHANT_NOT_ACCEPTING_ORDERS, is raised inside the write step's function, above its order write
+(`create_order`), and the write step's in-request busy retry can never reach it after a row exists.
 The list lives in contracts/order_create_prologue_refusals.json; the gateway vendors it.
 
-    C-0  the list itself (nine pairs, sha256 pinned, no 503, none of this change's new refusals)
-    C-1  where each listed code is written in this repository (an AST inventory, pinned), and that
-         the write step and everything it calls writes none of them
-    C-2  each pair, through the real route and the real error envelope, with the write step entered
-         0 times
-    C-3  an order row written, then every failure that can follow it: never a listed pair
+    C-0  the list itself (ten pairs, sha256 pinned, no 503, no 429, none of this change's new refusals)
+    C-1  where each listed code is written in this repository (an AST inventory, pinned), that the
+         write step and everything it calls writes none of them but the merchant refusal, that the
+         merchant refusal sits above the order write and after the quote's claim is read, that every
+         call on the way from each route to it, and in every dependency of those functions, is a
+         known read-only call (an allowlist), and that each create answers an order it already made,
+         and a quote that already holds its order, before any refusal from a live read
+    C-2  each pair, through the real route and the real error envelope, with the order write entered
+         0 times (and, for the nine prologue pairs, the write step entered 0 times)
+    C-3  an order row written, then every failure that can follow it: never a listed pair; the busy
+         retry, a resend after the order while a live read now refuses it, and a create for a quote
+         that holds its order outside the first create's replay scope
     C-4  the error envelope the gateway reads the code from
     C-5  the partner assertion is refused by the route's dependency, before the route body, and says
          why (a replayed assertion says `replay`)
@@ -58,8 +67,8 @@ ENVELOPE_PATH = REPO / "contracts" / "error_envelope_status_codes.json"
 # The list file is BYTE-IDENTICAL to the gateway's copy: the gateway pins the same sha256. A change
 # to it is a change to what the gateway may do with money and must land in both repositories. The
 # notes file is this repository's own; the envelope table is vendored by the gateway's test fixture.
-CONTRACT_SHA256 = "a353605e44e1fec5f304f075dfe4f7eac213865c56101d26f0eee1ecdefa839f"
-NOTES_SHA256 = "827e9e9ba5dfad682a745dd6adb0f1d3d0263573c5f6a0839ac33e7a635e2865"
+CONTRACT_SHA256 = "221f4bb28485caea22e7c0a84ae0c55e4f3ef644fca85a63ed3342adb80706a3"
+NOTES_SHA256 = "b26315e9541eb2fffa97a05133b2f0038dc7c7d72731087067090a86b16ed27d"
 ENVELOPE_SHA256 = "74e2875f61e8c3a96ba7a4a768731c7052d346d0ee3faec10c7c8954fdd1a3f5"
 
 #: THE list. Every case below reads the pairs from the file; none is written out a second time.
@@ -97,23 +106,23 @@ def test_c0_the_list_file_is_byte_identical_to_the_gateways_copy() -> None:
         "contracts/order_create_prologue_refusals.json no longer has the bytes the gateway pins. "
         "Change it only together with the gateway's copy, and update CONTRACT_SHA256 on both sides."
     )
-    assert len(raw) == 305 and b"\r" not in raw and raw.endswith(b"]\n") and not raw.endswith(b"\n\n")
+    assert len(raw) == 347 and b"\r" not in raw and raw.endswith(b"]\n") and not raw.endswith(b"\n\n")
     assert hashlib.sha256(NOTES_PATH.read_bytes()).hexdigest() == NOTES_SHA256
     assert hashlib.sha256(ENVELOPE_PATH.read_bytes()).hexdigest() == ENVELOPE_SHA256, (
         "contracts/error_envelope_status_codes.json changed: update ENVELOPE_SHA256 and re-vendor it in the gateway"
     )
 
 
-def test_c0_the_list_is_nine_distinct_pairs_sorted_by_status_then_code() -> None:
-    assert len(CONTRACT_PAIRS) == 9 == len(LISTED)
+def test_c0_the_list_is_ten_distinct_pairs_sorted_by_status_then_code() -> None:
+    assert len(CONTRACT_PAIRS) == 10 == len(LISTED)
     assert all(
         isinstance(pair, list) and len(pair) == 2 and type(pair[0]) is int and isinstance(pair[1], str)
         and CAPITAL_SNAKE.match(pair[1])
         for pair in CONTRACT_PAIRS
     )
     assert CONTRACT_PAIRS == sorted(CONTRACT_PAIRS)
-    assert {status for status, _ in LISTED} == {400, 404, 409}
-    assert len(LISTED_CODES) == 9, "a code listed at two statuses: the inventory below reads codes, not pairs"
+    assert {status for status, _ in LISTED} == {400, 403, 404, 409}
+    assert len(LISTED_CODES) == 10, "a code listed at two statuses: the inventory below reads codes, not pairs"
 
 
 def test_c0_no_case_in_this_file_writes_the_list_out_a_second_time() -> None:
@@ -151,6 +160,21 @@ def test_c0_the_notes_say_where_the_code_and_the_reason_are() -> None:
         "bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "resource",
     ]
     assert ASSERTION_NOTES["only_across_a_change_of_the_signing_secret"] == ["bad_mac", "no_secret"]
+    assert sorted(NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]) == ["after_a_written_row", "residual_race", "where"]
+    assert "PREFLIGHT_FAILED" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
+    assert "per-merchant lock" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
+    assert "claim" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["after_a_written_row"]
+    from utils.transient_errors import COMMERCE_PATH_UNKNOWN
+
+    assert COMMERCE_PATH_UNKNOWN in NOTES["UNSUPPORTED_COMMERCE_PATH"]
+    assert "Residual race" in NOTES["UNSUPPORTED_COMMERCE_PATH"] and "PREFLIGHT_FAILED" in NOTES["UNSUPPORTED_COMMERCE_PATH"]
+    assert "before the first copy's order row is written" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
+    assert "reads as no holder" in NOTES["MERCHANT_NOT_ACCEPTING_ORDERS"]["residual_race"]
+    assert COMMERCE_PATH_UNKNOWN in NOTES["not_listed_on_purpose"]["503 TEMPORARY_UNAVAILABLE"]
+    rate = NOTES["not_listed_on_purpose"]["429"]
+    assert "on both routes" in rate and "blocked or suspended" in rate and "403 (unlisted)" in rate
+    assert "/agent/v1/orders/create" not in rate
+    assert sorted(NOTES["not_listed_on_purpose"]) == ["409 QUOTE_CONSUMED", "429", "503 TEMPORARY_UNAVAILABLE"]
 
 
 def test_c0_no_503_and_none_of_the_could_not_tell_refusals_is_listed() -> None:
@@ -169,7 +193,20 @@ def test_c0_no_503_and_none_of_the_could_not_tell_refusals_is_listed() -> None:
         assert reason not in LISTED_CODES and fields["detail"]["reason"] == reason
     busy = db_busy_http_exception()
     assert (busy.status_code, busy.detail["error"]) not in LISTED
+    from utils.transient_errors import COMMERCE_PATH_UNKNOWN, commerce_path_unknown_http_exception_fields
+
+    unknown = commerce_path_unknown_http_exception_fields()
+    assert (unknown["status_code"], unknown["detail"]["error"]) == (503, "TEMPORARY_UNAVAILABLE")
+    assert unknown["detail"]["reason"] == COMMERCE_PATH_UNKNOWN not in LISTED_CODES
     assert (409, "QUOTE_CONSUMED") not in LISTED and "QUOTE_CONSUMED" not in LISTED_CODES
+
+
+def test_c0_no_429_is_listed() -> None:
+    """A resend of an accepted create can be answered 429 while its order exists (the cases at the
+    end of this file), so no 429 is on the list, under any code."""
+    assert not any(status == 429 for status, _ in LISTED)
+    assert not ({"RATE_LIMITED", "RATE_LIMIT_EXCEEDED", "rate_limit_exceeded"} & LISTED_CODES)
+    assert ENVELOPE["status_code"]["429"][0] not in LISTED_CODES
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +250,10 @@ def _scoped_constants(path: str) -> Iterator[Tuple[str, str]]:
 
 
 #: Every place a listed code is written as a string constant, outside tests.
-#: ON the order-create path of POST /agent/v2/orders (all prologue or the route dependency):
+#: ON the order-create path of POST /agent/v2/orders (the prologue, the route dependency, and the
+#: merchant refusal inside the write step's function, above its order write):
 ON_PATH = {
+    ("routes/order_routes.py", "create_new_order", "MERCHANT_NOT_ACCEPTING_ORDERS"),
     ("routes/agent_forwarded_owner.py", ":REJECTED_CODE", "PARTNER_ASSERTION_REJECTED"),
     ("services/quote_service.py", ":QUOTE_NOT_FOUND_DETAIL", "QUOTE_NOT_FOUND"),
     # The quote re-read. A QuoteError: every place that answers it writes 409 or 400, never 404.
@@ -265,15 +304,16 @@ def _first_call_line(fn: ast.AST, callee: str) -> int:
     return min(lines)
 
 
-def listed_codes_at_or_after_the_write_step(source: str, function: str, callee: str) -> List[Tuple[int, str]]:
+def listed_codes_at_or_after_the_write_step(source: str, function: str, callee: Optional[str]) -> List[Tuple[int, str]]:
     """(line, code) of every listed-code constant in `function` that is not lexically ABOVE the
-    function's first call of `callee` (the order write step, or the call that leads to it)."""
+    function's first call of `callee` (the order write step, or the call that leads to it). With
+    `callee` None the whole function runs after an order can exist: every constant counts."""
     tree = ast.parse(source)
     fn = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
     )
-    first = _first_call_line(fn, callee)
+    first = fn.lineno if callee is None else _first_call_line(fn, callee)
     return sorted(
         (const.lineno, const.value)
         for const in ast.walk(fn)
@@ -286,14 +326,17 @@ def listed_codes_at_or_after_the_write_step(source: str, function: str, callee: 
 _PROLOGUE_FUNCTIONS = [
     ("routes/agent_api.py", "agent_create_order", "create_new_order"),
     ("routes/agent_v2.py", "create_order_v2", "agent_v1_create_order"),
+    # The write step itself: its merchant refusal sits above its order write (the claim and the row).
+    ("routes/order_routes.py", "create_new_order", "create_order"),
 ]
 
 
 @pytest.mark.parametrize("path, function, callee", _PROLOGUE_FUNCTIONS, ids=[f[1] for f in _PROLOGUE_FUNCTIONS])
 def test_c1_every_listed_code_sits_above_the_first_call_of_the_write_step(path: str, function: str, callee: str) -> None:
-    """The inventory above knows WHICH function writes a listed code, not WHERE in it. These two
-    functions hold both the prologue and everything after the order is written, so each listed
-    constant must also sit above the function's first call of the write step."""
+    """The inventory above knows WHICH function writes a listed code, not WHERE in it. These
+    functions hold both what runs before an order row can exist and everything after it is written,
+    so each listed constant must also sit above the function's first call of the write step (for
+    `create_new_order`, of the order write)."""
     source = (REPO / path).read_text(encoding="utf-8")
     assert listed_codes_at_or_after_the_write_step(source, function, callee) == []
     # ... and the function does write listed codes above it (the check is looking at something).
@@ -309,14 +352,18 @@ def test_c1_every_listed_code_sits_above_the_first_call_of_the_write_step(path: 
         ("routes/agent_api.py", "agent_create_order", "create_new_order",
          "        _post_create_new_order_tail_started = time.perf_counter()\n"),
         # Right after the create returned, in the v2 route.
-        ("routes/agent_v2.py", "create_order_v2", "agent_v1_create_order",
+        # v2's answer for an order that exists (made or replayed), at its first statement.
+        ("routes/agent_v2.py", "_order_created_answer", None,
          '    order_id = str((response or {}).get("order_id") or "").strip()\n'),
+        # Right after the order write, inside the write step.
+        ("routes/order_routes.py", "create_new_order", "create_order",
+         "        order_id = await create_order(order_data)\n"),
     ],
-    ids=["agent_create_order_tail", "create_order_v2_after_the_create"],
+    ids=["agent_create_order_tail", "v2_answer_for_an_existing_order", "create_new_order_after_the_write"],
 )
 @pytest.mark.parametrize("pair", sorted(LISTED), ids=lambda pair: f"{pair[0]}_{pair[1]}")
 def test_c1_a_listed_pair_raised_after_the_write_step_is_caught(
-    path: str, function: str, callee: str, anchor: str, pair: Tuple[int, str]
+    path: str, function: str, callee: Optional[str], anchor: str, pair: Tuple[int, str]
 ) -> None:
     """The mutant, applied to the source text in memory: a listed pair raised below the first call
     of the write step, in a function the inventory already allows to write that code."""
@@ -333,6 +380,836 @@ def test_c1_a_listed_pair_raised_after_the_write_step_is_caught(
     found = listed_codes_at_or_after_the_write_step(mutated, function, callee)
 
     assert [c for _, c in found] == [code]
+
+
+#: Every call in the write step that writes the order or what hangs off it (the claim and the row,
+#: their updates, the order's events and edges, the merchant's sync job). Matched by the callee's
+#: name; `orders_table` (the orders table itself) is matched wherever it is read.
+_ORDER_WRITE_CALLEES = {
+    "create_order", "update_order_status", "update_payment_info", "mark_order_paid", "update_fulfillment_info",
+    "mark_order_shipped", "update_order_row", "log_order_event", "_bg_log_order_event",
+    "upsert_order_attribution_edge", "enqueue_merchant_order_create",
+}
+
+
+def _callee(call: ast.Call) -> Optional[str]:
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+
+def _merchant_refusal_raises(fn: ast.AST) -> List[ast.Raise]:
+    """`raise HTTPException(status_code=403, detail={"error": MERCHANT_NOT_ACCEPTING_ORDERS, ...})`."""
+    out = []
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call) and _callee(node.exc) == "HTTPException"):
+            continue
+        kws = {kw.arg: kw.value for kw in node.exc.keywords}
+        detail = kws.get("detail")
+        if (
+            isinstance(kws.get("status_code"), ast.Constant) and kws["status_code"].value == 403
+            and isinstance(detail, ast.Dict)
+            and any(isinstance(k, ast.Constant) and k.value == "error" and isinstance(v, ast.Constant) and v.value == "MERCHANT_NOT_ACCEPTING_ORDERS"
+                    for k, v in zip(detail.keys, detail.values))
+        ):
+            out.append(node)
+    return out
+
+
+def _order_writes(fn: ast.AST) -> List[ast.AST]:
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and _callee(n) in _ORDER_WRITE_CALLEES]
+    tables = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == "orders_table"]
+    return calls + tables
+
+
+def _position(node: ast.AST) -> Tuple[int, int]:
+    return (node.lineno, node.col_offset)
+
+
+def merchant_refusals_not_above_the_first_order_write(source: str) -> List[str]:
+    """What is wrong with the write step's merchant refusal, found by the AST: every place that
+    writes MERCHANT_NOT_ACCEPTING_ORDERS is one of its 403 raises, and each raise ends before the
+    first statement of the function that writes the order (or anything hung off it)."""
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_new_order"
+    )
+    raises = _merchant_refusal_raises(fn)
+    writes = _order_writes(fn)
+    problems: List[str] = []
+    if not writes:
+        return ["no order write found"]
+    first_write = min(writes, key=_position)
+    if not (isinstance(first_write, ast.Call) and _callee(first_write) == "create_order"):
+        problems.append(f"the first order write is no longer create_order: {ast.unparse(first_write)[:80]}")
+    for node in raises:
+        if (node.end_lineno, node.end_col_offset) >= _position(first_write):
+            problems.append(f"a merchant refusal at or below the first order write: line {node.lineno}")
+    inside = {id(c) for r in raises for c in ast.walk(r)}
+    for const in ast.walk(fn):
+        if isinstance(const, ast.Constant) and const.value == "MERCHANT_NOT_ACCEPTING_ORDERS" and id(const) not in inside:
+            problems.append(f"MERCHANT_NOT_ACCEPTING_ORDERS written outside a 403 raise: line {const.lineno}")
+    return problems
+
+
+def test_c1_both_merchant_refusals_are_raised_above_the_first_order_write() -> None:
+    source = (REPO / "routes/order_routes.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_new_order")
+    assert len(_merchant_refusal_raises(fn)) == 2, "the write step's merchant refusal is raised at two places"
+    assert merchant_refusals_not_above_the_first_order_write(source) == []
+
+
+def _create_new_order_node(tree: ast.AST) -> ast.AsyncFunctionDef:
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_new_order")
+
+
+def _quote_claim_read_comes_first(source: str) -> List[str]:
+    """The write step reads the quote's claim, and answers a quote that holds an order with
+    OrderForQuoteExists, before either merchant refusal can be raised."""
+    fn = _create_new_order_node(ast.parse(source))
+    reads = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "read_quote_claim_holder"]
+    raises = _merchant_refusal_raises(fn)
+    if len(reads) != 1 or not raises:
+        return [f"claim reads {len(reads)}, merchant refusals {len(raises)}"]
+    first_refusal = min(_position(r) for r in raises)
+    holds = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and _callee(n.exc) == "OrderForQuoteExists"
+        and _position(reads[0]) < _position(n) < first_refusal
+    ]
+    if len(holds) != 1:
+        return ["the quote's claim is not read and answered before the merchant refusal"]
+    return []
+
+
+#: The route bodies on the way to the write step's merchant refusal, each up to the call that
+#: leads on (for the write step itself: up to its second merchant refusal).
+_PATH_TO_THE_MERCHANT_REFUSAL = [
+    ("routes/agent_v2.py", "create_order_v2", "agent_v1_create_order"),
+    ("routes/agent_api.py", "agent_create_order", "create_new_order"),
+    ("routes/order_routes.py", "create_new_order", None),
+]
+
+_PURE = "in memory, no I/O"
+_REFUSAL = "builds the refusal it raises"
+_QUOTE_READ = "reads the quote (an expired quote is marked expired); writes no order"
+#: EVERY call on that way, by the name it is called with (`<expr>.x` is a method of a computed
+#: value). Each writes no order, no quote claim, no payment and no order event or edge; the ones
+#: that write anything else say what. A call not named here fails C-1: add it only after reading it.
+_CALLS_ON_THE_PATH: Dict[str, str] = {
+    **{name: _PURE for name in (
+        "any", "bool", "dict", "float", "getattr", "hasattr", "int", "isinstance", "len", "max", "str", "sum", "vars",
+        "Decimal", "SimpleNamespace", "PolicyInput", "CreateOrderRequest", "QuoteService", "PaymentRoutingService",
+        "<expr>.get", "<expr>.join", "<expr>.lower", "<expr>.strip", "<expr>.upper", "<expr>.timestamp",
+        "<expr>.total_seconds", "agent_v2_meta.update", "body.request_context.model_dump", "brief_meta.get",
+        "commerce_policy.as_dict", "commerce_policy.response_fields", "context.can_access_merchant",
+        "create_new_order_params.values", "detail.update", "drift_fields.append", "idempotency_cache_value.get",
+        "inventory_info.get", "li.get", "merchant.get", "meta.get", "metadata.get", "metadata.pop", "mvp_meta.update",
+        "o.model_dump", "order_request.metadata.get", "order_request.metadata.setdefault", "order_request.metadata.update",
+        "order_request.model_copy", "order_request.shipping_address.model_dump", "order_request_normalized.get", "p.get",
+        "p.model_dump", "pricing.get", "pricing_quote_meta.get", "psp_type.lower", "quote.expires_at.isoformat",
+        "quote_request_json.get", "quote_request_normalized.get", "replacement_quote.get", "replay_response.get",
+        "request_context_meta.get", "request_json.get", "smeta.get", "snap.get", "snap_for_policy.get", "snap_pricing.get",
+        "token_payload.get",
+        "_build_quote_drift_normalized_request", "_coerce_shipping_address", "_coerce_utc_datetime",
+        "_decision_layer_dict", "_default_order_create_idempotency_key", "_extract_checkout_decision_id_from_metadata",
+        "_extract_decision_id_from_metadata", "_fresh_quote_validate_skip_seconds", "_is_checkout_ui_order_create",
+        "_normalize_buyer_ref", "_normalize_order_provider_hint", "_order_create_replay_owner",
+        "_order_defers_payment_surface", "_order_items_from_quote_request", "_order_live_quote_revalidation_enabled",
+        "_pricing_quote_has_unverified_shipping", "_quote_order_items_unchanged", "_shopify_discount_reconciliation_mode",
+        "attach_traffic_taxonomy", "build_offers_from_quote", "build_traffic_taxonomy", "compute_request_fingerprint",
+        "governance.evaluate", "normalize_discount_codes", "parse_decimal_money", "partner_identity_metadata",
+        "preflight_offers", "resolve_commerce_execution_policy",
+    )},
+    **{name: _REFUSAL for name in (
+        "HTTPException", "QuoteError", "OrderForQuoteExists", "commerce_path_unknown_http_exception_fields",
+    )},
+    **{name: "logging, a clock, an id or the environment" for name in (
+        "logger.info", "logger.warning", "logger.error", "time.perf_counter", "time.time", "datetime.utcnow",
+        "datetime.now", "uuid.uuid4", "os.getenv", "inspect.signature", "partner_identity_forwarding_enabled",
+    )},
+    "asyncio.gather": "runs the calls passed to it, each of which is checked here",
+    "_timed_get_primary_store_for_policy": "a local wrapper of get_primary_store; its body is checked here",
+    "_timed_idempotency_get": "a local wrapper of _get_cached_agent_order_create_response; checked here",
+    "_timed_load_replayable_agent_order_create_response": "a local wrapper of the replay lookup; checked here",
+    "_set_request_taxonomy_state": "sets attributes on request.state",
+    "_get_order_create_lock": "the in-process per-merchant lock",
+    "validate_order_create_governance": "governance: reads the agent's policy (blocked, suspended), counts the request in memory",
+    "emit_best_effort": "a best-effort telemetry event; no order",
+    "require_quote_for_caller": "reads the quote's owner",
+    "should_require_quote_for_order_create": "reads the merchant's quote-first setting",
+    "get_primary_store": "reads the merchant's store",
+    "get_latest_policy_hashes": "reads the merchant's policy hashes",
+    "_get_cached_agent_order_create_response": "reads the response cache",
+    "_load_replayable_agent_order_create_response": "the replay lookup: reads the orders table",
+    "_cache_agent_order_create_response_best_effort": "writes the response cache for an order that EXISTS, then returns it",
+    "ensure_database_ready": "probes the database connection",
+    "get_merchant_onboarding": "reads the merchant",
+    "check_inventory_availability": "reads stock",
+    "read_quote_claim_holder": "reads the quote's claim and its order row",
+    "answer_for_a_quote_that_holds_its_order": "the quote's order inside this caller's replay scope (the replay lookup; the cache write for that existing order) or the 409",
+    "answer_for_a_create_whose_quote_holds_its_order": "reads the quote's claim, then as answer_for_a_quote_that_holds_its_order",
+    "_order_created_answer": "reads the order row an answer names, and builds the v2 answer",
+    "held_quote_response.get": _PURE,
+    "type": _PURE,
+    "_resolve_active_order_psp": "reads the merchant's payment provider",
+    "routing_service.select_psp": "reads the merchant's payment routing (may create its default route row); no order",
+    "service.load_active_quote_or_raise": _QUOTE_READ,
+    "quote_service.load_active_quote_or_raise": _QUOTE_READ,
+    "<expr>.load_active_quote_or_raise": _QUOTE_READ,
+    "quote_service.validate_quote_snapshot_live": "re-prices the quote live (may write a replacement QUOTE); no order",
+}
+
+#: Names that never appear on that way, called or not (passed to a scheduler, aliased, ...).
+_NEVER_ON_THE_PATH = {
+    "create_order", "_claim_quote_for_order", "orders_table", "order_quote_claims", "database", "execute",
+    "insert", "add_task", "create_task", "ensure_future",
+}
+
+
+def _call_key(call: ast.Call) -> str:
+    func, parts = call.func, []
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
+    parts.append(func.id if isinstance(func, ast.Name) else "<expr>")
+    return ".".join(reversed(parts))
+
+
+def _path_region(fn: ast.AST, stop: Optional[str]) -> Tuple[List[ast.AST], Tuple[int, int]]:
+    """Every node of the function's BODY (not its decorators or defaults) that comes before the
+    first call of `stop`, or (stop None, the write step) before the end of its last merchant refusal."""
+    if stop is None:
+        raises = _merchant_refusal_raises(fn)
+        assert raises, "the write step has no merchant refusal"
+        end = max((r.end_lineno, r.end_col_offset) for r in raises)
+    else:
+        calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == stop]
+        assert calls, f"{stop} is no longer called"
+        end = min(_position(c) for c in calls)
+    nodes = [n for stmt in fn.body for n in ast.walk(stmt) if hasattr(n, "lineno") and _position(n) < end]
+    return nodes, end
+
+
+def _module_path(module: str) -> Optional[str]:
+    path = module.replace(".", "/") + ".py"
+    return path if (REPO / path).exists() else None
+
+
+def _resolve_function(path: str, name: str, sources: Dict[str, str]) -> Optional[Tuple[str, ast.AST]]:
+    """The def `name` refers to in module `path`: defined there, or imported into it by name."""
+    tree = ast.parse(sources[path]) if path in sources else _tree(path)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return path, node
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    target = _module_path(node.module)
+                    return _resolve_function(target, alias.name, sources) if target else None
+    return None
+
+
+#: FastAPI security schemes: they read a request header and nothing else.
+_HEADER_SCHEMES = {"APIKeyHeader", "HTTPBearer"}
+
+
+def _is_header_scheme(path: str, name: str) -> bool:
+    for node in _tree(path).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return isinstance(node.value, ast.Call) and _call_key(node.value) in _HEADER_SCHEMES
+    for node in ast.walk(_tree(path)):
+        if isinstance(node, ast.ImportFrom) and node.module and any((a.asname or a.name) == name for a in node.names):
+            target = _module_path(node.module)
+            return bool(target) and _is_header_scheme(target, name)
+    return False
+
+
+def _dependency_targets(fn: ast.AST) -> List[ast.AST]:
+    args = fn.args
+    defaults = list(args.defaults) + [d for d in args.kw_defaults if d is not None]
+    return [
+        d.args[0] for d in defaults
+        if isinstance(d, ast.Call) and _call_key(d) in ("Depends", "Security") and d.args
+    ]
+
+
+def route_dependencies(sources: Dict[str, str]) -> Tuple[List[Tuple[str, str, List[ast.AST]]], List[str]]:
+    """Every dependency the three path functions declare, and theirs in turn (a factory's whole
+    body, nested dependency included): (file, name, the nodes of its body), and what could not be read."""
+    out: List[Tuple[str, str, List[ast.AST]]] = []
+    problems: List[str] = []
+    seen: Set[Tuple[str, str]] = set()
+    queue: List[Tuple[str, ast.AST]] = []
+    for path, function, _ in _PATH_TO_THE_MERCHANT_REFUSAL:
+        fn = next(
+            n for n in ast.walk(ast.parse(sources[path]))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+        )
+        queue.append((path, fn))
+    while queue:
+        path, fn = queue.pop()
+        holders = [fn] + [n for n in ast.walk(fn) if n is not fn and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for holder in holders:
+            for target in _dependency_targets(holder):
+                if isinstance(target, ast.Lambda):
+                    out.append((path, f"lambda@{target.lineno}", list(ast.walk(target.body))))
+                    continue
+                name = (
+                    target.id if isinstance(target, ast.Name)
+                    else target.attr if isinstance(target, ast.Attribute)
+                    else _call_key(target).split(".")[-1] if isinstance(target, ast.Call) else None
+                )
+                if name and isinstance(target, ast.Name) and _is_header_scheme(path, name):
+                    continue
+                found = _resolve_function(path, name, sources) if name else None
+                if not found:
+                    problems.append(f"{path}: a dependency that cannot be read: {ast.unparse(target)[:60]}")
+                    continue
+                dep_path, dep = found
+                if (dep_path, dep.name) in seen:
+                    continue
+                seen.add((dep_path, dep.name))
+                out.append((dep_path, dep.name, [n for stmt in dep.body for n in ast.walk(stmt)]))
+                queue.append((dep_path, dep))
+    return out, problems
+
+
+#: Every call in the bodies of those dependencies. They run before the route body; each writes no
+#: order, claim, payment or order event, and the ones that write anything else say what.
+_CALLS_IN_THE_DEPENDENCIES: Dict[str, str] = {
+    **{name: _PURE for name in (
+        "<expr>.strip", "AgentContext", "AgentUserContext", "ValueError", "agent.get",
+        "auth_metrics.get", "bearer.scheme.lower", "bool", "context.agent.get", "current_user.get", "hasattr",
+        "int", "isinstance", "max", "msg.lower", "re.match", "str", "secret_fingerprint",
+        "_build_internal_trusted_agent", "_is_internal_trusted_api_key", "agent_is_active", "pytest_bypass_allowed",
+    )},
+    **{name: _REFUSAL for name in ("HTTPException", "db_busy_http_exception")},
+    **{name: "logging, a clock or a pause" for name in (
+        "logger.info", "logger.warning", "time.perf_counter", "time.time", "asyncio.sleep",
+    )},
+    "Depends": "declares the nested dependency, which is checked here",
+    "adopt_forwarded_owner": "verifies the partner assertion and claims its nonce (the replay guard); no order",
+    "get_agent_by_key": "reads the agent by its key",
+    "resolve_agent_id_by_api_key": "reads the agent id by its key",
+    "_get_agent_context_from_checkout_token": "verifies the checkout token and reads its agent",
+    "check_rate_limit": "the agent's rate counter",
+    "check_daily_quota": "the agent's daily counter",
+    "update_agent_stats": "the agent's request counters",
+    "asyncio.create_task": "schedules update_agent_stats only (checked)",
+    "verify_agent_user_jwt_for_agent": "verifies a user token",
+    "decode_token": "verifies a token",
+    "logger.error": "logging",
+}
+
+#: What a dependency may hand to asyncio.create_task.
+_SCHEDULED_BY_A_DEPENDENCY = {"update_agent_stats"}
+
+
+def _unknown_on(nodes: List[ast.AST], allowed: Dict[str, str], where: str, *, scheduled_ok: Set[str] = frozenset()) -> List[str]:
+    problems: List[str] = []
+    # The routing service is built over the database handle; its one call is select_psp (allowed).
+    handed_over = {
+        id(arg) for n in nodes
+        if isinstance(n, ast.Call) and _call_key(n) == "PaymentRoutingService" for arg in n.args
+    }
+    for n in nodes:
+        if (
+            isinstance(n, ast.Call) and _call_key(n) == "asyncio.create_task" and n.args
+            and isinstance(n.args[0], ast.Call) and _call_key(n.args[0]) in scheduled_ok
+        ):
+            handed_over.add(id(n.func))
+    for node in nodes:
+        if isinstance(node, ast.Call) and _call_key(node) not in allowed:
+            problems.append(f"{where}:{node.lineno} calls {_call_key(node)}, not known to be read-only")
+        if isinstance(node, ast.Await) and not isinstance(node.value, ast.Call):
+            problems.append(f"{where}:{node.lineno} awaits something that is not a call")
+        name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+        if name in _NEVER_ON_THE_PATH and id(node) not in handed_over:
+            problems.append(f"{where}:{node.lineno} names {name}")
+    return problems
+
+
+def _path_nodes(sources: Dict[str, str]) -> List[Tuple[str, List[ast.AST]]]:
+    out = []
+    for path, function, stop in _PATH_TO_THE_MERCHANT_REFUSAL:
+        fn = next(
+            n for n in ast.walk(ast.parse(sources[path]))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+        )
+        out.append((f"{path} {function}", _path_region(fn, stop)[0]))
+    return out
+
+
+def calls_on_the_path_not_known(sources: Dict[str, str]) -> List[str]:
+    problems: List[str] = []
+    for where, nodes in _path_nodes(sources):
+        problems += _unknown_on(nodes, _CALLS_ON_THE_PATH, where)
+    dependencies, unreadable = route_dependencies(sources)
+    problems += unreadable
+    for path, name, nodes in dependencies:
+        problems += _unknown_on(nodes, _CALLS_IN_THE_DEPENDENCIES, f"{path} {name}", scheduled_ok=_SCHEDULED_BY_A_DEPENDENCY)
+    return problems
+
+
+def _path_sources() -> Dict[str, str]:
+    return {path: (REPO / path).read_text(encoding="utf-8") for path, _, _ in _PATH_TO_THE_MERCHANT_REFUSAL}
+
+
+def test_c1_every_call_on_the_way_to_the_merchant_refusal_is_known_to_be_read_only() -> None:
+    sources = _path_sources()
+    assert calls_on_the_path_not_known(sources) == []
+    used = {_call_key(n) for _, nodes in _path_nodes(sources) for n in nodes if isinstance(n, ast.Call)}
+    assert set(_CALLS_ON_THE_PATH) == used, f"stale entries: {sorted(set(_CALLS_ON_THE_PATH) - used)}"
+    dependencies, _ = route_dependencies(sources)
+    used_by_dependencies = {_call_key(n) for _, _, nodes in dependencies for n in nodes if isinstance(n, ast.Call)}
+    assert set(_CALLS_IN_THE_DEPENDENCIES) == used_by_dependencies, (
+        f"stale: {sorted(set(_CALLS_IN_THE_DEPENDENCIES) - used_by_dependencies)}"
+    )
+    names = {(path.split("/")[-1], name) for path, name, _ in dependencies if not name.startswith("lambda@")}
+    assert {("agent_forwarded_owner.py", "forwarded_owner_context"), ("agent_auth.py", "get_agent_context"),
+            ("agent_user_auth.py", "get_agent_user_context"), ("auth.py", "require_admin")} <= names, names
+
+
+def test_c1_a_writing_dependency_on_a_path_function_is_caught() -> None:
+    """M7: a dependency added to the v2 route whose body writes an order row."""
+    sources = _path_sources()
+    tree = ast.parse(sources["routes/agent_v2.py"])
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2")
+    tree.body.append(ast.parse(
+        "async def _oopq_planted_dependency():\n"
+        "    await database.execute(\"INSERT INTO orders (order_id) VALUES ('ORD_OOPQ_EARLY')\")\n"
+    ).body[0])
+    fn.args.kwonlyargs.append(ast.arg(arg="planted"))
+    fn.args.kw_defaults.append(ast.parse("Depends(_oopq_planted_dependency)", mode="eval").body)
+    mutated = {**sources, "routes/agent_v2.py": ast.unparse(tree)}
+
+    problems = calls_on_the_path_not_known(mutated)
+
+    assert any("_oopq_planted_dependency" in p and "database" in p for p in problems), problems
+
+
+def test_c1_a_dependency_that_cannot_be_read_is_caught() -> None:
+    sources = _path_sources()
+    tree = ast.parse(sources["routes/agent_v2.py"])
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2")
+    fn.args.kwonlyargs.append(ast.arg(arg="planted"))
+    fn.args.kw_defaults.append(ast.parse("Depends(oopq_somewhere_else)", mode="eval").body)
+
+    problems = calls_on_the_path_not_known({**sources, "routes/agent_v2.py": ast.unparse(tree)})
+
+    assert any("cannot be read" in p for p in problems), problems
+
+
+def test_c1_the_quote_claim_is_read_and_answered_before_the_merchant_refusal() -> None:
+    assert _quote_claim_read_comes_first((REPO / "routes/order_routes.py").read_text(encoding="utf-8")) == []
+
+
+def _statement_list_of(fn: ast.AST, stmt: ast.stmt) -> List[ast.stmt]:
+    for node in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and any(s is stmt for s in block):
+                return block
+    raise AssertionError("statement not found")
+
+
+def _statement_holding(fn: ast.AST, inner: ast.AST) -> ast.stmt:
+    """The innermost statement of `fn` that is, or contains, `inner` and sits directly in a block."""
+    best: Optional[ast.stmt] = None
+    for node in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            for stmt in block if isinstance(block, list) else []:
+                if isinstance(stmt, ast.stmt) and any(n is inner for n in ast.walk(stmt)):
+                    if best is None or _position(stmt) >= _position(best):
+                        best = stmt
+    assert best is not None
+    return best
+
+
+def _insert_before(fn: ast.AST, anchor: ast.stmt, new: List[ast.stmt]) -> None:
+    block = _statement_list_of(fn, anchor)
+    i = next(k for k, s in enumerate(block) if s is anchor)
+    block[i:i] = new
+
+
+def _insert_after(fn: ast.AST, anchor: ast.stmt, new: List[ast.stmt]) -> None:
+    block = _statement_list_of(fn, anchor)
+    i = next(k for k, s in enumerate(block) if s is anchor)
+    block[i + 1:i + 1] = new
+
+
+def _remove(fn: ast.AST, stmt: ast.stmt) -> None:
+    block = _statement_list_of(fn, stmt)
+    block[:] = [s for s in block if s is not stmt] or [ast.Pass()]
+
+
+_ESCAPES = {
+    "a_raw_insert": "await database.execute(\"INSERT INTO orders (order_id) VALUES ('ORD_OOPQ_EARLY')\")",
+    "the_claim_insert": "await _claim_quote_for_order({'agent_id': 'a', 'quote_id': 'q'}, 'ORD_OOPQ_EARLY')",
+    "a_scheduled_write": "background_tasks.add_task(create_order, {})",
+    "a_helper_that_writes": "await _write_order_early(order_request)",
+    "an_insert_through_another_alias": "await orders_module_alias.orders.insert().values(order_id='ORD_OOPQ_EARLY')",
+}
+
+
+def _mutated_write_step(mutation: str) -> str:
+    """The write step's source with one mutation applied to its AST (no source line is matched)."""
+    tree = ast.parse((REPO / "routes/order_routes.py").read_text(encoding="utf-8"))
+    fn = _create_new_order_node(tree)
+    first, second = sorted(_merchant_refusal_raises(fn), key=_position)
+    first_site, second_site = _statement_holding(fn, first), _statement_holding(fn, second)
+    write_call = min(
+        (c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "create_order"), key=_position
+    )
+    write_stmt = _statement_holding(fn, write_call)
+    claim_read = next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "read_quote_claim_holder")
+    claim_stmt = _statement_holding(fn, claim_read)
+    planted_403 = ast.parse(
+        'if merchant_status == "oopq_planted":\n'
+        '    raise HTTPException(status_code=403, detail={"error": "MERCHANT_NOT_ACCEPTING_ORDERS", "message": "planted"})\n'
+    ).body
+    if mutation == "write_above_the_first_site":
+        _remove(fn, write_stmt)
+        _insert_before(fn, first_site, [write_stmt])
+    elif mutation == "write_above_the_second_site":
+        _remove(fn, write_stmt)
+        _insert_before(fn, second_site, [write_stmt])
+    elif mutation == "an_event_write_above_a_site":
+        _insert_before(fn, second_site, ast.parse("await log_order_event('planted', 'planted', {})").body)
+    elif mutation == "a_raise_below_the_write":
+        _insert_after(fn, write_stmt, planted_403)
+    elif mutation == "the_code_outside_a_raise":
+        _insert_after(fn, write_stmt, ast.parse("order_metadata['refusal'] = 'MERCHANT_NOT_ACCEPTING_ORDERS'").body)
+    elif mutation == "the_claim_read_below_the_first_site":
+        _remove(fn, claim_stmt)
+        _insert_after(fn, first_site, [claim_stmt])
+    elif mutation in _ESCAPES:
+        _insert_before(fn, first_site, ast.parse(_ESCAPES[mutation]).body)
+    else:
+        raise AssertionError(mutation)
+    return ast.unparse(tree)
+
+
+def _write_step_problems(source: str) -> List[str]:
+    sources = {**_path_sources(), "routes/order_routes.py": source}
+    return (
+        merchant_refusals_not_above_the_first_order_write(source)
+        + _quote_claim_read_comes_first(source)
+        + calls_on_the_path_not_known(sources)
+    )
+
+
+def test_c1_the_unmutated_write_step_passes_the_same_checks_after_a_round_trip() -> None:
+    """The mutants are compared with this: the write step re-rendered from its AST, unmutated."""
+    tree = ast.parse((REPO / "routes/order_routes.py").read_text(encoding="utf-8"))
+    assert _write_step_problems(ast.unparse(tree)) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["write_above_the_first_site", "write_above_the_second_site", "an_event_write_above_a_site",
+     "a_raise_below_the_write", "the_code_outside_a_raise", "the_claim_read_below_the_first_site", *_ESCAPES],
+)
+def test_c1_the_merchant_refusal_checks_catch(mutation: str) -> None:
+    assert _write_step_problems(_mutated_write_step(mutation)) != []
+
+
+
+def listed_codes_before_the_replay(source: str) -> Set[str]:
+    """The listed codes `agent_create_order` writes ABOVE the point where it answers an order this
+    create already made (the cached answer, then the replay lookup's)."""
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "agent_create_order"
+    )
+    replay_returns = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Name) and n.value.id in ("replay_response", "idempotency_cache_value")
+    ]
+    assert replay_returns, "agent_create_order no longer answers a replay"
+    last = max(_position(r) for r in replay_returns if r.value.id == "replay_response")
+    first_replay = min(_position(r) for r in replay_returns)
+    assert first_replay <= last
+    return {
+        c.value for c in ast.walk(fn)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value in LISTED_CODES and _position(c) < first_replay
+    }
+
+
+def test_c1_a_resend_gets_its_order_before_any_listed_refusal_that_reads_live_state() -> None:
+    """Above the replay, agent_create_order writes only QUOTE_REQUIRED_BEFORE_PURCHASE (no quote:
+    such a request never made an order). Everything it refuses from a live read (the store and the
+    commerce path, the pre-flight, the quote's merchant, the variants) is below it, so the same
+    create sent again after its order was made is answered with that order."""
+    source = (REPO / "routes/agent_api.py").read_text(encoding="utf-8")
+    assert listed_codes_before_the_replay(source) == {"QUOTE_REQUIRED_BEFORE_PURCHASE"}
+
+
+def test_c1_a_listed_refusal_moved_above_the_replay_is_caught() -> None:
+    tree = ast.parse((REPO / "routes/agent_api.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "agent_create_order")
+    cache_read = next(
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "idempotency_cache_value" for t in n.targets)
+    )
+    _insert_before(fn, cache_read, ast.parse(
+        'if order_request_is_odd:\n'
+        '    raise HTTPException(status_code=409, detail={"error": "UNSUPPORTED_COMMERCE_PATH", "message": "planted"})\n'
+    ).body)
+
+    assert "UNSUPPORTED_COMMERCE_PATH" in listed_codes_before_the_replay(ast.unparse(tree))
+
+
+
+#: Where each create function answers a quote that already holds its order, and the listed codes it
+#: may still raise above that point: no quote at all (no claim can exist), and the quote-ownership
+#: refusal (it decides whose claim is read).
+_HOLDER_ANSWERED_FIRST = {
+    "routes/agent_api.py": ("agent_create_order", "answer_for_a_quote_that_holds_its_order",
+                            {"QUOTE_REQUIRED_BEFORE_PURCHASE", "QUOTE_NOT_FOUND"}),
+    "routes/agent_v2.py": ("create_order_v2", "answer_for_a_create_whose_quote_holds_its_order", {"QUOTE_NOT_FOUND"}),
+}
+
+
+def _codes_written_by(function_name: str) -> Set[str]:
+    """The listed codes a function of the inventory writes (the quote re-read's QuoteError is answered
+    409 by every caller, C-1 above, so it is not counted)."""
+    return {
+        code for path, scope, code in ON_PATH
+        if scope.split(".")[-1] == function_name and scope != "QuoteService.load_active_quote_or_raise"
+    } | ({"QUOTE_NOT_FOUND"} if function_name == "require_quote_for_caller" else set())
+
+
+def listed_codes_above_the_holder_answer(path: str, source: str) -> Set[str]:
+    function, answer, _ = _HOLDER_ANSWERED_FIRST[path]
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+    )
+    answers = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer]
+    assert len(answers) == 1, f"{function} no longer answers a quote that holds its order once"
+    at = _position(answers[0])
+    above = {
+        c.value for c in ast.walk(fn)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value in LISTED_CODES and _position(c) < at
+    }
+    for call in ast.walk(fn):
+        if isinstance(call, ast.Call) and _position(call) < at:
+            above |= _codes_written_by(_callee(call) or "")
+    return above
+
+
+@pytest.mark.parametrize("path", sorted(_HOLDER_ANSWERED_FIRST))
+def test_c1_a_quote_that_holds_its_order_is_answered_before_any_listed_refusal(path: str) -> None:
+    source = (REPO / path).read_text(encoding="utf-8")
+    # The route's dependencies (the partner assertion) run before its body and are not counted:
+    # their refusals say why, and the gateway keeps its claim on the three that can follow an order.
+    assert listed_codes_above_the_holder_answer(path, source) == _HOLDER_ANSWERED_FIRST[path][2]
+
+
+def test_c1_the_order_create_reads_the_quote_claim_with_its_parallel_reads() -> None:
+    fn = next(
+        n for n in ast.walk(_tree("routes/agent_api.py"))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "agent_create_order"
+    )
+    gathers = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _call_key(c) == "asyncio.gather"]
+    first = min(gathers, key=_position)
+    assert any(isinstance(a, ast.Call) and _callee(a) == "read_quote_claim_holder" for a in first.args)
+
+
+@pytest.mark.parametrize("path", sorted(_HOLDER_ANSWERED_FIRST))
+def test_c1_a_listed_refusal_above_the_holder_answer_is_caught(path: str) -> None:
+    function, answer, _ = _HOLDER_ANSWERED_FIRST[path]
+    tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function)
+    call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer)
+    _insert_before(fn, _statement_holding(fn, call), ast.parse(
+        'if order_request_is_odd:\n'
+        '    raise HTTPException(status_code=409, detail={"error": "PREFLIGHT_FAILED", "message": "planted"})\n'
+    ).body)
+
+    assert "PREFLIGHT_FAILED" in listed_codes_above_the_holder_answer(path, ast.unparse(tree))
+
+
+
+#: Governance runs before each create function answers a quote that holds its order.
+_GOVERNANCE_FIRST = {
+    "routes/agent_api.py": ("agent_create_order", "validate_order_create_governance", "answer_for_a_quote_that_holds_its_order"),
+    "routes/agent_v2.py": ("create_order_v2", "validate_order_create_governance", "answer_for_a_create_whose_quote_holds_its_order"),
+}
+
+
+def governance_comes_first(path: str, source: str) -> List[str]:
+    function, governance, answer = _GOVERNANCE_FIRST[path]
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+    )
+    gov = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == governance]
+    ans = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer]
+    if len(gov) != 1 or len(ans) != 1:
+        return [f"{function}: governance calls {len(gov)}, holder answers {len(ans)}"]
+    problems = []
+    if not _position(gov[0]) < _position(ans[0]):
+        problems.append(f"{function}: governance runs after the holder answer")
+    replays = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)
+        and n.value.id in ("replay_response", "idempotency_cache_value")
+    ]
+    if any(_position(r) < _position(gov[0]) for r in replays):
+        problems.append(f"{function}: an order is replayed before governance")
+    return problems
+
+
+@pytest.mark.parametrize("path", sorted(_GOVERNANCE_FIRST))
+def test_c1_governance_runs_before_a_held_quote_is_answered(path: str) -> None:
+    """A blocked or suspended agent (governance's 403) is refused before an order its quote holds,
+    or one this create already made (the cache and the replay lookup), is answered with its payment
+    surface."""
+    assert governance_comes_first(path, (REPO / path).read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("path", sorted(_GOVERNANCE_FIRST))
+def test_c1_governance_moved_below_the_holder_answer_is_caught(path: str) -> None:
+    function, governance, answer = _GOVERNANCE_FIRST[path]
+    tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function)
+    gov_stmt = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == governance))
+    ans_stmt = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer))
+    _remove(fn, gov_stmt)
+    _insert_after(fn, ans_stmt, [gov_stmt])
+
+    assert governance_comes_first(path, ast.unparse(tree)) != []
+
+
+#: (file, function, the holder answer, the name its result is bound to)
+_HELD_BRANCHES = [
+    ("routes/agent_api.py", "agent_create_order", "answer_for_a_quote_that_holds_its_order", "held_quote_response"),
+    ("routes/agent_v2.py", "create_order_v2", "answer_for_a_create_whose_quote_holds_its_order", "held"),
+]
+
+
+def held_branch_problems(source: str, function: str, answer: str, name: str) -> List[str]:
+    """Once a holder is known, the create may only answer that order. Every branch on the holder
+    answer's result holds a bookkeeping assignment at most, then `return` of that result (as is, or
+    through v2's `_order_created_answer`); and no listed code is written between the answer and the
+    end of its branch."""
+    fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function
+    )
+    problems: List[str] = []
+    branches = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(n.test))
+    ]
+    if len(branches) != 1:
+        return [f"{function}: {len(branches)} branches on {name}"]
+    branch = branches[0]
+    if branch.orelse:
+        problems.append(f"{function}: the held branch has an else")
+    *head, last = branch.body
+    for stmt in head:
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else []
+        if not (len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "_agent_order_id_for_perf"):
+            problems.append(f"{function}:{stmt.lineno} the held branch does more than answer: {ast.unparse(stmt)[:60]}")
+    value = last.value if isinstance(last, ast.Return) else None
+    plain = isinstance(value, ast.Name) and value.id == name
+    via_v2 = (
+        isinstance(value, ast.Await) and isinstance(value.value, ast.Call) and _callee(value.value) == "_order_created_answer"
+        and isinstance(value.value.args[0], ast.Name) and value.value.args[0].id == name
+    )
+    if not (plain or via_v2):
+        problems.append(f"{function}: the held branch does not end by answering the order")
+    answer_at = min(_position(c) for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == answer)
+    end = (branch.end_lineno, branch.end_col_offset)
+    for const in ast.walk(fn):
+        if isinstance(const, ast.Constant) and const.value in LISTED_CODES and answer_at <= _position(const) <= end:
+            problems.append(f"{function}:{const.lineno} {const.value} next to the holder answer")
+    return problems
+
+
+#: The functions that answer a quote that holds its order: none writes a listed code.
+_HOLDER_ANSWER_FUNCTIONS = [
+    ("routes/agent_api.py", "answer_for_a_quote_that_holds_its_order"),
+    ("routes/agent_api.py", "answer_for_a_create_whose_quote_holds_its_order"),
+    ("routes/agent_api.py", "_replay_order_that_holds_quote"),
+    ("routes/agent_v2.py", "_order_created_answer"),
+    ("db/orders.py", "read_quote_claim_holder"),
+]
+
+
+@pytest.mark.parametrize("path, function, answer, name", _HELD_BRANCHES, ids=[b[1] for b in _HELD_BRANCHES])
+def test_c1_a_held_branch_only_answers_the_order(path: str, function: str, answer: str, name: str) -> None:
+    assert held_branch_problems((REPO / path).read_text(encoding="utf-8"), function, answer, name) == []
+
+
+@pytest.mark.parametrize("path, function", _HOLDER_ANSWER_FUNCTIONS, ids=[f[1] for f in _HOLDER_ANSWER_FUNCTIONS])
+def test_c1_the_holder_answer_functions_write_no_listed_code(path: str, function: str) -> None:
+    assert listed_codes_at_or_after_the_write_step((REPO / path).read_text(encoding="utf-8"), function, None) == []
+
+
+@pytest.mark.parametrize("path, function, answer, name", _HELD_BRANCHES, ids=[b[1] for b in _HELD_BRANCHES])
+def test_c1_a_listed_refusal_in_the_held_branch_is_caught(path: str, function: str, answer: str, name: str) -> None:
+    """MG: a conditional listed refusal inside the branch that runs once an order is known."""
+    tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == function)
+    branch = next(n for n in ast.walk(fn) if isinstance(n, ast.If) and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(n.test)))
+    branch.body[0:0] = ast.parse(
+        f'if str({name}.get("currency") or "") != "oopq":\n'
+        '    raise HTTPException(status_code=409, detail={"error": "PREFLIGHT_FAILED", "message": "planted"})\n'
+    ).body
+
+    assert held_branch_problems(ast.unparse(tree), function, answer, name) != []
+
+
+#: Everything else that runs around these routes. Reviewed: none writes an order, a claim, a payment
+#: or an order event. Adding one fails here until it is read and named.
+_APP_MIDDLEWARE = {
+    "UsageLoggerMiddleware", "RateLimitMiddleware", "StructuredLoggingMiddleware", "SyntheticCallMiddleware",
+    "ErrorHandlerMiddleware", "SecurityHeadersMiddleware", "AP2SecurityMiddleware", "TieredCORSMiddleware",
+}
+_APP_HTTP_MIDDLEWARE_FUNCTIONS = {"add_service_version_headers", "cors_preflight_passthrough"}
+
+
+def _keyword(call: ast.Call, name: str) -> Optional[ast.AST]:
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def test_c1_no_router_or_app_dependency_and_only_the_reviewed_middleware_around_the_routes() -> None:
+    main = _tree("main.py")
+    app_calls = [
+        n for n in ast.walk(main)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "app" for t in n.targets)
+        and isinstance(n.value, ast.Call) and _call_key(n.value) == "FastAPI"
+    ]
+    assert len(app_calls) == 1 and _keyword(app_calls[0].value, "dependencies") is None
+    for path in ("routes/agent_api.py", "routes/agent_v2.py"):
+        routers = [
+            n.value for n in _tree(path).body
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "router" for t in n.targets)
+        ]
+        assert len(routers) == 1 and _keyword(routers[0], "dependencies") is None, path
+    includes = [
+        n for n in ast.walk(main)
+        if isinstance(n, ast.Call) and _call_key(n) == "app.include_router" and n.args
+        and isinstance(n.args[0], ast.Name) and n.args[0].id in ("agent_api_router", "agent_v2_router")
+    ]
+    assert len(includes) == 2 and all(_keyword(c, "dependencies") is None for c in includes)
+    added = {
+        ast.unparse(n.args[0]) for n in ast.walk(main)
+        if isinstance(n, ast.Call) and _call_key(n) == "app.add_middleware" and n.args
+    }
+    assert added == _APP_MIDDLEWARE, f"middleware to review: {sorted(added ^ _APP_MIDDLEWARE)}"
+    http = {
+        n.name for n in ast.walk(main)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(isinstance(d, ast.Call) and _call_key(d) == "app.middleware" for d in n.decorator_list)
+    }
+    assert http == _APP_HTTP_MIDDLEWARE_FUNCTIONS, f"middleware to review: {sorted(http ^ _APP_HTTP_MIDDLEWARE_FUNCTIONS)}"
 
 
 def _functions_reading(path: str, name: str) -> Set[str]:
@@ -417,7 +1294,7 @@ def _write_step_closure() -> Dict[Tuple[str, str, int], ast.AST]:
     return seen
 
 
-def test_c1_the_write_step_and_everything_it_calls_writes_no_listed_code() -> None:
+def test_c1_the_write_step_and_everything_it_calls_writes_no_listed_code_but_the_merchant_refusal() -> None:
     closure = _write_step_closure()
     assert len(closure) > 50, "the call graph collapsed; the walk is broken"
     names = {name for _, name, _ in closure}
@@ -431,9 +1308,14 @@ def test_c1_the_write_step_and_everything_it_calls_writes_no_listed_code() -> No
         for const in ast.walk(node)
         if isinstance(const, ast.Constant) and isinstance(const.value, str) and const.value in LISTED_CODES
     }
-    # The one exception: the quote re-read's QuoteError("QUOTE_NOT_FOUND"). The write step answers
-    # every QuoteError with 409 (C-3 drives it), and the listed pair is the 404.
-    assert hits == {("services/quote_service.py", "load_active_quote_or_raise", "QUOTE_NOT_FOUND")}
+    # Two exceptions. The quote re-read's QuoteError("QUOTE_NOT_FOUND"): the write step answers
+    # every QuoteError with 409 (C-3 drives it), and the listed pair is the 404. And the write step's
+    # own merchant refusal, which sits above its order write (pinned above) and which its busy
+    # retry cannot reach after a row exists (C-3).
+    assert hits == {
+        ("services/quote_service.py", "load_active_quote_or_raise", "QUOTE_NOT_FOUND"),
+        ("routes/order_routes.py", "create_new_order", "MERCHANT_NOT_ACCEPTING_ORDERS"),
+    }
 
 
 def test_c1_the_write_step_answers_every_quote_error_with_409() -> None:
@@ -887,7 +1769,8 @@ async def test_c3_busy_after_the_row_then_a_refusal_from_the_second_run_is_never
     assert runs == [1, 2]
     # The refusal is raised while the first run's busy error is being handled, so it carries that
     # error as its context and the busy check reads it as busy: today every one of these leaves
-    # as the busy 503. Either answer is acceptable here; a listed pair is not.
+    # as the busy 503. Either answer is acceptable here; a listed pair is not (the merchant
+    # refusal, listed at 403, must therefore leave as the 503).
     assert answer.status in (status, 503), (answer.status, answer.body)
     if answer.status == 503:
         assert answer.body["error"]["details"]["error"] == "TEMPORARY_UNAVAILABLE"
@@ -1341,3 +2224,833 @@ async def test_c5_an_accepted_request_delivered_again_while_the_agent_cannot_be_
     assert len(cw.nonce_claims) == 1, "the second copy was refused before its nonce was looked at"
     assert cw.body_entries == [AGENT_A] and cw.create_runs == ["r1"]
     assert [r["order_id"] for r in await cw.orders_for(quote, AGENT_A)] == [first.order_id]
+
+
+# ---------------------------------------------------------------------------
+# The merchant refusal: inside the write step's function, above its order write
+# ---------------------------------------------------------------------------
+
+MERCHANT_CODE = "MERCHANT_NOT_ACCEPTING_ORDERS"
+MERCHANT_MESSAGE = "This merchant is not currently able to accept orders."
+KEYED = "ak_live_" + "0d" * 32
+
+
+def _count_order_writes(monkeypatch: pytest.MonkeyPatch) -> List[int]:
+    """Every call of the order write itself (`db.orders.create_order`: the claim, then the row)."""
+    import routes.order_routes as order_routes
+
+    writes: List[int] = []
+    real = order_routes.create_order
+
+    async def counted(*args: Any, **kwargs: Any) -> Any:
+        writes.append(1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(order_routes, "create_order", counted)
+    return writes
+
+
+def _merchant_statuses(monkeypatch: pytest.MonkeyPatch, *statuses: str) -> List[str]:
+    """The merchant's status as each read of it sees it; the last one repeats."""
+    import routes.order_routes as order_routes
+
+    seen: List[str] = []
+
+    async def merchant(merchant_id: str) -> Dict[str, Any]:
+        status = statuses[min(len(seen), len(statuses) - 1)]
+        seen.append(status)
+        return {"merchant_id": merchant_id, "status": status}
+
+    monkeypatch.setattr(order_routes, "get_merchant_onboarding", merchant)
+    return seen
+
+
+def _real_replay_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real `find_replayable_order_for_create` (the contract world doubles it with "nothing")."""
+    import db.orders as orders_module
+    import routes.agent_api as agent_api
+
+    monkeypatch.setattr(agent_api, "find_replayable_order_for_create", orders_module.find_replayable_order_for_create)
+
+
+def _v1_payload(w: World, quote: str) -> Dict[str, Any]:
+    q = w.quotes.quotes[quote]
+    return {
+        "merchant_id": MERCHANT,
+        "quote_id": quote,
+        "customer_email": "buyer@example.com",
+        "items": [{"product_id": "prod_oopq_1", "variant_id": "var_oopq_1", "quantity": 1}],
+        "shipping_address": shipping_address(q["country"]),
+        "currency": q["currency"],
+        "metadata": {"market": q["market"]},
+    }
+
+
+async def _post_route(w: World, route: str, quote: str, *, tag: str = "r1", **kwargs: Any) -> Answer:
+    if route == "v1":
+        return await w._post("/agent/v1/orders/create", _v1_payload(w, quote), agent=AGENT_A, tag=tag, **kwargs)
+    return await post_v2(w, v2_body(quote), tag=tag, **kwargs)
+
+
+#: The two raise sites, by the merchant status that reaches each: one that takes no orders at all,
+#: and one that is not approved, for an order charged through the merchant's own payment provider.
+_MERCHANT_SITES = [("rejected", "suppressed_status"), ("pending", "not_approved_for_its_own_provider")]
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("status, site", _MERCHANT_SITES, ids=[s for _, s in _MERCHANT_SITES])
+async def test_c2_merchant_not_accepting_orders(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, status: str, site: str
+) -> None:
+    writes = _count_order_writes(monkeypatch)
+    _merchant_statuses(monkeypatch, status)
+    quote = cw.quotes.add()
+
+    answer = await _post_route(cw, route, quote)
+
+    assert (403, MERCHANT_CODE) in LISTED
+    assert answer.status == 403, (answer.status, answer.body)
+    err = answer.body["error"]
+    assert err["details"] == {"error": MERCHANT_CODE, "message": MERCHANT_MESSAGE, "merchant_id": MERCHANT}
+    assert err["message"] == MERCHANT_CODE
+    assert err["code"] == ENVELOPE["status_code"]["403"][0]
+    # Raised inside the write step's function: it was entered once, and its order write never.
+    assert cw.create_runs == ["r1"] and writes == []
+    assert cw.db.count("order_insert") == 0 and cw.db.count("claim_insert") == 0
+    assert await cw.orders_for(quote) == []
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("later", [s for s, _ in _MERCHANT_SITES])
+@pytest.mark.parametrize("lookup", ["finds_the_row", "cannot_read", "finds_nothing"])
+async def test_c3_the_busy_retry_never_answers_the_merchant_refusal_after_the_row(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, later: str, lookup: str
+) -> None:
+    """The REAL write step writes the order row, then meets a busy error; from then on the merchant
+    reads as not taking orders, so a second run of the write step would raise the 403.
+      finds_the_row  the real lookup: the row is answered, the write step ran once.
+      cannot_read    the lookup fails after the row: the retriable 503, the write step ran once.
+      finds_nothing  a lookup that misses the row: the second run reads the quote's claim before
+                     the merchant refusal, finds the row, and answers 409 QUOTE_CONSUMED with it
+                     (the replay that would answer it is the lookup that misses)."""
+    writes = _count_order_writes(monkeypatch)
+    seen = _merchant_statuses(monkeypatch, "approved", later)
+    cw.after_row_busy_runs = {1}
+    if lookup != "finds_nothing":
+        _real_replay_lookup(monkeypatch)
+    if lookup == "cannot_read":
+        cw.db.fail("replay_lookup", "before", times=999, armed_after="order_insert")
+    quote = cw.quotes.add()
+
+    answer = await _post_route(cw, route, quote)
+
+    rows = await cw.orders_for(quote)
+    assert len(rows) == 1 and writes == [1], "the case must have exactly one order row behind the answer"
+    assert answer.status != 403
+    assert_not_listed(answer)
+    if lookup == "finds_the_row":
+        assert answer.status == 200 and answer.order_id == rows[0]["order_id"], answer.body
+        assert cw.create_runs == ["r1"] and seen == ["approved"]
+    elif lookup == "cannot_read":
+        assert answer.status == 503, answer.body
+        assert answer.body["error"]["details"]["reason"] == "ORDER_REPLAY_LOOKUP_UNAVAILABLE"
+        assert cw.create_runs == ["r1"] and seen == ["approved"], "the write step ran again although the lookup could not tell"
+    else:
+        assert answer.status == 409, answer.body
+        assert answer.body["error"]["details"]["error"] == "QUOTE_CONSUMED"
+        assert answer.body["error"]["details"]["details"]["order_id"] == rows[0]["order_id"]
+        assert cw.create_runs == ["r1", "r1"] and seen == ["approved", later], "the second run did not read the merchant"
+        # The prologue's read (before the row), then one per run of the write step.
+        assert cw.db.count("claim_read") == (4 if route == "v2" else 3)
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("later", [s for s, _ in _MERCHANT_SITES])
+async def test_c3_a_resend_after_the_order_is_its_replay_never_the_merchant_refusal(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, later: str
+) -> None:
+    """The same create sent again after its order was made, the merchant no longer taking orders:
+    the prologue's replay lookup answers the order before the write step is entered."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    seen = _merchant_statuses(monkeypatch, "approved", later)
+    quote = cw.quotes.add()
+    first = await _post_route(cw, route, quote, tag="r1")
+    assert first.status == 200, first.body
+
+    again = await _post_route(cw, route, quote, tag="r2")
+
+    assert again.status == 200 and again.order_id == first.order_id, again.body
+    assert cw.create_runs == ["r1"] and writes == [1] and seen == ["approved"]
+
+
+
+# ---------------------------------------------------------------------------
+# A resend after its order was made, while a live read now refuses it: answered with the order
+# ---------------------------------------------------------------------------
+
+
+def _store_on_another_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.agent_api as agent_api
+
+    async def another_platform(_merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "woocommerce", "store_id": "store_oopq_other"}
+
+    monkeypatch.setattr(agent_api, "get_primary_store", another_platform)
+
+
+def _no_store_and_the_policy_quote_read_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No active store row, so the commerce path is read from the quote; that read fails (only the
+    one agent_create_order makes: the v2 route's own quote read still works)."""
+    import sys
+
+    import routes.agent_api as agent_api
+    import routes.order_routes as order_routes
+
+    async def no_store(_merchant_id: str) -> None:
+        return None
+
+    real = order_routes.QuoteService.load_active_quote_or_raise
+
+    async def fails_for_the_policy(self: Any, *, quote_id: str) -> Any:
+        if sys._getframe(1).f_code.co_name == "agent_create_order":
+            raise RuntimeError("connection reset by peer")
+        return await real(self, quote_id=quote_id)
+
+    monkeypatch.setattr(agent_api, "get_primary_store", no_store)
+    monkeypatch.setattr(order_routes.QuoteService, "load_active_quote_or_raise", fails_for_the_policy)
+
+
+def _preflight_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mvp.offer as offer_module
+
+    real_preflight = offer_module.preflight_offers
+
+    def failing_preflight(**kwargs: Any) -> Any:
+        return [r.model_copy(update={"status": "fail"}) for r in real_preflight(**kwargs)]
+
+    monkeypatch.setattr(offer_module, "preflight_offers", failing_preflight)
+    monkeypatch.setenv("MVP_PREFLIGHT_ENFORCE", "true")
+
+
+def _merchant_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    _merchant_statuses(monkeypatch, "rejected")
+
+
+#: (fault, what a FIRST create meets under it: a listed code, or the 503's reason)
+_LIVE_READ_FAULTS: List[Tuple[str, Any, str]] = [
+    ("store_on_another_platform", _store_on_another_platform, "UNSUPPORTED_COMMERCE_PATH"),
+    ("no_store_and_the_policy_quote_read_fails", _no_store_and_the_policy_quote_read_fails, "COMMERCE_PATH_UNKNOWN"),
+    ("preflight_fails", _preflight_fails, "PREFLIGHT_FAILED"),
+    ("merchant_rejected", _merchant_rejected, MERCHANT_CODE),
+]
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("fault, apply, first", _LIVE_READ_FAULTS, ids=[f[0] for f in _LIVE_READ_FAULTS])
+async def test_c3_the_fault_alone_refuses_a_first_create(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, fault: str, apply: Any, first: str
+) -> None:
+    """The control for the resend case below: each fault, on a quote with no order, is the refusal
+    it is named for. A policy read that fails is the retriable 503, never "unsupported"."""
+    writes = _count_order_writes(monkeypatch)
+    apply(monkeypatch)
+    quote = cw.quotes.add()
+
+    answer = await _post_route(cw, route, quote)
+
+    listed_at = [status for status, code in LISTED if code == first]
+    status = listed_at[0] if listed_at else 503
+    name = first
+    assert answer.status == status, (answer.status, answer.body)
+    details = answer.body["error"]["details"]
+    if status == 503:
+        assert (details["error"], details["reason"]) == ("TEMPORARY_UNAVAILABLE", name)
+        assert answer.retry_after == "1"
+        assert_not_listed(answer)
+    else:
+        assert (status, details["error"]) in LISTED and details["error"] == name
+    assert writes == [] and await cw.orders_for(quote) == []
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("fault, apply, first", _LIVE_READ_FAULTS, ids=[f[0] for f in _LIVE_READ_FAULTS])
+async def test_c3_a_resend_after_the_order_is_its_replay_whatever_a_live_read_now_says(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, fault: str, apply: Any, first: str
+) -> None:
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    made = await _post_route(cw, route, quote, tag="r1")
+    assert made.status == 200, made.body
+
+    apply(monkeypatch)
+    again = await _post_route(cw, route, quote, tag="r2")
+
+    assert again.status == 200 and again.order_id == made.order_id, (again.status, again.body)
+    assert cw.create_runs == ["r1"] and writes == [1]
+    assert [r["order_id"] for r in await cw.orders_for(quote)] == [made.order_id]
+
+
+# ---------------------------------------------------------------------------
+# A create for a quote that already holds its order, outside the first create's replay scope
+# ---------------------------------------------------------------------------
+
+
+def _checkout_token_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real auth dependency on the checkout-token path; the token names its intent."""
+    import routes.agent_auth as agent_auth
+
+    async def from_token(request: Any, token: str) -> Any:
+        context = agent_auth.AgentContext(
+            {"agent_id": AGENT_A, "agent_name": "Fixture Partner", "allowed_merchants": None}, request
+        )
+        setattr(context, "checkout_token_payload", {"intent_id": f"intent_oopq_{token}"})
+        return context
+
+    monkeypatch.setattr(agent_auth, "_get_agent_context_from_checkout_token", from_token)
+
+
+_OUTSIDE_THE_REPLAY_SCOPE = ["another_provider", "another_checkout_intent", "another_metadata_key"]
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("scope", _OUTSIDE_THE_REPLAY_SCOPE)
+async def test_c3_a_quote_that_holds_its_order_is_never_told_the_merchant_refusal(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, scope: str
+) -> None:
+    """The caller's first create for the quote makes the order. The merchant is then rejected, and
+    the same caller creates for the same quote again, in a way its replay lookup does not match: a
+    payment provider named, another checkout intent, or another key in the order's metadata. The
+    write step reads the quote's claim before the merchant refusal: the answer names the order."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    seen = _merchant_statuses(monkeypatch, "approved", "rejected")
+    quote = cw.quotes.add()
+    first_kw: Dict[str, Any] = {}
+    second_kw: Dict[str, Any] = {}
+    if scope == "another_checkout_intent":
+        _checkout_token_context(monkeypatch)
+        first_kw = {"headers": {"X-Checkout-Token": "a"}, "real_auth": True}
+        second_kw = {"headers": {"X-Checkout-Token": "b"}, "real_auth": True}
+
+    def body(extra: Dict[str, Any]) -> Dict[str, Any]:
+        b = _v1_payload(cw, quote) if route == "v1" else v2_body(quote)
+        if route == "v2":
+            b.setdefault("metadata", {})
+        b.update({k: v for k, v in extra.items() if k != "metadata"})
+        b["metadata"] = {**(b.get("metadata") or {}), **extra.get("metadata", {})}
+        return b
+
+    path = "/agent/v1/orders/create" if route == "v1" else "/agent/v2/orders"
+    first_extra = {"metadata": {"idempotency_key": "oopq-meta-key-1"}} if scope == "another_metadata_key" else {}
+    second_extra = {
+        "another_provider": {"preferred_psp": "adyen"},
+        "another_checkout_intent": {},
+        "another_metadata_key": {"metadata": {"idempotency_key": "oopq-meta-key-2"}},
+    }[scope]
+    made = await cw._post(path, body(first_extra), agent=AGENT_A, tag="r1", **first_kw)
+    assert made.status == 200, made.body
+
+    again = await cw._post(path, body(second_extra), agent=AGENT_A, tag="r2", **second_kw)
+
+    assert again.status != 403, again.body
+    assert_not_listed(again)
+    if scope == "another_metadata_key":
+        # The quote-scoped replay matches (same agent, provider and intent): the order itself.
+        assert again.status == 200 and again.order_id == made.order_id, (again.status, again.body)
+    else:
+        # Outside this caller's replay scope (another provider, another checkout intent): never the
+        # order's full answer, only that the quote has its order.
+        assert again.status == 409, (again.status, again.body)
+        details = again.body["error"]["details"]
+        assert details["error"] == "QUOTE_CONSUMED" and details["details"]["order_id"] == made.order_id
+    assert writes == [1] and [r["order_id"] for r in await cw.orders_for(quote)] == [made.order_id]
+    assert cw.create_runs == ["r1"], "the quote's claim was not answered before the write step"
+
+
+
+#: How many reads of the quote's claim a create makes before its write step: v2's own, then the
+#: order create's (v1 makes only the second).
+_CLAIM_READS_BEFORE_THE_WRITE_STEP = {"v2": 2, "v1": 1}
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("where", ["before_the_write_step", "in_the_write_step"])
+async def test_c3_a_claim_read_that_fails_is_the_503_and_writes_nothing(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, where: str
+) -> None:
+    """A read of the quote's claim fails: "could not tell" is the retriable 503, never "no order"
+    (which would let a refusal below answer), both where the create reads it before any refusal and
+    where the write step reads it again before the merchant refusal."""
+    writes = _count_order_writes(monkeypatch)
+    _merchant_statuses(monkeypatch, "rejected")
+    skip = 0 if where == "before_the_write_step" else _CLAIM_READS_BEFORE_THE_WRITE_STEP[route]
+    cw.db.fail("claim_read", "before", times=999, skip=skip, message="connection reset by peer")
+    quote = cw.quotes.add()
+
+    answer = await _post_route(cw, route, quote)
+
+    assert answer.status == 503, (answer.status, answer.body)
+    assert answer.body["error"]["details"]["reason"] == "ORDER_QUOTE_GUARD_UNAVAILABLE"
+    assert_not_listed(answer)
+    assert writes == [] and await cw.orders_for(quote) == []
+    assert cw.create_runs == ([] if where == "before_the_write_step" else ["r1"])
+
+
+
+# ---------------------------------------------------------------------------
+# Another create for a quote that holds its order, while a live read now refuses: never listed
+# ---------------------------------------------------------------------------
+
+
+def _variant_required(monkeypatch: pytest.MonkeyPatch, cw: World) -> None:
+    """The items carry no variant (v2: the quote's; v1: the request's, see _HELD_BODY)."""
+
+    def no_variant(_id: str, snapshot: SimpleNamespace, _n: int) -> None:
+        snapshot.request_json["items"] = [{"product_id": "prod_oopq_1", "quantity": 1}]
+
+    cw.quotes.reshape = no_variant
+
+
+#: (fault, how to apply it, the listed code it alone makes a create meet)
+_HELD_QUOTE_FAULTS: List[Tuple[str, Any, str]] = [
+    ("store_moved", lambda mp, _cw: _store_on_another_platform(mp), "UNSUPPORTED_COMMERCE_PATH"),
+    ("preflight_failing", lambda mp, _cw: _preflight_fails(mp), "PREFLIGHT_FAILED"),
+    ("variant_required", _variant_required, "VARIANT_REQUIRED"),
+]
+
+
+def _held_body(cw: World, route: str, quote: str, fault: str) -> Dict[str, Any]:
+    """A create for `quote` with a provider named (so its own replay lookup does not match)."""
+    if route == "v1":
+        body = {**_v1_payload(cw, quote), "preferred_psp": "adyen"}
+        if fault == "variant_required":
+            body["items"] = [{"product_id": "prod_oopq_1", "quantity": 1}]
+        return body
+    return {**v2_body(quote), "preferred_psp": "adyen"}
+
+
+def _route_path(route: str) -> str:
+    return "/agent/v1/orders/create" if route == "v1" else "/agent/v2/orders"
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("fault, apply, code", _HELD_QUOTE_FAULTS, ids=[f[0] for f in _HELD_QUOTE_FAULTS])
+async def test_c3_the_fault_alone_refuses_that_create(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, fault: str, apply: Any, code: str
+) -> None:
+    """The control: each fault, with the same create body, on a quote that has no order."""
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    apply(monkeypatch, cw)
+
+    answer = await cw._post(_route_path(route), _held_body(cw, route, quote, fault), agent=AGENT_A, tag="r1")
+
+    assert answer.body["error"]["details"]["error"] == code, (answer.status, answer.body)
+    assert (answer.status, code) in LISTED and writes == []
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("fault, apply, code", _HELD_QUOTE_FAULTS, ids=[f[0] for f in _HELD_QUOTE_FAULTS])
+async def test_c3_another_create_for_a_quote_that_holds_its_order_is_never_a_listed_refusal(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, fault: str, apply: Any, code: str
+) -> None:
+    """The caller's first create makes the order. Then the store moves, the pre-flight starts
+    failing, or the variants are missing, and the same caller creates for the same quote with a
+    payment provider named (its own replay lookup does not match; on v2 the quote's consume has not
+    landed). The quote's claim is answered first: 409 QUOTE_CONSUMED naming the order, one row."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    made = await _post_route(cw, route, quote, tag="r1")
+    assert made.status == 200, made.body
+    apply(monkeypatch, cw)
+
+    again = await cw._post(_route_path(route), _held_body(cw, route, quote, fault), agent=AGENT_A, tag="r2")
+
+    assert_not_listed(again)
+    assert again.status == 409, (again.status, again.body)
+    details = again.body["error"]["details"]
+    assert details["error"] == "QUOTE_CONSUMED" and details["details"]["order_id"] == made.order_id
+    assert writes == [1] and [r["order_id"] for r in await cw.orders_for(quote)] == [made.order_id]
+    assert cw.create_runs == ["r1"]
+
+
+
+#: The refusals POST /agent/v2/orders makes itself, before the order create: (fault, the body's
+#: buyer context, what the quote's snapshot loses, the listed code it alone makes a create meet).
+_V2_OWN_REFUSALS: List[Tuple[str, Optional[str], str, str]] = [
+    ("no_buyer_email", None, "customer_email", "INVALID_BUYER_CONTEXT"),
+    ("no_orderable_items", "buyer@example.com", "items", "INVALID_QUOTE"),
+]
+
+
+def _snapshot_loses(cw: World, field: str) -> None:
+    def lose(_id: str, snapshot: SimpleNamespace, _n: int) -> None:
+        if field == "items":
+            snapshot.request_json["items"] = []
+        else:
+            snapshot.request_json.pop(field, None)
+
+    cw.quotes.reshape = lose
+
+
+@pytest.mark.parametrize("held", ["no_order", "order_held"])
+@pytest.mark.parametrize("fault, email, field, code", _V2_OWN_REFUSALS, ids=[f[0] for f in _V2_OWN_REFUSALS])
+async def test_c3_v2_answers_a_held_quote_before_its_own_refusals(
+    cw: World, monkeypatch: pytest.MonkeyPatch, held: str, fault: str, email: Optional[str], field: str, code: str
+) -> None:
+    """v2 refuses a create's buyer context and the quote's items itself. With no order for the quote
+    that is the listed refusal (the control); for a quote that holds its order, the answer is the
+    409 QUOTE_CONSUMED naming it, never the listed code."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    made = None
+    if held == "order_held":
+        made = await post_v2(cw, v2_body(quote), tag="r1")
+        assert made.status == 200, made.body
+    _snapshot_loses(cw, field)
+
+    again = await post_v2(cw, {**v2_body(quote, email=email), "preferred_psp": "adyen"}, tag="r2")
+
+    if made is None:
+        assert again.body["error"]["details"]["error"] == code and (again.status, code) in LISTED, again.body
+        assert writes == []
+        return
+    assert_not_listed(again)
+    assert again.status == 409, (again.status, again.body)
+    details = again.body["error"]["details"]
+    assert details["error"] == "QUOTE_CONSUMED" and details["details"]["order_id"] == made.order_id
+    assert writes == [1] and len(await cw.orders_for(quote)) == 1
+
+
+
+def _agent_status(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """The real governance check, with the agent's policy at `status`."""
+    import services.agent_governance as governance
+
+    gov = governance.agent_governance
+
+    async def policy(_agent_id: str, **_: Any) -> Dict[str, Any]:
+        return {"status": status, "max_requests_per_minute": 1000}
+
+    monkeypatch.setattr(gov, "validate_request", type(gov).validate_request.__get__(gov))
+    monkeypatch.setattr(gov, "_get_policy", policy)
+
+
+_PAYMENT_SURFACE = ("client_secret", "payment_action", "payment_intent_id", "instructions")
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("status", ["blocked", "suspended"])
+@pytest.mark.parametrize("second", ["identical_resend", "another_provider"])
+@pytest.mark.parametrize("consume", ["lands", "does_not_land"])
+async def test_c3_a_blocked_or_suspended_agent_gets_nothing_of_its_order(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, status: str, second: str, consume: str
+) -> None:
+    """The agent made an order; an operator then blocks or suspends it. Its next create for that
+    quote (the same create again, or with a provider named) is refused 403 by governance: no order
+    id, no payment surface. Governance runs before any read of the quote on both routes, so this
+    holds when the quote's consume landed (the usual case: v2's quote read would otherwise answer
+    409 QUOTE_CONSUMED with the order id) and when it did not (the claim would answer)."""
+    _real_replay_lookup(monkeypatch)
+    cw.quotes.consume_lands = consume == "lands"
+    quote = cw.quotes.add()
+    made = await _post_route(cw, route, quote, tag="r1")
+    assert made.status == 200, made.body
+    _agent_status(monkeypatch, status)
+    body = _v1_payload(cw, quote) if route == "v1" else v2_body(quote)
+    if second == "another_provider":
+        body["preferred_psp"] = "adyen"
+
+    again = await cw._post(_route_path(route), body, agent=AGENT_A, tag="r2")
+
+    assert again.status == 403, (again.status, again.body)
+    assert_not_listed(again)
+    text = json.dumps(again.body)
+    assert made.order_id not in text and not any(field in text for field in _PAYMENT_SURFACE), text
+    assert cw.create_runs == ["r1"]
+    if consume == "lands":
+        assert cw.quotes.quotes[quote]["status"] == "consumed", "the case needs the consume to have landed"
+
+
+
+def test_c1_governance_is_the_first_awaited_call_of_each_create() -> None:
+    """Governance decides from the caller alone. On both routes it is the first thing a create
+    awaits: before the quote's owner is checked, the quote read (v2 answers a consumed quote with
+    its order id) or any claim read."""
+    for path, function in (("routes/agent_v2.py", "create_order_v2"), ("routes/agent_api.py", "agent_create_order")):
+        fn = next(
+            n for n in ast.walk(_tree(path))
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == function
+        )
+        awaited = sorted(
+            (n for stmt in fn.body for n in ast.walk(stmt) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)),
+            key=_position,
+        )
+        assert awaited and _callee(awaited[0].value) == "validate_order_create_governance", (
+            path, [_callee(a.value) for a in awaited[:3]]
+        )
+
+
+def test_c1_governance_moved_below_the_quote_read_is_caught() -> None:
+    tree = ast.parse((REPO / "routes/agent_v2.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2")
+    gov = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "validate_order_create_governance"))
+    quote_read = _statement_holding(fn, next(c for c in ast.walk(fn) if isinstance(c, ast.Call) and _callee(c) == "load_active_quote_or_raise"))
+    _remove(fn, gov)
+    _insert_after(fn, quote_read, [gov])
+    moved = next(
+        n for n in ast.walk(ast.parse(ast.unparse(tree)))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "create_order_v2"
+    )
+    awaited = sorted(
+        (n for stmt in moved.body for n in ast.walk(stmt) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)),
+        key=_position,
+    )
+
+    assert _callee(awaited[0].value) != "validate_order_create_governance"
+
+
+def _count_real_governance(monkeypatch: pytest.MonkeyPatch) -> Tuple[List[str], Any]:
+    """The REAL governance check, counted: every call of `validate_request`, and the agent's real
+    request counter. Only the policy row is given (the test database has no policies table)."""
+    import services.agent_governance as governance
+
+    gov = governance.agent_governance
+    real = type(gov).validate_request.__get__(gov)
+    calls: List[str] = []
+
+    async def counted(agent_id: str, *, fail_closed: bool = False) -> None:
+        calls.append(agent_id)
+        await real(agent_id, fail_closed=fail_closed)
+
+    async def policy(_agent_id: str, **_: Any) -> Dict[str, Any]:
+        return {"status": "active", "max_requests_per_minute": 100000}
+
+    monkeypatch.setattr(gov, "validate_request", counted)
+    monkeypatch.setattr(gov, "_get_policy", policy)
+    monkeypatch.setattr(gov, "_metrics_store", {})
+    return calls, gov
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("consume", ["lands", "does_not_land"])
+async def test_c3_governance_counts_each_create_once(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, consume: str
+) -> None:
+    """A create, its identical resend, and a create for the held quote with a provider named each
+    pass governance exactly once, and count once against the agent's per-minute rate: v2 runs it
+    itself and the order create then skips it."""
+    _real_replay_lookup(monkeypatch)
+    calls, gov = _count_real_governance(monkeypatch)
+    cw.quotes.consume_lands = consume == "lands"
+    quote = cw.quotes.add()
+
+    answers = []
+    for n, body in enumerate([None, None, {"preferred_psp": "adyen"}], start=1):
+        payload = _v1_payload(cw, quote) if route == "v1" else v2_body(quote)
+        payload.update(body or {})
+        answers.append(await cw._post(_route_path(route), payload, agent=AGENT_A, tag=f"r{n}"))
+        assert calls == [AGENT_A] * n, (n, calls, answers[-1].status, answers[-1].body)
+        assert gov._metrics_store[AGENT_A].requests == n, (n, gov._metrics_store[AGENT_A].requests)
+
+    made, again, other = answers
+    assert made.status == 200, made.body
+    assert again.status in (200, 409) and other.status == 409, (again.body, other.body)
+    assert cw.create_runs == ["r1"]
+
+
+async def test_c3_v2_a_claim_read_that_fails_once_on_a_held_quote_is_the_503(
+    cw: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only v2's own read of the quote's claim fails, once, for a quote that holds its order, on a
+    create v2 would itself refuse (no buyer email anywhere). "Could not tell" is the 503, never a
+    listed refusal and never "no holder" (the order create's own read would not be reached)."""
+    _real_replay_lookup(monkeypatch)
+    writes = _count_order_writes(monkeypatch)
+    quote = cw.quotes.add()
+    made = await post_v2(cw, v2_body(quote), tag="r1")
+    assert made.status == 200, made.body
+    _snapshot_loses(cw, "customer_email")
+    reads_before = cw.db.count("claim_read")
+    cw.db.fail("claim_read", "before", times=1, tag="r2")
+
+    again = await post_v2(cw, {**v2_body(quote, email=None), "preferred_psp": "adyen"}, tag="r2")
+
+    assert again.status == 503, (again.status, again.body)
+    assert again.body["error"]["details"]["reason"] == "ORDER_QUOTE_GUARD_UNAVAILABLE"
+    assert_not_listed(again)
+    assert cw.db.count("claim_read") == reads_before + 1, "more than v2's own read ran"
+    assert cw.create_runs == ["r1"] and writes == [1]
+
+
+@pytest.mark.parametrize("first_made_with", ["api_key", "another_checkout_intent"])
+async def test_c3_v2_a_checkout_token_never_gets_an_order_made_outside_its_intent(
+    cw: World, monkeypatch: pytest.MonkeyPatch, first_made_with: str
+) -> None:
+    """Independent of the merchant-refusal cases: the order is made under the agent's key (or under
+    another checkout intent), and a checkout token of the same agent sends the identical v2 create.
+    The token's intent narrows the replay: 409 QUOTE_CONSUMED, never the order's answer."""
+    _real_replay_lookup(monkeypatch)
+    _checkout_token_context(monkeypatch)
+    quote = cw.quotes.add()
+    first_kw: Dict[str, Any] = {}
+    if first_made_with == "another_checkout_intent":
+        first_kw = {"headers": {"X-Checkout-Token": "first"}, "real_auth": True}
+    made = await post_v2(cw, v2_body(quote), tag="r1", **first_kw)
+    assert made.status == 200, made.body
+
+    again = await post_v2(cw, v2_body(quote), tag="r2", headers={"X-Checkout-Token": "second"}, real_auth=True)
+
+    assert again.status == 409, (again.status, again.body)
+    details = again.body["error"]["details"]
+    assert details["error"] == "QUOTE_CONSUMED" and details["details"]["order_id"] == made.order_id
+    assert not any(field in json.dumps(again.body) for field in _PAYMENT_SURFACE)
+    assert cw.create_runs == ["r1"] and len(await cw.orders_for(quote)) == 1
+
+
+async def test_c3_a_failed_policy_read_is_logged_at_error_with_its_type(
+    cw: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 503 for a commerce path that could not be decided leaves an ERROR line naming the
+    exception's type, on the service's own logger (the one production keeps), so a failure that is
+    not transient does not hide behind "retry shortly"."""
+    import routes.agent_api as agent_api
+
+    errors: List[str] = []
+    real_logger = agent_api.logger
+
+    class _Spy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_logger, name)
+
+        def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+            errors.append(message % args if args else message)
+            real_logger.error(message, *args, **kwargs)
+
+    from utils.logger import logger as service_logger
+
+    assert real_logger is service_logger
+    monkeypatch.setattr(agent_api, "logger", _Spy())
+    _no_store_and_the_policy_quote_read_fails(monkeypatch)
+    quote = cw.quotes.add()
+
+    answer = await _post_route(cw, "v1", quote)
+
+    assert answer.status == 503 and answer.body["error"]["details"]["reason"] == "COMMERCE_PATH_UNKNOWN"
+    assert [e for e in errors if "commerce path unknown" in e and "RuntimeError" in e], errors
+
+
+# ---------------------------------------------------------------------------
+# Why no 429 is listed: a resend of an accepted create can be refused 429 while its order exists
+# ---------------------------------------------------------------------------
+
+
+def _rate_limiter(w: World) -> Any:
+    """The service's own RateLimitMiddleware instance, in the app the cases call."""
+    from middleware.rate_limiter import RateLimitMiddleware
+
+    if w.app.middleware_stack is None:
+        w.app.middleware_stack = w.app.build_middleware_stack()
+    node = w.app.middleware_stack
+    while node is not None:
+        if isinstance(node, RateLimitMiddleware):
+            return node
+        node = getattr(node, "app", None)
+    raise AssertionError("RateLimitMiddleware is not in the app's middleware stack")
+
+
+def _keyed_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.agent_auth as agent_auth
+
+    async def by_key(_key: str, **_: Any) -> Dict[str, Any]:
+        return {"agent_id": AGENT_A, "agent_name": "Fixture Partner", "is_active": True, "allowed_merchants": None}
+
+    monkeypatch.setattr(agent_auth, "get_agent_by_key", by_key)
+
+
+def _auth_rate_limit_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    import routes.agent_auth as agent_auth
+
+    async def over(*_: Any, **__: Any) -> Tuple[bool, int, int]:
+        return False, 11, 10
+
+    monkeypatch.setattr(agent_auth, "check_rate_limit", over)
+
+
+def _governance_over_its_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.agent_governance as governance
+
+    gov = governance.agent_governance
+
+    async def policy(_agent_id: str, **_: Any) -> Dict[str, Any]:
+        return {"status": "active", "max_requests_per_minute": 1}
+
+    monkeypatch.setattr(gov, "validate_request", type(gov).validate_request.__get__(gov))
+    monkeypatch.setattr(gov, "_get_policy", policy)
+    monkeypatch.setattr(gov, "_get_current_rpm", lambda _agent_id: 5.0)
+
+
+async def test_an_accepted_signed_request_delivered_again_can_be_refused_429_before_its_nonce(
+    cw: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact signed request, delivered twice. The first copy makes the order. The second meets
+    the rate-limit middleware's ceiling, which runs before the partner assertion's nonce is looked at
+    and before any replay lookup: a 429 with the first copy's order behind it."""
+    quote = cw.quotes.add()
+    raw, headers = signed(v2_body(quote))
+    first = await post_v2(cw, None, agent=GATEWAY, content=raw, headers=headers, tag="r1")
+    assert first.status == 200, first.body
+    lookups = cw.db.count("replay_lookup")
+
+    limiter = _rate_limiter(cw)
+    monkeypatch.setattr(limiter, "anon_enabled", True)
+    monkeypatch.setattr(limiter, "anon_global_rpm", 0)
+    again = await post_v2(cw, None, agent=GATEWAY, content=raw, headers=headers, tag="r2")
+
+    assert again.status == 429, again.body
+    assert again.retry_after is not None
+    details = again.body["error"]["details"]
+    assert details["error"] == "rate_limit_exceeded" and set(details) == {"error", "message", "retry_after"}
+    assert (429, details["error"]) not in LISTED
+    assert [r["order_id"] for r in await cw.orders_for(quote, AGENT_A)] == [first.order_id]
+    assert len(cw.nonce_claims) == 1, "the resend was refused before its nonce was looked at"
+    assert cw.db.count("replay_lookup") == lookups and cw.create_runs == ["r1"]
+
+
+@pytest.mark.parametrize("route", ["v2", "v1"])
+@pytest.mark.parametrize("limit", ["auth_dependency", "governance"])
+async def test_a_resend_after_the_order_can_be_refused_429_before_the_replay_lookup(
+    cw: World, monkeypatch: pytest.MonkeyPatch, route: str, limit: str
+) -> None:
+    """The same caller's create again, after its order was made. Without a limit the resend is
+    answered with that order (the control). Over the auth dependency's limit, or governance's (the
+    order create's first step), it is a 429 before the replay lookup reads anything."""
+    _real_replay_lookup(monkeypatch)
+    _keyed_agent(monkeypatch)
+    keyed: Dict[str, Any] = {"headers": {"X-API-Key": KEYED}, "real_auth": True}
+    quote = cw.quotes.add()
+    first = await _post_route(cw, route, quote, tag="r1", **keyed)
+    assert first.status == 200, first.body
+    control = await _post_route(cw, route, quote, tag="r2", **keyed)
+    assert control.status == 200 and control.order_id == first.order_id, control.body
+    lookups = cw.db.count("replay_lookup")
+
+    if limit == "auth_dependency":
+        _auth_rate_limit_over(monkeypatch)
+        sentence = "Rate limit exceeded: 11/10 requests per minute"
+    else:
+        _governance_over_its_limit(monkeypatch)
+        sentence = "Rate limit exceeded: 5 requests/minute (limit: 1)"
+    again = await _post_route(cw, route, quote, tag="r3", **keyed)
+
+    assert again.status == 429, again.body
+    assert again.body["error"]["details"] == {"error": sentence}
+    assert again.body["error"]["code"] == ENVELOPE["status_code"]["429"][0]
+    assert not (pairs_of(again) & LISTED)
+    assert [r["order_id"] for r in await cw.orders_for(quote, AGENT_A)] == [first.order_id]
+    assert cw.db.count("replay_lookup") == lookups, "the 429 came after the replay lookup"
+    assert cw.create_runs == ["r1"]

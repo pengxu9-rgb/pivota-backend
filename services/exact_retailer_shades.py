@@ -12,18 +12,13 @@ from services.catalog_identity import validated_source_gtin
 from services.handover_variant_identity import candidate_from_row, canonical_variant_id
 from services.seed_served_url import same_destination
 from services.exact_retailer_cohorts import (
-    COHORT_B_PROTECTED_FAMILY_URLS, COHORT_B_PROTECTED_LISTING_KEYS, RETAILER_COHORT_B,
+    EXACT_ONLY_FAMILY_URLS, EXACT_ONLY_LISTING_KEYS, RETAILER_COHORT_B, RETAILER_COHORT_C,
     PROOF_KEY, RETAILERS, RETAILER_COHORT_A, ExactRetailerCohort,
 )
 
 
 RETAILER_HOSTS = frozenset(listing.host for listing in RETAILERS.values())
-_COHORT_B_PROTECTED_LOCATIONS = frozenset((urlsplit(url).hostname, urlsplit(url).path)
-                                       for url in COHORT_B_PROTECTED_FAMILY_URLS)
-_COHORT_B_CANONICAL_VARIANTS = frozenset(
-    canonical_id for listing in RETAILER_COHORT_B.listings.values()
-    for canonical_id, _ in listing.variants.values()
-)
+_EXACT_ONLY_LOCATIONS = frozenset((urlsplit(url).hostname, urlsplit(url).path) for url in EXACT_ONLY_FAMILY_URLS)
 _ROW_LIMIT = 121
 
 _SELECT = """
@@ -68,7 +63,7 @@ def _canonical_signature(merchant_id, product_key):
 
 
 def canonical_signature(cohort: ExactRetailerCohort = RETAILER_COHORT_A):
-    return _canonical_signature(cohort.canonical_merchant_id, cohort.canonical_product_key)
+    return cohort.canonical_signature_id or _canonical_signature(cohort.canonical_merchant_id, cohort.canonical_product_key)
 
 
 def _named_us_request(sku_id, observed_market, merchant_scope):
@@ -87,16 +82,20 @@ def applies(product_id, sku_id, observed_market, merchant_scope):
 def matching_cohort(product_id, sku_id, observed_market, merchant_scope):
     if applies(product_id, sku_id, observed_market, merchant_scope):
         return RETAILER_COHORT_A
-    if (RETAILER_COHORT_B.enabled() and _named_us_request(sku_id, observed_market, merchant_scope)
-            and _native_id(sku_id) in _COHORT_B_CANONICAL_VARIANTS
-            and _matches_product(product_id, RETAILER_COHORT_B)):
-        return RETAILER_COHORT_B
+    if not _named_us_request(sku_id, observed_market, merchant_scope):
+        return None
+    native = _native_id(sku_id)
+    for cohort in (RETAILER_COHORT_B, RETAILER_COHORT_C):
+        if cohort is not None and cohort.enabled() and _matches_product(product_id, cohort) and any(
+            native == canonical_id for listing in cohort.listings.values() for canonical_id, _ in listing.variants.values()
+        ):
+            return cohort
     return None
 
 
 def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = RETAILER_COHORT_A):
     attached_key = row.get("attached_product_key")
-    if attached_key in COHORT_B_PROTECTED_LISTING_KEYS or (cohort is RETAILER_COHORT_A and attached_key in RETAILERS):
+    if attached_key in EXACT_ONLY_LISTING_KEYS or (cohort is RETAILER_COHORT_A and attached_key in RETAILERS):
         return True
     for field in ("domain", "destination_url", "canonical_url"):
         value = str(row.get(field) or "")
@@ -107,7 +106,7 @@ def is_pilot_retailer_seed(row, cohort: ExactRetailerCohort | None = RETAILER_CO
         host = (address.hostname or "").lower().removeprefix("www.")
         if cohort is RETAILER_COHORT_A and host in RETAILER_HOSTS:
             return True
-        if (host, address.path.rstrip("/")) in _COHORT_B_PROTECTED_LOCATIONS:
+        if (host, address.path.rstrip("/")) in _EXACT_ONLY_LOCATIONS:
             return True
     return False
 
@@ -173,26 +172,46 @@ def _offer(row, *, listing, canonical_product_key, canonical_id, gtin, now):
             "variant_id": canonical_id, "retailer_variant_id": retailer_id}
 
 
+async def _cohort_rows(db, cohort):
+    records = await db.fetch_all(_SELECT, {
+        "content_key": cohort.canonical_content_key, "group_id": cohort.canonical_group_id,
+        "canonical_key": cohort.canonical_product_key, "canonical_merchant": cohort.canonical_merchant_id,
+        "canonical_signature": canonical_signature(cohort), "retailer_keys": sorted(cohort.listings),
+        "limit": _ROW_LIMIT, "proof_key": PROOF_KEY,
+    })
+    return [dict(row) for row in records] if len(records) < _ROW_LIMIT else []
+
+
+def _canonical_anchor_gtin(anchor_rows, numeric):
+    anchor = [row for row in anchor_rows if _variant(row) == numeric]
+    if len(anchor) != 1:
+        return None
+    gtin = validated_source_gtin(anchor[0].get("barcode"))
+    return gtin if gtin and _selected_skus(anchor_rows, gtin) == {anchor[0]["sku_key"]} else None
+
+
+async def require_canonical_shades(db, *, cohort: ExactRetailerCohort):
+    """Verify every reviewed canonical shade through the serving selectors before an apply."""
+    rows = await _cohort_rows(db, cohort)
+    anchors = [row for row in rows if row["product_key"] == cohort.canonical_product_key]
+    listings = tuple(cohort.listings.values())
+    # Include the retailer rows an initial apply would add to the reader's limit.
+    if len(anchors) + sum(len(listing.variants) for listing in listings) >= _ROW_LIMIT or any(
+        _canonical_anchor_gtin(anchors, canonical) != gtin
+        for listing in listings for canonical, gtin in listing.variants.values()
+    ):
+        raise ValueError("reviewed canonical signature or unique merchant-issued GTIN anchor is missing")
+
+
 async def read_offers(db, sku_id, *, timeout, cohort: ExactRetailerCohort = RETAILER_COHORT_A):
     """Accept only a unique, currently live paired variant with persisted review evidence."""
     numeric = _native_id(sku_id)
     if not numeric:
         return []
-    records = await asyncio.wait_for(db.fetch_all(_SELECT, {
-        "content_key": cohort.canonical_content_key, "group_id": cohort.canonical_group_id,
-        "canonical_key": cohort.canonical_product_key, "canonical_merchant": cohort.canonical_merchant_id,
-        "canonical_signature": canonical_signature(cohort), "retailer_keys": sorted(cohort.listings),
-        "limit": _ROW_LIMIT, "proof_key": PROOF_KEY,
-    }), timeout=timeout)
-    if len(records) >= _ROW_LIMIT:
-        return []
-    rows = [dict(row) for row in records]
+    rows = await asyncio.wait_for(_cohort_rows(db, cohort), timeout=timeout)
     anchor_rows = [row for row in rows if row["product_key"] == cohort.canonical_product_key]
-    anchor = [row for row in anchor_rows if _variant(row) == numeric]
-    if len(anchor) != 1:
-        return []
-    gtin = validated_source_gtin(anchor[0].get("barcode"))
-    if not gtin or _selected_skus(anchor_rows, gtin) != {anchor[0]["sku_key"]}:
+    gtin = _canonical_anchor_gtin(anchor_rows, numeric)
+    if not gtin:
         return []
 
     offers = []

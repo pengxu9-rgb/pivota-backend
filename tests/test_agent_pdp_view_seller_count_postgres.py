@@ -322,6 +322,51 @@ def test_two_stores_are_two_sellers_and_multi_merchant(schema_engine, monkeypatc
     assert _scope(payload) == "multi_merchant_canonical"
 
 
+def test_a_proof_marked_listing_outside_every_cohort_stays_out_of_stock_pdp_rebuild(schema_engine, monkeypatch):
+    """The PDP exclusion follows the proof, not the cohort config: a listing in no cohort (cohort C on a
+    runtime without its private manifest) with one proof-marked offer is not counted as a seller."""
+    from sqlalchemy import text
+
+    from services.exact_retailer_cohorts import EXACT_ONLY_LISTING_KEYS, PROOF_KEY, RETAILERS
+
+    _seed(schema_engine)
+    _set_column(schema_engine, True)
+    ck, group = "ck_no_cohort_proof", "pg_no_cohort_proof"
+    brand_pk, brand_merchant = "ext:no-cohort-brand::0001", "merch_obs_" + "a" * 16
+    marked_pk, marked_merchant = "ext:retailer:" + "e" * 32, "merch_obs_" + "e" * 16
+    ordinary_pk, ordinary_merchant = "ext:retailer:" + "d" * 32, "merch_obs_" + "d" * 16
+    assert marked_pk not in RETAILERS and marked_pk not in EXACT_ONLY_LISTING_KEYS
+    with schema_engine.begin() as conn:
+        _insert_product(conn, pk=brand_pk, merchant=brand_merchant, url="https://brand.example/products/lip",
+                        title="Brand Product", ck=ck, group=group, primary=True)
+        _insert_offer(conn, offer_id="no-cohort-brand", sku=f"{brand_pk}::v:1", pk=brand_pk, merchant=brand_merchant,
+                      price=34, url="https://brand.example/products/lip")
+        for pk, merchant, host, price in ((ordinary_pk, ordinary_merchant, "ordinary.example", 40),
+                                          (marked_pk, marked_merchant, "marked.example", 19)):
+            url = f"https://{host}/products/lip"
+            _insert_product(conn, pk=pk, merchant=merchant, url=url, title="Retail Product", ck=ck, group=group)
+            _insert_offer(conn, offer_id=f"no-cohort-{host}", sku=f"{pk}::v:2", pk=pk, merchant=merchant,
+                          price=price, url=url)
+        conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload || CAST(:marker AS jsonb) "
+                          "WHERE offer_id='no-cohort-marked.example'"),
+                     {"marker": json.dumps({PROOF_KEY: {"observed_at": "2020-01-01T00:00:00Z"}})})
+
+    async def build(db):
+        return await _rebuild(db, ck)
+
+    row = _run(monkeypatch, build)
+    assert marked_merchant not in {offer["merchant_id"] for offer in row["offers"]}
+    assert row["seller_count"] == 2
+
+    with schema_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_offers SET offer_payload=offer_payload - CAST(:marker AS text) "
+                          "WHERE product_key=:pk"), {"marker": PROOF_KEY, "pk": marked_pk})
+    # Positive control: without the proof the same listing is an ordinary PDP seller.
+    row = _run(monkeypatch, build)
+    assert marked_merchant in {offer["merchant_id"] for offer in row["offers"]}
+    assert row["seller_count"] == 3
+
+
 @pytest.mark.parametrize("scope", ["cohort_a", "cohort_b", "cohort_b_bare"])
 def test_marked_exact_children_stay_out_of_stock_pdp_rebuild(schema_engine, monkeypatch, scope):
     from dataclasses import replace

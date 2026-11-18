@@ -2611,14 +2611,17 @@ async def apply_ingest_plan(
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
-    from services.exact_retailer_cohorts import COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_B, RETAILER_COHORT_A
+    from services.exact_retailer_cohorts import (
+        COHORT_B_BARE_LISTING_KEY, RETAILER_COHORT_A, RETAILER_COHORT_B, RETAILER_COHORT_C,
+    )
 
     planned_keys = {row.get("product_key") for section in ("pdps", "skus", "offers") for row in plan.get(section) or []}
     planned_keys.update(row.get("attached_product_key") for row in plan.get("seeds") or [])
     if COHORT_B_BARE_LISTING_KEY in planned_keys:
         raise ValueError("the unlocalized cohort B listing is reserved for the observed US product")
-    for scope in (RETAILER_COHORT_A, RETAILER_COHORT_B):
-        if planned_keys.intersection(scope.listings) and plan.get("reviewed_secondary_group") != scope.canonical_group_id:
+    for scope in (RETAILER_COHORT_A, RETAILER_COHORT_B, RETAILER_COHORT_C):
+        if (scope is not None and planned_keys.intersection(scope.listings)
+                and plan.get("reviewed_secondary_group") != scope.canonical_group_id):
             raise ValueError("reviewed listings require the scoped retailer writer")
 
     preflight = require_primary_plan(plan) if primary_readiness else None
