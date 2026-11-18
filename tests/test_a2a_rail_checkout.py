@@ -1770,9 +1770,9 @@ UNREADABLE_OR_OVER = {
     "line_items_sum": {"items": [{"price": "$40.00"}, {"price": "$40.00"}]},
     "quantity_times_price": {"items": [{"qty": 20, "price": "$50.00"}]},
     "line_strings_sum": {"lines": ["$30.00", "$30.00"]},
-    # Inside `shipping` only address / contact keys are exempt: a number under any other key there (an
-    # "eta") is read as money we cannot verify. Fail closed.
-    "shipping_unknown_key_with_digits": {"shipping": {"method": "standard", "eta": "3-5 days"}},
+    # Inside `shipping` only address / contact keys and descriptors (days, eta, weight) are exempt: a number
+    # under any other key there is read as money we cannot verify. Fail closed.
+    "shipping_unknown_key_with_digits": {"shipping": {"method": "standard", "window": "3-5"}},
 }
 #: Within the ceiling, or no amount: confirmed (the scan must not refuse the ordinary shapes).
 READABLE_AND_WITHIN = {
@@ -2290,11 +2290,12 @@ def test_each_pure_discount_spelling_within_the_ceiling_confirms(key):
     assert worker.confirm_card_refused({"subtotal": "$45.00", key: "-$5.00", "total": "$40.00"}, TOTAL) is False
 
 
-def test_a_total_after_discount_is_a_component_not_the_grand_total():
-    # Only the exact grand-total spellings are grand totals (v5): `totalAfterDiscount` is a component, so
-    # beside a $45 subtotal it adds up past the ceiling. Alone, or beside a discount, it is read as is.
+def test_a_total_after_discount_is_the_grand_total_of_its_subtotal():
+    # v6 (P2-F): a total qualified as what is finally charged (totalAfterDiscount) is a grand total again, so
+    # beside its own subtotal and discount it is not added to them. A total that names a component
+    # (itemsTotalAfterDiscount) stays a part.
     card = {"subtotal": "$45.00", "discount": "-$5.00", "totalAfterDiscount": "$40.00"}
-    assert worker.confirm_card_refused(card, TOTAL) is True
+    assert worker.confirm_card_refused(card, TOTAL) is False
     assert worker.confirm_card_refused({"discount": "-$5.00", "totalAfterDiscount": "$40.00"}, TOTAL) is False
     assert worker.confirm_card_refused({"subtotal": "$45.00", "discount": "-$5.00", "total": "$40.00"}, TOTAL) is False
     assert worker.confirm_card_refused({"totalAfterDiscount": "$51.50"}, TOTAL) is True
@@ -2528,7 +2529,8 @@ CHARGED_BESIDE_A_DISCOUNT_WORD = ["discountNet", "discountWithTax", "promoPay", 
 def test_a_charge_word_beside_a_discount_word_is_money_in_a_sum_and_for_its_sign(key):
     assert worker.confirm_card_refused({key: "-$5.00", "total": "$40.00"}, TOTAL) is True
     assert worker.confirm_card_refused({"subtotal": "$40.00", key: "$30.00"}, TOTAL) is True
-    assert worker.confirm_card_refused({key: "$5.00", "total": "$40.00"}, TOTAL) is False
+    # A charge the total reconciles with (v6: a total beside a lone charge and no base is refused, P1-E).
+    assert worker.confirm_card_refused({"subtotal": "$35.00", key: "$5.00", "total": "$40.00"}, TOTAL) is False
 
 
 @pytest.mark.parametrize("card", [
@@ -2603,8 +2605,12 @@ async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
 LUHN_13 = "4222222222222"
 
 
+#: An unpadded cryptogram that LOOKS like base64 (a "+" or "/" in it; a KSUID-style id never has one).
+TAVV_UNPADDED = "AgAAAAAABk4DWZ4C28yUQ+/AAAA"
+
+
 @pytest.mark.parametrize("order_id,rule", [
-    (CRYPTO.rstrip("="), "cryptogram_shape"), (LUHN_13, "luhn_run"), (f"ORD-{LUHN_13}", "luhn_run"), (DPAN, "luhn_run"),
+    (TAVV_UNPADDED, "cryptogram_shape"), (LUHN_13, "luhn_run"), (f"ORD-{LUHN_13}", "luhn_run"), (DPAN, "luhn_run"),
 ], ids=["cryptogram_unpadded", "luhn_13", "contains_luhn_13", "dpan"])
 async def test_an_order_id_that_may_echo_the_card_or_token_completes_without_its_reference(order_id, rule, caplog):
     assert worker._credential_rule(order_id) == rule
@@ -2752,3 +2758,181 @@ def test_the_opaque_rule_never_touches_a_splittable_key_or_relaxes_anything():
     assert worker.confirm_card_refused({"amountpaid": "$40.00"}, TOTAL) is False
     # A lower-case run with a discount word is never read as a discount by substring (fail closed: plain).
     assert worker.confirm_card_refused({"internetdiscount": "-$5.00", "total": "$40.00"}, TOTAL) is True
+
+
+# ── controller review v6: reconciliation (P1-E), the base counted once (P2-F), status words (P2-I), P3s ──
+
+_LINES = [{"price": "$20.00"}, {"price": "$20.00"}]
+
+#: P1-E: a grand total beside charges it does not itemise. Over the ceiling if the total excludes them ($55):
+#: refused, by reconciliation (the total must cover the base + the charges), or because there is no base.
+UNRECONCILED_TOTALS = {
+    "summary_total_and_fees": {"summary": {"total": "$40.00"}, "fees": {"service": "$15.00"}},
+    "order_total_and_shipping_total": {"order": {"total": "$40.00"}, "shipping": {"total": "$15.00"}},
+    "pricing_nested": {"pricing": {"order": {"total": "$40.00"}, "fees": {"total": "$15.00"}}},
+    "flat_total_and_shipping_object": {"total": "$40.00", "shipping": {"total": "$15.00"}},
+    "flat_total_and_shipping": {"total": "$40.00", "shipping": "$15.00"},
+    "total_and_details": {"total": "$40.00", "details": {"shipping": "$15.00"}},
+    # with a base: the total does not cover it and the charges
+    "lines_shipping_and_a_short_total": {"lines": _LINES, "shipping": "$15.00", "total": "$40.00"},
+    "summary_subtotal_and_an_unitemised_fee": {"summary": {"subtotal": "$40.00", "total": "$40.00"},
+                                               "fees": {"service": "$15.00"}},
+    # the accepted false cancels: a total and a lone charge, nothing itemised (true charge within the ceiling)
+    "G_summary_and_a_lone_fee": {"summary": {"total": "$48.00"}, "fees": {"service": "$3.00"}},
+    "K_shipping_and_a_total": {"shipping": "$5.00", "total": "$48.00"},
+    "L_tax_shipping_and_a_total": {"tax": "$3.00", "shipping": "$5.00", "total": "$48.00"},
+}
+#: The realistic cards the rule must keep (true charge within the ceiling), and P2-F's shapes.
+RECONCILED_CARDS = {
+    "A_summary_itemised_beside_lines": {"summary": {"subtotal": "$40.00", "shipping": "$5.00", "tax": "$3.00",
+                                                    "total": "$48.00"}, "lines": _LINES},
+    "B_summary_total_beside_lines": {"summary": {"total": "$48.00"}, "lines": _LINES},
+    "C_summary_lines_shipping_tax": {"summary": {"total": "$48.00"}, "lines": _LINES, "shipping": "$5.00", "tax": "$3.00"},
+    "D_totals_beside_items": {"totals": {"subtotal": "$40.00", "total": "$48.00"}, "items": [{"price": "$40.00"}]},
+    "E_order_with_lines_and_a_method": {"order": {"lines": _LINES, "total": "$48.00"}, "shippingMethod": "Ground"},
+    "F_pricing_and_shipping": {"pricing": {"subtotal": "$40.00", "tax": "$3.00", "total": "$48.00"},
+                               "shipping": {"price": "$5.00"}},
+    "H_cart_and_checkout": {"cart": {"items": _LINES, "subtotal": "$40.00"}, "checkout": {"total": "$48.00"}},
+    "I_summary_shipping_tax_objects": {"summary": {"subtotal": "$40.00", "total": "$48.00"},
+                                       "shipping": {"cost": "$5.00"}, "tax": {"amount": "$3.00"}},
+    "J_lines_and_summary": {"lines": _LINES, "summary": {"total": "$40.00"}},
+    "M_items_shipping_total": {"items": [{"price": "$40.00"}], "shipping": "$5.00", "total": "$48.00"},
+    "canonical_receipt": {"lines": _LINES, "subtotal": "$40.00", "shipping": "$5.00", "tax": "$3.00", "total": "$48.00"},
+    "items_qty_one_and_subtotal": {"items": [{"quantity": 1, "price": "$40.00"}], "subtotal": "$40.00", "total": "$45.00"},
+    "line_total_beside_its_price": {"items": [{"quantity": 2, "price": "$20.00", "lineTotal": "$40.00"}]},
+    "discounted_and_reconciled": {"subtotal": "$45.00", "discount": "-$5.00", "shipping": "$5.00", "total": "$45.00"},
+}
+GRAND_SPELLINGS_V6 = ["totalPayable", "grandTotalAmount", "amount_total", "totalAfterDiscount", "finalTotal",
+                      "total_with_tax", "current_total_price", "order_total_amount", "totalCharged"]
+
+
+@pytest.mark.parametrize("name", sorted(UNRECONCILED_TOTALS))
+def test_a_grand_total_beside_charges_it_does_not_cover_or_itemise_is_refused(name):
+    assert worker.confirm_card_refused(UNRECONCILED_TOTALS[name], TOTAL) is True
+
+
+@pytest.mark.parametrize("name", sorted(RECONCILED_CARDS))
+def test_a_card_whose_total_reconciles_and_whose_base_is_counted_once_confirms(name):
+    assert worker.confirm_card_refused(RECONCILED_CARDS[name], TOTAL) is False
+
+
+@pytest.mark.parametrize("key", GRAND_SPELLINGS_V6)
+def test_every_grand_spelling_beside_its_subtotal_is_the_total_not_a_part(key):
+    assert worker.confirm_card_refused({"subtotal": "$40.00", "tax": "$3.00", key: "$43.00"}, TOTAL) is False
+    # It still covers what it sits beside, and is never above the ceiling.
+    assert worker.confirm_card_refused({"subtotal": "$40.00", "tax": "$3.00", key: "$30.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({"subtotal": "$40.00", "tax": "$3.00", key: "$51.50"}, TOTAL) is True
+
+
+def test_the_base_counted_once_is_the_larger_of_the_subtotal_and_the_lines():
+    # The lines above the ceiling cancel whatever the subtotal says, and the other way round.
+    assert worker.confirm_card_refused({"lines": [{"price": "$30.00"}, {"price": "$30.00"}], "subtotal": "$40.00"}, TOTAL)
+    assert worker.confirm_card_refused({"lines": _LINES, "subtotal": "$60.00"}, TOTAL)
+    # Base + charges past the ceiling cancel even with a total that "covers" them.
+    assert worker.confirm_card_refused({"lines": _LINES, "subtotal": "$40.00", "shipping": "$15.00", "total": "$55.00"}, TOTAL)
+    # An object's own price beside its own subtotal is ambiguous: both are summed.
+    assert worker.confirm_card_refused({"subtotal": "$40.00", "price": "$40.00"}, TOTAL)
+
+
+@pytest.mark.parametrize("status", ["paid_pending_shipment", "paid_awaiting_fulfillment", "completed_with_errors",
+                                    "completed_notification_sent", "payment_completed_non_refundable",
+                                    "paid_cancel_requested", "succeeded", "charged", "settled", "captured",
+                                    "payment reached", "Payment-Completed"])
+async def test_a_status_that_says_payment_happened_is_payment_reached_and_never_resolvable(status):
+    assert worker._status_says_paid(status)
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    assert worker.operator_eligibility(await _row(pid), worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED) == (
+        False, "payment_reached_recorded")
+
+
+@pytest.mark.parametrize("status", ["unpaid", "payment_failed", "payment-declined", "incomplete", "not_paid",
+                                    "not_completed", "non_completed", "never_charged", "payment-pending",
+                                    "awaiting-payment", "repayment", "payment_cancelled", "uncaptured"])
+def test_a_status_that_does_not_say_payment_happened_stays_unrecognised(status):
+    assert not worker._status_says_paid(status)
+
+
+@pytest.mark.parametrize("key,value", [("feedback", "5 stars"), ("costume", "Size 10"), ("coffee", "2 shots"),
+                                       ("taxonomy", "Shoes > 42"), ("residue", "0"), ("shippingaddr", "12 Pen Rd"),
+                                       ("paidat", "2026-11-18T10:00:00Z"), ("taxexemptid", "12345")])
+def test_a_lone_lower_case_key_that_only_contains_a_money_word_is_not_money(key, value):
+    assert worker.confirm_card_refused({key: value, "total": "$40.00"}, TOTAL) is False
+
+
+@pytest.mark.parametrize("card", [
+    {"subtotal": "$40.00", "tax": {"rate": 8.25, "amount": "$3.30"}, "total": "$43.30"},
+    {"subtotal": "$40.00", "shipping": {"days": 2, "cost": "$5.00"}, "total": "$45.00"},
+    {"shipping": {"eta": "3-5 days"}, "total": "$40.00"},
+    {"items": [{"price": {"amount": "$40.00", "formatted": "$40.00"}}], "total": "$40.00"},
+    {"total": {"amount": "40.00", "currency": "USD"}},
+    {"totalItems": 2, "total": "$40.00"}, {"total_quantity": 2, "total": "$40.00"},
+    {"total_weight": "2 lb", "total": "$40.00"},
+], ids=["tax_rate", "shipping_days", "shipping_eta", "price_formatted", "usd_sibling", "total_items",
+        "total_quantity", "total_weight"])
+def test_a_money_object_with_descriptors_confirms(card):
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+@pytest.mark.parametrize("card", [
+    {"total": {"amount": "40.00", "currency": "EUR"}},           # another currency is never a mark
+    {"shipping": {"rate": 999}},                                 # a rate alone under shipping is its price
+    {"subtotal": "$45.00", "formatted": "$10.00"},               # an "echo" of nothing here is a charge
+    {"items": [{"price": {"amount": "$40.00", "formatted": "$45.00"}}]},  # an echo larger than its amount
+], ids=["eur_sibling", "shipping_rate_alone", "echo_beside_a_subtotal", "echo_larger"])
+def test_a_descriptor_never_hides_money(card):
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+@pytest.mark.parametrize("key", ["discountReversal", "couponRemoved", "promoClawback", "discount_reversed"])
+def test_a_discount_taken_back_is_a_charge(key):
+    assert worker.confirm_card_refused({"subtotal": "$45.00", key: "-$10.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({"subtotal": "$45.00", key: "$10.00"}, TOTAL) is True
+
+
+def test_a_word_before_a_discount_word_that_is_no_target_keeps_the_sign_rule():
+    # H15: `internetDiscount` is a pure discount but not a PLAIN one, so a positive value is money, summed.
+    assert worker.confirm_card_refused({"subtotal": "$45.00", "internetDiscount": "$10.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({"subtotal": "$45.00", "shippingDiscount": "$10.00"}, TOTAL) is False
+
+
+async def test_an_expiry_that_is_a_whole_number_in_prose_but_not_in_card_context_is_read():
+    # H16: "1129" is our expiry, but here it is an amount due, not the card's expiry: it is read (and refused).
+    answer = _task({"kind": "text", "text": "Amount due 1129 today"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+
+
+def test_a_ksuid_or_base64url_order_id_keeps_its_reference():
+    import random
+    import string
+
+    rng = random.Random(11)
+    base62 = string.ascii_letters + string.digits
+    for _ in range(500):
+        ksuid = "".join(rng.choice(base62) for _ in range(27))
+        b64url = "".join(rng.choice(base62 + "-_") for _ in range(27))
+        assert worker._credential_rule(ksuid) is None and worker._credential_rule(b64url) is None
+    assert worker._credential_rule(TAVV_UNPADDED) == "cryptogram_shape"
+    assert worker._credential_rule("AgAAAAAABk4DWZ4C28yUQAAAAAA=") == "cryptogram_shape"
+
+
+@pytest.mark.parametrize("echo,refused", [
+    ({"foo": "715"}, True), ({"securityCode": "715"}, True),
+    ({"ref": "$715.00", "suite": "Suite 715", "n": "715 units"}, False),
+], ids=["whole_value_unknown_key", "card_key", "inside_other_values"])
+async def test_a_davv_under_its_own_field_is_scrubbed_from_the_setup_answer_as_a_whole_value(echo, refused):
+    token = _network_token(**{a2a_rail.DAVV_FIELD: "715"})
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=token), answer), setup=_setup(ceiling_minor=100000))
+    assert (relay.checkout.credential_fields_stripped >= 1) is refused
+    data = relay.checkout.card("checkout.confirm").data
+    assert "715" not in [v for v in data.values() if isinstance(v, str)] or not refused
+
+
+@pytest.mark.parametrize("key", ["totalAfterPromo", "totalWithCoupon", "grand_total_after_savings", "currentTotal"])
+def test_a_total_qualified_as_what_is_charged_is_the_grand_total_beside_its_subtotal(key):
+    # Not in the exact list: promoted by its qualifier because it names no component.
+    assert worker.confirm_card_refused({"subtotal": "$40.00", "tax": "$3.00", key: "$43.00"}, TOTAL) is False

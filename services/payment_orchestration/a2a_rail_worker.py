@@ -143,11 +143,14 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                                        missing: a contradiction, HELD (`checkout_result_unrecognised`)
                              timeout / script-error        -> HELD (`checkout_unknown_*`): whether it was
                                        submitted is unknown; never retried
-                             any other status naming payment or completion (`paid`, `payment_reached`,
-                                       `completed`) and not its negation (`unpaid`, `payment_failed`,
-                                       `incomplete`, `not_paid`, `payment-pending`) -> HELD
+                             any other status that, read word by word, says payment happened (`paid`,
+                                       `completed`, `captured`, `succeeded`, `charged`, `settled`,
+                                       `payment reached`; also `paid_pending_shipment`,
+                                       `completed_with_errors`) and is not negated right before
+                                       (`not_paid`, `non_completed`) -> HELD
                                        `checkout_payment_reached_unconfirmed`, a payment-reached code
-                                       (never resolved as not charged); a negation: unrecognised
+                                       (never resolved as not charged); otherwise (`unpaid`,
+                                       `payment_failed`, `incomplete`, `payment-pending`): unrecognised
   Every HELD checkout stays held until a human, having checked the provider's side, ends it with
   jobs/a2a_rail_operator.py (`operator_fail_held_checkout`, `operator_confirmed_not_charged`); nothing in
   the worker resolves a hold. docs/agent_purchases_routes.md, "Held A2A checkouts", is the procedure.
@@ -1539,11 +1542,18 @@ _DIGIT_RUN_RE = re.compile(r"(?<![0-9])[0-9]{13,19}(?![0-9])")
 #: EXACTLY a TAVV cryptogram's shape: 20 bytes of base64 (27 characters, then "=" or nothing), mixing upper
 #: case, lower case and digits. (The token's own values are never known here: only the relay held them.)
 _CRYPTOGRAM_SHAPE_RE = re.compile(r"^[A-Za-z0-9+/]{27}=?\Z")
-#: An unrecognised result status that speaks of payment or completion: a charge may exist ...
-_PAYMENT_STATUS_RE = re.compile(r"pay|paid|complet")
-#: ... unless it says the opposite (unpaid, payment_failed, incomplete, not_paid, payment-pending): those are
-#: unrecognised, never payment-reached.
-_PAYMENT_NEGATION_RE = re.compile(r"unpaid|not|non|fail|declin|incomplet|pending|await|refus|reject|cancel|void|error|repay")
+#: ... and it must look like base64 rather than an id: padded, or holding "+" or "/" (a KSUID-style 27-char
+#: base62 id, or a base64url one, never does), with the last data character a multiple of 4 in the base64
+#: alphabet (20 bytes leave its low two bits zero).
+_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+#: An unrecognised result status is read as WORDS (split on "-", "_" and spaces). It says payment happened when
+#: a word is one of these, or it holds "payment reached" ...
+_PAYMENT_DONE_WORDS = frozenset({"paid", "complete", "completed", "captured", "succeeded", "success", "successful",
+                                 "charged", "settled"})
+#: ... and that word is not negated right before it ("not_paid", "non_completed", "never_charged"). A negation
+#: elsewhere ("paid_pending_shipment", "completed_with_errors", "paid_cancel_requested") never undoes it.
+#: Words that are themselves the opposite (unpaid, incomplete, uncaptured) are not in the set above.
+_PAYMENT_NEGATORS = frozenset({"not", "non", "no", "never"})
 #: Result statuses that say the checkout was NOT submitted to the merchant: the purchase fails.
 _CHECKOUT_NOT_SUBMITTED = frozenset({"captcha-failed", "form-error", "pay-disabled"})
 #: Result statuses that leave the submission unknown: held for a human, never retried.
@@ -1738,10 +1748,23 @@ def _credential_rule(value: str) -> Optional[str]:
     or None. Narrow on purpose: a match costs only the stored reference, never the completion."""
     if any(a2a_rail._luhn(m.group(0)) for m in _DIGIT_RUN_RE.finditer(value)):
         return "luhn_run"
+    data = value.rstrip("=")
     if (_CRYPTOGRAM_SHAPE_RE.match(value) and re.search(r"[A-Z]", value) and re.search(r"[a-z]", value)
-            and re.search(r"[0-9]", value)):
+            and re.search(r"[0-9]", value) and (value.endswith("=") or "+" in data or "/" in data)
+            and _BASE64_ALPHABET.index(data[-1]) % 4 == 0):
         return "cryptogram_shape"
     return None
+
+
+def _status_says_paid(status: str) -> bool:
+    """Whether an unrecognised result status says payment happened (`_PAYMENT_DONE_WORDS`), read word by word."""
+    words = [w for w in re.split(r"[-_\s]+", str(status or "").lower()) if w]
+    for i, word in enumerate(words):
+        if i and words[i - 1] in _PAYMENT_NEGATORS:
+            continue
+        if word in _PAYMENT_DONE_WORDS or (word == "reached" and i and words[i - 1] == "payment"):
+            return True
+    return False
 
 
 def _card_shaped(value: str) -> bool:
@@ -2083,7 +2106,7 @@ async def _checkout_result(s: _Step, card: Any) -> str:
         return await _checkout_failed(s, f"checkout_{status.replace('-', '_')}")
     if status in _CHECKOUT_UNKNOWN:
         return await _checkout_hold(s, _CHECKOUT_UNKNOWN[status])
-    if _PAYMENT_STATUS_RE.search(status) and not _PAYMENT_NEGATION_RE.search(status):
+    if _status_says_paid(status):
         # A status we do not know that speaks of payment or completion ("paid", "payment_reached",
         # "completed"): a charge may exist. Held as payment-reached: an operator never ends it as not charged.
         return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)

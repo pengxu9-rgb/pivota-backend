@@ -18,9 +18,12 @@ THE RULES, in the order they apply:
      lower-case run of known words ("grandtotal", "shippingfee") is split into them. Every test below is on
      WHOLE words, never on a substring: "internet" holds no "net", "payee" no "pay", "aftercare" no "after".
      ONE exception, in the conservative direction only: a key the tokeniser cannot split at all (a single
-     run out of the vocabulary: "saleprice", "AMOUNTPAID", "shippingandhandling") is read as MONEY when a
-     money word is a substring of it (price, total, amount, paid, cost, fee, charge, due, tax, ...), and as a
-     unit price when price / cost / amount is. Never as a discount or contact word.
+     run out of the vocabulary: "amountpaid", "TOTALPAID", "shippingandhandling") is read as MONEY when it
+     ENDS in a money word (price, total, amount, paid, cost, charge, handling, shipping, ...), and as a unit
+     price when it ends in price / cost / amount. A money word inside it is not enough ("coffee",
+     "feedback", "taxonomy", "paidat"). Never as a discount or contact word.
+     Never money, whatever stands before them: a key ending in a count, a weight or a time (totalItems,
+     total_weight, days, eta), and a `rate` beside an amount in the same money object (tax{rate, amount}).
   3. Classify the key (`key_kind`), first match wins:
        contact   the exact code keys (couponCode, promoCode, discountCode); a key whose last word is an
                  address / contact word (shippingAddress, paymentMethod, taxId); any other key with a
@@ -47,15 +50,23 @@ THE RULES, in the order they apply:
                  or a total-word (in the three words before it) stands next to it.
      Inside money, a key that is nothing else inherits money; inside a discount, it follows the sign rule.
   4. A BARE number (int or float) under a money, discount or slot key is unreadable (units unknown).
-  5. SUMS, per object: its grand total (ONLY the exact spellings total, grandTotal, totalAmount, amountDue,
-     orderTotal, totalPrice, totalDue, balanceDue, in any case or separator) and its parts: every other
-     amount (subtotal, shipping, tax, fees, `total_*` and `*Total` parts) AND every child object or list,
-     whatever total it holds (items{total} + shipping{total} is their sum, like list items). Only a child
-     under a summary key (summary, totals, pricing, order, cart, checkout) that holds a grand total stands
-     for the object's own grand total (a summary beside the line items is not counted twice). The object's
-     charge is max(grand total, sum of parts); each must be at most the ceiling. By design a part at most
-     the grand total can sit beside it unadded ({"total": "$40", "shipping": "$15"}): bounded at twice the
-     ceiling; the token's own cap is the primary control. Per list, its items add up.
+  5. SUMS, per object, in three parts:
+       grand total  the exact spellings (total, grandTotal, totalAmount, amountDue, orderTotal, totalPrice,
+                    totalDue, balanceDue, totalPayable, grandTotalAmount, amount_total, finalTotal,
+                    total_with_tax, totalAfterDiscount, ...), a total qualified as what is charged that names
+                    no component (totalAfterPromo; never itemsTotalAfterDiscount), or a summary child
+                    (summary, totals, pricing, order, cart, checkout) that holds one;
+       base         the line items and the subtotal they total, counted ONCE: max(subtotal, the line items),
+                    where the line items are a list (or a cart / items object of them) under a line word, an
+                    item's quantity x unit price, or a summary child's own base;
+       charges      everything else: shipping, tax, fees, and every other child object or list, whatever
+                    total it holds (items{total} + shipping{total} is their sum, like list items).
+     base + charges must be at most the ceiling. RECONCILIATION: with a grand total and charges beside it,
+     the total must cover base + charges (net of what the object takes off), and with no base at all to
+     reconcile against the card is refused ({"total": "$40", "shipping": "$15"}: we cannot tell whether the
+     total includes the shipping). The object charges max(grand total, base + charges). Per list, its items
+     add up. An object's own price beside its own subtotal is ambiguous and both are summed, unless a
+     quantity makes them the same line. An echo for display (price{amount, formatted}) is not added again.
      Quantity x unit price: a quantity is read from an int, a whole float, a digit string, a one-item list
      or an object's number under any qty / quantity / count / units / pcs key (the largest wins); a unit
      price from any price / cost / each / amount key that is not a total. JSON (or a Python literal) inside
@@ -102,6 +113,9 @@ _DISCOUNT_WORDS = frozenset({
 _CHARGE_QUALIFIERS = frozenset({
     "after", "with", "final", "net", "post", "pay", "payable", "due", "balance", "charged", "of", "sum", "grand",
     "less", "minus", "incl", "including", "without", "adjusted", "remaining",
+    # a discount taken BACK is a charge (discountReversal, couponRemoved, rebateClawback)
+    "reversal", "reversed", "reverse", "removed", "removal", "clawback", "revoked", "chargeback", "undo", "undone",
+    "cancelled", "canceled", "voided",
 })
 #: After the discount word, these keep a key a pure discount (discountAmount, couponValue).
 _DISCOUNT_AMOUNT_WORDS = frozenset({"amount", "amounts", "amt", "value", "values"})
@@ -134,7 +148,33 @@ _HEAD_SUFFIXES = frozenset({"code", "line", "number"})
 #: THE grand totals (joined words). Every other total-ish key is a component.
 _GRAND_TOTAL_KEYS = frozenset({
     "total", "grandtotal", "totalamount", "amountdue", "ordertotal", "totalprice", "totaldue", "balancedue",
+    # the other common spellings of what is charged (v6 P2-F)
+    "totalpayable", "grandtotalamount", "amounttotal", "ordertotalamount", "totalcharged", "finaltotal",
+    "totalwithtax", "currenttotalprice", "totalafterdiscount", "totalincltax", "totalincludingtax", "amountpayable",
+    "totalamountdue", "grandtotalprice", "totaldueamount",
 })
+#: A total qualified as what is finally charged is a grand total too, unless it names a component
+#: (itemsTotalAfterDiscount, shippingTotalWithTax stay components).
+_GRAND_QUALIFIERS = frozenset({"after", "with", "final", "payable", "charged", "current", "grand", "incl", "including"})
+#: Components a total can be of (a part, never the grand total). "tax" after "with" / "incl" is not one.
+_COMPONENT_WORDS = frozenset({
+    "item", "items", "line", "lines", "merchandise", "product", "products", "goods", "shipping", "delivery", "tax",
+    "taxes", "fee", "fees", "handling", "freight", "postage", "duty", "duties", "service", "sub",
+})
+#: The line items' words: a key with one of them and "total" is a SUBTOTAL (lineTotal, itemsTotal,
+#: total_line_items_price), and a list or object under one of them holds the line items.
+_LINE_WORDS = frozenset({
+    "item", "items", "line", "lines", "merchandise", "product", "products", "goods", "cart", "entries", "skus",
+    "articles", "positions", "basket", "bag", "purchases",
+})
+#: Never money, whatever money word stands before them: a count, a weight, a time (totalItems, total_weight,
+#: shipping{days}, shipping{eta}).
+_DESCRIPTOR_TAILS = frozenset({
+    "items", "quantity", "quantities", "qty", "count", "weight", "weights", "pieces", "days", "day", "eta",
+    "hours", "weeks", "time", "date",
+})
+#: An echo of an amount for display (price{amount, formatted}): not added again.
+_ECHO_WORDS = frozenset({"formatted", "display", "displayed", "pretty", "localized", "readable", "text", "string"})
 _TOTALISH = frozenset({"total", "totals", "subtotal", "subtotals", "sum"})
 _UNIT_PRICE_WORDS = frozenset({"price", "prices", "cost", "costs", "each", "amount", "amt", "rate"})
 _QUANTITY_WORDS = frozenset({"qty", "quantity", "quantities", "count", "units", "pcs", "pieces", "piece"})
@@ -142,6 +182,9 @@ _QUANTITY_WORDS = frozenset({"qty", "quantity", "quantities", "count", "units", 
 _STRUCTURE_WORDS = frozenset({
     "order", "orders", "item", "items", "line", "lines", "product", "products", "merchandise", "cart",
     "shipment", "discounted", "applied", "unit", "info", "details", "summary", "grand", "code", "per",
+    # price qualifiers, so "saleprice" / "listprice" split into words instead of being opaque
+    "sale", "sales", "list", "base", "regular", "retail", "compare", "original", "current", "special", "member",
+    "formatted", "display", "weight",
 })
 #: Words that make a nearby number in a plain field (or the answer's prose) an amount.
 _TOTAL_WORDS = frozenset({
@@ -261,8 +304,8 @@ _DISCOUNT_TARGETS = frozenset({
 #: A key the tokeniser cannot split (one run, out of the vocabulary: "saleprice", "AMOUNTPAID") is read for
 #: these as SUBSTRINGS: money only (the conservative direction), never a discount or contact word.
 _OPAQUE_MONEY_PARTS = (
-    "price", "total", "amount", "paid", "cost", "fee", "charge", "due", "tax", "shipping", "handling", "freight",
-    "postage", "balance", "payable",
+    "price", "total", "amount", "paid", "cost", "costs", "charge", "charges", "handling", "shipping", "freight",
+    "postage", "balance", "payable", "subtotal",
 )
 _OPAQUE_UNIT_PARTS = ("price", "cost", "amount")
 #: A child object under one of these holds the object's own summary: its grand total stands for the object
@@ -278,11 +321,18 @@ def _opaque_run(words: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _opaque_money(words: Sequence[str]) -> bool:
+    """A run the tokeniser could not split that ENDS in a money word ("amountpaid", "totalpaid",
+    "shippingandhandling"). A money word inside it is not enough: never "coffee", "residue", "feedback",
+    "taxonomy", "shippingaddr", "paidat", "taxexemptid"."""
+    run = _opaque_run(words)
+    return run is not None and run.endswith(_OPAQUE_MONEY_PARTS)
+
+
 def _has_money_word(words: Sequence[str]) -> bool:
     if any(w in _MONEY_WORDS for w in words) or "".join(words) in _MONEY_EXACT:
         return True
-    run = _opaque_run(words)
-    return run is not None and any(part in run for part in _OPAQUE_MONEY_PARTS)
+    return _opaque_money(words)
 
 
 def is_pure_discount(name_or_words: Any) -> bool:
@@ -317,16 +367,50 @@ def _is_discount_slot_key(words: Sequence[str]) -> bool:
             and all(w == "total" or w in _DISCOUNT_AMOUNT_WORDS for w in rest))
 
 
+def _component_words(words: Sequence[str]) -> set:
+    """The component words in a key, a "tax" right after "with" / "incl" / "including" excepted."""
+    found = set()
+    for i, w in enumerate(words):
+        if w in _COMPONENT_WORDS and not (w in ("tax", "taxes") and i and words[i - 1] in ("with", "incl", "including")):
+            found.add(w)
+    return found
+
+
 def _is_grand_total_key(name_or_words: Any) -> bool:
-    """One of the exact grand-total spellings (rule 5)."""
-    return "".join(_words(name_or_words)) in _GRAND_TOTAL_KEYS
+    """A grand total (rule 5): one of the exact spellings, or a total qualified as what is finally charged
+    that names no component (totalAfterDiscount, total_with_tax; never itemsTotalAfterDiscount)."""
+    words = _words(name_or_words)
+    if "".join(words) in _GRAND_TOTAL_KEYS:
+        return True
+    return ("total" in words and "subtotal" not in words and bool(set(words) & _GRAND_QUALIFIERS)
+            and not _component_words(words) and not set(words) & _LINE_WORDS)
+
+
+def _is_subtotal_key(words: Sequence[str]) -> bool:
+    """A subtotal: the line items' total (subtotal, itemsTotal, lineTotal, total_line_items_price, sub_total)."""
+    present = set(words)
+    if "subtotal" in present or {"sub", "total"} <= present:
+        return True
+    return bool(present & {"total", "totals", "amount", "price"} and present & _LINE_WORDS and "total" in present
+                and not present & {"shipping", "delivery", "tax", "taxes", "fee", "fees", "handling", "freight",
+                                   "postage", "duty", "duties", "service"})
+
+
+def _is_descriptor_key(words: Sequence[str]) -> bool:
+    """A count, a weight or a time, never money (totalItems, total_weight, days, eta)."""
+    core = [w for w in words if not w.isdigit()]
+    return bool(core) and core[-1] in _DESCRIPTOR_TAILS
 
 
 def _is_unit_price_key(words: Sequence[str]) -> bool:
+    """A line item's own price (price, unitCost, each, salePrice, amount): never a total, never a charge
+    component (shipping_cost, taxAmount and serviceFee are charges)."""
+    if _component_words(words) - {"item", "items", "line", "lines", "product", "products", "merchandise", "goods"}:
+        return False
     if any(w in _UNIT_PRICE_WORDS for w in words) and not any(w in _TOTALISH for w in words):
         return True
     run = _opaque_run(words)
-    return run is not None and any(p in run for p in _OPAQUE_UNIT_PARTS) and "total" not in run
+    return _opaque_money(words) and run is not None and run.endswith(_OPAQUE_UNIT_PARTS) and "total" not in run
 
 
 def _is_quantity_key(words: Sequence[str]) -> bool:
@@ -343,14 +427,19 @@ def _contact_head(words: Sequence[str]) -> bool:
     return core[-1] in _CONTACT_HEADS
 
 
-def key_kind(name: str, parent: str, sibling_currency: bool = False) -> str:
+def key_kind(name: str, parent: str, sibling_currency: bool = False, amount_sibling: bool = False) -> str:
     """CONTACT, SLOT, PLAIN, DISCOUNT, MONEY or DISCOUNT_INNER for the value under `name`, inside a parent
-    read as `parent` (rule 3, whole words)."""
+    read as `parent` (rule 3, whole words). `amount_sibling`: the object also holds an amount (a money
+    object, so a `rate` beside it is its percentage)."""
     words = key_words(name)
     joined = "".join(words)
     present = set(words)
     if joined in _CODE_KEYS:
         return CONTACT
+    if _is_descriptor_key(words):
+        return PLAIN  # a count, a weight or a time: never money (a currency symbol there is still read)
+    if joined in ("rate", "rates") and parent == MONEY and amount_sibling:
+        return PLAIN  # tax{rate: 8.25, amount: "$3.00"}: the rate of the amount beside it
     if parent in _DISCOUNT_PARENTS and joined in _SLOT_CHILD_KEYS:
         return SLOT  # `{"discount": {"amount": "-$5.00"}}`: the amount of a discount
     if _is_discount_slot_key(words):
@@ -410,7 +499,8 @@ def _total_word_before(text: str, start: int) -> bool:
     return any(_skeleton(w).lower() in _TOTAL_WORDS for w in words)
 
 
-def string_amounts(raw: str, ceiling: int, kind: str, taken_off: Optional[List[int]] = None) -> List[int]:
+def string_amounts(raw: str, ceiling: int, kind: str, taken_off: Optional[List[int]] = None,
+                   usd_sibling: bool = False) -> List[int]:
     """The USD amounts `raw` adds to a sum, each read with certainty and within `ceiling`; raises `_Refused`
     for an amount-shaped number that is not one (module docstring, rules 3 and 4)."""
     text = normalise(raw)
@@ -429,7 +519,8 @@ def string_amounts(raw: str, ceiling: int, kind: str, taken_off: Optional[List[i
         raw_words = [m.group(1) for m in (_LEFT_WORD_RE.search(left), _RIGHT_WORD_RE.search(right)) if m]
         words = [_skeleton(w).lower() for w in raw_words]
         usd_word = "usd" in words
-        marked = dollar is not None or usd_word
+        # A money value whose sibling says `currency: "USD"` ({"amount": "40.00", "currency": "USD"}) is marked by it.
+        marked = dollar is not None or usd_word or (usd_sibling and kind == MONEY)
         currency_next = symbol or marked or foreign_dollar is not None or any(w in _CURRENCY_WORDS for w in words)
         if kind == CONTACT:
             amount_shaped = symbol or marked
@@ -527,8 +618,10 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
         if nodes > CARD_SCAN_MAX_NODES or depth > CARD_SCAN_MAX_DEPTH:
             raise _Refused("card too large to scan")
 
-    def scan_string(raw: str, depth: int, kind: str, taken_off: Optional[List[int]] = None) -> Tuple[int, bool, bool]:
-        """(what the string adds to a sum, whether that is a grand total, whether it held embedded data)."""
+    def scan_string(raw: str, depth: int, kind: str, taken_off: Optional[List[int]] = None,
+                    usd_sibling: bool = False) -> Tuple[int, bool, int, bool, bool]:
+        """(what the string adds, whether that is a grand total, its base, whether it is base only, whether it
+        held embedded data). Embedded data is walked like an object or a list."""
         text = normalise(raw).strip()
         if text[:1] in ("{", "["):
             if len(text) > CARD_SCAN_MAX_JSON_CHARS:
@@ -536,17 +629,25 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
             parsed = _parse_embedded(text)
             if parsed is not None:
                 return (*walk(parsed, depth + 1, kind), True)
-        return sum(string_amounts(raw, ceiling, kind, taken_off)), False, False
+        return sum(string_amounts(raw, ceiling, kind, taken_off, usd_sibling)), False, 0, False, False
 
-    def walk(value: Any, depth: int, kind: str) -> Tuple[int, bool]:
-        """Scan `value`; return (what it adds to its parent's sum, whether that came from a grand total)."""
+    def walk(value: Any, depth: int, kind: str) -> Tuple[int, bool, int, bool]:
+        """Scan `value`; return (what it charges, whether a grand total says so, its BASE (the line items or
+        the subtotal, counted once), whether it holds nothing but that base)."""
         count(depth)
         if isinstance(value, Mapping):
             sibling_currency = any(canon_key(str(k)) == "currency" for k in value)
-            totals: List[int] = []
-            components: List[int] = []
-            children: List[int] = []
+            usd_sibling = any(canon_key(str(k)) == "currency" and isinstance(v, str) and normalise(v).strip().upper() == "USD"
+                              for k, v in value.items())
+            amount_sibling = any(_is_unit_price_key(kw) and "".join(kw) not in ("rate", "rates")
+                                 for kw in (key_words(normalise(str(k))) for k in value))
+            totals: List[int] = []        # grand totals: own keys, and summary children
+            summary_bases: List[int] = []  # the base a summary child itemised (its subtotal / lines)
+            subtotals: List[int] = []     # subtotal-like keys: the line items' total
+            lines: List[int] = []         # line-item lists and containers (counted once with the subtotal)
+            charges: List[int] = []       # everything else: shipping, tax, fees, other parts
             units: List[int] = []
+            echoes: List[int] = []
             quantities: List[int] = []
             taken_off: List[int] = []
             for key, item in value.items():
@@ -559,62 +660,93 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
                     if found is not None:
                         quantities.append(found)
                     continue
-                child = key_kind(name, kind, sibling_currency)
+                child = key_kind(name, kind, sibling_currency, amount_sibling)
                 if isinstance(item, str):
                     count(depth + 1)
-                    contribution, is_total, nested = scan_string(item, depth + 1, child, taken_off)
+                    contribution, is_total, base, base_only, nested = scan_string(
+                        item, depth + 1, child, taken_off, usd_sibling)
                 else:
-                    contribution, is_total = walk(item, depth + 1, child)
+                    contribution, is_total, base, base_only = walk(item, depth + 1, child)
                     nested = isinstance(item, (Mapping, list, tuple))
                 if not contribution:
                     continue
+                present = set(words)
                 if _is_grand_total_key(words):
                     totals.append(contribution)
-                elif nested or is_total:
-                    # A child object (or list) is a part, like a list item, and parts add up, whatever total
-                    # it holds: items{total} + shipping{total} is their sum. Only a summary child (`summary`,
-                    # `totals`, `order`, ...) that holds a grand total stands for this object's own total.
-                    if is_total and words and set(words) <= _SUMMARY_WORDS:
-                        totals.append(contribution)
-                    else:
-                        children.append(contribution)
-                else:
-                    components.append(contribution)
-                if _is_unit_price_key(words):
+                elif is_total and words and present <= _SUMMARY_WORDS:
+                    # A summary child's grand total stands for this object's own (with the base it itemised).
+                    totals.append(contribution)
+                    summary_bases.append(base)
+                elif _is_unit_price_key(words):
                     units.append(contribution)
-            parts = sum(components) + sum(children)
-            if parts > ceiling:
-                raise _Refused("parts add up past the ceiling")
+                elif not nested and _is_subtotal_key(words):
+                    subtotals.append(contribution)
+                elif nested and not is_total and present & _LINE_WORDS and (base_only or isinstance(item, (list, tuple))):
+                    lines.append(contribution)  # the line items (a list, or a cart / items object of them)
+                elif not nested and present and present <= _ECHO_WORDS:
+                    echoes.append(contribution)  # price{amount, formatted}: the same amount again
+                else:
+                    # A part. A child object (or list) holding a total is a part too, like a list item:
+                    # items{total} + shipping{total} is their sum.
+                    charges.append(contribution)
             quantity = max(quantities) if quantities else None
             if quantity is not None and quantity < 0:
                 raise _Refused("a negative quantity")
-            line = quantity * max(units) if quantity and units else 0
+            line = quantity * max(units) if quantity and units else sum(units)
             if line > ceiling:
                 raise _Refused("quantity x unit price past the ceiling")
-            charged = max([parts, line, *totals])
+            # An echo no larger than a real amount here is that amount shown again; a larger one is a charge.
+            real = max([line, *totals], default=0)
+            charges.extend(e for e in echoes if e > real)
+            # P2-F: the subtotal and the line items it totals are ONE base, counted once. An object's own price
+            # beside its own subtotal is ambiguous (the item's price, or a second charge?): then it is a charge.
+            if subtotals and line:
+                if quantity and line == sum(subtotals):
+                    line = 0  # {"qty": 2, "price": "$20", "lineTotal": "$40"}: one line, said twice
+                else:
+                    charges.append(line)
+                    line = 0
+            base = max([sum(subtotals), sum(lines) + line, *summary_bases])
+            extra = sum(charges)
+            parts = base + extra
+            if parts > ceiling:
+                raise _Refused("parts add up past the ceiling")
+            if totals:
+                total = max(totals)
+                if extra:
+                    # P1-E, RECONCILIATION: a grand total beside charges it does not itemise must cover the base
+                    # and those charges (net of what this object takes off). With no base at all to reconcile
+                    # against, whether the total includes them cannot be told: refused.
+                    if not base:
+                        raise _Refused("a total beside charges it may not include, with nothing to reconcile")
+                    if total + sum(taken_off) < parts:
+                        raise _Refused("a total that does not cover its parts")
+                charged = max(total, parts)
+            else:
+                charged = parts
             if taken_off and charged and sum(taken_off) > charged:
                 # More taken off than this object charges: not a discount we can read.
                 raise _Refused("a discount larger than what it is taken off")
-            return charged, bool(totals)
+            return charged, bool(totals), base, (not totals and not extra and base > 0)
         if isinstance(value, (list, tuple)):
             line_items = 0
             for item in value:
                 if isinstance(item, str):
                     count(depth + 1)
-                    contribution, _, _ = scan_string(item, depth + 1, kind)
+                    contribution = scan_string(item, depth + 1, kind)[0]
                 else:
-                    contribution, _ = walk(item, depth + 1, kind)
+                    contribution = walk(item, depth + 1, kind)[0]
                 line_items += contribution
             if line_items > ceiling:
                 raise _Refused("line items add up past the ceiling")
-            return line_items, False
+            return line_items, False, line_items, True
         if isinstance(value, str):
-            return scan_string(value, depth, kind)[:2]
+            return scan_string(value, depth, kind)[:4]
         if value is None or isinstance(value, bool):
-            return 0, False
+            return 0, False, 0, False
         if isinstance(value, (int, float)) and (kind == MONEY or kind in _DISCOUNT_KINDS):
             raise _Refused("a bare number under a money or discount key: units unknown")
-        return 0, False
+        return 0, False, 0, False
 
     try:
         walk(data if isinstance(data, Mapping) else {"card": data}, 0, PLAIN)

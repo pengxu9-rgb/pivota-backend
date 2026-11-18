@@ -719,19 +719,27 @@ class TokenRelay:
 _SCRUB_SUBSTRING_MIN = 8
 
 
+#: The token-result field that will carry the DAVV (the 3-digit dynamic CVV the checkout card is filled with:
+#: the provider's 11-18 answer; the mapping lands with the DAVV change). Read here already so a DAVV that
+#: arrives under it is scrubbed from the setup answer BY VALUE, like the expiry: as a WHOLE value only
+#: ("715" alone), never inside another value ("$715.00", "Suite 715"), and in prose only as a whole token in
+#: card context. PENDING THE PROVIDER'S A2A UPDATE AND SANDBOX MEASUREMENT of the field's name.
+DAVV_FIELD = "davv"
+
+
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
-    expiry (raw and as "MM/YY") only as a whole value."""
+    expiry (raw and as "MM/YY") and its DAVV only as a whole value."""
     contains: List[str] = []
     exact = set()
-    for key in ("value", "cryptogram", "expiryDate"):
+    for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
         raw = network_token.get(key)
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
         # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
         for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
-            if len(form) >= _SCRUB_SUBSTRING_MIN:
+            if len(form) >= _SCRUB_SUBSTRING_MIN and key != DAVV_FIELD:
                 contains.append(form)
             exact.add(form)
         match = _TOKEN_EXPIRY_RE.match(raw) if key == "expiryDate" else None
