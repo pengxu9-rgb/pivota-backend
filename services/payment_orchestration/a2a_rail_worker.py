@@ -102,9 +102,10 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            submission (`checkout_setup_submitted`), never seen, a 403, an error card or
                            another ambiguous 4xx (`checkout_setup_unresolved`): HELD in `paying`.
   paying (a checkout)   -> THE CONFIRM, only in the setup's own step, after scanning THAT step's confirm card:
-                           every value at any depth (`confirm_card_refused`). Any amount above the ceiling,
-                           malformed, negative, in another currency, a bare number under a money key, or a
-                           card too large to scan: CANCELLED instead (write-ahead `checkout.confirm#cancel`;
+                           every value at any depth (`confirm_card_refused`, a strict allowlist). A card with
+                           anything money-like that is not exactly one of the named receipt shapes within the
+                           ceiling, or a card too large to scan: CANCELLED instead (write-ahead
+                           `checkout.confirm#cancel`;
                            `checkout_confirm_total_refused` on a definite cancel, else HELD
                            `checkout_cancel_unresolved`). Otherwise the confirm, write-ahead
                            `checkout.confirm#confirm`, body `{}`. A MONEY WRITE: it submits the merchant's
@@ -1546,10 +1547,11 @@ _CRYPTOGRAM_SHAPE_RE = re.compile(r"^[A-Za-z0-9+/]{27}=?\Z")
 #: base62 id, or a base64url one, never does), with the last data character a multiple of 4 in the base64
 #: alphabet (20 bytes leave its low two bits zero).
 _BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-#: An unrecognised result status is read as WORDS (split on "-", "_" and spaces). It says payment happened when
-#: a word is one of these, or it holds "payment reached" ...
+#: An unrecognised result status is read as WORDS (lower-cased, split on EVERY character that is not a letter or
+#: a digit: "Paid.", "order.paid", "payment:captured", "status=paid", "paid,shipped"). It says payment happened
+#: when a word is one of these, or it holds "payment reached" ...
 _PAYMENT_DONE_WORDS = frozenset({"paid", "complete", "completed", "captured", "succeeded", "success", "successful",
-                                 "charged", "settled"})
+                                 "charged", "settled", "chargeback", "chargedback"})
 #: ... and that word is not negated right before it ("not_paid", "non_completed", "never_charged"). A negation
 #: elsewhere ("paid_pending_shipment", "completed_with_errors", "paid_cancel_requested") never undoes it.
 #: Words that are themselves the opposite (unpaid, incomplete, uncaptured) are not in the set above.
@@ -1758,7 +1760,7 @@ def _credential_rule(value: str) -> Optional[str]:
 
 def _status_says_paid(status: str) -> bool:
     """Whether an unrecognised result status says payment happened (`_PAYMENT_DONE_WORDS`), read word by word."""
-    words = [w for w in re.split(r"[-_\s]+", str(status or "").lower()) if w]
+    words = [w for w in re.split(r"[^a-z0-9]+", str(status or "").lower()) if w]
     for i, word in enumerate(words):
         if i and words[i - 1] in _PAYMENT_NEGATORS:
             continue
@@ -1904,13 +1906,13 @@ async def _checkout_confirm(s: _Step, setup: Any) -> str:
     """Submit the merchant's checkout, IN THE SETUP'S OWN STEP, after checking THIS step's setup answer (every
     card in it). A MONEY WRITE: recorded first, never resent on an answer from the provider."""
     if setup_answer_refused(setup, s.row.get("quoted_total_minor")):
-        # An amount on a card of the setup's answer we cannot verify against the ceiling (above it, malformed,
-        # foreign, a bare number under a money key, parts adding up past it; a card too large to read; a
-        # value the relay scrubbed): never confirmed. Cancelled instead; nothing has been submitted yet.
+        # A card of the setup's answer we cannot verify against the ceiling (money-like and not exactly a named
+        # shape within it: services/payment_orchestration/checkout_amounts; a card too large to read; a value
+        # the relay scrubbed): never confirmed. Cancelled instead; nothing has been submitted yet.
         logger.error("a2a_rail_worker: confirm card amount not within the ceiling purchase=%s; cancelling", s.id)
         return await _cancel_checkout(s, CHECKOUT_CONFIRM_TOTAL_REFUSED)
-    # NO MONETARY AMOUNT on the card (the provider's documented confirm card has none: merchant, shipping,
-    # cardLast4, cardBrand), or every one within the ceiling: confirm. This rests on the token having been
+    # NOTHING MONEY-LIKE on the card (the provider's measured confirm card has none: merchant, shipping,
+    # cardLast4, cardBrand), or exactly a named shape within the ceiling: confirm. This rests on the token having been
     # minted for EXACTLY the ceiling (`amount_cents == quoted_total_minor`, `_start_token`): the provider
     # fixes the token's amount at mint and the scheme enforces it, so a merchant total above it cannot be
     # charged to this token. Pinned by tests/test_a2a_rail_checkout.py::
