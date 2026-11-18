@@ -340,13 +340,19 @@ def cmd_run(args) -> None:
         gate = gate_json(gate_run.stdout, gate_run.returncode, datetime.now(timezone.utc))
         common = dict(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest, secrets=secrets)
         # No execution of this job may be running (a hand-started one would write alongside ours).
-        busy = unfinished(list_executions(job)) if job else []
+        pre_arm = list_executions(job) if job else []
+        busy = unfinished(pre_arm)
         require(not busy, f"an execution of this job is already running: {', '.join(busy)}")
+        # Every execution that existed before arming; any other name, except ours, is foreign (publish checks).
+        state["executions_pre_arm"] = sorted(r["metadata"]["name"] for r in pre_arm)
         state["armed"] = True          # set before the deploy: a deploy that fails half-way is still disarmed
         path.write_text(json.dumps(state))
         run(job_spec_args(**common, gate=gate, armed=True))
-        before = [r["metadata"]["name"] for r in list_executions(job)]
-        require(not unfinished(list_executions(job)), "an execution started while the job was being armed")
+        # ONE listing: what it shows is both the check and the list the lookup below compares against.
+        rows = list_executions(job)
+        before = sorted(r["metadata"]["name"] for r in rows)
+        require(before == state["executions_pre_arm"] and not unfinished(rows),
+                "an execution started while the job was being armed")
         # From here an execution may exist even if the call below fails: record that BEFORE calling.
         state.update(execute_attempted=True, executions_before=before)
         path.write_text(json.dumps(state))
@@ -358,6 +364,8 @@ def cmd_run(args) -> None:
         except Exception as error:  # noqa: BLE001 - the server may have created it anyway
             state["execute_error"] = f"{type(error).__name__}: {error}"[:300]
             state["execution"] = find_started_execution(job, state["executions_before"])
+            # A run started by hand in this window would look the same: publish keeps the lock for a human to confirm.
+            state["execution_found_by_lookup"] = state["execution"] is not None
             path.write_text(json.dumps(state))
             require(state["execution"] is not None,
                     "execute failed and exactly one execution since arming could not be found: lock stays held")
@@ -393,6 +401,9 @@ def lock_decision(state: dict) -> str | None:
         return "HELD: the execution's state is not terminal; do not remove the lock"
     if state.get("armed") and state.get("disarmed") is False:
         return "HELD: the job is still ARMED (disarm failed); disarm it before removing the lock"
+    if state.get("execution_found_by_lookup"):
+        return ("HELD: the execute call failed and the execution was found by lookup; confirm it is this build's "
+                "before removing the lock")
     return None
 
 
@@ -432,19 +443,25 @@ def cmd_publish(args) -> None:
     rows, bad = parse_lines(log)
     put(prefix, "rows.json", json.dumps(rows, indent=1))
     held = lock_decision(state)
+    unsure = False
     if held is None and state.get("armed"):
-        # Nothing but our own (finished) execution may be running when the lock goes.
+        # Since arming, no execution but ours may have existed, finished or not.
         try:
-            others = [n for n in unfinished(list_executions(job_name(args.batch_id))) if n != state.get("execution")]
+            executions = list_executions(job_name(args.batch_id))
+            known = set(state.get("executions_pre_arm") or []) | {state.get("execution")}
+            others = sorted(r["metadata"]["name"] for r in executions if r["metadata"]["name"] not in known)
+            running = [n for n in unfinished(executions) if n in others]
         except Exception as error:  # noqa: BLE001
-            others, held = [], f"HELD: could not list the job's executions: {error}"[:300]
+            others, running, unsure = [], [], True
+            held = f"HELD: could not list the job's executions: {error}"[:300]
         if others:
-            held = f"HELD: a FOREIGN execution of this job is still running: {', '.join(others)}"
+            held = (f"HELD: a FOREIGN execution of this job ran during the batch: {', '.join(others)}"
+                    f" (still running: {', '.join(running) or 'none'})")
     lock = held or "to be released after result.json (outcome in lock.json)"
     result = summarise(rows, mode=args.mode, run_state=state, bad_lines=bad, lock=lock)
     if state.get("armed") and state.get("disarmed") is False:
         result["ok"], result["decision"] = False, None
-    if held and held.startswith("HELD: a FOREIGN"):
+    if unsure or (held and held.startswith(("HELD: a FOREIGN", "HELD: the execute call failed"))):
         result["ok"], result["decision"] = False, None
     result.update(build=build_id(), batch_id=args.batch_id, release=args.release, log_error=log_error,
                   job_armed=bool(state.get("armed")) and state.get("disarmed") is False)

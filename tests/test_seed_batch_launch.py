@@ -219,7 +219,8 @@ class Gcloud:
 
     def __init__(self, *, gate=(f"{SUMMARY}\nGATE_OPEN\n", 0), states=("EXECUTION_SUCCEEDED",), describe_errors=0,
                  lock_build=BUILD, log=None, cp_fail=None, execute_fails=False, listed=None, disarm_fails=False,
-                 before=(("reviewed-seed-batch-batch-one-old", True),), after=None, foreign_at_release=()):
+                 before=(("reviewed-seed-batch-batch-one-old", True),), after=None, foreign_at_release=(),
+                 armed_rows=None, list_fails_at_release=False):
         self.calls, self.gate, self.states, self.describe_errors = [], gate, list(states), describe_errors
         self.lock_build, self.log, self.cp_fail = lock_build, log, cp_fail
         self.execute_fails, self.disarm_fails = execute_fails, disarm_fails
@@ -228,6 +229,8 @@ class Gcloud:
         self.after = list(after) if after is not None else (
             list(listed) if listed is not None else [*self.before, ("reviewed-seed-batch-batch-one-x7k2p", True)])
         self.foreign_at_release, self.executed = list(foreign_at_release), False
+        # Shown after the first deploy and before execute (None: the same as before).
+        self.armed_rows, self.deployed, self.list_fails_at_release = armed_rows, False, list_fails_at_release
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
@@ -240,9 +243,14 @@ class Gcloud:
                 return subprocess.CompletedProcess(args, 1, stdout="", stderr="connection reset")
             return ok("reviewed-seed-batch-batch-one-x7k2p\n")
         if args[:5] == ["gcloud", "run", "jobs", "executions", "list"]:
-            rows = (self.after + self.foreign_at_release) if self.executed else self.before
+            if self.list_fails_at_release and self.executed:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="permission denied")
+            rows = (self.after + self.foreign_at_release) if self.executed else (
+                self.armed_rows if self.deployed and self.armed_rows is not None else self.before)
             return ok(json.dumps([{"metadata": {"name": name}, "status": {"completionTime": "t"} if done else {}}
                                   for name, done in rows]))
+        if args[:4] == ["gcloud", "run", "jobs", "deploy"]:
+            self.deployed = True
         if args[:4] == ["gcloud", "run", "jobs", "deploy"] and self.disarm_fails and \
                 "REVIEWED_SEED_BATCH_GATE" not in args[args.index("--set-env-vars") + 1]:
             return subprocess.CompletedProcess(args, 1, stdout="", stderr="deploy failed")
@@ -544,6 +552,14 @@ def test_a_failed_execute_call_finds_the_one_execution_it_started_and_waits_on_i
     state = json.loads((tmp_path / "run.json").read_text())
     assert state["execution"] == "reviewed-seed-batch-batch-one-new" and state["state"] == "EXECUTION_SUCCEEDED"
     assert "connection reset" in state["execute_error"] and state["disarmed"] is True
+    assert state["execution_found_by_lookup"] is True
+    fake = Gcloud(listed=[("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-new", True)],
+                  log="\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})]))
+    fake.executed = True
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert not result["ok"] and result["lock"].startswith("HELD: the execute call failed") and not released(fake.calls)
 
 
 @pytest.mark.parametrize("listed", [[("reviewed-seed-batch-batch-one-old", True)],
@@ -600,8 +616,51 @@ def test_a_foreign_execution_at_release_keeps_the_lock_and_fails_the_build(monke
     with pytest.raises(launch.LaunchRefused):
         publish(monkeypatch, fake)
     result = result_of(tmp_path)
-    assert not result["ok"] and "FOREIGN" in result["lock"] and "reviewed-seed-batch-batch-one-manual" in result["lock"]
+    assert not result["ok"] and "FOREIGN" in result["lock"] and "still running: reviewed-seed-batch-batch-one-manual" in result["lock"]
     assert not released(fake.calls)
+
+
+def test_a_foreign_execution_that_finished_before_publish_still_keeps_the_lock(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(foreign_at_release=[("reviewed-seed-batch-batch-one-manual", True)])
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    fake.log = "\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})])
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert not result["ok"] and "ran during the batch: reviewed-seed-batch-batch-one-manual (still running: none)" in result["lock"]
+    assert result["batch_lines"] == 1 and result["entries"][0]["receipt_sha256"] == "r" and result["decision"] is None
+    assert not released(fake.calls)
+
+
+def test_a_failed_listing_at_publish_keeps_the_lock_and_is_not_ok(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(list_fails_at_release=True)
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    fake.log = "\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})])
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert not result["ok"] and result["lock"].startswith("HELD: could not list") and not released(fake.calls)
+
+
+@pytest.mark.parametrize("armed_rows", [
+    [("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-manual", False)],
+    [("reviewed-seed-batch-batch-one-old", True), ("reviewed-seed-batch-batch-one-manual", True)]],
+    ids=["running", "finished"])
+def test_an_execution_that_appears_while_arming_refuses_execute_and_disarms(monkeypatch, tmp_path, armed_rows):
+    held(tmp_path)
+    fake = Gcloud(armed_rows=armed_rows)
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    with pytest.raises(launch.LaunchRefused, match="started while the job was being armed"):
+        launch.cmd_run(run_args())
+    assert not fake.executed and len(deploys(fake.calls)) == 2      # armed, then disarmed
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["execute_attempted"] is False and state["disarmed"] is True
 
 
 def test_an_input_refusal_never_claims_the_job_is_armed(monkeypatch, tmp_path):
