@@ -185,6 +185,23 @@ good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human
 may or may not have gone out. If the provider shows no checkout session for the purchase at all, nothing
 was set up, and the purchase can be resolved as above.
 
+**Who may run it.** Running `resolve-held --apply` in production is a gated one-off job: it runs only
+behind the one-off gate, and only with **Peng's go** for that purchase. A preview (no `--apply`) writes
+nothing, but it reads production too, so it follows the same gate.
+
+**What it resolves, and what it does not.** `resolve-held` ends ONLY a checkout hold: a purchase in
+`paying` with a token, held with one of the codes in `a2a_rail_worker._CHECKOUT_HOLD_CODES`, the code
+alone (exit 3 otherwise). It does not resolve, and an operator must not try to resolve by other means:
+- a VIC order hold (`vic_*` codes),
+- `money_result_seen` (an answer reported money moving where none should have),
+- a compound code (one carrying a schedule prefix, e.g. `paid_sent:...:...`, or `worker_error`).
+For those, **escalate** to an engineer with the purchase id and the code. Never edit the database by hand:
+the row's pending write and code are the only record of what may have happened at the provider.
+
+**What the buyer sees.** A resolution usually lands after the buyer's 30-minute payment link has expired.
+The buyer learns the outcome from a fresh read: the agent's `get_order` in the chat (the purchase body,
+`state` `failed` with `last_error_code` `operator_confirmed_not_charged`), never from the old link.
+
 ## Webhook events (`purchase.*`)
 
 Agents can be told about a purchase instead of polling. Events go through the existing agent
