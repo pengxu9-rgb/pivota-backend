@@ -155,6 +155,36 @@ unavailable rail). Neither names a reason, and neither opens anything.
   backfill again until it exits 0 (`missing_parents=0`).
 - Turn off: unset the dial. The table stays; nothing reads or writes it.
 
+### Held A2A checkouts (operator path)
+
+The A2A rail's checkout step HOLDS a purchase whenever it cannot prove what happened at the rail provider:
+a setup or confirm whose answer nobody saw (`checkout_setup_unresolved`, `checkout_confirm_unresolved`),
+a `paid` sent through the relay whose step was cut, a total it cannot verify, and the other codes in
+`a2a_rail_worker._CHECKOUT_HOLD_CODES`. A held purchase stays in `paying` (the agent sees `placing`) for
+good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human does:
+
+1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
+   its id, its hold code, whether a write is pending, whether a checkout task id is recorded.
+2. **Check the provider's side for that purchase** (its order lookup, its dashboard, its support). Look for
+   an order and for a charge on the purchase's token.
+3. Only if there is **no order and no charge**: preview, then apply. In production run it as a one-off job
+   (`scripts/ops/run_oneoff_job.sh`, behind the one-off gate):
+
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <the code from step 1>
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> \
+           --apply --operator <handle> --expect-env production --provider-checked
+
+   The purchase ends `failed` / `operator_confirmed_not_charged`. The write is a compare-and-swap on the
+   code you read and refuses a row a worker holds right now, so a row that moved since is not touched
+   (exit 3, with the reason).
+4. If the provider DID place the order (or charged the token), do **not** resolve it here: it is not a
+   failed purchase. Record the merchant's order number by hand with an engineer; there is no command for
+   that yet.
+
+`checkout.relay#paid` held as `checkout_setup_unresolved` after a cut step: the setup carrying the token
+may or may not have gone out. If the provider shows no checkout session for the purchase at all, nothing
+was set up, and the purchase can be resolved as above.
+
 ## Webhook events (`purchase.*`)
 
 Agents can be told about a purchase instead of polling. Events go through the existing agent

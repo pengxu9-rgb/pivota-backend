@@ -826,6 +826,77 @@ async def record_checkout_task_as_holder(
     return _purchase(await database.fetch_one(_RECORD_CHECKOUT_TASK_SQL_SQLITE, values))
 
 
+# ── the operator's resolution of a HELD checkout ─────────────────────────────────────────────
+#
+# A checkout the worker HELD (a code in a2a_rail_worker._CHECKOUT_HOLD_CODES) stays in `paying` for good:
+# no sweep ends `paying`, and the worker never resolves a hold by itself. A HUMAN who has checked the
+# provider's side (no order, no charge for this purchase) ends it here, through jobs/a2a_rail_operator.py.
+# Compare-and-swap on the hold code the human read, on an UNCLAIMED `paying` checkout row (it has a token
+# id): a row that moved since, or that a worker holds right now, is not touched. The terminal write NULLs
+# the contact, the page, the pending write and the claim, like every terminal write here.
+_OPERATOR_FAIL_HELD_CHECKOUT_SQL = """
+    UPDATE a2a_rail_purchases
+       SET state = 'failed',
+           last_error_code = :code,
+           pending_write = NULL,
+           pending_write_at = NULL,
+           buyer_action_kind = NULL,
+           buyer_action_url = NULL,
+           buyer_action_expires_at = NULL,
+           buyer_email = NULL,
+           shipping_address = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = clock_timestamp(),
+           state_entered_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'paying'
+       AND claimed_by IS NULL
+       AND payment_token_id IS NOT NULL
+       AND last_error_code = :expected_code
+    RETURNING *
+"""
+_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE = _OPERATOR_FAIL_HELD_CHECKOUT_SQL.replace(
+    "clock_timestamp()", "CURRENT_TIMESTAMP")
+#: The operator's list: `paying` checkout rows whose code looks like a checkout code (filtered to the hold
+#: set by the caller). Names its columns: no contact, no URL, no rail id beyond the purchase's own.
+_LIST_PAYING_CHECKOUTS_SQL = """
+    SELECT id, state, last_error_code, pending_write, claimed_by,
+           CASE WHEN checkout_task_id IS NULL THEN 0 ELSE 1 END AS has_task, state_entered_at, updated_at
+      FROM a2a_rail_purchases
+     WHERE state = 'paying'
+       AND payment_token_id IS NOT NULL
+       AND last_error_code LIKE 'checkout%'
+     ORDER BY updated_at, id
+     LIMIT :limit
+"""
+
+
+async def operator_fail_held_checkout(purchase_id: str, *, expected_code: str, code: str) -> Optional[Dict[str, Any]]:
+    """End a HELD checkout as `failed` with `code`. None when the row is not an unclaimed `paying` checkout
+    whose code is exactly `expected_code`. Callers: the operator job only (a2a_rail_worker's wrapper)."""
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "expected_code": _require(_CODE_RE, expected_code, "expected_code"),
+        "code": _require(_CODE_RE, code, "code"),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL, values))
+    return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE, values))
+
+
+async def list_paying_checkouts(*, limit: int = 50) -> List[Dict[str, Any]]:
+    rows = await database.fetch_all(_LIST_PAYING_CHECKOUTS_SQL, {"limit": _limit(limit, 500)})
+    out = []
+    for row in rows:
+        item = dict(row)
+        for column in ("state_entered_at", "updated_at"):
+            item[column] = _decode_dt(item.get(column))
+        out.append(item)
+    return out
+
+
 # ── the worker's claim pair ──────────────────────────────────────────────────────────────────
 #
 # House style (db/reap_agentic_ledger): an advisory SELECT of due candidates, then ONE conditional

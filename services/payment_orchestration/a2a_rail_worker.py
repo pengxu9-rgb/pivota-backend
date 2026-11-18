@@ -116,8 +116,11 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            (`checkout_confirm_error_card`), 409 (`checkout_confirm_conflict`), any other 4xx,
                            401 / 403 / 429 included (`checkout_confirm_ambiguous_4xx`), anything unseen, 408
                            included (`checkout_confirm_unresolved`): never resent.
-                        -> no task, no hold, no pending write (a later tick; unreachable: the pending-check
-                           hold and the confirm's write-ahead each prevent it): whether the confirm went out
+                        -> no task, no hold, no pending write (a later tick): not reached by the step itself
+                           (the pending-check hold and the confirm's write-ahead each prevent it, and a crash
+                           release keeps a hold the step wrote); seen only if something else cleared the
+                           hold (a crash release that could not re-read the row, a hand edit). Whether the
+                           confirm went out
                            cannot be proven, so HELD (`checkout_paying_without_task`), logged at ERROR, and
                            NOTHING is sent, not even a cancel. A staged checkout never confirmed lapses at
                            the provider (about 30 minutes). The cancel-instead-of-confirm exists only in the
@@ -139,6 +142,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                                        missing: a contradiction, HELD (`checkout_result_unrecognised`)
                              timeout / script-error        -> HELD (`checkout_unknown_*`): whether it was
                                        submitted is unknown; never retried
+  Every HELD checkout stays held until a human, having checked the provider's side, ends it with
+  jobs/a2a_rail_operator.py (`operator_fail_held_checkout`, `operator_confirmed_not_charged`); nothing in
+  the worker resolves a hold. docs/agent_purchases_routes.md, "Held A2A checkouts", is the procedure.
   Dial off: nothing is sent or read for a checkout; it parks (`checkout_step_disabled`), and an approved
   token ends as before (`pay_step_unavailable`): the worker takes exactly the pre-checkout path.
   Dial on, a row read without the checkout columns (migrations 287/288 not healed): parked
@@ -181,6 +187,7 @@ Nothing here logs the buyer's email or address, the member id, or a rail URL.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -1468,9 +1475,11 @@ CHECKOUT_SETUP_UNRESOLVED = "checkout_setup_unresolved"
 CHECKOUT_CONFIRM_PENDING_CHECK = "checkout_confirm_pending_check"
 #: The confirm could not be sent: our own token exchange failed twice in the step (nothing went out). Held.
 CHECKOUT_CONFIRM_NOT_SENT = "checkout_confirm_not_sent"
-#: A `paying` checkout found by a later tick with no task, no hold and no pending write. Unreachable by
-#: design (the pending-check hold and the confirm's write-ahead each prevent it), so if it is ever seen,
-#: whether a confirm went out cannot be proven. Held; NOTHING is sent (no confirm, no cancel).
+#: A `paying` checkout found by a later tick with no task, no hold and no pending write. The step itself never
+#: leaves one (the pending-check hold and the confirm's write-ahead each prevent it, and `run_tick`'s crash
+#: release re-reads the row and keeps a hold the step wrote); it is seen only if something else cleared the
+#: hold (a crash release that could not re-read the row, a hand edit). Whether a confirm went out cannot be
+#: proven then. Held; NOTHING is sent (no confirm, no cancel).
 CHECKOUT_PAYING_WITHOUT_TASK = "checkout_paying_without_task"
 #: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
 CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
@@ -1483,41 +1492,53 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
     CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
 })
-#: The confirm is sent again ONLY when nothing was sent: our own token exchange failed (`auth_failed`),
-#: retried once in the same step. Every provider answer that is not a task, a 401 and a 429 included, is
-#: held: the provider makes its own idempotency key per call (a2a_rail rule 4), and no dedupe of a resent
-#: confirm after a 401 / 429 has been measured.
-_CONFIRM_RESEND_4XX: frozenset = frozenset()
 #: The setup's answers that refused it before anything was set up: validation (400, 422), our credentials
 #: (401), throttling (429). A 403 and an error card are HELD, as on the confirm: a provider-side refusal
 #: after a check-out of its own would look the same.
 _SETUP_REFUSED_4XX = frozenset({400, 401, 422, 429})
-#: The confirm card scan's bounds: deeper or larger than this is refused (cancelled), never skipped.
+#: The confirm card scan's bounds: deeper or larger than this is refused (cancelled), never skipped. The
+#: card's data is depth 0; a leaf at depth 8 is read, at 9 refused. 2000 values are read, 2001 refused.
 _CARD_SCAN_MAX_DEPTH = 8
 _CARD_SCAN_MAX_NODES = 2000
-#: Key spellings (lower case, ASCII letters and digits only) that make a field MONEY-ISH: a bare number, or
-#: a numeric string with no currency mark, under such a key (at any depth below it) is an amount we cannot
-#: read, so the card is refused. Elsewhere a bare number (zip, phone, ids, cardLast4) is ignored. NOT
-#: `shipping` / `payment`: the documented confirm card echoes the shipping ADDRESS under `shipping`.
-_MONEY_KEY_PARTS = ("total", "amount", "price", "cost", "charge", "balance", "discount")
+#: A string longer than this that looks like JSON is not parsed: refused.
+_CARD_SCAN_MAX_JSON_CHARS = 20000
+#: Key spellings (NFKC, lower case, ASCII letters and digits only) that make a field MONEY-ISH: under such a
+#: key (at any depth below it) a bare number, a numeric string with no currency mark, or any amount we
+#: cannot read with certainty refuses the card.
+_MONEY_KEY_PARTS = ("total", "amount", "price", "cost", "charge", "balance", "discount", "vat", "duty", "money")
 _MONEY_KEY_SUFFIXES = ("due", "fee", "fees", "tax", "taxes")
-_MONEY_KEYS = frozenset({"sum"})
-#: A USD-marked amount inside any string ("$999.00", "US$ 1,234", "USD 23.5", "23.00 USD"); the amount is
-#: then read strictly (`_usd_minor`). "$" right after letters ("CA$") is another country's dollar.
-_USD_MARKED_RE = re.compile(
-    r"(?<![A-Za-z])(?:US\$|\$|USD)\s?(-?\s?[0-9][0-9,]*(?:\.[0-9]+)?)|(-?[0-9][0-9,]*(?:\.[0-9]+)?)\s?USD(?![A-Za-z])")
-_USD_AMOUNT_RE = re.compile(r"^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,9})(?:\.[0-9]{2})?\Z")
-#: Other countries' dollars ("CA$250", "250 A$") and three-letter codes next to a number.
-_FOREIGN_DOLLAR_RE = re.compile(r"(?<![A-Za-z])([A-Za-z]{1,3})\$\s?[0-9]|[0-9]\s?([A-Za-z]{1,3})\$")
-_CURRENCY_CODE_RE = re.compile(r"(?<![A-Za-z])([A-Z]{3})(?![A-Za-z])")
-#: A string that is only a number ("40.00", "1,234"): under a money-ish key it is an amount we cannot read.
-_NUMERIC_STRING_RE = re.compile(r"^\s*-?[0-9][0-9,]*(?:\.[0-9]+)?\s*\Z")
-#: ISO 4217 codes this scan treats as another currency when they stand next to a number.
-_FOREIGN_CODES = frozenset({
-    "EUR", "GBP", "CAD", "AUD", "NZD", "JPY", "CNY", "HKD", "SGD", "INR", "MXN", "CHF", "SEK", "NOK", "DKK",
-    "BRL", "KRW", "ZAR", "TWD", "THB", "MYR", "IDR", "PHP", "PLN", "CZK", "HUF", "ILS", "AED", "SAR", "TRY",
-    "RUB", "ARS", "CLP", "COP", "PEN", "VND",
+_MONEY_KEYS = frozenset({"sum", "shipping", "payment", "delivery", "postage", "handling"})
+#: Keys that name an ADDRESS, a CONTACT, a card's display fields or an id: a bare number under them (a zip, a
+#: phone, "1 Main St", cardLast4) is not money, even inside `shipping` or `payment`. A money-ish spelling
+#: wins over these (`cardTotal` is money); a currency-marked string is read under any key.
+_NON_MONEY_KEY_PARTS = (
+    "zip", "postal", "postcode", "phone", "address", "street", "city", "state", "country", "region",
+    "province", "email", "name", "line1", "line2", "apt", "suite", "last4", "brand", "card", "method",
+    "sku", "date", "time",
+)
+_NON_MONEY_KEY_SUFFIXES = ("id",)
+#: Keys whose integer value is a QUANTITY (for quantity x unit price).
+_QUANTITY_KEYS = frozenset({"qty", "quantity", "count", "units"})
+#: Zero-width and invisible characters removed before a string is read.
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad\u180e"), None)
+#: A run of digits with its separators, as written ("1,234.50", "999", "9.99"). Read strictly afterwards.
+_NUMBER_TOKEN_RE = re.compile(r"[0-9][0-9.,]*")
+_STRICT_AMOUNT_RE = re.compile(r"^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,9})(?:\.[0-9]{2})?\Z")
+#: Currency words and ISO codes (lower case). Next to a number, any of them but `usd` makes the amount one we
+#: do not read ("999 eur", "Rs. 999", "999.00 dollars": which dollar?).
+_CURRENCY_WORDS = frozenset({
+    "eur", "gbp", "cad", "aud", "nzd", "jpy", "cny", "hkd", "sgd", "inr", "mxn", "chf", "sek", "nok", "dkk",
+    "brl", "krw", "zar", "twd", "thb", "myr", "idr", "php", "pln", "czk", "huf", "ils", "aed", "sar", "try",
+    "rub", "ars", "clp", "cop", "pen", "vnd", "euro", "euros", "pound", "pounds", "yen", "yuan", "rupee",
+    "rupees", "rs", "peso", "pesos", "dollar", "dollars", "cent", "cents", "bucks", "usd",
 })
+_LEFT_WORD_RE = re.compile(r"([A-Za-z]+)[ .]{0,2}\Z")
+_RIGHT_WORD_RE = re.compile(r"^[ .]{0,2}([A-Za-z]+)")
+#: "$" (or "US$") right before the number, with at most one space between; letters before the "$" make it
+#: another country's dollar ("CA$", "A$").
+_LEFT_DOLLAR_RE = re.compile(r"(?:(?<![A-Za-z])|(?<=[Uu][Ss]))\$(\s*)\Z")
+_LEFT_FOREIGN_DOLLAR_RE = re.compile(r"([A-Za-z]{1,3})\$\s*\Z")
+_LEFT_NEGATIVE_RE = re.compile(r"(?:-|\()\s?(?:[Uu][Ss])?\$?\s*(?:[Uu][Ss][Dd]\s?)?\Z")
 #: The ONLY 4xx answers to a confirm that fail the purchase: validation refusals, which say the request
 #: was never accepted. Every other 4xx (409 conflict, 404, 410, 423, 425, ...) may mean "already
 #: confirmed or submitted": when we cannot tell whether an order exists, the rule is HOLD, because a
@@ -1717,94 +1738,184 @@ def _card_shaped(value: str) -> bool:
     return bool(_CARD_SHAPED_ORDER_RE.match(value)) and a2a_rail._luhn(value)
 
 
-class _CardTooLarge(Exception):
-    """The confirm card is deeper or larger than the scan reads: refused, never skipped."""
+class _CardRefused(Exception):
+    """The confirm card shows something we cannot verify against the ceiling: never confirmed."""
 
 
-def _money_key(key: str) -> bool:
-    canon = "".join(ch for ch in key.lower() if ch.isascii() and ch.isalnum())
-    return canon in _MONEY_KEYS or any(p in canon for p in _MONEY_KEY_PARTS) or canon.endswith(_MONEY_KEY_SUFFIXES)
+def _normalise(text: str) -> str:
+    """NFKC (full-width "$９９９" reads as "$999", a no-break space as a space) with invisible characters
+    removed, so what is read is what a person would read."""
+    return unicodedata.normalize("NFKC", text).translate(_INVISIBLE)
 
 
-def _usd_minor(text: str) -> Optional[int]:
-    """A USD amount's digits ("1,234.50", "999") in minor units, or None (negative or malformed)."""
-    amount = text.replace(" ", "")
-    if not _USD_AMOUNT_RE.match(amount):
-        return None
-    units, _, cents = amount.partition(".")
-    return int(units.replace(",", "")) * 100 + int(cents or 0)
+def _canon_key(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isascii() and ch.isalnum())
 
 
-def _foreign_amount(text: str) -> bool:
-    """`text` shows an amount in a currency other than USD."""
-    for index, char in enumerate(text):
-        if char != "$" and unicodedata.category(char) == "Sc":
-            near = text[max(0, index - 2):index] + text[index + 1:index + 3]
-            if any(c.isdigit() for c in near):
-                return True
-    for match in _FOREIGN_DOLLAR_RE.finditer(text):
-        if (match.group(1) or match.group(2) or "").upper() != "US":
-            return True
-    for match in _CURRENCY_CODE_RE.finditer(text):
-        if match.group(1) in _FOREIGN_CODES:
-            near = text[max(0, match.start() - 2):match.start()] + text[match.end():match.end() + 2]
-            if any(c.isdigit() for c in near):
-                return True
-    return False
-
-
-def _bad_money_string(text: str, ceiling: int, money: bool) -> bool:
-    """A string that shows an amount above `ceiling`, a malformed or negative USD amount, an amount in
-    another currency, or (under a money-ish key) a bare number we cannot read."""
-    marked = False
-    for match in _USD_MARKED_RE.finditer(text):
-        marked = True
-        minor = _usd_minor(match.group(1) or match.group(2) or "")
-        # A minus before the mark ("-$5.00") is a negative amount too: malformed for this check.
-        if minor is None or minor > ceiling or text[:match.start()].rstrip().endswith("-"):
-            return True
-    if _foreign_amount(text):
+def _child_money(name: str, parent_money: bool, sibling_currency: bool) -> bool:
+    """Whether the value under key `name` is money-ish. A money spelling wins; then an address / contact /
+    card-display / id spelling is NOT money (even under `shipping`); a key we cannot read as ASCII (a
+    lookalike letter) IS (fail closed); `value` next to a `currency` key is; otherwise inherited."""
+    canon = _canon_key(name)
+    if any(ch.isalpha() and not ch.isascii() for ch in name):
         return True
-    return money and not marked and bool(_NUMERIC_STRING_RE.match(text))
+    if (canon in _MONEY_KEYS or any(p in canon for p in _MONEY_KEY_PARTS)
+            or canon.endswith(_MONEY_KEY_SUFFIXES)):
+        return True
+    if any(p in canon for p in _NON_MONEY_KEY_PARTS) or canon.endswith(_NON_MONEY_KEY_SUFFIXES):
+        return False
+    if canon == "value" and sibling_currency:
+        return True
+    return parent_money
+
+
+def _string_amounts(raw: str, ceiling: int, money: bool) -> List[int]:
+    """The USD amounts a string shows, each read with certainty and at most `ceiling`; raises `_CardRefused`
+    for anything else that looks monetary: a number next to another currency (a symbol, another country's
+    dollar, a code or currency word in any case), a USD amount that is negative, malformed, in exponent form
+    or loosely spaced, a non-ASCII digit, or (under a money-ish key) any number with no USD mark."""
+    text = _normalise(raw)
+    if any(ch.isdigit() and not ch.isascii() for ch in text):
+        raise _CardRefused("non-ascii digit")
+    amounts: List[int] = []
+    for match in _NUMBER_TOKEN_RE.finditer(text):
+        token = match.group(0).rstrip(".,")
+        start, end = match.start(), match.start() + len(token)
+        left, right = text[:start], text[end:]
+        near = text[max(0, start - 3):start] + right[:3]
+        if any(ch != "$" and unicodedata.category(ch) == "Sc" for ch in near):
+            raise _CardRefused("another currency symbol")
+        foreign_dollar = _LEFT_FOREIGN_DOLLAR_RE.search(left)
+        if foreign_dollar and foreign_dollar.group(1).lower() != "us":
+            raise _CardRefused("another country's dollar")
+        words = [m.group(1).lower() for m in (_LEFT_WORD_RE.search(left), _RIGHT_WORD_RE.search(right)) if m]
+        if any(word in _CURRENCY_WORDS and word != "usd" for word in words):
+            raise _CardRefused("another currency word")
+        dollar = _LEFT_DOLLAR_RE.search(left)
+        marked = dollar is not None or "usd" in words
+        if not (marked or money):
+            continue  # a zip, a phone, an id, a street number: not money here
+        if not marked:
+            raise _CardRefused("a number under a money key with no USD mark")
+        if dollar is not None and len(dollar.group(1)) > 1:
+            raise _CardRefused("loosely spaced amount")
+        if right[:1] in ("e", "E") or not _STRICT_AMOUNT_RE.match(token) or _LEFT_NEGATIVE_RE.search(left):
+            raise _CardRefused("negative or malformed amount")
+        units, _, cents = token.partition(".")
+        minor = int(units.replace(",", "")) * 100 + int(cents or 0)
+        if minor > ceiling:
+            raise _CardRefused("an amount above the ceiling")
+        amounts.append(minor)
+    return amounts
+
+
+def _is_total_key(canon: str) -> bool:
+    return "total" in canon and "subtotal" not in canon
 
 
 def confirm_card_refused(data: Any, ceiling: Any) -> bool:
-    """True when the confirm card must NOT be confirmed: any monetary amount anywhere in its data (every
-    value and key at any depth, lists included, prose included) is above `ceiling`, malformed, negative, in
-    another currency, or a bare number under a money-ish key; or the card is larger than the scan reads
-    (deeper than _CARD_SCAN_MAX_DEPTH or more than _CARD_SCAN_MAX_NODES values); or there is no ceiling.
-    Non-monetary numbers (zip, phone, ids, cardLast4) are ignored. Pure."""
+    """True when the card must NOT be confirmed. Every key and value at any depth is read (lists, prose,
+    JSON inside a string), after NFKC and with invisible characters removed:
+
+      * any monetary token we cannot read with certainty refuses (`_string_amounts`), and so does a bare
+        number, a boolean or a non-USD-marked number under a money-ish key (`_child_money`);
+      * any single USD amount above the ceiling refuses;
+      * SUMS are checked too: the non-total amounts of one object (subtotal + shipping + tax + fees),
+        quantity x unit price, and the line items of a list, each at most the ceiling;
+      * a card deeper than _CARD_SCAN_MAX_DEPTH or with more than _CARD_SCAN_MAX_NODES values refuses, and
+        so does no positive ceiling.
+
+    Non-monetary numbers (a zip, a phone, an address, cardLast4, ids) are ignored. Pure."""
     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
         return True
     nodes = 0
 
-    def walk(value: Any, depth: int, money: bool) -> bool:
+    def scan_string(raw: str, depth: int, money: bool) -> List[int]:
+        text = _normalise(raw).strip()
+        if text[:1] in ("{", "[") and len(text) <= _CARD_SCAN_MAX_JSON_CHARS:
+            try:
+                parsed = json.loads(text)
+            except (ValueError, RecursionError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                walk(parsed, depth + 1, money)
+                return []
+        elif text[:1] in ("{", "["):
+            raise _CardRefused("JSON-looking string too large to read")
+        return _string_amounts(raw, ceiling, money)
+
+    def walk(value: Any, depth: int, money: bool) -> int:
+        """Scan `value`; return what it contributes to a sum one level up (minor units)."""
         nonlocal nodes
         nodes += 1
         if nodes > _CARD_SCAN_MAX_NODES or depth > _CARD_SCAN_MAX_DEPTH:
-            raise _CardTooLarge()
+            raise _CardRefused("card too large to scan")
         if isinstance(value, Mapping):
+            sibling_currency = any(_canon_key(str(k)) == "currency" for k in value)
+            totals: List[int] = []
+            components: List[int] = []
+            units: List[int] = []
+            quantity: Optional[int] = None
             for key, item in value.items():
-                name = str(key)
-                if _bad_money_string(name, ceiling, False):
-                    return True
-                if walk(item, depth + 1, money or _money_key(name)):
-                    return True
-            return False
+                name = _normalise(str(key))
+                _string_amounts(name, ceiling, False)  # an amount in a key name is read too
+                canon = _canon_key(name)
+                child_money = _child_money(name, money, sibling_currency)
+                if canon in _QUANTITY_KEYS and isinstance(item, int) and not isinstance(item, bool):
+                    quantity = item
+                    continue
+                if isinstance(item, str):
+                    found = scan_string(item, depth + 1, child_money)
+                    nodes += 1
+                    if nodes > _CARD_SCAN_MAX_NODES or depth + 1 > _CARD_SCAN_MAX_DEPTH:
+                        raise _CardRefused("card too large to scan")
+                    for amount in found:
+                        (totals if _is_total_key(canon) else components).append(amount)
+                        if "price" in canon:
+                            units.append(amount)
+                    continue
+                contribution = walk(item, depth + 1, child_money)
+                if contribution:
+                    (totals if _is_total_key(canon) else components).append(contribution)
+            if sum(components) > ceiling:
+                raise _CardRefused("components add up past the ceiling")
+            if quantity is not None and quantity > 0 and units and quantity * max(units) > ceiling:
+                raise _CardRefused("quantity x unit price past the ceiling")
+            if totals:
+                return max(totals)
+            if quantity is not None and quantity > 0 and units:
+                return quantity * max(units)
+            return sum(components)
         if isinstance(value, (list, tuple)):
-            return any(walk(item, depth + 1, money) for item in value)
+            line_items = 0
+            for item in value:
+                if isinstance(item, str):
+                    found = scan_string(item, depth + 1, money)
+                    nodes += 1
+                    if nodes > _CARD_SCAN_MAX_NODES or depth + 1 > _CARD_SCAN_MAX_DEPTH:
+                        raise _CardRefused("card too large to scan")
+                    line_items += sum(found)
+                else:
+                    line_items += walk(item, depth + 1, money)
+            if line_items > ceiling:
+                raise _CardRefused("line items add up past the ceiling")
+            return line_items
         if isinstance(value, str):
-            return _bad_money_string(value, ceiling, money)
-        if isinstance(value, bool) or value is None:
-            return False
-        if isinstance(value, (int, float)):
-            return money  # a bare number under a money-ish key: cents or dollars? Not readable.
-        return False
+            return sum(scan_string(value, depth, money))
+        if value is None:
+            return 0
+        if isinstance(value, (bool, int, float)) and money:
+            raise _CardRefused("a bare number or boolean under a money key: units unknown")
+        return 0
 
     try:
-        return walk(data, 0, False)
-    except (_CardTooLarge, RecursionError):
+        if isinstance(data, Mapping):
+            walk(data, 0, False)
+        else:
+            walk({"card": data}, 0, False)
+    except (_CardRefused, RecursionError):
         return True
+    return False
 
 
 def _lock_valid(row: Mapping[str, Any]) -> bool:
@@ -1829,9 +1940,10 @@ async def _hold_before_paying(s: _Step, resolves: Optional[str], code: str) -> s
 
 async def _checkout_hold(s: _Step, code: str) -> str:
     """Hold a checkout for a human: logged once, and on every later tick parked unread. Any pending write
-    stays (a confirm whose answer nobody saw is never resent)."""
+    stays (a confirm whose answer nobody saw is never resent). The code is written BARE: an approval
+    schedule's `paid_sent:` prefix belongs to `awaiting_authorization`, not to a held checkout."""
     logger.error("a2a_rail_worker: checkout held for a human purchase=%s code=%s", s.id, code)
-    await s.release(POLL_PARKED, code)
+    await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED), last_error_code=code)
     return code
 
 
@@ -1877,7 +1989,7 @@ async def _setup_answer(s: _Step, resolves: Optional[str], setup: Any) -> str:
         if moved is not None and moved.get("claimed_by") == s.worker:
             # Still held (a live state keeps the lease): checked and confirmed now, with this step's card.
             s.row = moved
-            return await _checkout_confirm(s, confirm)
+            return await _checkout_confirm(s, setup)
         return await _settled(s, moved, CHECKOUT_CONFIRM_PENDING_CHECK)
     if setup.ok and (setup.card("checkout.await") is not None or setup.card("checkout.result") is not None):
         # A submission answering the setup (an idempotency replay, or a provider that checks out on its own):
@@ -1918,13 +2030,23 @@ async def _cancel_checkout(s: _Step, fail_code: str) -> str:
     return await _checkout_hold(s, CHECKOUT_CANCEL_UNRESOLVED)
 
 
-async def _checkout_confirm(s: _Step, confirm_card: Any) -> str:
-    """Submit the merchant's checkout, IN THE SETUP'S OWN STEP, after checking THIS step's confirm card. A
-    MONEY WRITE: recorded first, never resent on an answer from the provider."""
-    if confirm_card_refused(confirm_card.data, s.row.get("quoted_total_minor")):
-        # An amount on the confirm card we cannot verify against the ceiling (above it, malformed, foreign, a
-        # bare number under a money key; or a card too large to read): never confirmed. Cancelled instead;
-        # nothing has been submitted yet.
+def setup_answer_refused(setup: Any, ceiling: Any) -> bool:
+    """True when the setup's answer must not be confirmed: ANY of its cards (the confirm card and every
+    sibling, e.g. a summary card) shows an amount `confirm_card_refused` cannot verify against `ceiling`,
+    or the relay stripped a credential from it (a value it scrubbed is unknown: the card echoed the token)."""
+    if int(getattr(setup, "credential_fields_stripped", 0) or 0) > 0:
+        return True
+    cards = list(getattr(setup, "cards", None) or [])
+    return not cards or any(confirm_card_refused(card.data, ceiling) for card in cards)
+
+
+async def _checkout_confirm(s: _Step, setup: Any) -> str:
+    """Submit the merchant's checkout, IN THE SETUP'S OWN STEP, after checking THIS step's setup answer (every
+    card in it). A MONEY WRITE: recorded first, never resent on an answer from the provider."""
+    if setup_answer_refused(setup, s.row.get("quoted_total_minor")):
+        # An amount on a card of the setup's answer we cannot verify against the ceiling (above it, malformed,
+        # foreign, a bare number under a money key, parts adding up past it; a card too large to read; a
+        # value the relay scrubbed): never confirmed. Cancelled instead; nothing has been submitted yet.
         logger.error("a2a_rail_worker: confirm card amount not within the ceiling purchase=%s; cancelling", s.id)
         return await _cancel_checkout(s, CHECKOUT_CONFIRM_TOTAL_REFUSED)
     # NO MONETARY AMOUNT on the card (the provider's documented confirm card has none: merchant, shipping,
@@ -1973,8 +2095,9 @@ async def _confirm_answer(s: _Step, result: Any) -> str:
         await s.release(POLL_CHECKOUT, CHECKOUT_PLACING)
         return "placing"
     # ONLY ONE ANSWER SAYS "NOT SUBMITTED": a validation 4xx (400, 422). Everything else that is not a task
-    # is held, a 401 and a 429 included (`_CONFIRM_RESEND_4XX` is empty: the provider makes its own
-    # idempotency key per call, and no dedupe of a resent confirm is measured). Text only is held: prose is
+    # is held, a 401 and a 429 included (the provider makes its own idempotency key per call, and no dedupe
+    # of a resent confirm is measured; only our own token exchange failing, nothing sent, is retried, in
+    # `_checkout_confirm`). Text only is held: prose is
     # not a shape to trust (a2a_rail rule 3), and "your order has been placed" is prose too.
     kind, status = result.kind, getattr(result, "http_status", None)
     if kind == "unexpected_text":
@@ -2036,8 +2159,9 @@ async def _checkout_paying(s: _Step) -> str:
     elapsed = (_now() - entered).total_seconds() if entered else 0.0
     task_id = row.get("checkout_task_id")
     if not task_id:
-        # No task, no hold, no pending write: unreachable by design. Whether a confirm went out cannot be
-        # proven here, and a cancel's answer is too weak to end the purchase on: HELD, nothing sent.
+        # No task, no hold, no pending write: never left by the step itself (see CHECKOUT_PAYING_WITHOUT_TASK),
+        # so something else cleared the hold. Whether a confirm went out cannot be proven here, and a cancel's
+        # answer is too weak to end the purchase on: HELD, nothing sent.
         logger.error("a2a_rail_worker: checkout in paying with no task, hold or pending write purchase=%s", s.id)
         return await _checkout_hold(s, CHECKOUT_PAYING_WITHOUT_TASK)
     if elapsed > CHECKOUT_CEILING_SECONDS:
@@ -2118,6 +2242,41 @@ async def _checkout_result(s: _Step, card: Any) -> str:
     if status in _CHECKOUT_UNKNOWN:
         return await _checkout_hold(s, _CHECKOUT_UNKNOWN[status])
     return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+
+
+# ── the operator's resolution of a held checkout (never automatic) ───────────────────────────
+
+#: Written when a human, having checked the provider's side, confirms a HELD checkout placed no order and
+#: charged nothing. Only `operator_fail_held_checkout` writes it; nothing in the worker calls that.
+CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED = "operator_confirmed_not_charged"
+_OPERATOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}\Z")
+
+
+def held_checkout_codes() -> frozenset:
+    """The codes a checkout is held with (what the operator may resolve)."""
+    return _CHECKOUT_HOLD_CODES
+
+
+async def operator_fail_held_checkout(purchase_id: str, *, expected_code: str, operator: str) -> Dict[str, Any]:
+    """A HUMAN's decision, after checking the provider's side for this purchase (no order, no charge): end the
+    held checkout as `failed` / `operator_confirmed_not_charged`. NEVER called by the worker or any job on a
+    schedule: only jobs/a2a_rail_operator.py `resolve-held --apply`. Refused (nothing written) unless the row
+    is an unclaimed `paying` checkout held with exactly `expected_code`, a checkout hold code. Returns
+    {"outcome": "resolved" | "refused", "reason": ...}."""
+    if expected_code not in _CHECKOUT_HOLD_CODES:
+        return {"outcome": "refused", "reason": "not_a_checkout_hold_code"}
+    if not _OPERATOR_RE.match(str(operator or "")):
+        return {"outcome": "refused", "reason": "operator_handle_invalid"}
+    try:
+        moved = await ledger.operator_fail_held_checkout(
+            purchase_id, expected_code=expected_code, code=CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED)
+    except ValueError:
+        return {"outcome": "refused", "reason": "purchase_id_invalid"}
+    if moved is None:
+        return {"outcome": "refused", "reason": "row_not_held_with_that_code_or_claimed"}
+    logger.warning("a2a_rail_worker: operator resolved held checkout purchase=%s from=%s operator=%s",
+                   purchase_id, expected_code, operator)
+    return {"outcome": "resolved", "reason": CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED, "state": moved.get("state")}
 
 
 #: The park reason when the token step is refused because this is production (not just dialled off).
@@ -2360,7 +2519,13 @@ async def run_tick(
                     # A STICKY marker (money seen, token ACTIVE) is never overwritten: losing it would
                     # un-park a purchase that must stay parked. Kept as it is (no code: COALESCE).
                     prefix = _schedule_prefix(row)
-                    if _sticky(row):
+                    # Re-read: a hold the step itself wrote before it crashed (the pending-check hold of a
+                    # move to `paying`) is sticky too, though the row as CLAIMED did not carry it yet.
+                    try:
+                        current = await ledger.get_purchase_internal(str(row["id"]))
+                    except Exception:  # noqa: BLE001 - fall back to the row as claimed
+                        current = None
+                    if _sticky(row) or (current is not None and _sticky(current)):
                         crash_code = None
                     else:
                         crash_code = f"{prefix}:worker_error" if prefix else "worker_error"
