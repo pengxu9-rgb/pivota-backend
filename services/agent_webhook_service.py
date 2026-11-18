@@ -1155,7 +1155,7 @@ async def list_deliveries(
     )
     deliveries = []
     for row in rows:
-        payload = _coerce_json(row["payload"], {})
+        payload = await _purchase_consent_gated(str(row["event_type"]), agent_id, _coerce_json(row["payload"], {}))
         headers = _coerce_json(row["request_headers"], {})
         created_at = _coerce_datetime(row["created_at"])
         delivered_at = _coerce_datetime(row["delivered_at"])
@@ -1185,6 +1185,20 @@ async def list_deliveries(
     }
 
 
+async def _purchase_consent_gated(event_type: str, agent_id: str, envelope: Any) -> Any:
+    """A `purchase.*` delivery stored before the AgenPas consent gate went on holds the rail's hosted URL in
+    `data`. Re-sent (the retry loop, a manual retry) or listed, it goes through the gate first, decided by
+    THIS process at THIS moment (services/payment_orchestration/purchase_consent.gate_stored_payload). Gate
+    off, or any other event type: the envelope itself. The stored row is not rewritten here (a retry records
+    what it actually sent, as every attempt does)."""
+    if not event_type.startswith("purchase.") or not isinstance(envelope, dict) or not isinstance(envelope.get("data"), dict):
+        return envelope
+    from services.payment_orchestration import purchase_consent
+
+    data = await purchase_consent.gate_stored_payload(envelope["data"], agent_id=agent_id)
+    return envelope if data is envelope["data"] else {**envelope, "data": data}
+
+
 async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
     await ensure_agent_webhook_tables()
     row = await database.fetch_one(
@@ -1210,7 +1224,7 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
     if not destination_url or not signing_secret:
         raise ValueError("Webhook destination is not configured.")
 
-    payload = _coerce_json(row["payload"], {})
+    payload = await _purchase_consent_gated(str(row["event_type"]), agent_id, _coerce_json(row["payload"], {}))
     created_at = _coerce_datetime(row["created_at"]) or _utcnow()
     request_id = row["request_id"]
     return await _attempt_delivery(

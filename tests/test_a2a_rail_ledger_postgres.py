@@ -331,6 +331,32 @@ async def test_the_new_statements_run_with_real_parameters_on_postgres():
     assert (await ledger.get_purchase_internal(other))["state"] == "expired"
 
 
+async def test_entering_quoting_with_a_token_is_refused_and_entry_clears_the_quote_with_typed_nulls_on_postgres():
+    """The quoting branch's CASEs bind typed NULLs on Postgres (the re-quote edge used to drive this; the edge
+    is closed, `needs_payment_method -> quoting` still takes the branch)."""
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    row = await ledger.create_purchase(
+        agent_id=AGENT, agent_user_ref_hash="r" * 64, merchant_domain="brand.example",
+        checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=4650,
+        buyer_email="ada@example.test")
+    [claimed] = await ledger.claim_due_purchases("w1")
+    assert claimed["id"] == row["id"]
+    await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="needs_payment_method",
+                                      buyer_action_kind="card_binding", buyer_action_url=PAGE)
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_1', quote_id = 'q_1', order_id = 'o_1', "
+        "quoted_total_minor = 4650, shipping_minor = 100, tax_minor = 50 WHERE id = :i", {"i": row["id"]})
+    assert await ledger.transition_as_holder(row["id"], "w1", from_states=["needs_payment_method"],
+                                             to_state="quoting") is None
+    await database.execute("UPDATE a2a_rail_purchases SET payment_token_id = NULL WHERE id = :i", {"i": row["id"]})
+    moved = await ledger.transition_as_holder(row["id"], "w1", from_states=["needs_payment_method"], to_state="quoting")
+    assert moved["state"] == "quoting"
+    for column in ("quote_id", "order_id", "payment_token_id", "quoted_total_minor", "shipping_minor", "tax_minor"):
+        assert moved[column] is None, column
+
+
 async def _rail_check_state():
     from db.database import database
 

@@ -647,3 +647,22 @@ async def test_the_route_reads_an_ap_id_and_heals_its_parent(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
         app.dependency_overrides.pop(get_agent_user_context, None)
+
+
+async def test_entering_quoting_with_a_token_recorded_is_refused_and_entry_clears_the_old_quote():
+    """The transition's quoting branch, now that no re-quote edge drives it: entering `quoting` is refused
+    while a payment token is recorded (an abandoned authorization must be voided first, which needs its id),
+    and entry replaces the quote, order and token fields rather than keeping stale ones."""
+    pid = await _in_state("needs_payment_method", buyer_action_kind="card_binding", buyer_action_url=PAGE)
+    await _claimed({"id": pid})
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_1', quote_id = 'q_1', order_id = 'o_1', "
+        "quoted_total_minor = 4650, shipping_minor = 100, tax_minor = 50 WHERE id = :i", {"i": pid})
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["needs_payment_method"], to_state="quoting") is None
+    assert (await ledger.get_purchase_internal(pid))["state"] == "needs_payment_method"
+    await database.execute("UPDATE a2a_rail_purchases SET payment_token_id = NULL WHERE id = :i", {"i": pid})
+    moved = await ledger.transition_as_holder(pid, "w1", from_states=["needs_payment_method"], to_state="quoting")
+    assert moved["state"] == "quoting"
+    for column in ("quote_id", "order_id", "payment_token_id", "quoted_total_minor", "shipping_minor", "tax_minor",
+                   "buyer_action_url"):
+        assert moved[column] is None, column

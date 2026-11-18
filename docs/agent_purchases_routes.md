@@ -164,11 +164,23 @@ approve) and while none is recorded for (rail, rail purchase, step, approval epo
 the rail's hosted URL**: this door's read and list, the Reap rail's own routes (GET, list, create, resume,
 recover), the `purchase.*` webhook payloads, and the internal AgenPas read. The rail's `detail` drops
 `hosted_url`, keeps its deadline (`hosted_url_expires_at`, `approval_deadline`) and adds
-`buyer_step = {"kind", "expires_at", "consent_required": true}`; `next_action` becomes
+`buyer_step = {"kind", "expires_at", "consent_required": true, "available"}`; `next_action` becomes
 `{"kind", "expires_at", "consent_required": true}`. `purchase.action_required` still fires, with that
 body. Once the consent is recorded, every surface answers today's body (URL included). The A2A rail's 3DS
 page (`authenticate`, while `placing`) is never gated. A consent table that cannot be read withholds
 every page (fail closed). List pages read the consents once per page.
+
+`buyer_step.available` follows the same rule as the internal read's `consent.available`: true only when the
+consent POST could succeed now (configuration and offer secret set, the write registered, its dial on and its
+key valid, the consent table readable) and the step is not blocked by Reap's contact re-entry. In
+`purchase.*` payloads it is decided by the process that sends them (the worker, which registers no routes:
+there, "registered" is read from `AGENPAS_CONSENT_WRITE_ENABLED`).
+
+**The offer** binds the agent id, the rail, the rail purchase id, the step, the approval epoch, both versions,
+both URLs and `issued_at` (length-prefixed). **Rotating `AGENPAS_CONSENT_OFFER_SECRET`**: set the old value
+as `AGENPAS_CONSENT_OFFER_SECRET_PREVIOUS` for at least 30 minutes (the offer's lifetime). An offer minted
+under it answers 409 `consent_stale` (the page re-reads and shows a fresh offer), not 400. Without it, offers
+in flight answer 400 `consent_refused`. The previous secret verifies only; nothing is minted with it.
 
 The approval consent may be given while the rail is still pricing (`locking`) or on the approval page,
 and binds to that purchase's single approval (`approval_epoch` 1 on both rails: a Reap re-quote fails the
@@ -179,26 +191,32 @@ Configuration (all on the backend; none is read by the browser):
 
 | Env | |
 |---|---|
-| `AGENPAS_CONSENT_GATE` | the gate, default off |
+| `AGENPAS_CONSENT_GATE` | the gate, default off. **Set it on BOTH the `web` and the `worker` service** (the worker builds and sends the `purchase.*` webhooks); each logs its state once at boot (WARNING `purchase_consent: service=… AGENPAS_CONSENT_GATE=on|off …`) |
 | `AGENPAS_CONSENT_WRITE_ENABLED` | the write route, default off, read at startup |
 | `AGENPAS_INTERNAL_CONSENT_KEY` | the write's key, >= 32 characters, not the read key |
 | `AGENPAS_TERMS_URL`, `AGENPAS_TERMS_VERSION` | Pivota's buyer terms of service: https URL, version tag (printable ASCII, <= 32) |
 | `AGENPAS_PRIVACY_URL`, `AGENPAS_PRIVACY_VERSION` | Pivota's buyer privacy policy: the same shapes |
-| `AGENPAS_CONSENT_OFFER_SECRET` | the offer HMAC key, >= 32 characters, backend only |
+| `AGENPAS_CONSENT_OFFER_SECRET` | the offer HMAC key, >= 32 characters, backend only, and neither the read key nor the consent key (else: unconfigured, `available` false) |
+| `AGENPAS_CONSENT_OFFER_SECRET_PREVIOUS` | optional: the secret before the last rotation, verification only (same rules) |
 | `AGENPAS_CONSENT_MIN_DWELL_SECONDS` | a whole number 0..120, default 3 (anything else: 3); stated to the page as `consent.min_dwell_seconds` |
 
 **Turn on, in this order**: the gateway's consent UI and rails first (`AGENPAS_CONSENT_ENABLED`,
 `AGENPAS_RAILS`), then the backend configuration above and `AGENPAS_CONSENT_WRITE_ENABLED` (a restart),
-then `AGENPAS_CONSENT_GATE`. **Events recorded before the gate went on** still hold the hosted URL in their
-stored payload: the hand-over re-applies the gate (the payload is sent without the URL, and with
-`next_action.consent_required`, while no consent exists for that step), so a pending
-`purchase.action_required` backlog never carries a card or approval URL past the gate. The stored rows are
-not rewritten. Gate on before the rest: every card / approval page is withheld and the
+then `AGENPAS_CONSENT_GATE` on the **worker FIRST, then on `web`** (worker on and web off leaks nothing new;
+web on and worker off sends every card and approval URL to agents in webhooks). Check both boot lines.
+**Deliveries made before the gate went on** still hold the hosted URL in their stored payload (the
+`purchase.*` event row and the agent webhook delivery row): every send re-applies the gate in the process
+that sends, at send time: the first hand-over, the retry loop, and a manual retry, and the deliveries list
+(the agent webhook deliveries list, `routes/agent_webhooks.py`) shows them gated too. While no consent exists for
+the step, the payload goes out without the URL and with `next_action.consent_required`, so a pending
+`purchase.action_required` backlog never carries a card or approval URL past the gate. The event rows are not
+rewritten (a delivery row records what each attempt actually sent). Gate on before the rest: every card / approval page is withheld and the
 AgenPas page says "not available right now". **Precondition for scripts/ops/reap_local_e2e.py and the
 Reap staging preflight**: the gate is off (they open the hosted page directly), or the run records the
 consent step first.
 
-**Turn off**: unset `AGENPAS_CONSENT_GATE`; bodies are today's again at once. The records stay
+**Turn off**: unset `AGENPAS_CONSENT_GATE` on **`web` first, then the worker**; bodies are today's again at
+once. The records stay
 (insert-only: nothing updates or deletes them, no PII scrub touches them).
 
 ## `GET /agent/v2/commerce/purchases?limit=N`

@@ -243,3 +243,20 @@ async def test_scrubs_and_sweeps_leave_the_consents(_db):
 
 def test_this_module_does_not_import_main():
     assert "main" not in sys.modules
+
+
+async def test_a_failed_consent_read_inside_a_transaction_does_not_abort_it(_db, monkeypatch):
+    """The Reap create's idempotent-race branch builds the winner's view inside a transaction; with the gate on
+    and table 289 missing, the consent read fails. It must fail CLOSED (FAILED: no hosted URL) in a savepoint,
+    so the caller's transaction is still usable (else the commit fails and the create answers 503)."""
+    from services.payment_orchestration import purchase_consent
+
+    monkeypatch.setenv(purchase_consent.GATE_ENV, "1")
+    await _db.execute("ALTER TABLE agent_purchase_consents RENAME TO agent_purchase_consents_hidden_289")
+    try:
+        async with _db.transaction():
+            got = await purchase_consent.snapshot(AGENT, [("reap", "rp_" + "a" * 24)])
+            assert got is purchase_consent.FAILED
+            assert (await _db.fetch_one("SELECT 1 AS ok"))["ok"] == 1  # the transaction is not aborted
+    finally:
+        await _db.execute("ALTER TABLE agent_purchase_consents_hidden_289 RENAME TO agent_purchase_consents")

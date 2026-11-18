@@ -45,7 +45,8 @@ THE WRITE is a SECOND router with its OWN key and its OWN dial, so the read key 
   BODY   exactly `{step, offer_id, issued_at, terms_version, privacy_version}` (strings, <= 1 KiB): the offer
          the GET showed (not exactly that shape: 400 consent_refused). Accepted only when the versions are
          the configured ones (else 409 consent_stale), the purchase is not final and is in that step (else
-         409 consent_stale), the offer's HMAC verifies (else 400 consent_refused) and it is at least AGENPAS_CONSENT_MIN_DWELL_SECONDS old (else
+         409 consent_stale), the offer's HMAC (which binds the agent id too) verifies (else 400
+         consent_refused; 409 consent_stale when it verifies only under the previous secret) and it is at least AGENPAS_CONSENT_MIN_DWELL_SECONDS old (else
          409 consent_too_soon) and at most 1800 s (else 409 consent_stale). Configuration or offer secret
          missing: 503 consent_unavailable. Any refusal writes nothing. A repeat is the same one row
          (201 when this call wrote it, 200 when it already existed). Calls no rail.
@@ -122,15 +123,16 @@ def mount(app: Any) -> bool:
     """Register the read on `app` only while its dial is on, and the consent write only while ITS dial is
     on (both read now, at build). Returns whether anything was registered. Both dials off: nothing is, so
     the app is exactly what it was without this module."""
-    global _CONSENT_WRITE_MOUNTED
     mounted = False
     if is_enabled():
         app.include_router(router)
         mounted = True
-    if purchase_consent.write_enabled():
+    write = purchase_consent.write_enabled()
+    if write:
         app.include_router(consent_router)
-        _CONSENT_WRITE_MOUNTED = True
         mounted = True
+    # Recorded either way: `available` is false in this process while the write is not registered here.
+    purchase_consent.record_write_mount(write)
     return mounted
 
 
@@ -189,7 +191,7 @@ async def get_purchase_for_gateway(
             if error is None:
                 block = purchase_consent.consent_block(
                     rail=str(parent["rail"]), rail_purchase_id=str(parent["rail_purchase_id"]),
-                    unified=str(body.get("state") or ""), consents=consents, write_ready=consent_write_ready(),
+                    unified=str(body.get("state") or ""), consents=consents, agent_id=agent_id,
                     # Reap asks the agent for the buyer's contact again first: no consent until it is back.
                     blocked=(body.get("detail") or {}).get("contact_reentry_required") is True)
                 if block is not None:
@@ -203,8 +205,8 @@ async def get_purchase_for_gateway(
 # ── the consent write ────────────────────────────────────────────────────────────────────────
 
 #: The write's own key. Never the read key, never the introspect key.
-CONSENT_KEY_ENV = "AGENPAS_INTERNAL_CONSENT_KEY"
-INTERNAL_CONSENT_KEY_MIN_LENGTH = 32
+CONSENT_KEY_ENV = purchase_consent.CONSENT_KEY_ENV
+INTERNAL_CONSENT_KEY_MIN_LENGTH = purchase_consent.CONSENT_KEY_MIN_LENGTH
 _CONSENT_BODY_KEYS = frozenset({"step", "offer_id", "issued_at", "terms_version", "privacy_version"})
 _CONSENT_BODY_MAX_BYTES = 1024
 _OFFER_ID_RE = re.compile(r"^[0-9a-f]{64}\Z")
@@ -218,28 +220,14 @@ def _write_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 
-def _configured_consent_key() -> Optional[str]:
-    """The write's key, or None when it is missing, shorter than 32 characters, or the read key itself."""
-    expected = str(os.getenv(CONSENT_KEY_ENV) or "").strip()
-    read_key = str(os.getenv(INTERNAL_KEY_ENV) or "").strip()
-    if len(expected) < INTERNAL_CONSENT_KEY_MIN_LENGTH or (read_key and hmac.compare_digest(
-            expected.encode("utf-8"), read_key.encode("utf-8"))):
-        return None
-    return expected
-
-
-#: Set by `mount` when the consent write is registered on the app (at build).
-_CONSENT_WRITE_MOUNTED = False
-
-
 def consent_write_ready() -> bool:
-    """Whether a consent POST could succeed now: the route is registered, its dial is on, its key is valid.
-    The read offers a consent only then (`consent.available`)."""
-    return _CONSENT_WRITE_MOUNTED and purchase_consent.write_enabled() and _configured_consent_key() is not None
+    """Whether a consent POST could succeed now (services/payment_orchestration/purchase_consent.write_ready):
+    registered here (`mount` records it), its dial on, its key valid. Offers are made only then."""
+    return purchase_consent.write_ready()
 
 
 def _require_consent_key(x_internal_key: Optional[str] = Header(None, alias="X-Internal-Key")) -> None:
-    expected = _configured_consent_key()
+    expected = purchase_consent.configured_consent_key()
     if expected is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail={"error": "internal_key_not_configured"})
@@ -348,8 +336,13 @@ async def record_purchase_consent(
     if rail == "reap" and row.get("state") in _REAP_CONTACT_REENTRY_STATES and continuation.contact_required(row):
         return _refusal(409, "consent_stale")
     epoch = purchase_consent.approval_epoch(rail, step)
-    if not purchase_consent.offer_matches(cfg, body["offer_id"], rail=rail, rail_purchase_id=rail_id, step=step,
-                                          epoch=epoch, issued_at=body["issued_at"]):
+    fields = dict(agent_id=agent_id, rail=rail, rail_purchase_id=rail_id, step=step, epoch=epoch,
+                  issued_at=body["issued_at"])
+    if not purchase_consent.offer_matches(cfg, body["offer_id"], **fields):
+        # Minted under the secret before the last rotation: well-formed and ours, just old. The page re-reads.
+        previous = purchase_consent.previous_config(cfg)
+        if previous is not None and purchase_consent.offer_matches(previous, body["offer_id"], **fields):
+            return _refusal(409, "consent_stale")
         return _refusal(400, "consent_refused")
     issued = purchase_consent.parse_issued_at(body["issued_at"])
     age = (datetime.now(timezone.utc) - issued).total_seconds()

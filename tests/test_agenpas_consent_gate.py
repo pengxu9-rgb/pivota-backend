@@ -106,8 +106,8 @@ def _mounted(request):
     app.include_router(internal_routes.router)
     # The consent write as an app built with ITS dial on registers it; its own dial still answers per request.
     app.include_router(internal_routes.consent_router)
-    was_mounted = internal_routes._CONSENT_WRITE_MOUNTED
-    internal_routes._CONSENT_WRITE_MOUNTED = True  # what `mount` records when it includes the write
+    was_mounted = purchase_consent._WRITE_MOUNTED
+    purchase_consent.record_write_mount(True)  # what `mount` records when it includes the write
     added = [r for r in app.router.routes if r not in before]
     app.router.routes[:] = added + before
     app.openapi_schema = None
@@ -115,7 +115,7 @@ def _mounted(request):
         yield
     finally:
         app.router.routes[:] = before
-        internal_routes._CONSENT_WRITE_MOUNTED = was_mounted
+        purchase_consent._WRITE_MOUNTED = was_mounted
         app.openapi_schema = None
 
 
@@ -437,7 +437,7 @@ async def test_gate_on_and_unconsented_no_card_or_approval_url_appears_on_any_su
         golden_door = _body(golden[f"door:{name}"])
         assert door["next_action"] == {"kind": step, "expires_at": golden_door["next_action"]["expires_at"],
                                        "consent_required": True}
-        assert door["detail"]["buyer_step"] == door["next_action"]
+        assert door["detail"]["buyer_step"] == {**door["next_action"], "available": True}
         assert "hosted_url" not in door["detail"]
         # the deadline stays
         assert door["detail"]["hosted_url_expires_at"] == golden_door["detail"]["hosted_url_expires_at"]
@@ -594,13 +594,14 @@ async def test_with_the_gate_off_nothing_reads_the_consent_table(monkeypatch):
 # ── the consent write ────────────────────────────────────────────────────────────────────────
 
 
-def _offer(rail_id: str, step: str, *, age: float = 10, epoch: Optional[int] = None) -> Dict[str, str]:
+def _offer(rail_id: str, step: str, *, age: float = 10, epoch: Optional[int] = None, agent: str = AGENT,
+           cfg: Any = None) -> Dict[str, str]:
     rail = "reap" if rail_id.startswith("rp_") else "a2a"
     issued = purchase_consent.issued_at_text(datetime.now(timezone.utc) - timedelta(seconds=age))
-    cfg = purchase_consent.config()
+    cfg = cfg or purchase_consent.config()
     return {
         "step": step,
-        "offer_id": purchase_consent.offer_id(cfg, rail=rail, rail_purchase_id=rail_id, step=step,
+        "offer_id": purchase_consent.offer_id(cfg, agent_id=agent, rail=rail, rail_purchase_id=rail_id, step=step,
                                               epoch=purchase_consent.approval_epoch(rail, step) if epoch is None else epoch,
                                               issued_at=issued),
         "issued_at": issued, "terms_version": TERMS_V, "privacy_version": PRIVACY_V,
@@ -878,9 +879,11 @@ def test_the_checks_are_the_python_vocabularies():
 
 def test_the_offer_hmac_binds_every_field():
     cfg = purchase_consent.ConsentConfig(TERMS_URL, TERMS_V, PRIVACY_URL, PRIVACY_V, SECRET.encode())
-    base = dict(rail="reap", rail_purchase_id="rp_" + "1" * 24, step="approval", epoch=1, issued_at="2026-11-18T00:00:00Z")
+    base = dict(agent_id=AGENT, rail="reap", rail_purchase_id="rp_" + "1" * 24, step="approval", epoch=1,
+                issued_at="2026-11-18T00:00:00Z")
     first = purchase_consent.offer_id(cfg, **base)
-    variants = [dict(base, rail="a2a"), dict(base, rail_purchase_id="rp_" + "2" * 24), dict(base, step="card_binding"),
+    variants = [dict(base, agent_id="agent_other"), dict(base, rail="a2a"), dict(base, rail_purchase_id="rp_" + "2" * 24),
+                dict(base, step="card_binding"),
                 dict(base, epoch=2), dict(base, issued_at="2026-11-18T00:00:01Z")]
     seen = {first}
     for v in variants:
@@ -893,6 +896,11 @@ def test_the_offer_hmac_binds_every_field():
         seen.add(purchase_consent.offer_id(other, **base))
     assert len(seen) == 1 + len(variants) + 5
     assert SECRET not in repr(cfg)
+    # LENGTH-PREFIXED: two field lists that concatenate to the same bytes are different offers.
+    for left, right in ((dict(base, agent_id="a", rail="bc"), dict(base, agent_id="ab", rail="c")),
+                        (dict(base, rail="a", rail_purchase_id="bc"), dict(base, rail="ab", rail_purchase_id="c")),
+                        (dict(base, step="x", epoch=12), dict(base, step="x1", epoch=2))):
+        assert purchase_consent.offer_id(cfg, **left) != purchase_consent.offer_id(cfg, **right)
 
 
 @pytest.mark.parametrize("raw,expected", [("", 3), ("0", 0), ("10", 10), ("120", 120), ("121", 3), ("-1", 3),
@@ -949,9 +957,9 @@ async def test_available_is_true_only_when_the_write_can_succeed(gate):
         assert consent["available"] is False and "offer" not in consent, consent
 
     # the write route not registered on this app (its dial was off at startup)
-    gate.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", False)
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", False)
     _not_ready(await _offered(ids, "R_approve"))
-    gate.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", True)
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", True)
     # its dial turned off since
     gate.delenv(purchase_consent.WRITE_ENABLED_ENV)
     _not_ready(await _offered(ids, "R_approve"))
@@ -971,13 +979,13 @@ async def test_available_is_true_only_when_the_write_can_succeed(gate):
 def test_mount_records_that_the_write_is_registered(monkeypatch):
     from fastapi import FastAPI
 
-    monkeypatch.setattr(internal_routes, "_CONSENT_WRITE_MOUNTED", False)
+    monkeypatch.setattr(purchase_consent, "_WRITE_MOUNTED", None)
     monkeypatch.delenv(purchase_consent.WRITE_ENABLED_ENV, raising=False)
     internal_routes.mount(FastAPI())
-    assert internal_routes._CONSENT_WRITE_MOUNTED is False
+    assert purchase_consent._WRITE_MOUNTED is False
     monkeypatch.setenv(purchase_consent.WRITE_ENABLED_ENV, "1")
     internal_routes.mount(FastAPI())
-    assert internal_routes._CONSENT_WRITE_MOUNTED is True
+    assert purchase_consent._WRITE_MOUNTED is True
 
 
 async def test_reap_contact_re_entry_offers_no_consent_and_refuses_the_write(gate):
@@ -1106,3 +1114,268 @@ async def test_gate_on_recover_and_resume_carry_no_card_or_approval_url(gate, mo
     for name in ("R_enroll", "R_approve"):
         recovered = json.loads(bodies[name][:len(bodies[name]) // 2])
         assert recovered["buyer_step"]["consent_required"] is True and "hosted_url" not in recovered
+
+
+# ── review round 2: webhook retries and listings, buyer_step.available, secrets, agent binding, boot log ─────
+
+
+class _CapturingHttp:
+    """Stands in for httpx.AsyncClient in the agent webhook sender: records each POSTed body, answers 200."""
+
+    bodies: List[str] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, content=None, headers=None):
+        _CapturingHttp.bodies.append(content if isinstance(content, str) else content.decode())
+
+        class _Resp:
+            status_code = 200
+            text = "ok"
+
+        return _Resp()
+
+
+async def _pre_gate_deliveries(ids, monkeypatch) -> Dict[str, str]:
+    """Four `retrying` purchase.action_required deliveries whose stored payload holds R_approve's approval URL,
+    as the sender stored them BEFORE the gate went on. Returns delivery id by use."""
+    from services import agent_webhook_service as svc, webhook_delivery_gate
+
+    body = (await _request("GET", f"{DOOR}/{ids['R_approve']}")).json()
+    assert body["next_action"]["url"] == URLS["R_approve"]
+    envelope = {"id": "evt_consent_1", "type": "purchase.action_required", "created_at": "2026-11-01T00:00:00+00:00",
+                "data": body}
+    await svc.ensure_agent_webhook_tables()
+    await database.execute("DELETE FROM agent_webhook_deliveries WHERE agent_id = :a", {"a": AGENT})
+    uses = {"retry": "whd_consent_retry", "loop": "whd_consent_loop", "list": "whd_consent_list",
+            "manual": "whd_consent_manual"}
+    for delivery_id in uses.values():
+        await database.execute(
+            "INSERT INTO agent_webhook_deliveries (delivery_id, agent_id, event_id, event_type, status, attempt_count, "
+            "next_retry_at, destination_url, payload, request_headers) VALUES (:d, :a, 'evt_consent_1', "
+            "'purchase.action_required', 'retrying', 1, :due, 'https://hooks.example/consent', :p, '{}')",
+            {"d": delivery_id, "a": AGENT, "due": "2000-01-01 00:00:00" if delivery_id.endswith("loop") else "2999-01-01 00:00:00",
+             "p": json.dumps(envelope)})
+
+    async def _config(*a, **k):
+        return {"destination_url": "https://hooks.example/consent", "signing_secret": "whsec_test", "enabled": True,
+                "subscribed_events": ["purchase.action_required"]}
+
+    monkeypatch.setattr(svc, "_get_or_create_raw_config", _config)
+    monkeypatch.setattr(svc, "_delivery_client_options", lambda *a, **k: {})
+
+    async def _summary(*a, **k):  # its SQL is Postgres-only (`::int`); the summary carries no payload
+        return {}
+
+    monkeypatch.setattr(svc, "get_delivery_summary", _summary)
+    monkeypatch.setattr(svc.httpx, "AsyncClient", _CapturingHttp)
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    _CapturingHttp.bodies = []
+    return uses
+
+
+async def test_a_retry_of_a_pre_gate_delivery_sends_no_url(gate, monkeypatch):
+    from services import agent_webhook_service as svc
+
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    uses = await _pre_gate_deliveries(ids, monkeypatch)
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+    stored = (await database.fetch_one("SELECT payload FROM agent_webhook_deliveries WHERE delivery_id = :d",
+                                       {"d": uses["retry"]}))["payload"]
+    assert URLS["R_approve"] in stored
+    result = await svc.retry_delivery(AGENT, uses["retry"])
+    assert result["status"] == "delivered"
+    [sent] = _CapturingHttp.bodies
+    assert URLS["R_approve"] not in sent and "approve/golden1" not in sent
+    data = json.loads(sent)["data"]
+    assert data["next_action"]["consent_required"] is True and data["detail"]["buyer_step"]["kind"] == "approval"
+    # the retry loop takes the same path
+    _CapturingHttp.bodies = []
+    assert await svc.process_due_retries(limit=10) == 1
+    [looped] = _CapturingHttp.bodies
+    assert URLS["R_approve"] not in looped
+
+
+async def test_a_retry_after_the_consent_sends_todays_payload(gate, monkeypatch):
+    from services import agent_webhook_service as svc
+
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    uses = await _pre_gate_deliveries(ids, monkeypatch)
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+    await _consent(ids, "R_approve")
+    await svc.retry_delivery(AGENT, uses["retry"])
+    assert json.loads(_CapturingHttp.bodies[0])["data"]["next_action"]["url"] == URLS["R_approve"]
+
+
+async def test_with_the_gate_off_a_retry_sends_the_stored_payload_unchanged(monkeypatch):
+    from services import agent_webhook_service as svc
+
+    ids = await _fixtures()
+    uses = await _pre_gate_deliveries(ids, monkeypatch)
+    stored = json.loads((await database.fetch_one(
+        "SELECT payload FROM agent_webhook_deliveries WHERE delivery_id = :d", {"d": uses["retry"]}))["payload"])
+    await svc.retry_delivery(AGENT, uses["retry"])
+    assert json.loads(_CapturingHttp.bodies[0])["data"] == stored["data"]
+
+
+async def test_the_deliveries_list_shows_a_pre_gate_payload_without_the_url(gate, monkeypatch):
+    from services import agent_webhook_service as svc
+
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    await _pre_gate_deliveries(ids, monkeypatch)
+    listed_off = await svc.list_deliveries(AGENT, limit=50)
+    assert URLS["R_approve"] in json.dumps(listed_off["deliveries"], default=str)
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+    listed = await svc.list_deliveries(AGENT, limit=50)
+    text = json.dumps(listed["deliveries"], default=str)
+    assert len(listed["deliveries"]) == 4 and URLS["R_approve"] not in text and "approve/golden1" not in text
+    for delivery in listed["deliveries"]:
+        assert delivery["payload"]["data"]["next_action"]["consent_required"] is True
+
+
+async def test_the_manual_retry_route_sends_no_url(gate, monkeypatch):
+    import routes.agent_webhooks as webhook_routes
+    from utils.auth import get_current_user
+
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    uses = await _pre_gate_deliveries(ids, monkeypatch)
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+
+    async def _scope(*a, **k):
+        return None
+
+    monkeypatch.setattr(webhook_routes, "assert_agent_scope_or_owner", _scope)
+    app.dependency_overrides[get_current_user] = lambda: {"id": "staff_test", "role": "admin"}
+    try:
+        answer = await _request("POST", f"/agents/{AGENT}/webhooks/deliveries/{uses['manual']}/retry", agent=False)
+        listed = await _request("GET", f"/agents/{AGENT}/webhooks/deliveries?limit=50", agent=False)
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert answer.status_code == 200, answer.text
+    assert listed.status_code == 200, listed.text
+    for text in _CapturingHttp.bodies + [answer.text, listed.text]:
+        assert URLS["R_approve"] not in text and "approve/golden1" not in text
+
+
+async def test_buyer_step_says_whether_the_consent_can_be_given_now(gate, monkeypatch):
+    ids = await _fixtures()
+
+    async def _steps():
+        return {name: (await _request("GET", f"{DOOR}/{ids[name]}")).json()["detail"]["buyer_step"]
+                for name in GATED}
+
+    assert all(step["available"] is True for step in (await _steps()).values())
+    # mirrors the read's block, case by case
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", False)
+    assert all(step["available"] is False for step in (await _steps()).values())
+    for name in GATED:
+        assert (await _internal(ids[name])).json()["consent"]["available"] is False
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", True)
+    gate.setenv(internal_routes.CONSENT_KEY_ENV, READ_KEY)
+    assert all(step["available"] is False for step in (await _steps()).values())
+    gate.setenv(internal_routes.CONSENT_KEY_ENV, WRITE_KEY)
+    gate.delenv(purchase_consent.TERMS_URL_ENV)
+    assert all(step["available"] is False for step in (await _steps()).values())
+    gate.setenv(purchase_consent.TERMS_URL_ENV, TERMS_URL)
+    # Reap's contact re-entry on the card step
+    await database.execute("UPDATE reap_agentic_purchases SET contact_purged_at = :v WHERE id = :i",
+                           {"v": FIXED, "i": ids["R_enroll"]})
+    steps = await _steps()
+    assert steps["R_enroll"]["available"] is False and steps["R_approve"]["available"] is True
+    assert (await _internal(ids["R_enroll"])).json()["consent"]["available"] is False
+    # a consent read that fails
+    async def _broken(*a, **k):
+        raise RuntimeError("consent table unreadable")
+
+    monkeypatch.setattr(consents_db, "consents_for", _broken)
+    assert all(step["available"] is False for step in (await _steps()).values())
+
+
+async def test_on_a_process_that_registers_no_routes_the_write_dial_says_whether_it_is_up(gate):
+    """The worker builds purchase.* payloads and never runs `mount`: there the environment decides."""
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", None)
+    assert purchase_consent.write_ready() is True
+    gate.delenv(purchase_consent.WRITE_ENABLED_ENV)
+    assert purchase_consent.write_ready() is False
+    gate.setenv(purchase_consent.WRITE_ENABLED_ENV, "1")
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", False)
+    assert purchase_consent.write_ready() is False
+
+
+@pytest.mark.parametrize("which", ["read", "consent"])
+async def test_an_offer_secret_equal_to_a_key_is_unconfigured(gate, which):
+    key = READ_KEY if which == "read" else WRITE_KEY
+    gate.setenv(purchase_consent.OFFER_SECRET_ENV, key)
+    assert purchase_consent.config() is None
+    ids = await _fixtures()
+    consent = (await _internal(ids["R_approve"])).json()["consent"]
+    assert consent["available"] is False and "offer" not in consent
+
+
+PREVIOUS = "previous_offer_secret_for_tests_0123456789ab"
+
+
+async def test_an_offer_from_before_a_secret_rotation_is_stale_not_refused(gate):
+    ids = await _fixtures()
+    old_cfg = purchase_consent.ConsentConfig(TERMS_URL, TERMS_V, PRIVACY_URL, PRIVACY_V, PREVIOUS.encode())
+    old_offer = _offer(ids["R_approve"], "approval", cfg=old_cfg)
+    # no previous secret configured: indistinguishable from a forgery
+    await _refused(ids["R_approve"], old_offer, 400, "consent_refused")
+    gate.setenv(purchase_consent.OFFER_SECRET_PREVIOUS_ENV, PREVIOUS)
+    await _refused(ids["R_approve"], old_offer, 409, "consent_stale")
+    # a forgery is still a forgery
+    await _refused(ids["R_approve"], {**old_offer, "offer_id": "0" * 64}, 400, "consent_refused")
+    # the previous secret verifies only: the read mints with the current one
+    offer = (await _internal(ids["R_approve"])).json()["consent"]["offer"]
+    cfg = purchase_consent.config()
+    assert offer["id"] == purchase_consent.offer_id(cfg, agent_id=AGENT, rail="reap", rail_purchase_id=ids["R_approve"],
+                                                    step="approval", epoch=1, issued_at=offer["issued_at"])
+    # an unusable previous secret is ignored
+    for bad in ("short", READ_KEY, WRITE_KEY, SECRET):
+        gate.setenv(purchase_consent.OFFER_SECRET_PREVIOUS_ENV, bad)
+        bad_cfg = purchase_consent.ConsentConfig(TERMS_URL, TERMS_V, PRIVACY_URL, PRIVACY_V, bad.encode())
+        if bad != SECRET:
+            await _refused(ids["R_approve"], _offer(ids["R_approve"], "approval", cfg=bad_cfg), 400, "consent_refused")
+        assert purchase_consent.previous_config(cfg) is None
+
+
+async def test_an_offer_minted_for_another_agent_is_refused(gate):
+    ids = await _fixtures()
+    await _refused(ids["R_approve"], _offer(ids["R_approve"], "approval", agent="agent_someone_else"), 400,
+                   "consent_refused")
+
+
+def test_the_boot_log_states_the_gate_and_never_a_value(gate, caplog):
+    import logging
+
+    gate.setenv(purchase_consent.OFFER_SECRET_PREVIOUS_ENV, PREVIOUS)
+    with caplog.at_level(logging.WARNING, logger=purchase_consent.logger.name):
+        purchase_consent.log_boot_state("worker")
+    [record] = [r for r in caplog.records if r.name == purchase_consent.logger.name]
+    line = record.getMessage()
+    assert record.levelno == logging.WARNING
+    assert "service=worker" in line and "AGENPAS_CONSENT_GATE=on" in line and "configured=yes" in line
+    for value in (SECRET, PREVIOUS, WRITE_KEY, READ_KEY, TERMS_URL, TERMS_V):
+        assert value not in line
+    gate.delenv(purchase_consent.GATE_ENV)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=purchase_consent.logger.name):
+        purchase_consent.log_boot_state("web")
+    assert "AGENPAS_CONSENT_GATE=off" in caplog.records[-1].getMessage()
+
+
+def test_main_logs_the_gate_at_boot_on_every_service():
+    source = (_REPO / "main.py").read_text("utf-8")
+    assert "log_boot_state(_consent_service_name() or \"web\")" in source
+    assert purchase_consent.READ_KEY_ENV == internal_routes.INTERNAL_KEY_ENV
