@@ -55,11 +55,18 @@ CARD_SCAN_MAX_JSON_CHARS = 20000
 #: "shippingMethod" a method, "itemName" a name): the buyer's contact and the descriptors around it.
 _CONTACT_STRONG = (
     "address", "zip", "postal", "postcode", "phone", "email", "method", "speed", "carrier", "service",
-    "instruction", "name", "company", "merchant", "label", "description", "title", "note", "currency",
+    "instruction", "name", "company", "merchant", "label", "description", "title", "note", "currency", "code",
 )
+#: DISCOUNT spellings (after the strong contact check, so a `couponCode` is a code, not an amount). A
+#: discount only ever LOWERS what is charged, so its amount is never added to a sum (that could only make a
+#: card look dearer) and never subtracted from one either (conservative: a sum is checked as if no discount
+#: applied, so ignoring a discount can never let an over-ceiling charge through). A negative discount
+#: ("-$5.00", -500) is therefore allowed, and so is one above the ceiling. It must still be READABLE: an
+#: unmarked string, a malformed amount or another currency under a discount key refuses like anywhere else.
+_DISCOUNT_PARTS = ("discount", "saving", "promo", "coupon", "rebate", "voucher")
 #: Money spellings, matched as parts of the canonical key ...
 _MONEY_PARTS = (
-    "total", "amount", "price", "cost", "charge", "balance", "discount", "vat", "duty", "money", "shipping",
+    "total", "amount", "price", "cost", "charge", "balance", "vat", "duty", "money", "shipping",
     "freight", "postage", "handling", "gratuity",
 )
 #: ... at its end ...
@@ -138,7 +145,7 @@ def canon_key(name: str) -> str:
 
 
 #: How a key's value is read.
-CONTACT, MONEY, PLAIN = "contact", "money", "plain"
+CONTACT, MONEY, PLAIN, DISCOUNT = "contact", "money", "plain", "discount"
 
 
 def key_kind(name: str, parent: str, sibling_currency: bool = False) -> str:
@@ -146,6 +153,10 @@ def key_kind(name: str, parent: str, sibling_currency: bool = False) -> str:
     canon = canon_key(name)
     if any(part in canon for part in _CONTACT_STRONG):
         return CONTACT
+    if any(part in canon for part in _DISCOUNT_PARTS):
+        return DISCOUNT
+    if parent == DISCOUNT and not (canon in _CONTACT_EXACT or any(p in canon for p in _CONTACT_PARTS)):
+        return DISCOUNT  # `{"discount": {"amount": "-$5.00"}}`: the amount of a discount
     if (canon in _MONEY_EXACT or any(part in canon for part in _MONEY_PARTS)
             or canon.endswith(_MONEY_SUFFIXES)):
         return MONEY
@@ -202,7 +213,9 @@ def string_amounts(raw: str, ceiling: int, kind: str) -> List[int]:
         marked = dollar is not None or usd_word
         if kind == CONTACT:
             amount_shaped = symbol or marked
-        elif kind == MONEY:
+        elif kind == DISCOUNT and right[:1] == "%":
+            amount_shaped = False  # "10%" off: a rate, and a discount only lowers the charge
+        elif kind in (MONEY, DISCOUNT):
             amount_shaped = True
         else:
             amount_shaped = (
@@ -227,14 +240,18 @@ def string_amounts(raw: str, ceiling: int, kind: str) -> List[int]:
             raise _Refused("an amount with no USD mark")
         if dollar is not None and len(dollar.group(1)) > 1:
             raise _Refused("a loosely spaced amount")
-        if right[:1] in ("e", "E") or not _STRICT_AMOUNT_RE.match(token) or _LEFT_NEGATIVE_RE.search(left):
-            raise _Refused("a negative or malformed amount")
+        if right[:1] in ("e", "E") or not _STRICT_AMOUNT_RE.match(token):
+            raise _Refused("a malformed amount")
+        if kind == DISCOUNT:
+            continue  # readable USD; a negative or a large one only lowers the charge; never summed
+        if _LEFT_NEGATIVE_RE.search(left):
+            raise _Refused("a negative amount")
         units, _, cents = token.partition(".")
         minor = int(units.replace(",", "")) * 100 + int(cents or 0)
         if minor > ceiling:
             raise _Refused("an amount above the ceiling")
         amounts.append(minor)
-    if kind == MONEY and not any(ch.isdigit() for ch in text):
+    if kind in (MONEY, DISCOUNT) and not any(ch.isdigit() for ch in text):
         # "nine hundred ninety-nine dollars": an amount we cannot read. A currency name alone ("USD") is not.
         words = {_skeleton(w).lower() for w in re.findall(r"[^\W\d_]+", text)}
         if words & _NUMBER_WORDS:
@@ -339,7 +356,7 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
             return 0, False
         if isinstance(value, (int, float)) and kind == MONEY:
             raise _Refused("a bare number under a money key: units unknown")
-        return 0, False
+        return 0, False  # a bare number under a DISCOUNT key (-500) only lowers the charge: not summed
 
     try:
         walk(data if isinstance(data, Mapping) else {"card": data}, 0, PLAIN)

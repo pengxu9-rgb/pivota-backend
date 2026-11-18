@@ -2193,3 +2193,55 @@ async def test_the_preview_reads_that_row_by_id_and_says_what_a_resolution_cause
     text = json.dumps(preview)
     for needle in (EMAIL, "ptk_1", "pvm_", "https://"):
         assert needle not in text
+
+
+# ── discounts: a discount only lowers the charge (never cancels for its sign, never summed) ─────
+
+DISCOUNTED_CARDS = {
+    "subtotal_discount_total": {"subtotal": "$45.00", "discount": "-$5.00", "total": "$40.00"},
+    "unicode_minus": {"subtotal": "$45.00", "discount": "−$5.00", "total": "$40.00"},
+    "bare_negative_number": {"subtotal": "$45.00", "discount": -500, "total": "$40.00"},
+    "discount_money_object": {"subtotal": "$45.00", "discount": {"amount": "-$5.00", "currency": "USD"},
+                              "total": "$40.00"},
+    "discount_amount_key": {"subtotal": "$45.00", "discountAmount": "-$5.00", "total": "$40.00"},
+    "total_discounts": {"total_line_items_price": "$45.00", "total_discounts": "-$5.00", "total": "$40.00"},
+    "discounts_list": {"subtotal": "$45.00", "discounts": [{"amount": "-$5.00"}, {"amount": "$1.00"}],
+                       "total": "$39.00"},
+    "positive_savings": {"subtotal": "$45.00", "savings": "$5.00", "total": "$40.00"},
+    "promo_amount": {"subtotal": "$45.00", "promoAmount": "$5.00", "total": "$40.00"},
+    "coupon_amount": {"subtotal": "$45.00", "coupon": {"amount": "-$5.00", "code": "SAVE10"}, "total": "$40.00"},
+    "coupon_code_with_digits": {"subtotal": "$45.00", "couponCode": "SAVE10", "total": "$45.00"},
+    "percent_off": {"subtotal": "$45.00", "discount": "10% off", "total": "$40.50"},
+    # Large positive savings would push a naive component sum past the ceiling: not summed, so it confirms.
+    "savings_not_summed": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
+    "discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
+}
+REFUSED_WITH_A_DISCOUNT = {
+    "discount_in_eur_symbol": {"subtotal": "$45.00", "discount": "-€5.00", "total": "$40.00"},
+    "discount_in_eur_code": {"subtotal": "$45.00", "discount": "-5.00 EUR", "total": "$40.00"},
+    "discount_malformed": {"subtotal": "$45.00", "discount": "-$5.0", "total": "$40.00"},
+    "discount_unmarked_string": {"subtotal": "$45.00", "discount": "-5.00", "total": "$40.00"},
+    "negative_total": {"total": "-$5.00"},
+    "negative_line_price": {"items": [{"price": "-$5.00"}, {"price": "$40.00"}]},
+    "negative_subtotal": {"subtotal": "-$45.00", "total": "$40.00"},
+    # A discount never lowers a sum: items past the ceiling still cancel whatever the discount says.
+    "discount_does_not_rescue_an_over_sum": {"items": [{"price": "$30.00"}, {"price": "$30.00"}],
+                                             "discount": "-$10.00"},
+}
+
+
+@pytest.mark.parametrize("name", sorted(DISCOUNTED_CARDS))
+def test_a_discount_never_cancels_for_its_sign_or_size(name):
+    assert worker.confirm_card_refused(DISCOUNTED_CARDS[name], TOTAL) is False
+
+
+@pytest.mark.parametrize("name", sorted(REFUSED_WITH_A_DISCOUNT))
+def test_an_unreadable_discount_or_a_negative_elsewhere_still_cancels(name):
+    assert worker.confirm_card_refused(REFUSED_WITH_A_DISCOUNT[name], TOTAL) is True
+
+
+async def test_a_discounted_checkout_within_the_ceiling_confirms_end_to_end():
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(DISCOUNTED_CARDS["subtotal_discount_total"]))
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
