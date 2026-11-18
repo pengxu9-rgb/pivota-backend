@@ -360,9 +360,12 @@ async def test_agent_create_order_parallel_pre_create_reads_idempotency_hit_shor
 
 
 @pytest.mark.asyncio
-async def test_agent_create_order_parallel_pre_create_reads_prioritizes_store_exception(
+async def test_agent_create_order_parallel_pre_create_reads_prioritizes_the_replay_over_the_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The replay lookup's outcome is acted on before the store read's: an order this create
+    already made must be answered before the commerce path (read from the store) can refuse it, and
+    a lookup that failed must say so before a store failure does."""
     store_error = HTTPException(status_code=418, detail="store-boom")
     replay_error = HTTPException(status_code=409, detail="replay-boom")
     module, calls = _install_agent_create_order_harness(
@@ -376,8 +379,28 @@ async def test_agent_create_order_parallel_pre_create_reads_prioritizes_store_ex
     with pytest.raises(HTTPException) as exc_info:
         await _call_agent_create_order(module, order_request)
 
-    assert exc_info.value.status_code == 418
-    assert exc_info.value.detail == "store-boom"
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "replay-boom"
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_parallel_pre_create_reads_replays_an_order_although_the_store_read_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_error = HTTPException(status_code=418, detail="store-boom")
+    replayed = {"status": "success", "order_id": "ORD_WS14_REPLAY", "merchant_id": "merch_ws14"}
+    module, calls = _install_agent_create_order_harness(
+        monkeypatch,
+        store_exception=store_error,
+        replay_result=replayed,
+    )
+    order_request = _build_order_request()
+    calls["order_request"] = order_request
+
+    response = await _call_agent_create_order(module, order_request)
+
+    assert response == replayed
+    assert calls["cached_replay"]["response"] == replayed
 
 
 @pytest.mark.asyncio
