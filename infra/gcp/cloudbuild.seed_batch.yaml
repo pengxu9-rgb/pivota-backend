@@ -8,12 +8,14 @@
 #       _NAMED='["named-referral-variants-manifest",<v>,"<sha256>"]'
 #   (apply adds _PLAN and _APPROVAL; rollback adds _RECEIPTS; each '["<secret>",<version>,"<sha256>"]')
 #
-# 1 copies scripts/, services/ and this config OUT OF THE RELEASE IMAGE (by digest) and refuses unless the submitted
-#   config is the release's copy; every later step runs the release's own launcher code.
+# 1 copies scripts/, services/ and this config OUT OF THE RELEASE IMAGE (by digest). The next step refuses unless the
+#   submitted config's sha is the release copy's: that catches a stale checkout, not a deliberate mismatch. Every
+#   later step runs the release's own launcher code.
 # 2 the digest is the release tag's digest. 3 web's serving revision runs that digest with the batch's named pin.
 # 4 the batch lock. Steps 1-4 fail closed with nothing taken or run.
 # 5 run: gate -> armed deploy -> execute --async -> wait BY NAME -> disarm (allowFailure, so 6 always runs).
-# 6 publish: log.txt, rows.json, then result.json LAST (create-only); releases the lock only on a terminal state.
+# 6 publish: log.txt, rows.json, result.json (create-only), then releases the lock only when nothing can still run
+#   and the job is disarmed; the release outcome goes to lock.json.
 substitutions:
   _MODE: ""
   _BATCH_ID: ""
@@ -37,11 +39,12 @@ steps:
     name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
     entrypoint: bash
     timeout: 120s
+    env: ["RELEASE=${_RELEASE}"]
     args:
       - -c
       - |
         set -euo pipefail
-        test "$$(cat /app/.image_commit_sha)" = "${_RELEASE}"
+        test "$$(cat /app/.image_commit_sha)" = "$$RELEASE"
         mkdir -p /workspace/release/infra/gcp /workspace/seed-batch
         cp -r /app/scripts /workspace/release/scripts
         cp -r /app/services /workspace/release/services
@@ -55,12 +58,14 @@ steps:
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
     entrypoint: bash
     timeout: 120s
+    env: ["RELEASE=${_RELEASE}", "DIGEST=${_DIGEST}"]
     args:
       - -c
       - |
         set -euo pipefail
-        tag_digest="$$(gcloud artifacts docker images describe us-west1-docker.pkg.dev/pivota-shared/pivota/backend:${_RELEASE} --format 'value(image_summary.digest)')"
-        test "$$tag_digest" = "${_DIGEST}"
+        [[ "$$RELEASE" =~ ^[0-9a-f]{40}$$ && "$$DIGEST" =~ ^sha256:[0-9a-f]{64}$$ ]]
+        tag_digest="$$(gcloud artifacts docker images describe "us-west1-docker.pkg.dev/pivota-shared/pivota/backend:$$RELEASE" --format 'value(image_summary.digest)')"
+        test "$$tag_digest" = "$$DIGEST"
   - id: web
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
     entrypoint: python3

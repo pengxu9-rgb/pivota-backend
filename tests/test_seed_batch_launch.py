@@ -218,9 +218,10 @@ class Gcloud:
     """A fake `subprocess.run` that answers the launcher's gcloud calls and records them."""
 
     def __init__(self, *, gate=(f"{SUMMARY}\nGATE_OPEN\n", 0), states=("EXECUTION_SUCCEEDED",), describe_errors=0,
-                 lock_build=BUILD, log=None, cp_fail=None):
+                 lock_build=BUILD, log=None, cp_fail=None, execute_fails=False, listed=None, disarm_fails=False):
         self.calls, self.gate, self.states, self.describe_errors = [], gate, list(states), describe_errors
         self.lock_build, self.log, self.cp_fail = lock_build, log, cp_fail
+        self.execute_fails, self.listed, self.disarm_fails = execute_fails, listed or [], disarm_fails
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
@@ -228,7 +229,14 @@ class Gcloud:
         if args[1:2] and args[1].endswith("oneoff_gate.py"):
             return subprocess.CompletedProcess(args, self.gate[1], stdout=self.gate[0], stderr="")
         if args[:4] == ["gcloud", "run", "jobs", "execute"]:
+            if self.execute_fails:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="connection reset")
             return ok("reviewed-seed-batch-batch-one-x7k2p\n")
+        if args[:5] == ["gcloud", "run", "jobs", "executions", "list"]:
+            return ok(json.dumps([{"metadata": {"name": name, "creationTimestamp": created}} for name, created in self.listed]))
+        if args[:4] == ["gcloud", "run", "jobs", "deploy"] and self.disarm_fails and \
+                "REVIEWED_SEED_BATCH_GATE" not in args[args.index("--set-env-vars") + 1]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="deploy failed")
         if args[:5] == ["gcloud", "run", "jobs", "executions", "describe"]:
             if self.describe_errors:
                 self.describe_errors -= 1
@@ -329,6 +337,7 @@ def puts(calls):
 
 
 ENTRY = {"kind": "entry", "seed_id": "eps_1", "status": "committed", "receipt_sha256": "r"}
+RELEASE_CALL = ["gcloud", "storage", "r" + "m", "--if-generation-match=17", "gs://pivota-prod-ops-locks/seed-batch.lock"]
 
 
 def publish(monkeypatch, fake, mode="apply"):
@@ -349,14 +358,18 @@ def test_publish_writes_log_rows_then_result_create_only_and_releases_the_lock(m
     run_state(tmp_path)
     fake = Gcloud(log="\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})]))
     publish(monkeypatch, fake)
-    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json"]
+    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json", "lock.json"]
+    release = RELEASE_CALL
+    # result.json is written BEFORE the release, so a failed release cannot lose it.
+    assert fake.calls.index(release) > [i for i, c in enumerate(fake.calls) if c[-1].endswith("/result.json")][0]
     for c in fake.calls:
         if c[:3] == ["gcloud", "storage", "cp"]:
             assert "--if-generation-match=0" in c
             assert c[-1].startswith(f"gs://pivota-prod-ops-receipts/seed-batch/batch-one/apply-{BUILD}/")
     assert ["gcloud", "storage", "rm", "--if-generation-match=17", "gs://pivota-prod-ops-locks/seed-batch.lock"] in fake.calls
     result = result_of(tmp_path)
-    assert result["ok"] and result["decision"] == "pending_keep" and result["lock"] == "lock 17 released"
+    assert result["ok"] and result["decision"] == "pending_keep" and result["lock"].startswith("to be released")
+    assert json.loads((tmp_path / "lock.json").read_text()) == {"lock": "lock 17 released"}
 
 
 def test_a_failed_execution_still_publishes_its_committed_receipts_and_releases(monkeypatch, tmp_path):
@@ -367,7 +380,8 @@ def test_a_failed_execution_still_publishes_its_committed_receipts_and_releases(
     with pytest.raises(launch.LaunchRefused, match="did not finish cleanly"):
         publish(monkeypatch, fake)
     result = result_of(tmp_path)
-    assert not result["ok"] and result["entries"][0]["receipt_sha256"] == "r" and result["lock"].startswith("lock 17")
+    assert not result["ok"] and result["entries"][0]["receipt_sha256"] == "r"
+    assert json.loads((tmp_path / "lock.json").read_text()) == {"lock": "lock 17 released"}
 
 
 def test_a_non_terminal_execution_keeps_the_lock(monkeypatch, tmp_path):
@@ -396,12 +410,12 @@ def test_a_bad_line_or_missing_log_still_publishes_everything(monkeypatch, tmp_p
     fake = Gcloud(log="\n".join([line(ENTRY), job.PREFIX + "trunc@ted", line({"kind": "batch", "status": "committed"})]))
     with pytest.raises(launch.LaunchRefused):
         publish(monkeypatch, fake)
-    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json"] and result_of(tmp_path)["bad_lines"]
+    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json", "lock.json"] and result_of(tmp_path)["bad_lines"]
     (tmp_path / "run.json").unlink()
     fake = Gcloud()
     with pytest.raises(launch.LaunchRefused):
         publish(monkeypatch, fake)
-    assert puts(fake.calls) == ["log.txt", "rows.json", "result.json"]
+    assert puts(fake.calls)[:3] == ["log.txt", "rows.json", "result.json"]
     assert result_of(tmp_path)["run_error"] == "run step did not start"
 
 
@@ -455,8 +469,12 @@ def test_builder_images_are_pinned_and_the_digest_check_escapes_its_shell_variab
     for step in steps():
         assert "@sha256:" in step["name"] or step["name"].endswith("@${_DIGEST}"), step["id"]
     digest_step = next(s for s in steps() if s["id"] == "digest-is-the-release-tag")["args"][1]
-    assert 'test "$$tag_digest" = "${_DIGEST}"' in digest_step and "$tag_digest\"" not in digest_step.replace("$$", "")
-    assert "$$(cat /app/.image_commit_sha)" in next(s for s in steps() if s["id"] == "release-scripts")["args"][1]
+    assert 'test "$$tag_digest" = "$$DIGEST"' in digest_step and "${_" not in digest_step
+    release_step = next(s for s in steps() if s["id"] == "release-scripts")
+    assert 'test "$$(cat /app/.image_commit_sha)" = "$$RELEASE"' in release_step["args"][1]
+    assert release_step["env"] == ["RELEASE=${_RELEASE}"]
+    assert next(s for s in steps() if s["id"] == "digest-is-the-release-tag")["env"] == [
+        "RELEASE=${_RELEASE}", "DIGEST=${_DIGEST}"]
 
 
 def test_build_id_is_mapped_and_buckets_are_not_substitutions():
@@ -474,3 +492,76 @@ def test_a_failed_job_is_a_terminal_state_and_keeps_its_name(monkeypatch, tmp_pa
     state = json.loads((tmp_path / "run.json").read_text())
     assert (state["execution"], state["state"], state["disarmed"]) == ("reviewed-seed-batch-batch-one-x7k2p",
                                                                        "EXECUTION_FAILED", True)
+
+
+
+def released(calls):
+    return [c for c in calls if c[:3] == RELEASE_CALL[:3]]
+
+
+def test_lock_is_created_only_if_absent(monkeypatch, tmp_path):
+    fake = Gcloud()
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    launch.cmd_lock(type("A", (), {"batch_id": "batch-one", "mode": "apply"})())
+    create, = [c for c in fake.calls if c[:3] == ["gcloud", "storage", "cp"]]
+    assert create[3] == "--if-generation-match=0" and create[-1] == "gs://pivota-prod-ops-locks/seed-batch.lock"
+    assert json.loads((tmp_path / "lock.json").read_text())["build"] == BUILD
+
+
+def test_execute_attempted_is_recorded_before_the_call(monkeypatch, tmp_path):
+    held(tmp_path)
+    seen = []
+    fake = Gcloud()
+
+    def spy(args, **kwargs):
+        if args[:4] == ["gcloud", "run", "jobs", "execute"]:
+            seen.append(json.loads((tmp_path / "run.json").read_text()))
+        return fake(args, **kwargs)
+
+    monkeypatch.setattr(launch.subprocess, "run", spy)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    assert seen and seen[0]["execute_attempted"] is True and seen[0]["execution"] is None
+
+
+def test_a_failed_execute_call_finds_the_one_execution_it_started_and_waits_on_it(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(execute_fails=True, listed=[("reviewed-seed-batch-batch-one-old", "2000-01-01T00:00:00Z"),
+                                              ("reviewed-seed-batch-batch-one-new", "2999-01-01T00:00:00Z")])
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["execution"] == "reviewed-seed-batch-batch-one-new" and state["state"] == "EXECUTION_SUCCEEDED"
+    assert "connection reset" in state["execute_error"] and state["disarmed"] is True
+
+
+@pytest.mark.parametrize("listed", [[], [("a", "2999-01-01T00:00:00Z"), ("b", "2999-01-01T00:00:01Z")]])
+def test_a_failed_execute_call_with_no_single_execution_keeps_the_lock_and_the_job_armed(monkeypatch, tmp_path, listed):
+    held(tmp_path)
+    fake = Gcloud(execute_fails=True, listed=listed)
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    with pytest.raises(launch.LaunchRefused, match="lock stays held"):
+        launch.cmd_run(run_args())
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["execute_attempted"] and state["execution"] is None and "disarmed" not in state
+    assert len(deploys(fake.calls)) == 1          # armed once, never disarmed while an execution may run
+    fake = Gcloud()
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    assert not released(fake.calls)
+    assert result_of(tmp_path)["lock"].startswith("HELD: execute was attempted")
+
+
+def test_a_failed_disarm_fails_the_build_keeps_the_lock_and_says_armed(monkeypatch, tmp_path):
+    held(tmp_path)
+    monkeypatch.setattr(launch.subprocess, "run", Gcloud(disarm_fails=True))
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    assert json.loads((tmp_path / "run.json").read_text())["disarmed"] is False
+    fake = Gcloud(log="\n".join([line(ENTRY), line({"kind": "batch", "status": "committed"})]))
+    with pytest.raises(launch.LaunchRefused):
+        publish(monkeypatch, fake)
+    result = result_of(tmp_path)
+    assert not result["ok"] and result["job_armed"] is True and "ARMED" in result["lock"]
+    assert not released(fake.calls)

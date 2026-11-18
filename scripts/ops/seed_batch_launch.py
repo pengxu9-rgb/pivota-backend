@@ -1,8 +1,9 @@
 """Cloud Build launcher steps for the reviewed seed batch job (infra/gcp/cloudbuild.seed_batch.yaml).
 
 Runs in the Cloud Build workspace (cloud-sdk image pinned by digest; stdlib + gcloud), from scripts COPIED OUT OF THE
-RELEASE IMAGE by the build's first step, so every step is the reviewed release's own code. The build config is
-release-owned too: step 1 refuses unless the submitted config's sha256 (_CONFIG_SHA256) equals the release's copy.
+RELEASE IMAGE by the build's first step, so every step is the reviewed release's own code. _CONFIG_SHA256 must equal
+the release copy of this config: that catches a stale operator checkout (a config other than the release's); it is
+not a defence against a submitter who deliberately passes a mismatched config and sha.
 
 Subcommands, in build order:
   web       web's ONE serving revision (100% traffic == latest ready == latest created, generation observed, Ready)
@@ -10,10 +11,12 @@ Subcommands, in build order:
   lock      create gs://pivota-prod-ops-locks/seed-batch.lock with ifGenerationMatch=0 (the gate is not a lock)
   run       gate (a real scripts/ops/oneoff_gate.py run, parsed into the job's gate dict) -> deploy the ARMED job ->
             execute --async (the execution name is saved at once) -> poll it BY NAME to a terminal state ->
-            DISARM the job (redeploy with no write flag, gate, plan, approval or receipts) -> write run.json
-  publish   always: log.txt FIRST, then rows.json, then result.json LAST (each create-only), to
-            gs://pivota-prod-ops-receipts/seed-batch/<batch>/<mode>-<build id>/; releases the lock ONLY when run.json
-            records a terminal execution state (otherwise the lock stays held, and result.json says so)
+            DISARM the job (redeploy with no write flag, gate, plan, approval or receipts) -> write run.json.
+            A failed execute call may still have started an execution: it is looked up as the ONE execution
+            created since arming; none or several keeps the lock held
+  publish   always: log.txt, rows.json, then result.json (each create-only), to
+            gs://pivota-prod-ops-receipts/seed-batch/<batch>/<mode>-<build id>/; then releases the lock ONLY when
+            nothing can still run and the job is disarmed, recording the outcome in lock.json
 
 Before `lock`, any failure stops the build with nothing taken and nothing run. From `lock` on, `run` may fail
 (allowFailure) so that `publish` always writes what exists and decides about the lock.
@@ -305,10 +308,21 @@ def wait_for_execution(name: str, *, sleep=None, monotonic=None) -> str | None:
         sleep(EXECUTION_POLL_SECONDS)
 
 
+def find_started_execution(job: str, armed_at: str) -> str | None:
+    """After a failed execute call: the ONE execution of this job created since this build armed it, else None.
+    The lock is held, so no other build can have executed it in that window."""
+    rows = json.loads(run(["gcloud", "run", "jobs", "executions", "list", "--job", job, "--project", PROJECT,
+                           "--region", REGION, "--format", "json"], timeout=120))
+    since = [r["metadata"]["name"] for r in rows
+             if str(r.get("metadata", {}).get("creationTimestamp", ""))[:19] >= armed_at[:19]]
+    return since[0] if len(since) == 1 else None
+
+
 def cmd_run(args) -> None:
-    state = {"execution": None, "state": None, "error": None}
+    state = {"execution": None, "state": None, "error": None, "execute_attempted": False}
     path = WORK / "run.json"
     path.write_text(json.dumps(state))
+    job = job_name(args.batch_id) if args.batch_id else ""
     try:
         require((WORK / "lock.held").exists(), "run needs this build's lock")
         secrets = parse_secrets(args.mode, {"MANIFEST": args.manifest, "PLAN": args.plan, "APPROVAL": args.approval,
@@ -320,10 +334,20 @@ def cmd_run(args) -> None:
         gate = gate_json(gate_run.stdout, gate_run.returncode, datetime.now(timezone.utc))
         common = dict(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest, secrets=secrets)
         run(job_spec_args(**common, gate=gate, armed=True))
-        out = run(["gcloud", "run", "jobs", "execute", job_name(args.batch_id), "--project", PROJECT, "--region", REGION,
-                   "--async", "--format", "value(metadata.name)"], timeout=120).strip().splitlines()
-        require(out and out[-1].startswith(job_name(args.batch_id) + "-"), "execute did not name an execution")
-        state["execution"] = out[-1]
+        # From here an execution may exist even if the call below fails: record that BEFORE calling.
+        state.update(execute_attempted=True, armed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+        path.write_text(json.dumps(state))
+        try:
+            out = run(["gcloud", "run", "jobs", "execute", job, "--project", PROJECT, "--region", REGION,
+                       "--async", "--format", "value(metadata.name)"], timeout=120).strip().splitlines()
+            require(out and out[-1].startswith(job + "-"), "execute did not name an execution")
+            state["execution"] = out[-1]
+        except Exception as error:  # noqa: BLE001 - the server may have created it anyway
+            state["execute_error"] = f"{type(error).__name__}: {error}"[:300]
+            state["execution"] = find_started_execution(job, state["armed_at"])
+            path.write_text(json.dumps(state))
+            require(state["execution"] is not None,
+                    "execute failed and exactly one execution since arming could not be found: lock stays held")
         path.write_text(json.dumps(state))
         state["state"] = wait_for_execution(state["execution"])
         path.write_text(json.dumps(state))
@@ -333,8 +357,8 @@ def cmd_run(args) -> None:
         path.write_text(json.dumps(state))
         raise
     finally:
-        # Disarm whatever happened, once the execution (if any) is terminal or never started.
-        if state["execution"] is None or state["state"] is not None:
+        # Disarm once nothing can still be running: execute never attempted, or the execution is terminal.
+        if not state["execute_attempted"] or state["state"] is not None:
             try:
                 run(job_spec_args(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest,
                                   secrets=parse_secrets(args.mode, {"MANIFEST": args.manifest, "PLAN": args.plan,
@@ -346,6 +370,17 @@ def cmd_run(args) -> None:
                 state["disarmed"] = False
                 state["error"] = (state.get("error") or "") + f"; disarm failed: {error}"[:300]
             path.write_text(json.dumps(state))
+
+
+def lock_decision(state: dict) -> str | None:
+    """None when the lock may be released; otherwise why it must stay held."""
+    if state.get("execute_attempted") and not state.get("execution"):
+        return "HELD: execute was attempted and no execution could be identified; check before removing the lock"
+    if state.get("execution") and state.get("state") not in TERMINAL:
+        return "HELD: the execution's state is not terminal; do not remove the lock"
+    if state.get("disarmed") is False:
+        return "HELD: the job is still ARMED (disarm failed); disarm it before removing the lock"
+    return None
 
 
 def read_log(execution: str, *, sleep=None, monotonic=None) -> tuple[str, str | None]:
@@ -383,15 +418,22 @@ def cmd_publish(args) -> None:
     put(prefix, "log.txt", log if log else f"(no log: {log_error})\n")
     rows, bad = parse_lines(log)
     put(prefix, "rows.json", json.dumps(rows, indent=1))
-    terminal = state.get("execution") is None or state.get("state") in TERMINAL
-    try:
-        lock = release_lock() if terminal else "HELD: the execution's state is not terminal; do not remove the lock"
-    except Exception as error:  # noqa: BLE001
-        lock = f"HELD: release failed: {error}"[:300]
+    held = lock_decision(state)
+    lock = held or "to be released after result.json (outcome in lock.json)"
     result = summarise(rows, mode=args.mode, run_state=state, bad_lines=bad, lock=lock)
-    result.update(build=build_id(), batch_id=args.batch_id, release=args.release, log_error=log_error)
+    if state.get("disarmed") is False:
+        result["ok"], result["decision"] = False, None
+    result.update(build=build_id(), batch_id=args.batch_id, release=args.release, log_error=log_error,
+                  job_armed=state.get("disarmed") is False)
+    # result.json first, so a failure in the release below cannot lose it.
     put(prefix, "result.json", json.dumps(result, indent=1))
     print(json.dumps(result, indent=1))
+    if held is None:
+        try:
+            lock = release_lock()
+        except Exception as error:  # noqa: BLE001
+            lock = f"HELD: release failed: {error}"[:300]
+        put(prefix, "lock.json", json.dumps({"lock": lock}))
     require(result["ok"], "batch did not finish cleanly; read result.json")
     require(not lock.startswith("HELD"), f"the batch finished but the lock is still held: {lock}")
 
