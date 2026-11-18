@@ -185,9 +185,27 @@ good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human
 may or may not have gone out. If the provider shows no checkout session for the purchase at all, nothing
 was set up, and the purchase can be resolved as above.
 
-**Who may run it.** Running `resolve-held --apply` in production is a gated one-off job: it runs only
-behind the one-off gate, and only with **Peng's go** for that purchase. A preview (no `--apply`) writes
-nothing, but it reads production too, so it follows the same gate.
+**Who may run it.** `list-held`, the preview (`resolve-held` without `--apply`) and `resolve-held --apply`
+all read or write production, so each is a **production one-off**: run it through the one-off gate (`oneoff_gate.sh`,
+GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **Peng's go for that purchase**. The tool does not
+check the gate itself.
+
+**Never "not charged" over a recorded payment.** A hold written after the provider reported
+`payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
+set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`) is refused, whatever the flags
+(`payment_reached_recorded`): our own ledger says the order may be placed and paid. **Escalate; the merchant
+refunds.**
+
+**Not too soon.** A purchase must have been in `paying` for at least an hour
+(`OPERATOR_MIN_HOLD_AGE_SECONDS`) before it can be resolved: the provider's staged checkout lapses after
+about 30 minutes, and a check made sooner can miss an order that lands later. The write refuses a younger
+row itself (`held_too_recently` in the preview).
+
+**What a resolution causes.** The preview reads that purchase by id and shows its code, how long it has
+been held, and whether the apply would be accepted. A resolved purchase keeps its token id: the next worker
+tick's orphan pass voids that token on the rail (when a voider is configured), a second rail call caused by
+the resolution.
 
 **What it resolves, and what it does not.** `resolve-held` ends ONLY a checkout hold: a purchase in
 `paying` with a token, held with one of the codes in `a2a_rail_worker._CHECKOUT_HOLD_CODES`, the code

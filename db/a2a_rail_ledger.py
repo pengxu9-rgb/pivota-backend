@@ -855,10 +855,33 @@ _OPERATOR_FAIL_HELD_CHECKOUT_SQL = """
        AND claimed_by IS NULL
        AND payment_token_id IS NOT NULL
        AND last_error_code = :expected_code
+       AND state_entered_at < clock_timestamp() - (:min_age_seconds * INTERVAL '1 second')
     RETURNING *
 """
-_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE = _OPERATOR_FAIL_HELD_CHECKOUT_SQL.replace(
-    "clock_timestamp()", "CURRENT_TIMESTAMP")
+_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE = """
+    UPDATE a2a_rail_purchases
+       SET state = 'failed',
+           last_error_code = :code,
+           pending_write = NULL,
+           pending_write_at = NULL,
+           buyer_action_kind = NULL,
+           buyer_action_url = NULL,
+           buyer_action_expires_at = NULL,
+           buyer_email = NULL,
+           shipping_address = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = CURRENT_TIMESTAMP,
+           state_entered_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = :id
+       AND state = 'paying'
+       AND claimed_by IS NULL
+       AND payment_token_id IS NOT NULL
+       AND last_error_code = :expected_code
+       AND state_entered_at < datetime('now', '-' || :min_age_seconds || ' seconds')
+    RETURNING *
+"""
 #: The operator's list: `paying` checkout rows whose code looks like a checkout code (filtered to the hold
 #: set by the caller). Names its columns: no contact, no URL, no rail id beyond the purchase's own.
 _LIST_PAYING_CHECKOUTS_SQL = """
@@ -871,19 +894,47 @@ _LIST_PAYING_CHECKOUTS_SQL = """
      ORDER BY updated_at, id
      LIMIT :limit
 """
+#: The preview's read of ONE row, by id (the same columns as the list).
+_GET_PAYING_CHECKOUT_SQL = """
+    SELECT id, state, last_error_code, pending_write, claimed_by,
+           CASE WHEN checkout_task_id IS NULL THEN 0 ELSE 1 END AS has_task, state_entered_at, updated_at
+      FROM a2a_rail_purchases
+     WHERE id = :id
+       AND state = 'paying'
+       AND payment_token_id IS NOT NULL
+"""
 
 
-async def operator_fail_held_checkout(purchase_id: str, *, expected_code: str, code: str) -> Optional[Dict[str, Any]]:
+async def operator_fail_held_checkout(
+    purchase_id: str, *, expected_code: str, code: str, min_age_seconds: int
+) -> Optional[Dict[str, Any]]:
     """End a HELD checkout as `failed` with `code`. None when the row is not an unclaimed `paying` checkout
-    whose code is exactly `expected_code`. Callers: the operator job only (a2a_rail_worker's wrapper)."""
+    whose code is exactly `expected_code`, in `paying` for at least `min_age_seconds`. Callers: the operator
+    job only (a2a_rail_worker's wrapper, which also refuses every code that recorded payment)."""
+    if isinstance(min_age_seconds, bool) or not isinstance(min_age_seconds, int) or min_age_seconds < 1800:
+        raise ValueError("min_age_seconds must be at least 1800")
     values = {
         "id": _require(_ID_RE, purchase_id, "purchase_id"),
         "expected_code": _require(_CODE_RE, expected_code, "expected_code"),
         "code": _require(_CODE_RE, code, "code"),
+        "min_age_seconds": min_age_seconds,
     }
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL, values))
     return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE, values))
+
+
+async def get_paying_checkout(purchase_id: str) -> Optional[Dict[str, Any]]:
+    """ONE `paying` checkout row by id (the preview's read), or None. PII-free columns only."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    row = await database.fetch_one(_GET_PAYING_CHECKOUT_SQL, {"id": purchase_id})
+    if row is None:
+        return None
+    item = dict(row)
+    for column in ("state_entered_at", "updated_at"):
+        item[column] = _decode_dt(item.get(column))
+    return item
 
 
 async def list_paying_checkouts(*, limit: int = 50) -> List[Dict[str, Any]]:

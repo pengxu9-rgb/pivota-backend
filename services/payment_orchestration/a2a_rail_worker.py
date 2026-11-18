@@ -187,17 +187,15 @@ Nothing here logs the buyer's email or address, the member id, or a rail URL.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
 import time
-import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail, vic_order
+from services.payment_orchestration import a2a_rail, checkout_amounts, vic_order
 from services.payment_orchestration import router as rail_router
 
 logger = logging.getLogger(__name__)
@@ -1483,6 +1481,8 @@ CHECKOUT_CONFIRM_NOT_SENT = "checkout_confirm_not_sent"
 CHECKOUT_PAYING_WITHOUT_TASK = "checkout_paying_without_task"
 #: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
 CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
+#: The provider said `payment-reached` but its `success` was not true: a charge may exist. Held.
+CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
 _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_UNRESOLVED, CHECKOUT_CONFIRM_UNRECOGNISED, CHECKOUT_TASK_INVALID, CHECKOUT_TASK_MISMATCH,
     CHECKOUT_RESULT_UNRECOGNISED, CHECKOUT_RESULT_OVERDUE, CHECKOUT_TOTAL_OVER_APPROVED,
@@ -1491,54 +1491,28 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX, CHECKOUT_CONFIRM_TEXT_ONLY,
     CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
     CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
+    CHECKOUT_PAYMENT_REACHED_UNCONFIRMED,
 })
+#: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`): our own
+#: ledger then records that the order may have been placed and paid. The operator path can NEVER mark these
+#: "not charged": they need a human and the merchant (a refund), not a `failed`. Every hold code is either
+#: here or in `_OPERATOR_RESOLVABLE_HOLD_CODES` (a test holds the partition, and that every hold written in
+#: `_checkout_result`'s payment-reached branch is here).
+_CHECKOUT_PAYMENT_REACHED_CODES = frozenset({
+    CHECKOUT_TOTAL_OVER_APPROVED, CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_ORDER_ID_CARD_SHAPED,
+    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED,
+})
+#: The holds a human may end as `operator_confirmed_not_charged`, after checking the provider's side: the
+#: outcome at the provider is unknown to us, and no payment was reported.
+_OPERATOR_RESOLVABLE_HOLD_CODES = _CHECKOUT_HOLD_CODES - _CHECKOUT_PAYMENT_REACHED_CODES
 #: The setup's answers that refused it before anything was set up: validation (400, 422), our credentials
 #: (401), throttling (429). A 403 and an error card are HELD, as on the confirm: a provider-side refusal
 #: after a check-out of its own would look the same.
 _SETUP_REFUSED_4XX = frozenset({400, 401, 422, 429})
-#: The confirm card scan's bounds: deeper or larger than this is refused (cancelled), never skipped. The
-#: card's data is depth 0; a leaf at depth 8 is read, at 9 refused. 2000 values are read, 2001 refused.
-_CARD_SCAN_MAX_DEPTH = 8
-_CARD_SCAN_MAX_NODES = 2000
-#: A string longer than this that looks like JSON is not parsed: refused.
-_CARD_SCAN_MAX_JSON_CHARS = 20000
-#: Key spellings (NFKC, lower case, ASCII letters and digits only) that make a field MONEY-ISH: under such a
-#: key (at any depth below it) a bare number, a numeric string with no currency mark, or any amount we
-#: cannot read with certainty refuses the card.
-_MONEY_KEY_PARTS = ("total", "amount", "price", "cost", "charge", "balance", "discount", "vat", "duty", "money")
-_MONEY_KEY_SUFFIXES = ("due", "fee", "fees", "tax", "taxes")
-_MONEY_KEYS = frozenset({"sum", "shipping", "payment", "delivery", "postage", "handling"})
-#: Keys that name an ADDRESS, a CONTACT, a card's display fields or an id: a bare number under them (a zip, a
-#: phone, "1 Main St", cardLast4) is not money, even inside `shipping` or `payment`. A money-ish spelling
-#: wins over these (`cardTotal` is money); a currency-marked string is read under any key.
-_NON_MONEY_KEY_PARTS = (
-    "zip", "postal", "postcode", "phone", "address", "street", "city", "state", "country", "region",
-    "province", "email", "name", "line1", "line2", "apt", "suite", "last4", "brand", "card", "method",
-    "sku", "date", "time",
-)
-_NON_MONEY_KEY_SUFFIXES = ("id",)
-#: Keys whose integer value is a QUANTITY (for quantity x unit price).
-_QUANTITY_KEYS = frozenset({"qty", "quantity", "count", "units"})
-#: Zero-width and invisible characters removed before a string is read.
-_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad\u180e"), None)
-#: A run of digits with its separators, as written ("1,234.50", "999", "9.99"). Read strictly afterwards.
-_NUMBER_TOKEN_RE = re.compile(r"[0-9][0-9.,]*")
-_STRICT_AMOUNT_RE = re.compile(r"^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,9})(?:\.[0-9]{2})?\Z")
-#: Currency words and ISO codes (lower case). Next to a number, any of them but `usd` makes the amount one we
-#: do not read ("999 eur", "Rs. 999", "999.00 dollars": which dollar?).
-_CURRENCY_WORDS = frozenset({
-    "eur", "gbp", "cad", "aud", "nzd", "jpy", "cny", "hkd", "sgd", "inr", "mxn", "chf", "sek", "nok", "dkk",
-    "brl", "krw", "zar", "twd", "thb", "myr", "idr", "php", "pln", "czk", "huf", "ils", "aed", "sar", "try",
-    "rub", "ars", "clp", "cop", "pen", "vnd", "euro", "euros", "pound", "pounds", "yen", "yuan", "rupee",
-    "rupees", "rs", "peso", "pesos", "dollar", "dollars", "cent", "cents", "bucks", "usd",
-})
-_LEFT_WORD_RE = re.compile(r"([A-Za-z]+)[ .]{0,2}\Z")
-_RIGHT_WORD_RE = re.compile(r"^[ .]{0,2}([A-Za-z]+)")
-#: "$" (or "US$") right before the number, with at most one space between; letters before the "$" make it
-#: another country's dollar ("CA$", "A$").
-_LEFT_DOLLAR_RE = re.compile(r"(?:(?<![A-Za-z])|(?<=[Uu][Ss]))\$(\s*)\Z")
-_LEFT_FOREIGN_DOLLAR_RE = re.compile(r"([A-Za-z]{1,3})\$\s*\Z")
-_LEFT_NEGATIVE_RE = re.compile(r"(?:-|\()\s?(?:[Uu][Ss])?\$?\s*(?:[Uu][Ss][Dd]\s?)?\Z")
+#: The confirm-card scan lives in services/payment_orchestration/checkout_amounts.py (shared with the
+#: transport, which reads the setup answer's prose with the same rules). Its bounds, re-exported here.
+_CARD_SCAN_MAX_DEPTH = checkout_amounts.CARD_SCAN_MAX_DEPTH
+_CARD_SCAN_MAX_NODES = checkout_amounts.CARD_SCAN_MAX_NODES
 #: The ONLY 4xx answers to a confirm that fail the purchase: validation refusals, which say the request
 #: was never accepted. Every other 4xx (409 conflict, 404, 410, 423, 425, ...) may mean "already
 #: confirmed or submitted": when we cannot tell whether an order exists, the rule is HOLD, because a
@@ -1699,6 +1673,7 @@ def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
         checkout_url=str(row["checkout_url"]), shipping=shipping,
         cardholder_name=f"{shipping['first_name']} {shipping['last_name']}",
         idempotency_key=_checkout_idempotency_key(str(row["id"])),
+        ceiling_minor=row.get("quoted_total_minor") if isinstance(row.get("quoted_total_minor"), int) else None,
     )
 
 
@@ -1738,184 +1713,8 @@ def _card_shaped(value: str) -> bool:
     return bool(_CARD_SHAPED_ORDER_RE.match(value)) and a2a_rail._luhn(value)
 
 
-class _CardRefused(Exception):
-    """The confirm card shows something we cannot verify against the ceiling: never confirmed."""
-
-
-def _normalise(text: str) -> str:
-    """NFKC (full-width "$９９９" reads as "$999", a no-break space as a space) with invisible characters
-    removed, so what is read is what a person would read."""
-    return unicodedata.normalize("NFKC", text).translate(_INVISIBLE)
-
-
-def _canon_key(name: str) -> str:
-    return "".join(ch for ch in name.lower() if ch.isascii() and ch.isalnum())
-
-
-def _child_money(name: str, parent_money: bool, sibling_currency: bool) -> bool:
-    """Whether the value under key `name` is money-ish. A money spelling wins; then an address / contact /
-    card-display / id spelling is NOT money (even under `shipping`); a key we cannot read as ASCII (a
-    lookalike letter) IS (fail closed); `value` next to a `currency` key is; otherwise inherited."""
-    canon = _canon_key(name)
-    if any(ch.isalpha() and not ch.isascii() for ch in name):
-        return True
-    if (canon in _MONEY_KEYS or any(p in canon for p in _MONEY_KEY_PARTS)
-            or canon.endswith(_MONEY_KEY_SUFFIXES)):
-        return True
-    if any(p in canon for p in _NON_MONEY_KEY_PARTS) or canon.endswith(_NON_MONEY_KEY_SUFFIXES):
-        return False
-    if canon == "value" and sibling_currency:
-        return True
-    return parent_money
-
-
-def _string_amounts(raw: str, ceiling: int, money: bool) -> List[int]:
-    """The USD amounts a string shows, each read with certainty and at most `ceiling`; raises `_CardRefused`
-    for anything else that looks monetary: a number next to another currency (a symbol, another country's
-    dollar, a code or currency word in any case), a USD amount that is negative, malformed, in exponent form
-    or loosely spaced, a non-ASCII digit, or (under a money-ish key) any number with no USD mark."""
-    text = _normalise(raw)
-    if any(ch.isdigit() and not ch.isascii() for ch in text):
-        raise _CardRefused("non-ascii digit")
-    amounts: List[int] = []
-    for match in _NUMBER_TOKEN_RE.finditer(text):
-        token = match.group(0).rstrip(".,")
-        start, end = match.start(), match.start() + len(token)
-        left, right = text[:start], text[end:]
-        near = text[max(0, start - 3):start] + right[:3]
-        if any(ch != "$" and unicodedata.category(ch) == "Sc" for ch in near):
-            raise _CardRefused("another currency symbol")
-        foreign_dollar = _LEFT_FOREIGN_DOLLAR_RE.search(left)
-        if foreign_dollar and foreign_dollar.group(1).lower() != "us":
-            raise _CardRefused("another country's dollar")
-        words = [m.group(1).lower() for m in (_LEFT_WORD_RE.search(left), _RIGHT_WORD_RE.search(right)) if m]
-        if any(word in _CURRENCY_WORDS and word != "usd" for word in words):
-            raise _CardRefused("another currency word")
-        dollar = _LEFT_DOLLAR_RE.search(left)
-        marked = dollar is not None or "usd" in words
-        if not (marked or money):
-            continue  # a zip, a phone, an id, a street number: not money here
-        if not marked:
-            raise _CardRefused("a number under a money key with no USD mark")
-        if dollar is not None and len(dollar.group(1)) > 1:
-            raise _CardRefused("loosely spaced amount")
-        if right[:1] in ("e", "E") or not _STRICT_AMOUNT_RE.match(token) or _LEFT_NEGATIVE_RE.search(left):
-            raise _CardRefused("negative or malformed amount")
-        units, _, cents = token.partition(".")
-        minor = int(units.replace(",", "")) * 100 + int(cents or 0)
-        if minor > ceiling:
-            raise _CardRefused("an amount above the ceiling")
-        amounts.append(minor)
-    return amounts
-
-
-def _is_total_key(canon: str) -> bool:
-    return "total" in canon and "subtotal" not in canon
-
-
-def confirm_card_refused(data: Any, ceiling: Any) -> bool:
-    """True when the card must NOT be confirmed. Every key and value at any depth is read (lists, prose,
-    JSON inside a string), after NFKC and with invisible characters removed:
-
-      * any monetary token we cannot read with certainty refuses (`_string_amounts`), and so does a bare
-        number, a boolean or a non-USD-marked number under a money-ish key (`_child_money`);
-      * any single USD amount above the ceiling refuses;
-      * SUMS are checked too: the non-total amounts of one object (subtotal + shipping + tax + fees),
-        quantity x unit price, and the line items of a list, each at most the ceiling;
-      * a card deeper than _CARD_SCAN_MAX_DEPTH or with more than _CARD_SCAN_MAX_NODES values refuses, and
-        so does no positive ceiling.
-
-    Non-monetary numbers (a zip, a phone, an address, cardLast4, ids) are ignored. Pure."""
-    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
-        return True
-    nodes = 0
-
-    def scan_string(raw: str, depth: int, money: bool) -> List[int]:
-        text = _normalise(raw).strip()
-        if text[:1] in ("{", "[") and len(text) <= _CARD_SCAN_MAX_JSON_CHARS:
-            try:
-                parsed = json.loads(text)
-            except (ValueError, RecursionError):
-                parsed = None
-            if isinstance(parsed, (dict, list)):
-                walk(parsed, depth + 1, money)
-                return []
-        elif text[:1] in ("{", "["):
-            raise _CardRefused("JSON-looking string too large to read")
-        return _string_amounts(raw, ceiling, money)
-
-    def walk(value: Any, depth: int, money: bool) -> int:
-        """Scan `value`; return what it contributes to a sum one level up (minor units)."""
-        nonlocal nodes
-        nodes += 1
-        if nodes > _CARD_SCAN_MAX_NODES or depth > _CARD_SCAN_MAX_DEPTH:
-            raise _CardRefused("card too large to scan")
-        if isinstance(value, Mapping):
-            sibling_currency = any(_canon_key(str(k)) == "currency" for k in value)
-            totals: List[int] = []
-            components: List[int] = []
-            units: List[int] = []
-            quantity: Optional[int] = None
-            for key, item in value.items():
-                name = _normalise(str(key))
-                _string_amounts(name, ceiling, False)  # an amount in a key name is read too
-                canon = _canon_key(name)
-                child_money = _child_money(name, money, sibling_currency)
-                if canon in _QUANTITY_KEYS and isinstance(item, int) and not isinstance(item, bool):
-                    quantity = item
-                    continue
-                if isinstance(item, str):
-                    found = scan_string(item, depth + 1, child_money)
-                    nodes += 1
-                    if nodes > _CARD_SCAN_MAX_NODES or depth + 1 > _CARD_SCAN_MAX_DEPTH:
-                        raise _CardRefused("card too large to scan")
-                    for amount in found:
-                        (totals if _is_total_key(canon) else components).append(amount)
-                        if "price" in canon:
-                            units.append(amount)
-                    continue
-                contribution = walk(item, depth + 1, child_money)
-                if contribution:
-                    (totals if _is_total_key(canon) else components).append(contribution)
-            if sum(components) > ceiling:
-                raise _CardRefused("components add up past the ceiling")
-            if quantity is not None and quantity > 0 and units and quantity * max(units) > ceiling:
-                raise _CardRefused("quantity x unit price past the ceiling")
-            if totals:
-                return max(totals)
-            if quantity is not None and quantity > 0 and units:
-                return quantity * max(units)
-            return sum(components)
-        if isinstance(value, (list, tuple)):
-            line_items = 0
-            for item in value:
-                if isinstance(item, str):
-                    found = scan_string(item, depth + 1, money)
-                    nodes += 1
-                    if nodes > _CARD_SCAN_MAX_NODES or depth + 1 > _CARD_SCAN_MAX_DEPTH:
-                        raise _CardRefused("card too large to scan")
-                    line_items += sum(found)
-                else:
-                    line_items += walk(item, depth + 1, money)
-            if line_items > ceiling:
-                raise _CardRefused("line items add up past the ceiling")
-            return line_items
-        if isinstance(value, str):
-            return sum(scan_string(value, depth, money))
-        if value is None:
-            return 0
-        if isinstance(value, (bool, int, float)) and money:
-            raise _CardRefused("a bare number or boolean under a money key: units unknown")
-        return 0
-
-    try:
-        if isinstance(data, Mapping):
-            walk(data, 0, False)
-        else:
-            walk({"card": data}, 0, False)
-    except (_CardRefused, RecursionError):
-        return True
-    return False
+#: Whether a card's amounts cannot be verified against a ceiling (services/payment_orchestration/checkout_amounts).
+confirm_card_refused = checkout_amounts.confirm_card_refused
 
 
 def _lock_valid(row: Mapping[str, Any]) -> bool:
@@ -2035,6 +1834,9 @@ def setup_answer_refused(setup: Any, ceiling: Any) -> bool:
     sibling, e.g. a summary card) shows an amount `confirm_card_refused` cannot verify against `ceiling`,
     or the relay stripped a credential from it (a value it scrubbed is unknown: the card echoed the token)."""
     if int(getattr(setup, "credential_fields_stripped", 0) or 0) > 0:
+        return True
+    if getattr(setup, "text_amounts_refused", False):
+        # The answer's prose shows an amount we cannot verify (read in the transport; the text never leaves it).
         return True
     cards = list(getattr(setup, "cards", None) or [])
     return not cards or any(confirm_card_refused(card.data, ceiling) for card in cards)
@@ -2203,7 +2005,8 @@ async def _checkout_result(s: _Step, card: Any) -> str:
     order_id = order_id[1:].strip() if order_id.startswith("#") else order_id
     if status == "payment-reached":
         if data.get("success") is not True:
-            return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+            # Payment reached, but not reported a success: a charge may exist.
+            return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
         if not order_id:
             # The checkout reached the payment gateway but the merchant gave no order: a declined card
             # looks like this, and so might a charge whose order page failed. Not completed; a human checks.
@@ -2252,9 +2055,40 @@ CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED = "operator_confirmed_not_charged"
 _OPERATOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}\Z")
 
 
+#: A held checkout is resolvable only this long after it entered `paying`: the provider's staged checkout
+#: lapses after about 30 minutes, and a check made sooner can miss an order that lands later. Enforced in
+#: the SQL of the compare-and-swap.
+OPERATOR_MIN_HOLD_AGE_SECONDS = 3600
+
+
 def held_checkout_codes() -> frozenset:
-    """The codes a checkout is held with (what the operator may resolve)."""
+    """The codes a checkout is held with (what `list-held` shows)."""
     return _CHECKOUT_HOLD_CODES
+
+
+def operator_resolvable_codes() -> frozenset:
+    """The hold codes a human may end as `operator_confirmed_not_charged` (never one that recorded payment)."""
+    return _OPERATOR_RESOLVABLE_HOLD_CODES
+
+
+def operator_eligibility(row: Optional[Mapping[str, Any]], expected_code: str) -> Tuple[bool, str]:
+    """(eligible, reason) for resolving `row` with `expected_code`. The same checks the write makes, so a
+    preview says what the apply will do."""
+    if row is None:
+        return False, "not_a_held_checkout"
+    code = str(row.get("last_error_code") or "")
+    if code in _CHECKOUT_PAYMENT_REACHED_CODES or expected_code in _CHECKOUT_PAYMENT_REACHED_CODES:
+        return False, "payment_reached_recorded"
+    if code not in _OPERATOR_RESOLVABLE_HOLD_CODES:
+        return False, "not_a_checkout_hold_code"
+    if code != expected_code:
+        return False, "code_changed"
+    if row.get("claimed_by"):
+        return False, "claimed_by_a_worker"
+    entered = _aware(row.get("state_entered_at"))
+    if entered is None or (_now() - entered).total_seconds() < OPERATOR_MIN_HOLD_AGE_SECONDS:
+        return False, "held_too_recently"
+    return True, "eligible"
 
 
 async def operator_fail_held_checkout(purchase_id: str, *, expected_code: str, operator: str) -> Dict[str, Any]:
@@ -2263,17 +2097,22 @@ async def operator_fail_held_checkout(purchase_id: str, *, expected_code: str, o
     schedule: only jobs/a2a_rail_operator.py `resolve-held --apply`. Refused (nothing written) unless the row
     is an unclaimed `paying` checkout held with exactly `expected_code`, a checkout hold code. Returns
     {"outcome": "resolved" | "refused", "reason": ...}."""
-    if expected_code not in _CHECKOUT_HOLD_CODES:
+    if expected_code in _CHECKOUT_PAYMENT_REACHED_CODES:
+        # Our own ledger records that the provider reported payment reached: never "not charged".
+        return {"outcome": "refused", "reason": "payment_reached_recorded",
+                "message": "payment was reported for this purchase: escalate; the merchant refunds"}
+    if expected_code not in _OPERATOR_RESOLVABLE_HOLD_CODES:
         return {"outcome": "refused", "reason": "not_a_checkout_hold_code"}
     if not _OPERATOR_RE.match(str(operator or "")):
         return {"outcome": "refused", "reason": "operator_handle_invalid"}
     try:
         moved = await ledger.operator_fail_held_checkout(
-            purchase_id, expected_code=expected_code, code=CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED)
+            purchase_id, expected_code=expected_code, code=CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED,
+            min_age_seconds=OPERATOR_MIN_HOLD_AGE_SECONDS)
     except ValueError:
         return {"outcome": "refused", "reason": "purchase_id_invalid"}
     if moved is None:
-        return {"outcome": "refused", "reason": "row_not_held_with_that_code_or_claimed"}
+        return {"outcome": "refused", "reason": "row_not_held_with_that_code_claimed_or_held_too_recently"}
     logger.warning("a2a_rail_worker: operator resolved held checkout purchase=%s from=%s operator=%s",
                    purchase_id, expected_code, operator)
     return {"outcome": "resolved", "reason": CHECKOUT_OPERATOR_CONFIRMED_NOT_CHARGED, "state": moved.get("state")}

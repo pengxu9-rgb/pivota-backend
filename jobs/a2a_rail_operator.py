@@ -18,8 +18,18 @@ and nothing calls it automatically.
 WHAT IT IS NOT FOR. A held checkout the provider DID place (an order, a charge) is not "failed": do not
 resolve it here. That case needs the merchant's order number recorded by hand; there is no command for it.
 
-DRY RUN BY DEFAULT. `resolve-held` without `--apply` only reports whether the row is eligible. `--apply`
-additionally requires:
+NEVER FOR A CHARGE WE RECORDED. A hold written after the provider reported `payment-reached`
+(a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES: an unverified or over-ceiling total, an order id that looks
+like a card number, no order id, a payment not reported a success) is refused, whatever the flags: our own
+ledger says the order may be paid. Escalate; the merchant refunds. A row in `paying` for less than
+a2a_rail_worker.OPERATOR_MIN_HOLD_AGE_SECONDS (1 hour; the provider's staged checkout lapses after about
+30 minutes) is refused too, in the SQL of the write.
+
+WHAT A RESOLUTION CAUSES. The purchase keeps its token id: the next worker tick's orphan pass voids that
+token on the rail when a voider is configured (a second rail call, caused by this write).
+
+DRY RUN BY DEFAULT. `resolve-held` without `--apply` reads THAT row (by id) and reports its code, how long
+it has been held, and whether the apply would be accepted and why not. `--apply` additionally requires:
   * `--operator <handle>` (logged with the decision);
   * `--expect-env <PIVOTA_ENV>`, EXACTLY this process's PIVOTA_ENV;
   * `--provider-checked`: the operator's statement that they checked the provider's side for this purchase.
@@ -43,6 +53,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 EXIT_OK = 0
@@ -106,11 +117,24 @@ async def run(argv: List[str], out=sys.stdout) -> int:
             for row in await _held(args.limit):
                 print(json.dumps(row, default=str, sort_keys=True), file=out)
             return EXIT_OK
-        held = [row for row in await _held(500) if row["id"] == args.purchase_id]
-        eligible = bool(held) and held[0]["last_error_code"] == args.expected_code and not held[0]["claimed_by"]
+        import db.a2a_rail_ledger as ledger
+
+        row = await ledger.get_paying_checkout(args.purchase_id)  # THIS row, by id
+        eligible, reason = worker.operator_eligibility(row, args.expected_code)
         if not args.apply:
-            print(json.dumps({"outcome": "dry_run", "eligible": eligible,
-                              "row": held[0] if held else None}, default=str, sort_keys=True), file=out)
+            entered = row.get("state_entered_at") if row else None
+            age = int((datetime.now(timezone.utc) - entered).total_seconds()) if isinstance(entered, datetime) else None
+            preview = {
+                "outcome": "dry_run", "eligible": eligible, "reason": reason,
+                "code": row.get("last_error_code") if row else None,
+                "held_for_seconds": age, "minimum_hold_age_seconds": worker.OPERATOR_MIN_HOLD_AGE_SECONDS,
+                "row": row,
+                "on_resolve": "the purchase ends failed / operator_confirmed_not_charged, and the next worker tick's "
+                              "orphan pass voids its token on the rail (when a voider is configured)",
+            }
+            if reason == "payment_reached_recorded":
+                preview["message"] = "payment was reported for this purchase: escalate; the merchant refunds"
+            print(json.dumps(preview, default=str, sort_keys=True), file=out)
             return EXIT_OK if eligible else EXIT_REFUSED
         result = await worker.operator_fail_held_checkout(
             args.purchase_id, expected_code=args.expected_code, operator=args.operator)

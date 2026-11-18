@@ -87,6 +87,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 from urllib.parse import urlparse
 
 from config.platform import is_production as _platform_is_production
+from services.payment_orchestration import checkout_amounts
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,9 @@ class A2AResult:
     context_id: Optional[str] = None
     #: Whether the action sent may have changed state on the provider's side.
     may_write: bool = False
+    #: Set on a checkout setup's answer only: a text part shows an amount the ceiling cannot be verified
+    #: against (read here with services/payment_orchestration/checkout_amounts; the text is never returned).
+    text_amounts_refused: bool = False
     elapsed_s: float = 0.0
 
     @property
@@ -669,6 +673,9 @@ class CheckoutSetup:
     cardholder_name: str = field(repr=False)
     #: Deterministic per purchase (the provider lists it as required), so a repeat is one checkout.
     idempotency_key: str = ""
+    #: The approval ceiling (minor units): the setup answer's PROSE is read against it here, in the
+    #: transport, so no text leaves this module (`text_amounts_refused`). None: any text part refuses.
+    ceiling_minor: Optional[int] = None
 
 
 def _setup_problem(setup: Any) -> Optional[str]:
@@ -801,6 +808,29 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
         result.credential_fields_stripped += removed
         cards.append(Card(component=component, kind=kind, data=data, actions=actions))
     result.cards = cards
+
+
+def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -> bool:
+    """Whether any text part of the agent's answer shows an amount the ceiling cannot be verified against
+    (checkout_amounts.text_refused). The token's own values are removed from the text first. No ceiling:
+    any text part refuses. Never raises; the text is not kept."""
+    try:
+        task = body.get("result") if isinstance(body, dict) else None
+        texts = [str(p.get("text") or "") for p in _latest_agent_parts(task) if p.get("kind") == "text"] if isinstance(
+            task, dict) else []
+        if not texts:
+            return False
+        if ceiling is None:
+            return True
+        contains, exact = _scrub_needles(network_token) if isinstance(network_token, Mapping) else ((), frozenset())
+        for text in texts:
+            for needle in sorted({*contains, *exact}, key=len, reverse=True):
+                text = text.replace(needle, " ")
+            if checkout_amounts.text_refused(text, ceiling):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - unreadable prose refuses (and nothing of it is logged)
+        return True
 
 
 def _approved_token(body: Any, expected_token_id: str) -> Optional[Mapping[str, Any]]:
@@ -1039,10 +1069,17 @@ class A2ARailClient:
                 "idempotency_key": setup.idempotency_key,
             }
             known = network_token
+            ceiling = setup.ceiling_minor
+
+            def _read_setup_answer(result: A2AResult, body: Any) -> None:
+                _scrub_values(result, known)
+                # The answer's prose: read for amounts HERE, with the token's own values removed first, and
+                # only a yes/no kept. Prose never leaves this module (rule 1).
+                result.text_amounts_refused = _text_parts_refused(body, known, ceiling)
+
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
-                action="submit", payload=checkout_payload,
-                inspect=lambda result, _body: _scrub_values(result, known))
+                action="submit", payload=checkout_payload, inspect=_read_setup_answer)
             known = None
         except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
             # `_send` classifies every transport failure itself; this is anything else. The setup may or
