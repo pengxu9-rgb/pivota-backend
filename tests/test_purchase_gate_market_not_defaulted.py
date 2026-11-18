@@ -653,10 +653,14 @@ _PROVENANCE_FN = "request_market_observed"
 #: (file, enclosing function path) -> (leaves of the request argument, keyword args of the call)
 _SITES: Dict[Tuple[str, str], Tuple[Set[str], Set[str]]] = {
     # `payload.market_assumed` (decision D-10): a market the gateway ASSUMED turns the flag OFF, never on.
+    # `_normalized_offers_resolve_market` reads `payload.market` alone (trimmed, upper-cased; an unlisted
+    # market is refused before it), so it is the request carrier too.
     ("routes/agent_shop_gateway.py", "_handle_offers_resolve/_append_external_offers_from_seed_rows"): (
-        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured"}, set()),
+        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured",
+         "call:_normalized_offers_resolve_market"}, set()),
     ("routes/agent_shop_gateway.py", "_handle_offers_resolve"): (
-        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured"}, set()),
+        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured",
+         "call:_normalized_offers_resolve_market"}, set()),
     ("routes/agent_shop_gateway.py", "_attach_connected_product_redirects"): ({"param:market"}, set()),
     ("routes/agent_shop_gateway.py", "mint_external_seed_links"): ({"body.market"}, set()),
     ("routes/agent_shop_gateway.py", "_build_prefetched_external_seed_wrappers"): (
@@ -933,7 +937,7 @@ def test_the_request_market_edges_into_the_mint_sites_are_request_carriers() -> 
 
 #: enclosing function path -> the leaves the gate's market argument must resolve to
 _GATE_SITES: Dict[str, Set[str]] = {
-    "_handle_offers_resolve": {"payload.market"},
+    "_handle_offers_resolve": {"payload.market", "call:_normalized_offers_resolve_market"},
     "mint_external_seed_links": {"body.market"},
     "_handle_find_products_multi_inner": {
         "call:_request_market_for_multi", "param:payload", "param:request_metadata"},

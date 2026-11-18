@@ -3655,7 +3655,9 @@ class OffersResolveProductRef(BaseModel):
 class OffersResolvePayload(BaseModel):
     product: OffersResolveProductRef
     limit: int = Field(10, ge=1, le=30, description="Max offers to return")
-    market: Optional[str] = Field(None, description="Market for outbound allowlist and UTM")
+    # Any, not str: a market that is not a string (123, a list) is refused by name in the handler
+    # (`market_invalid`) instead of failing validation as a 500.
+    market: Optional[Any] = Field(None, description="Market for outbound allowlist and UTM")
     tool: Optional[str] = Field(None, description="Tool identifier for outbound allowlist and UTM")
     commerce_surface: Optional[str] = Field(
         None,
@@ -4954,7 +4956,15 @@ async def _handle_offers_resolve(
 
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
-    market_hint = str(payload.market or "").strip() or None
+    # THE BUYER MARKET, read as the gateway's get_offers reads one (trimmed, upper-cased: 'us' is US) and
+    # refused by name, before any read, when it is not a market this registry lists: `market_invalid` for a
+    # value that is not a two-letter code ('USA', 'EU-DE', 123), `market_not_priced` for a well-formed code the
+    # registry does not list (DE, ZZ). Never defaulted and never answered as another market. Absent, null or
+    # blank names no market (the gateway's rule, D-10's marketIsUnnamed): no market, exactly as before.
+    market_refusal = _offers_resolve_market_refusal(payload.market)
+    if market_refusal is not None:
+        return market_refusal
+    market_hint = _normalized_offers_resolve_market(payload.market)
     # DECISION D-10: a market the gateway ASSUMED (US, `marketAssumed`) is the market this answer is decided for --
     # the cart gate, the currency filter and the served market all use `market_hint` -- but it was never NAMED, so
     # every `market_observed` / cart-pin decision below reads this instead: None, exactly as for no market.
@@ -9949,6 +9959,57 @@ def _offer_destination_host(url: Optional[str]) -> str:
     """
     host = _seed_domain_from_url(url)
     return host[4:] if host.startswith("www.") else host
+
+
+_OFFERS_RESOLVE_MARKET_CODE = re.compile(r"[A-Z]{2}")
+
+
+def _offers_resolve_market_unnamed(raw: Any) -> bool:
+    """Absent, null or a blank string: the request names no market (the gateway's marketIsUnnamed)."""
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+def _normalized_offers_resolve_market(raw: Any) -> Optional[str]:
+    """The caller's market as a code (trimmed, upper-cased), or None when it names none."""
+    if _offers_resolve_market_unnamed(raw) or not isinstance(raw, str):
+        return None
+    return market_registry.normalize_market(raw)
+
+
+def _offers_resolve_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
+    """offers.resolve's named refusal for a market it cannot answer for, or None (unnamed, or listed).
+
+    The vocabulary is the gateway get_offers door's: `market_invalid` (not a two-letter code; the value is
+    never echoed) and `market_not_priced` (a well-formed code the market registry does not list)."""
+    if _offers_resolve_market_unnamed(raw):
+        return None
+    code = market_registry.normalize_market(raw) if isinstance(raw, str) else ""
+    if not _OFFERS_RESOLVE_MARKET_CODE.fullmatch(code):
+        return {
+            "status": "error",
+            "offers": [],
+            "offers_count": 0,
+            "error": {
+                "code": "MARKET_INVALID",
+                "reason": "market_invalid",
+                "message": "`market` is not an ISO 3166-1 alpha-2 country code; nothing was looked up. "
+                           "Send the buyer's country as two letters; a market is never guessed.",
+            },
+        }
+    if market_registry.market_or_none(code) is None:
+        return {
+            "status": "error",
+            "offers": [],
+            "offers_count": 0,
+            "market": code,
+            "error": {
+                "code": "MARKET_NOT_PRICED",
+                "reason": "market_not_priced",
+                "message": f"No offer is priced for a buyer in {code}; nothing was looked up, and a request for "
+                           f"{code} is never answered as another market.",
+            },
+        }
+    return None
 
 
 def _declared_buyer_currency(market_hint: Optional[str]) -> Optional[str]:
