@@ -4704,15 +4704,28 @@ def test_every_market_cell_answers_the_merchant_scoped_ref_as_the_listing_key_it
     monkeypatch: pytest.MonkeyPatch, client: TestClient, market
 ) -> None:
     """The merchant-scoped ref is answered exactly as the listing's own product_key is, market by
-    market: same offers, same binds (the market and its currency are never defaulted or rewritten)."""
+    market: same offers, same binds (the market and its currency are never defaulted or rewritten).
+    A market this backend does not price (DE, ZZ) is refused by name for both refs alike, before any
+    catalog read."""
+
+    unpriced = market in ("DE", "ZZ")
 
     def answer(**kwargs):
         seen: list = []
         _scoped_setup(monkeypatch, _scoped_fetch_all(
             listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
         body = _post_scoped(client, market=market, **kwargs)
+        if unpriced:
+            assert (body["status"], body["error"]["reason"], body["market"]) == ("error", "market_not_priced", market)
+            assert _catalog_binds(seen) == [] and not body.get("offers")
+            return [], None
         (binds,) = _catalog_binds(seen)
         return [(o["source"]["offer_id"], o["price"], o["currency"]) for o in body.get("offers") or []], binds
+
+    if unpriced:
+        answer()
+        answer(merchant_id=None, product_id=_SCOPED_LISTING_KEY)
+        return
 
     scoped, scoped_binds = answer()
     direct, direct_binds = answer(merchant_id=None, product_id=_SCOPED_LISTING_KEY)
