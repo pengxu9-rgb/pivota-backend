@@ -6,10 +6,14 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+from hmac import compare_digest
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import stat
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -76,6 +80,94 @@ def _listing(row: dict) -> PilotListing:
 
 
 LISTINGS = {row["seed_id"]: _listing(row) for row in _CONFIG["listings"].values()}
+
+# Serving may preserve the selected shade for independently reviewed additions after
+# they are present in the active seed and catalog. Draft review uses LISTINGS only.
+# The reviewed additions are real catalog identifiers, so they live in a private manifest
+# mounted per runtime: NAMED_REFERRAL_VARIANTS_MANIFEST_PATH, pinned by
+# NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256. Shape:
+#   {"schema_version": 1, "listings": {"<seed_id>": {"<native variant id>": ["<GTIN-14>", "<SKU>"]}}}
+# Unset: no additions. Set but unreadable, unpinned or invalid: no additions and an ERROR
+# log; only this shade pinning is disabled (links fall back to the family page).
+NAMED_REFERRAL_VARIANTS_MANIFEST = "NAMED_REFERRAL_VARIANTS_MANIFEST_PATH"
+NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256 = "NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256"
+_MANIFEST_LIMIT = 32768
+_NATIVE_VARIANT_ID = re.compile(r"[1-9][0-9]{0,23}\Z")
+_SKU = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}\Z")
+_logger = logging.getLogger(__name__)
+
+
+def _unique_object(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate manifest key")
+    return dict(pairs)
+
+
+def validate_named_referral_variants(config, listings) -> dict[str, dict[str, tuple[str, str]]]:
+    """Return the reviewed additions keyed by seed, or raise ValueError naming the first problem."""
+    if (not isinstance(config, dict) or config.keys() != {"schema_version", "listings"}
+            or type(config["schema_version"]) is not int or config["schema_version"] != 1):
+        raise ValueError("manifest must be {schema_version: 1, listings: {...}}")
+    entries = config["listings"]
+    if not isinstance(entries, dict) or not entries:
+        raise ValueError("manifest lists no seeds")
+    result = {}
+    for seed_id, additions in entries.items():
+        listing = listings.get(seed_id)
+        if listing is None:
+            raise ValueError("manifest seed is not a reviewed listing")
+        if not isinstance(additions, dict) or not additions:
+            raise ValueError("manifest seed has no additions")
+        existing_ids = {variant_id for variant_id, *_ in listing.variants}
+        seen_gtins = {validated_source_gtin(barcode) for _, barcode, *_ in listing.variants}
+        seen_skus = {sku for *_, sku in listing.variants}
+        checked = {}
+        for native_id, identity in additions.items():
+            if not isinstance(native_id, str) or not _NATIVE_VARIANT_ID.fullmatch(native_id):
+                raise ValueError("manifest variant id is not a native id")
+            if native_id in existing_ids:
+                raise ValueError("manifest variant repeats a reviewed listing variant")
+            if not isinstance(identity, list) or len(identity) != 2:
+                raise ValueError("manifest variant must be [GTIN-14, SKU]")
+            gtin, sku = identity
+            if not isinstance(gtin, str) or len(gtin) != 14 or validated_source_gtin(gtin) != gtin:
+                raise ValueError("manifest GTIN is not a check-digit valid GTIN-14")
+            if not isinstance(sku, str) or not _SKU.fullmatch(sku):
+                raise ValueError("manifest SKU is invalid")
+            if gtin in seen_gtins or sku in seen_skus:
+                raise ValueError("manifest GTIN or SKU is not unique within its listing")
+            seen_gtins.add(gtin)
+            seen_skus.add(sku)
+            checked[native_id] = (gtin, sku)
+        result[seed_id] = checked
+    return result
+
+
+def load_named_referral_variants(listings=None) -> dict[str, dict[str, tuple[str, str]]]:
+    listings = LISTINGS if listings is None else listings
+    path = os.getenv(NAMED_REFERRAL_VARIANTS_MANIFEST)
+    digest = os.getenv(NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256)
+    if not path and not digest:
+        return {}
+    try:
+        if not path or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("manifest requires a path and a SHA-256 pin")
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise ValueError("manifest path is not a regular file")
+        with Path(path).open("rb") as source:
+            data = source.read(_MANIFEST_LIMIT + 1)
+        if len(data) > _MANIFEST_LIMIT:
+            raise ValueError("manifest is too large")
+        if not compare_digest(sha256(data).hexdigest(), digest):
+            raise ValueError("manifest bytes do not match the SHA-256 pin")
+        return validate_named_referral_variants(json.loads(data, object_pairs_hook=_unique_object), listings)
+    except (OSError, ValueError, RecursionError) as error:
+        _logger.error("named referral variants manifest refused; shade pinning disabled: %s", error)
+        return {}
+
+
+NAMED_REFERRAL_VARIANTS = load_named_referral_variants()
 
 
 SCOPED_LISTING = _listing(_CONFIG["scoped_listing"])

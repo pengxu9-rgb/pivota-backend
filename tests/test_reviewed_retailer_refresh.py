@@ -10,7 +10,9 @@ import pytest
 from services.catalog_enrichment_agent.apply import apply_ingest_plan
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.catalog_enrichment_agent.reviewed_retailer_offers import scope_reviewed_plan
-from services.exact_retailer_cohorts import COHORT_A_CONFIG, COHORT_B_CONFIG, PROOF_KEY, RETAILERS, RETAILER_COHORT_B
+from services.exact_retailer_cohorts import (
+    COHORT_A_CONFIG, COHORT_B_CONFIG, PROOF_KEY, RETAILERS, RETAILER_COHORT_B, ExactRetailerCohort, RetailerListing,
+)
 
 # The refresh job entrypoint keeps its deployed module path; the config names it.
 refresh = importlib.import_module(COHORT_A_CONFIG["refresh"]["module"])
@@ -128,3 +130,70 @@ async def test_cohort_b_bare_listing_cannot_enter_the_generic_or_reviewed_writer
         await apply_ingest_plan({"pdps": [{"product_key": COHORT_B_BARE_LISTING_KEY}],
                                  "reviewed_secondary_group": RETAILER_COHORT_B.canonical_group_id},
                                 batch_label="unlocalized-test", db=object(), market="US")
+
+
+def test_supplemental_refresh_filters_unreviewed_shades_and_preserves_observed_price_stock():
+    import json
+    from scripts.ops import reviewed_retailer_offers as historical_refresh
+    from services.catalog_enrichment_agent.ingestion import retailer_product_key
+    from services.seller_identity import make_observed_retailer_id
+
+    variants = {"65000000000001": ("66000000000001", "01234567890128"),
+                "65000000000002": ("66000000000002", "01234567890135")}
+    host = "example-retailer.example"
+    listing = RetailerListing(make_observed_retailer_id(host), host, "67000000000001", variants, "/products/lip-color")
+    key = retailer_product_key(listing.host, listing.family_url)
+    config = {"vendor": "Fixture Maker", "retailer_name": "Example Retailer",
+              "category_path": "beauty/makeup/lip/lipstick",
+              "sku_by_variant": {"65000000000001": "SKU1", "65000000000002": "SKU2"}}
+    raw = {
+        "id": int(listing.native_product_id), "handle": "lip-color", "vendor": config["vendor"],
+        "title": "Fixture Lip Color", "type": "Makeup", "images": ["https://cdn.example/lip.jpg"],
+        "variants": [{"id": int(native), "title": str(i), "sku": f"SKU{i}", "barcode": gtin,
+                      "price": 1400 + i, "available": i == 1}
+                     for i, (native, (_, gtin)) in enumerate(variants.items(), start=1)],
+    }
+    raw["variants"].append({"id": 67000000000002, "title": "Unreviewed", "sku": "Other", "price": 100})
+    now = datetime.now(timezone.utc)
+    record = historical_refresh.storefront_record(raw, now, listing=listing, config=config)
+    cohort = ExactRetailerCohort("EXACT_RETAILER_TEST_ENABLED", "brand-key", "seller-brand", "pg_placeholder",
+                                 "ck_placeholder", {key: listing})
+    plan = scope_reviewed_plan(ingest_validated_jsonl([record], market="US"), cohort=cohort)
+    proofs = [json.loads(row["offer_payload"])[PROOF_KEY] for row in plan["offers"]]
+    assert {(proof["retailer_native_variant_id"], proof["price_minor"], proof["availability"]) for proof in proofs} == {
+        ("65000000000001", 1401, "in_stock"), ("65000000000002", 1402, "out_of_stock"),
+    }
+    raw["variants"][0]["sku"] = "Changed"
+    with pytest.raises(ValueError, match="variant identity, price or stock is unproven"):
+        historical_refresh.storefront_record(raw, now, listing=listing, config=config)
+
+
+@pytest.mark.asyncio
+async def test_supplemental_listing_cannot_go_through_ordinary_catalog_writer(monkeypatch):
+    from services import exact_retailer_cohorts
+
+    key = "ext:retailer:placeholder"
+    listing = RetailerListing("merchant-retailer", "example-retailer.example", "67000000000001",
+                              {"65000000000001": ("66000000000001", "01234567890128")}, "/products/lip-color")
+    cohort = ExactRetailerCohort("EXACT_RETAILER_TEST_ENABLED", "brand-key", "seller-brand", "pg_placeholder",
+                                 "ck_placeholder", {key: listing})
+    monkeypatch.setattr(exact_retailer_cohorts, "RETAILER_COHORT_C", cohort)
+    with pytest.raises(ValueError, match="require the scoped retailer writer"):
+        await apply_ingest_plan({"pdps": [{"product_key": key}]},
+                                batch_label="unreviewed-test", db=object(), market="US")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["plan", "refresh"])
+async def test_supplemental_refresh_requires_private_configuration_before_io(monkeypatch, mode):
+    from scripts.ops import reviewed_retailer_offers as historical_refresh
+
+    monkeypatch.setattr(historical_refresh, "COHORT_C_CONFIG", None)
+    monkeypatch.setattr(historical_refresh, "RETAILER_COHORT_C", None)
+
+    def no_environment_check(**_):
+        pytest.fail("missing configuration should hold before environment or database access")
+
+    monkeypatch.setattr(historical_refresh, "check_environment", no_environment_check)
+    with pytest.raises(ValueError, match="reviewed retailer cohort configuration is unavailable"):
+        await historical_refresh.run(mode)

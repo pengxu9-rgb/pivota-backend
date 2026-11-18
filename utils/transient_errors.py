@@ -125,6 +125,24 @@ def order_existence_unknown_http_exception_fields(reason: str, *, retry_after_se
     }
 
 
+#: Why an agent order create was refused with a retriable 503 before its commerce path was
+#: decided: the merchant has no active store row, and the quote the path is then read from could not
+#: be read. Not "unsupported": that refusal says the path WAS decided.
+COMMERCE_PATH_UNKNOWN = "COMMERCE_PATH_UNKNOWN"
+
+
+def commerce_path_unknown_http_exception_fields(*, retry_after_seconds: int = 1) -> dict:
+    return {
+        "status_code": 503,
+        "headers": {"Retry-After": str(max(1, int(retry_after_seconds)))},
+        "detail": {
+            "error": "TEMPORARY_UNAVAILABLE",
+            "reason": COMMERCE_PATH_UNKNOWN,
+            "message": "Could not tell how this merchant's orders are placed. Retry shortly.",
+        },
+    }
+
+
 def db_busy_http_exception(*, retry_after_seconds: int = 1) -> HTTPException:
     return HTTPException(
         status_code=503,

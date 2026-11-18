@@ -18,7 +18,16 @@ WHAT IS STORED. One surface_click_events row per hand-off, under its own surface
   dest_domain  the seller host the buyer is sent to;
   issued_at    when the hand-off was issued (and created_at, as for every row);
   context      {kind, v, binding, referral_click_id, buyer_market, quoted_total_minor, currency,
-               quote_source, price_as_of, via_agent_id}.
+               quote_source, price_as_of, via_agent_id, catalog_attributed}.
+
+`catalog_attributed: true` (absent otherwise) says the gateway sent the seller's cart with Shopify
+catalog-attributed variant ids (Promoted Placements, the gateway's SHOPIFY_CATALOG_ATTRIBUTION):
+the sale, if any, is attributed to our saved Shopify catalog, and the cart link carries none of
+Pivota's own tracking members, so such a record carries no `referral_click_id` either. Readers that
+report hand-offs can tell the two kinds apart by it. Shopify's click id is not stored here. Its later
+state is `handed_off` for good: no Pivota click or order edge is keyed to it (Shopify reports the sale
+per catalog). The gateway's partner-facing get_order passes only its own allowlisted fields, so the
+member is not part of the partner contract.
 
 `binding` is the sha256 of the full esc id as handed out. A read must present the same esc id: a
 record id lifted into a forged esc id (other items, another cart) does not match, and neither does
@@ -112,6 +121,7 @@ class HandoffRecord:
     referral_click_id: Optional[str] = None
     price_as_of: Optional[str] = None
     merchant_id: Optional[str] = None
+    catalog_attributed: bool = False
 
 
 def _context(record: HandoffRecord) -> Dict[str, Any]:
@@ -127,6 +137,9 @@ def _context(record: HandoffRecord) -> Dict[str, Any]:
         value = getattr(record, key)
         if value:
             out[key] = value
+    # Only ever written as true: an absent member is an ordinary hand-off, so every existing row reads as before.
+    if record.catalog_attributed is True:
+        out["catalog_attributed"] = True
     return out
 
 
@@ -269,4 +282,6 @@ async def read_handoff(record_id: str, binding: str, partner_agent_id: str) -> D
     for key in ("buyer_market", "price_as_of"):
         if context.get(key):
             handoff[key] = context[key]
+    if context.get("catalog_attributed") is True:
+        handoff["catalog_attributed"] = True
     return {"outcome": "accepted", "handoff": handoff}

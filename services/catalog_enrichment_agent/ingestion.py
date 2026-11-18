@@ -2050,7 +2050,7 @@ def ingest_validated_jsonl(
     """
     from services.exact_retailer_cohorts import (
         COHORT_A_CONFIG, COHORT_B_BARE_LISTING_KEY, COHORT_B_CONFIG, COHORT_B_PROTECTED_LISTING_KEYS,
-        RETAILERS as COHORT_A_LISTINGS,
+        COHORT_C_SKIP_REASON, RETAILER_COHORT_C, RETAILERS as COHORT_A_LISTINGS,
     )
 
     pdp_rows: List[Dict[str, Any]] = []
@@ -2084,6 +2084,11 @@ def ingest_validated_jsonl(
         if key in COHORT_B_PROTECTED_LISTING_KEYS and (key == COHORT_B_BARE_LISTING_KEY or key not in reviewed_retailer_keys):
             skipped += 1
             reason = COHORT_B_CONFIG["ingest_skip_reason"]
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            continue
+        if RETAILER_COHORT_C is not None and key in RETAILER_COHORT_C.listings and key not in reviewed_retailer_keys:
+            skipped += 1
+            reason = COHORT_C_SKIP_REASON
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
         named = (current_listings or {}).get(key)
