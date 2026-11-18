@@ -76,11 +76,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
 import re
 import unicodedata
+import urllib.parse
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -572,11 +574,22 @@ _CARD_CODE_RE = re.compile(
 
 
 def _fold(text: str) -> str:
-    """NFKC, invisible characters removed, lower case, and every decimal digit (Arabic-Indic, full-width, ...)
-    read as its ASCII digit: what a card-code match is made on."""
+    """What a card-code match is made on: HTML entities and %-escapes decoded ("&#55;", "cvv%20715"), NFKC,
+    invisible characters removed, lower case, every decimal digit (Arabic-Indic, full-width, ...) read as its
+    ASCII digit, a dotted word joined ("c.v.v" -> "cvv"), and runs of whitespace collapsed to one space."""
+    text = html.unescape(text)
+    if "%" in text:
+        text = urllib.parse.unquote(text)
     text = checkout_amounts.normalise(text).lower()
-    return "".join(str(unicodedata.digit(ch)) if ch.isdigit() and not ch.isascii() and unicodedata.digit(ch, None) is not None
+    text = "".join(str(unicodedata.digit(ch)) if ch.isdigit() and not ch.isascii() and unicodedata.digit(ch, None) is not None
                    else ch for ch in text)
+    text = _DOTTED_WORD_RE.sub(lambda m: m.group(0).replace(".", ""), text)
+    return _WHITESPACE_RE.sub(" ", text)
+
+
+#: A word spelt with dots between single letters ("c.v.v", "c.v.v.2").
+_DOTTED_WORD_RE = re.compile(r"(?<![a-z0-9])(?:[a-z0-9]\.){2,}[a-z0-9](?![a-z0-9])")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def has_card_code(text: Any) -> bool:
@@ -836,8 +849,7 @@ _SCRUB_SUBSTRING_MIN = 8
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
     expiry (raw and as "MM/YY") and its DAVV (`DAVV_FIELD`) only as a WHOLE value: "715" alone, never inside
-    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context. (The DAVV is
-    also scrubbed under a card-shaped key by `_card_only_needles`, now a subset of this.)"""
+    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context."""
     contains: List[str] = []
     exact = set()
     for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
@@ -856,36 +868,10 @@ def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], F
     return tuple(contains), frozenset(exact)
 
 
-def _card_only_needles(network_token: Any) -> FrozenSet[str]:
-    """Values scrubbed only under a card-shaped key: the 3-digit DAVV."""
-    davv = davv_from_network_token(network_token)
-    return frozenset({davv}) if davv else frozenset()
-
-
-#: Keys (canonical) under which a card's security code would sit: the DAVV is scrubbed by value only here
-#: (and anywhere inside a card-shaped object), never in an address, an amount or prose.
-_CARD_SHAPED_KEYS = frozenset({
-    "card", "cards", "cardinfo", "carddetails", "carddata", "paymentcard", "paymentmethod", "cvv", "cvc", "cvv2",
-    "cvc2", "cvn", "csc", "securitycode", "cardsecuritycode", "cardcode", "cardcvv", "cardcvc", "davv", "dcvv",
-    "dcvv2", "dynamiccvv", "dynamicdata", "cryptogram", "networktoken",
-    "cid", "cv2", "verificationcode", "verificationvalue", "securityvalue", "pin", "payment",
-})
-#: Key prefixes of the same kind ("cardExtra", "dynamicDataValue", "securityCode2", "verificationCodeDigits").
-_CARD_SHAPED_PREFIXES = ("card", "dynamicdata", "dynamiccvv", "security", "verificationcode", "verificationvalue")
-
-
-def _card_shaped_key(key: Any) -> bool:
-    canon = _canon(key)
-    return (canon in _CARD_SHAPED_KEYS or canon.startswith(_CARD_SHAPED_PREFIXES)
-            or any(part in canon for part in ("cvv", "cvc", "cvn", "davv")))
-
-
-def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], depth: int = 0,
-                 card_only: FrozenSet[str] = frozenset(), in_card: bool = False) -> Tuple[Any, int]:
-    """`value` with every string (or number) that is, or carries, a known credential removed WHOLE. A
-    `card_only` value (the DAVV) counts only under a card-shaped key (`in_card`)."""
+def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], depth: int = 0) -> Tuple[Any, int]:
+    """`value` with every string (or number) that is, or carries, a known credential removed WHOLE."""
     def hit(text: str) -> bool:
-        return text in exact or any(needle in text for needle in contains) or (in_card and text in card_only)
+        return text in exact or any(needle in text for needle in contains)
 
     if depth > _MAX_STRIP_DEPTH:
         return None, 1
@@ -893,17 +879,16 @@ def _scrub_value(value: Any, contains: Tuple[str, ...], exact: FrozenSet[str], d
         out: Dict[str, Any] = {}
         removed = 0
         for key, item in value.items():
-            if str(key) in exact or any(needle in str(key) for needle in contains):
+            if hit(str(key)):
                 removed += 1
                 continue
-            out[key], count = _scrub_value(item, contains, exact, depth + 1, card_only,
-                                           in_card or _card_shaped_key(key))
+            out[key], count = _scrub_value(item, contains, exact, depth + 1)
             removed += count
         return out, removed
     if isinstance(value, list):
         items, removed = [], 0
         for item in value:
-            cleaned, count = _scrub_value(item, contains, exact, depth + 1, card_only, in_card)
+            cleaned, count = _scrub_value(item, contains, exact, depth + 1)
             items.append(cleaned)
             removed += count
         return items, removed
@@ -919,8 +904,7 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
     if result is None or not isinstance(network_token, Mapping):
         return
     contains, exact = _scrub_needles(network_token)
-    card_only = _card_only_needles(network_token)
-    if not contains and not exact and not card_only:
+    if not contains and not exact:
         return
     def hit(text: Optional[str]) -> bool:
         return bool(text) and (text in exact or any(n in text for n in contains))
@@ -930,7 +914,7 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
         result.credential_fields_stripped += 1
     cards: List[Card] = []
     for card in result.cards:
-        data, removed = _scrub_value(card.data, contains, exact, card_only=card_only)
+        data, removed = _scrub_value(card.data, contains, exact)
         component, kind = card.component, card.kind
         for name in (component, kind or ""):
             if name and (name in exact or any(n in name for n in contains)):

@@ -3011,8 +3011,7 @@ async def test_a_lookup_that_finds_the_result_completes_on_a_verified_total(code
     _checkout_result("form-error", success=False, order_id=None, total=None),
     _checkout_result("captcha-failed", success=False, order_id=None, total=None),
     _checkout_result("pay-disabled", success=False, order_id=None, total=None),
-    _checkout_result("payment-reached", success=False),
-], ids=["form_error", "captcha_failed", "pay_disabled", "success_false"])
+], ids=["form_error", "captcha_failed", "pay_disabled"])
 @pytest.mark.parametrize("code,pending", LOOKUP_HOLDS, ids=[c for c, _ in LOOKUP_HOLDS])
 async def test_a_not_submitted_lookup_answer_on_a_task_we_never_recorded_keeps_the_hold(code, pending, answer):
     # P2-1: nothing ties the answer to OUR checkout (another purchase's result could come back): never failed.
@@ -3052,17 +3051,73 @@ async def test_a_lookup_on_our_recorded_task_with_a_pending_write_completes_and_
 
 
 @pytest.mark.parametrize("code,pending", LOOKUP_HOLDS, ids=[c for c, _ in LOOKUP_HOLDS])
-async def test_a_lookup_that_finds_it_in_progress_records_the_task_and_the_poll_goes_on(code, pending):
+async def test_a_lookup_that_finds_an_unbound_task_in_progress_keeps_the_hold_and_adopts_nothing(code, pending):
+    # P2-1a: an await on a task the row never recorded is not adopted (nor noted): still held, the write kept.
     pid = await _held(code, pending=pending)
     rail = Rail().on("checkout.lookup#submit", _checkout_await())
-    assert await _step(rail, pid) == "placing"
+    assert await _step(rail, pid) == "checkout_held"
     _lookup_only(rail, pid)
+    row = await _row(pid)
+    assert (row["state"], row["checkout_task_id"], row["last_error_code"], row["pending_write"]) == (
+        "paying", None, code, pending)
+
+
+async def test_a_lookup_that_finds_our_own_task_in_progress_records_it_and_the_poll_goes_on():
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_abc123")
+    rail = Rail().on("checkout.lookup#submit", _checkout_await())
+    assert await _step(rail, pid) == "placing"
     row = await _row(pid)
     assert (row["checkout_task_id"], row["last_error_code"], row["pending_write"]) == (
         "ckout_abc123", worker.CHECKOUT_PLACING, None)
     poll = Rail().on("checkout.await#poll", _checkout_result())
     assert await _step(poll, pid) == "completed"
     assert poll.actions() == ["checkout.await#poll"]
+
+
+async def test_purchase_a_never_fails_on_purchase_bs_task_found_in_progress_then_not_submitted():
+    # The reviewer's P2-1a probe: A held with no task; its lookup answers await on B's task; B later ends
+    # form-error. A is still held, nothing was resolved, the write is kept.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    assert await _step(Rail().on("checkout.lookup#submit", _checkout_await(task="ckout_B")), pid) == "checkout_held"
+    b_failed = _checkout_result("form-error", task="ckout_B", success=False, order_id=None, total=None)
+    rail = Rail().on("checkout.lookup#submit", b_failed).on("checkout.await#poll", b_failed)
+    assert await _step(rail, pid) == "checkout_held"
+    assert "checkout.await#poll" not in rail.actions()
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["checkout_task_id"], row["pending_write"], row["terminal_at"]) == (
+        "paying", "checkout_confirm_unresolved", None, worker.CHECKOUT_CONFIRM_ACTION, None)
+
+
+@pytest.mark.parametrize("status", ["payment-reached", "paid"])
+async def test_an_unbound_payment_reached_answer_with_success_false_is_held_as_payment_reached(status):
+    # P2-4: the provider said payment reached; that is never an operator-resolvable hold.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    answer = _checkout_result(status, task="ckout_B", success=False)
+    assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600, pid)
+    expected = ("resolve-held", "--purchase-id", pid, "--expected-code", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    code_, [preview] = await _operator(*expected)
+    assert (code_, preview["eligible"], preview["reason"]) == (3, False, "payment_reached_recorded")
+    code_, [result] = await _operator(*expected, "--apply", "--operator", "ops-1", "--expect-env", "staging",
+                                      "--provider-checked")
+    assert (code_, result["outcome"], result["reason"]) == (3, "refused", "payment_reached_recorded")
+    assert (await _row(pid))["state"] == "paying"
+
+
+async def test_the_lookup_count_sql_itself_refuses_at_the_cap():
+    # N2 (W09): a second line behind the worker's own check.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    await _ago("next_poll_at", 1, pid)
+    await ledger.claim_due_purchases(W, limit=5)
+    await database.execute("UPDATE a2a_rail_purchases SET checkout_lookups = :n WHERE id = :i",
+                           {"n": worker.CHECKOUT_LOOKUP_MAX_TRIES, "i": pid})
+    assert await ledger.count_checkout_lookup_as_holder(pid, W, max_tries=worker.CHECKOUT_LOOKUP_MAX_TRIES) is None
+    await database.execute("UPDATE a2a_rail_purchases SET checkout_lookups = :n WHERE id = :i",
+                           {"n": worker.CHECKOUT_LOOKUP_MAX_TRIES - 1, "i": pid})
+    counted = await ledger.count_checkout_lookup_as_holder(pid, W, max_tries=worker.CHECKOUT_LOOKUP_MAX_TRIES)
+    assert counted is not None and counted["checkout_lookups"] == worker.CHECKOUT_LOOKUP_MAX_TRIES
 
 
 @pytest.mark.parametrize("answer", [httpx.Response(404), httpx.Response(500), _text_only("No such checkout."),
@@ -3363,6 +3418,8 @@ async def test_before_the_confirm_prose_near_a_card_word_that_is_not_our_davv_do
 
 @pytest.mark.parametrize("prose", ["CVV: 7 1 5", "security code 7-1-5", "cvv ٧١٥", "dcvv 715", "cv2 715", "CVN 715",
                                    "715 (cvv)",
+                                   # N4: whitespace runs, HTML entities, %-escapes and a dotted word are folded
+                                   "cvv 7  1  5", "&#55;&#49;&#53; (cvv)", "cvv%20715", "c.v.v 715",
                                    # our digits beside a card word by coincidence still cancel: fail closed
                                    "Suite 715 · security code verified"])
 async def test_before_the_confirm_our_davv_echoed_in_any_spelling_cancels(prose):
@@ -3387,3 +3444,12 @@ async def test_after_the_confirm_a_code_in_other_digits_is_folded_and_held():
     pid = await _placing()
     poll = _task({"kind": "text", "text": "cvv ٤٤٥"}, _card("checkout.await", {"task_id": "ckout_abc123"}))
     assert await _step(Rail().on("checkout.await#poll", poll), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
+
+
+async def test_an_unbound_not_submitted_status_without_success_false_goes_through_the_result_rules():
+    # Only a not-submitted status WITH success false is diverted; a contradictory one ("form-error", success true)
+    # is read by the ordinary rules: held as unrecognised, never failed.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    answer = _checkout_result("form-error", task="ckout_B", success=True, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == worker.CHECKOUT_RESULT_UNRECOGNISED
+    assert (await _row(pid))["state"] == "paying"

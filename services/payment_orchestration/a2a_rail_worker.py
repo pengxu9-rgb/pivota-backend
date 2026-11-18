@@ -2163,15 +2163,30 @@ async def _checkout_lookup(s: _Step) -> str:
     known = row.get("checkout_task_id")
     if known and known != task_id:
         return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
+    if not known and final is None:
+        # P2-1a: an AWAIT on a task the row never recorded is NOT adopted (and not noted either: a recorded task
+        # would make the provider's later answer for it look like ours, and a "not submitted" there would fail
+        # this purchase). The hold stays, the write is kept, and the lookup runs again on the backoff, within
+        # the cap, until a result comes back (read by the rules below) or a human resolves it.
+        logger.warning("a2a_rail_worker: held checkout lookup is still in progress on an unbound task "
+                       "purchase=%s code=%s; still held", s.id, code)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
+        return "checkout_held"
     if not known and final is not None:
         status = str(final.data.get("status") or "").strip().lower()
-        if status in _CHECKOUT_NOT_SUBMITTED or final.data.get("success") is False:
+        # P2-4: ONLY the outcome that would FAIL the purchase (a not-submitted status, success false) is diverted.
+        # Every other answer goes through the ordinary result rules, which on a held row only hold (a
+        # payment-reached answer escalates to a payment-reached code, never resolvable) or complete on a
+        # verified total.
+        if status in _CHECKOUT_NOT_SUBMITTED and final.data.get("success") is False:
             # NOTHING TIES THIS ANSWER TO OUR CHECKOUT: the lookup names a task we never recorded, and the
             # provider's lookup resolution is not measured (another purchase's result could come back). A
             # "not submitted" on it would fail a purchase that may be charged and invite a second buy: it
-            # KEEPS the hold, and the task is not adopted. Completing on a verified total, and an await that
-            # leads to the poll, are bounded and stay. Binding a lookup's answer to our idempotency key, our
-            # checkout URL or our merchant waits for the sandbox measurement of what a lookup echoes.
+            # KEEPS the hold, and the task is not adopted. Completing on a verified total stays (bounded by the
+            # approved total). Binding a lookup's answer to our idempotency key, our checkout URL or our
+            # merchant waits for the sandbox measurement of what a lookup echoes. SANDBOX MEASUREMENT GATE: until
+            # then an unbound lookup that completes may record ANOTHER purchase's order id on this one (N1:
+            # bounded by the total, no money risk, but the reference shown may be foreign).
             logger.warning("a2a_rail_worker: held checkout lookup said not submitted on an unbound task "
                            "purchase=%s code=%s; still held", s.id, code)
             await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
