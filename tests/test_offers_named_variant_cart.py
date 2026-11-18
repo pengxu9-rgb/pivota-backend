@@ -78,7 +78,7 @@ def _sku_row(vid: str) -> Dict[str, Any]:
 def _resolve(
     monkeypatch, client, seeds: List[Dict[str, Any]], *, sku_id: Optional[str] = None,
     sku_rows: Optional[List[Dict[str, Any]]] = None,
-    market_assumed: bool = False,
+    market_assumed: bool = False, allowed_host: str = HOST,
 ) -> List[Dict[str, Any]]:
     import routes.agent_shop_gateway as gateway
 
@@ -97,7 +97,7 @@ def _resolve(
     monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
     monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", open_gate)
-    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=[HOST]))
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=[allowed_host]))
     product: Dict[str, Any] = {"sku_id": sku_id} if sku_id else {"product_id": "sig_rare_blush"}
     res = client.post(
         "/agent/shop/v1/invoke",
@@ -238,6 +238,234 @@ def test_referral_does_not_pin_unproven_selection(monkeypatch, client, referral_
 
     _assert_referral(offer)
     assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+
+def test_reviewed_referral_expansion_activates_only_after_seed_and_catalog_agree(monkeypatch, client):
+    from routes import outbound_links
+    from services import external_seed_review_pilot as pilot
+
+    host = "brand.example"
+    family = f"https://{host}/products/tinted-balm"
+    seller = "merch_obs_example"
+    seed = _seed(seed_id="eps_referral_expansion", host=host)
+    product_key = f'prod::{seller}::external_seed::{seed["external_product_id"]}'
+    seed.update(attached_product_key=product_key, seller_ref=seller, canonical_url=family, destination_url=family,
+                title="Tinted Balm")
+    seed["seed_data"] = {"brand": "Example Brand", "snapshot": {}}
+    variants = []
+    catalog_skus = []
+    for index in range(16):
+        prefix = f"0001234567{index:03}"
+        checksum = -sum(int(digit) * weight for digit, weight in zip(prefix, (3, 1) * 7)) % 10
+        variant = _shade(index, f"Shade {index + 1}")
+        native_id = variant.pop("shopify_variant_id")
+        variant.update(sku=f"EX-{index + 1:02}", barcode=f"{prefix[1:]}{checksum}",
+                       url=f"{family}?variant={native_id}")
+        variants.append(variant)
+        catalog_skus.append({**_sku_row(native_id), "product_key": product_key,
+                             "sku_key": f"{product_key}::v:{native_id}"})
+    listing = pilot.PilotListing(
+        family, seller, 2500, "Example Brand", "Tinted Balm", "A tinted balm.",
+        tuple((v["variant_id"], v["barcode"], v["title"], v["sku"]) for v in variants[:2]), int(SPID),
+    )
+    # Shade 16 is in the seed and the catalog with a matching URL, but was never reviewed.
+    unreviewed = variants[15]
+    additions = {v["variant_id"]: (v["barcode"].zfill(14), v["sku"]) for v in variants[2:15]}
+    monkeypatch.setitem(pilot.LISTINGS, seed["id"], listing)
+    monkeypatch.setitem(pilot.NAMED_REFERRAL_VARIANTS, seed["id"], additions)
+    monkeypatch.setattr(outbound_links, "log_outbound_click", AsyncMock())
+
+    def resolve(native_id, rows):
+        offer, = _resolve(monkeypatch, client, [seed], sku_id=native_id, sku_rows=rows, allowed_host=host)
+        _assert_referral(offer)
+        return offer
+
+    seed["seed_data"]["variants"] = variants[:2]
+    for variant in variants[2:15]:
+        offer = resolve(variant["variant_id"], catalog_skus[:2])
+        assert offer["source"]["variant_match"] == "fallback"
+        assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+    seed["seed_data"]["variants"] = variants
+    for variant in variants[:15]:
+        offer = resolve(variant["variant_id"], catalog_skus)
+        assert offer["source"]["variant_match"] == "exact"
+        target = offer["execution_spec"]["pdp_url"]
+        assert _payload(offer)["dest"] == target
+        location = urlparse(target)
+        assert location._replace(query="").geturl() == family
+        assert parse_qs(location.query)["variant"] == [variant["variant_id"]]
+        redirect = client.get("/r", params={"token": _token(offer)}, follow_redirects=False)
+        assert redirect.status_code == 302
+        assert redirect.headers["location"] == target
+
+    offer = resolve(unreviewed["variant_id"], catalog_skus)
+    assert unreviewed["url"] == f"{family}?variant={unreviewed['variant_id']}"
+    assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+    assert "variant" not in parse_qs(urlparse(offer["execution_spec"]["pdp_url"]).query)
+
+    new_variant = variants[14]
+    without_catalog = resolve(new_variant["variant_id"], catalog_skus[:14])
+    assert "variant" not in parse_qs(urlparse(_payload(without_catalog)["dest"]).query)
+    for field in ("barcode", "sku"):
+        with monkeypatch.context() as mismatch:
+            mismatch.setitem(new_variant, field, variants[0][field])
+            offer = resolve(new_variant["variant_id"], catalog_skus)
+            assert "variant" not in parse_qs(urlparse(_payload(offer)["dest"]).query)
+
+    assert pilot.machine_review_listing(seed["id"]) is listing
+    assert len(listing.variants) == 2
+
+
+def _manifest_listing():
+    from services import external_seed_review_pilot as pilot
+
+    return pilot.PilotListing(
+        "https://brand.example/products/tinted-balm", "merch_obs_example", 2500, "Example Brand", "Tinted Balm",
+        "A tinted balm.", (("100000000001", "0001234567000", "Shade 1", "EX-01"),), 1,
+    )
+
+
+def _gtin14(prefix13: str) -> str:
+    return prefix13 + str(-sum(int(d) * w for d, w in zip(prefix13, (3, 1) * 7)) % 10)
+
+
+def _write_manifest(tmp_path, monkeypatch, payload):
+    import hashlib
+    from services import external_seed_review_pilot as pilot
+
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    path = tmp_path / "named.json"
+    path.write_bytes(data)
+    monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST, str(path))
+    monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256, hashlib.sha256(data).hexdigest())
+    return path
+
+
+def test_named_referral_manifest_absent_is_empty(monkeypatch):
+    from services import external_seed_review_pilot as pilot
+
+    monkeypatch.delenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST, raising=False)
+    monkeypatch.delenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256, raising=False)
+    assert pilot.load_named_referral_variants({"eps_x": _manifest_listing()}) == {}
+
+
+def test_named_referral_manifest_loads_pinned_reviewed_additions(tmp_path, monkeypatch):
+    from services import external_seed_review_pilot as pilot
+
+    gtin = _gtin14("0001234567010")
+    _write_manifest(tmp_path, monkeypatch, {"schema_version": 1, "listings": {"eps_x": {"100000000002": [gtin, "EX-02"]}}})
+    assert pilot.load_named_referral_variants({"eps_x": _manifest_listing()}) == {"eps_x": {"100000000002": (gtin, "EX-02")}}
+
+
+@pytest.mark.parametrize("case", [
+    "bad_pin", "changed_bytes", "unknown_seed", "bad_gtin_check_digit", "gtin_13_digits", "repeats_reviewed_variant",
+    "duplicate_gtin", "duplicate_sku", "bad_native_id", "duplicate_key", "extra_top_level_key", "empty_additions",
+    "path_without_sha", "bad_sku", "too_large", "missing_listings", "gtin_of_reviewed_variant", "sku_of_reviewed_variant",
+    "schema_version_true", "schema_version_float", "not_a_regular_file",
+])
+def test_named_referral_manifest_refusals_disable_only_pinning(tmp_path, monkeypatch, caplog, case):
+    from services import external_seed_review_pilot as pilot
+
+    good = _gtin14("0001234567010")
+    other = _gtin14("0001234567011")
+    additions = {"100000000002": [good, "EX-02"]}
+    payload = {"schema_version": 1, "listings": {"eps_x": additions}}
+    if case == "unknown_seed":
+        payload["listings"] = {"eps_unknown": additions}
+    elif case == "bad_gtin_check_digit":
+        additions["100000000002"][0] = good[:-1] + str((int(good[-1]) + 1) % 10)
+    elif case == "gtin_13_digits":
+        additions["100000000002"][0] = good[1:]
+    elif case == "repeats_reviewed_variant":
+        additions["100000000001"] = [other, "EX-03"]
+    elif case == "duplicate_gtin":
+        additions["100000000003"] = [good, "EX-03"]
+    elif case == "duplicate_sku":
+        additions["100000000003"] = [other, "EX-02"]
+    elif case == "bad_native_id":
+        additions["0100"] = [other, "EX-03"]
+    elif case == "extra_top_level_key":
+        payload["note"] = "x"
+    elif case == "empty_additions":
+        payload["listings"] = {"eps_x": {}}
+    elif case == "bad_sku":
+        additions["100000000002"][1] = "EX 02"
+    elif case == "missing_listings":
+        del payload["listings"]
+    elif case == "gtin_of_reviewed_variant":
+        additions["100000000002"][0] = "0" + "0001234567000"
+    elif case == "sku_of_reviewed_variant":
+        additions["100000000002"][1] = "EX-01"
+    elif case == "schema_version_true":
+        payload["schema_version"] = True
+    elif case == "schema_version_float":
+        payload["schema_version"] = 1.0
+    data = json.dumps(payload).encode()
+    expected = {"duplicate_key": "duplicate manifest key", "path_without_sha": "path and a SHA-256 pin",
+                "too_large": "too large", "not_a_regular_file": "not a regular file",
+                "gtin_of_reviewed_variant": "not unique", "sku_of_reviewed_variant": "not unique",
+                "bad_sku": "SKU is invalid", "missing_listings": "schema_version: 1",
+                "schema_version_true": "schema_version: 1", "schema_version_float": "schema_version: 1"}.get(case)
+    if case == "duplicate_key":
+        # Otherwise valid additions, so only the duplicate can refuse it.
+        data = ('{"schema_version": 1, "listings": {"eps_x": {"100000000002": ["%s", "EX-02"], '
+                '"100000000002": ["%s", "EX-03"]}}}' % (good, other)).encode()
+    elif case == "too_large":
+        data = data + b" " * (32769 - len(data))
+    path = _write_manifest(tmp_path, monkeypatch, data)
+    if case == "bad_pin":
+        monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256, "0" * 63)
+    elif case == "changed_bytes":
+        monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256, "0" * 64)
+    elif case == "path_without_sha":
+        monkeypatch.delenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256)
+    elif case == "not_a_regular_file":
+        import os
+
+        fifo = tmp_path / "named.fifo"
+        os.mkfifo(fifo)
+        monkeypatch.setenv(pilot.NAMED_REFERRAL_VARIANTS_MANIFEST, str(fifo))
+    with caplog.at_level("ERROR", logger=pilot.__name__):
+        assert pilot.load_named_referral_variants({"eps_x": _manifest_listing()}) == {}
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("manifest refused" in message for message in messages)
+    if expected:
+        assert any(expected in message for message in messages), messages
+    assert path.exists()
+
+
+def test_named_referral_manifest_listing_fixture_has_a_valid_gtin():
+    from services.catalog_identity import validated_source_gtin
+
+    # The overlap rules compare against the listing's own GTIN; an invalid fixture GTIN would skip them.
+    assert validated_source_gtin(_manifest_listing().variants[0][1]) == "00001234567000"
+
+
+def test_named_referral_manifest_is_wired_at_import_from_env(tmp_path):
+    # A fresh interpreter imports the pilot module with the env set, as a runtime would.
+    import hashlib
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from services import external_seed_review_pilot as pilot
+
+    seed_id = pilot.SEED_C_ID
+    gtin = _gtin14("0001234567010")
+    data = json.dumps({"schema_version": 1, "listings": {seed_id: {"100000000002": [gtin, "EX-02"]}}}).encode()
+    path = tmp_path / "named.json"
+    path.write_bytes(data)
+    env = {key: value for key, value in os.environ.items() if key != "DATABASE_URL"}
+    env.update({pilot.NAMED_REFERRAL_VARIANTS_MANIFEST: str(path),
+                pilot.NAMED_REFERRAL_VARIANTS_MANIFEST_SHA256: hashlib.sha256(data).hexdigest()})
+    probe = ("import json; from services import external_seed_review_pilot as p; "
+             "print(json.dumps({k: {i: list(v) for i, v in a.items()} for k, a in p.NAMED_REFERRAL_VARIANTS.items()}))")
+    run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env,
+                         cwd=str(Path(pilot.__file__).resolve().parents[1]), timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.strip().splitlines()[-1]) == {seed_id: {"100000000002": [gtin, "EX-02"]}}
 
 
 # ------------------------------------------------------------------ the reviewer's case and kin
