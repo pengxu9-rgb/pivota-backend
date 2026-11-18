@@ -4536,28 +4536,33 @@ _SCOPED_OFFER_ROW = {
 }
 
 
-def _is_scoped_listing_lookup(query: str) -> bool:
-    q = str(query)
-    return "FROM catalog_products listing" in q and "listing.source_product_id = ANY(:aliases)" in q and "JOIN" not in q
+def _is_scoped_listing_lookup(query: str, values=None) -> bool:
+    """Routed on the statement's own binds, never on its text."""
+    v = values or {}
+    return "FROM catalog_products" in str(query) and {"merchant_id", "platforms", "aliases"} <= set(v)
 
 
 def _scoped_fetch_all(*, listings, lookup_error=None, honour_market=True, seen=None):
-    """`listings`: (merchant_id, source_product_id, product_key) rows the lookup can find. The
-    catalog statement answers the US/USD offer only when its listing key is among the bound aliases
-    and, with `honour_market`, only as its `o.market` conjunct would (NULL market or 'US')."""
+    """`listings`: (merchant_id, source_product_id, product_key[, platform]) rows the lookup can find
+    (platform defaults to the seed platform). The fake applies the merchant, platform and source id
+    filters as the database would. The catalog statement answers the US/USD offer only when its listing
+    key is among the bound aliases and, with `honour_market`, only as its `o.market` conjunct would."""
 
     async def fake_fetch_all(query: str, values=None):
         values = values or {}
         if seen is not None:
             seen.append((str(query), dict(values)))
-        if _is_scoped_listing_lookup(query):
+        if _is_scoped_listing_lookup(query, values):
             if lookup_error is not None:
                 raise lookup_error
-            return [
-                {"product_key": key}
-                for merchant, source_id, key in listings
-                if merchant == values.get("merchant_id") and source_id in (values.get("aliases") or [])
-            ][:2]
+            rows = []
+            for listing in listings:
+                merchant, source_id, key = listing[:3]
+                platform = listing[3] if len(listing) > 3 else "external_seed"
+                if (merchant == values["merchant_id"] and platform in values["platforms"]
+                        and source_id in values["aliases"]):
+                    rows.append({"product_key": key})
+            return rows[:2]
         q = str(query)
         if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
             if _SCOPED_LISTING_KEY not in (values.get("aliases") or []):
@@ -4609,14 +4614,16 @@ def test_a_merchant_scoped_source_product_ref_serves_its_listings_catalog_offer(
     assert offers[0]["url"] == "https://retailer.example.test/products/lip-tint"
     assert offers[0]["price"] == 12.5 and offers[0]["currency"] == "USD"
     # The lookup is merchant-exact and bounded, and the listing key is ADDED to the caller's aliases.
-    lookups = [v for q, v in seen if _is_scoped_listing_lookup(q)]
+    lookups = [v for q, v in seen if _is_scoped_listing_lookup(q, v)]
     assert len(lookups) == 1
     assert lookups[0]["merchant_id"] == _SCOPED_MERCHANT
-    assert _SCOPED_SOURCE_ID in lookups[0]["aliases"]
-    lookup_sql = next(q for q, _ in seen if _is_scoped_listing_lookup(q))
+    assert lookups[0]["platforms"] == ["external_seed"]
+    assert lookups[0]["aliases"] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
+    lookup_sql = next(q for q, v in seen if _is_scoped_listing_lookup(q, v))
     assert "LIMIT 2" in lookup_sql
-    assert "listing.merchant_id = :merchant_id" in lookup_sql
-    assert "listing.suppressed_at IS NULL" in lookup_sql and "listing.suppression_reason IS NULL" in lookup_sql
+    assert "merchant_id = :merchant_id" in lookup_sql and "platform = ANY(:platforms)" in lookup_sql
+    assert "source_product_id = ANY(:aliases)" in lookup_sql
+    assert "suppressed_at IS NULL" in lookup_sql and "suppression_reason IS NULL" in lookup_sql
     (binds,) = _catalog_binds(seen)
     assert binds["aliases"][:-1] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
     assert binds["aliases"][-1] == _SCOPED_LISTING_KEY
@@ -4727,7 +4734,91 @@ def test_the_merchant_listing_lookup_never_runs_without_a_merchant_scope(
         listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
     body = _post_scoped(client, merchant_id=None)
     assert (body.get("offers") or []) == []
-    assert not any(_is_scoped_listing_lookup(q) for q, _ in seen)
+    assert not any(_is_scoped_listing_lookup(q, v) for q, v in seen)
+
+
+def test_the_merchant_listing_lookup_reads_product_refs_only_never_sku_aliases(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, "48000000000001", f"ext:retailer:{'beef0000' * 4}")], seen=seen))
+    res = client.post("/agent/shop/v1/invoke", json={
+        "operation": "offers.resolve",
+        "payload": {"product": {"product_id": _SCOPED_SOURCE_ID, "sku_id": "48000000000001",
+                                "merchant_id": _SCOPED_MERCHANT},
+                    "limit": 10, "market": "US", "tool": "*", "commerce_surface": "agent_api"},
+        "metadata": {"source": "creator-agent-ui"},
+    })
+    assert res.status_code == 200
+    (lookup,) = [v for q, v in seen if _is_scoped_listing_lookup(q, v)]
+    assert lookup["aliases"] == [_SCOPED_SOURCE_ID, _SCOPED_HEX]
+    assert not any("48000000000001" in str(a) for a in lookup["aliases"]), "a variant id is never a listing ref"
+    (binds,) = _catalog_binds(seen)
+    assert f"ext:retailer:{'beef0000' * 4}" not in binds["aliases"]
+
+
+@pytest.mark.parametrize("ref", ["sig_" + "a1" * 16, "ck_" + "b2" * 16, "SIG_" + "C3" * 16])
+def test_the_merchant_listing_lookup_never_runs_for_a_signature_or_content_key(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, ref
+) -> None:
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, ref, _SCOPED_LISTING_KEY)], seen=seen))
+    _post_scoped(client, product_id=ref)
+    assert not any(_is_scoped_listing_lookup(q, v) for q, v in seen), ref
+    (binds,) = _catalog_binds(seen)
+    assert binds["aliases"][0] == ref, "the arm still asks by the id itself"
+
+
+def test_a_listing_on_a_platform_outside_the_lookup_set_is_not_widened(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A connected merchant's own product is answered by the internal lane: its scoped ref is not
+    widened to the retailer offers on its content key (today's answer)."""
+    seen: list = []
+    _scoped_setup(monkeypatch, _scoped_fetch_all(
+        listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY, "placeholder_platform")], seen=seen))
+    body = _post_scoped(client)
+    assert (body.get("offers") or []) == []
+    (binds,) = _catalog_binds(seen)
+    assert _SCOPED_LISTING_KEY not in binds["aliases"]
+
+
+def test_the_lookup_platform_is_the_seed_platform_the_catalog_writes():
+    import routes.agent_shop_gateway as gateway
+    import scripts.mirror_external_seeds_to_catalog_products as mirror
+    from services.external_seed_servability import EXTERNAL_SEED_PLATFORM
+
+    assert gateway._MERCHANT_SCOPED_LISTING_PLATFORMS == (EXTERNAL_SEED_PLATFORM,) == (mirror.PLATFORM,)
+
+
+def test_the_merchant_listing_lookup_is_bounded_at_one_second_and_never_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lookup that never answers is given up after at most 1 s, even when the seed-query budget is
+    larger, and answers None (the arm then runs without it). Bounded from outside so a regression fails
+    instead of hanging the suite."""
+    import time
+
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS", 30.0)
+
+    class _NeverAnswers:
+        async def fetch_all(self, query, values=None):
+            await asyncio.Event().wait()
+
+    async def go():
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            gateway._merchant_scoped_listing_product_key(
+                _NeverAnswers(), merchant_id=_SCOPED_MERCHANT, aliases=[_SCOPED_SOURCE_ID]),
+            timeout=3.0,
+        )
+        return result, time.monotonic() - started
+
+    result, elapsed = asyncio.run(go())
+    assert result is None
+    assert 0.9 <= elapsed < 2.0, elapsed
 
 
 def test_a_sku_matched_seed_offer_outranks_a_catalog_offer(

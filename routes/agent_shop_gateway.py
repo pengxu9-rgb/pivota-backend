@@ -7329,9 +7329,12 @@ async def _handle_offers_resolve(
         # (merchant_id, product_id = the listing's source_product_id), and the statement below matches
         # only a signature, content_key or product_key, so that ref found no catalog offer. The one
         # listing it names joins by its product_key; none or several add nothing. Never raises.
-        if merchant_scope and product_id_aliases:
+        # PRODUCT refs only (a sku alias is a variant id, never a listing's source id), and not for a
+        # signature or content key, which the statement already matches and no source id can equal.
+        listing_refs = [a for a in product_id_aliases if not _is_signature_or_content_key_ref(a)]
+        if merchant_scope and listing_refs and not cohort_a_exact_referrals:
             listing_key = await _merchant_scoped_listing_product_key(
-                database, merchant_id=merchant_scope, aliases=product_id_aliases,
+                database, merchant_id=merchant_scope, aliases=listing_refs,
             )
             if listing_key and listing_key not in ident_aliases:
                 ident_aliases.append(listing_key)
@@ -7875,8 +7878,9 @@ async def _handle_offers_resolve(
     # GROUP SHADOW (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS=shadow). `_response` is the off answer and is
     # returned untouched. This only SCHEDULES: the work runs after the response has been sent, on a
     # connection of its own (`_run_group_shadow`), and a request whose content keys name no resolved
-    # group schedules nothing and sends no query. A merchant-scoped call is never widened, so it
-    # has no group answer to compare.
+    # group schedules nothing and sends no query. The GROUP lane never widens a merchant-scoped call
+    # (the catalog-offers arm's merchant listing lookup is a separate thing), so it has no group
+    # answer to compare.
     if _group_flag == "shadow" and not merchant_scope:
         _schedule_group_shadow(
             background_tasks,
@@ -10582,20 +10586,38 @@ def _catalog_offer_entry(r: Dict[str, Any], *, group_mode: bool, redirect_url: O
     }
 
 
+# The platforms a merchant-scoped listing lookup reads: the observed-seller (seed) listings, which is
+# where a (merchant_id, source_product_id) ref with no catalog offer comes from -- a connected
+# merchant's own product is answered by the internal lane. With the platform named, the lookup is an
+# equality on every column of the (merchant_id, platform, source_product_id) UNIQUE index
+# (idx_catalog_products_source_identity, migration 058) and reads at most one row per platform. A
+# platform not listed here gets no widening (today's answer); adding one is a one-line change.
+# The literal is services.external_seed_servability.EXTERNAL_SEED_PLATFORM (and the seed mirror's PLATFORM),
+# not imported: that module pulls the quality stack in at route import. A test pins the two equal.
+_MERCHANT_SCOPED_LISTING_PLATFORMS: Tuple[str, ...] = ("external_seed",)
+
 _MERCHANT_SCOPED_LISTING_STATEMENT = """
-    SELECT listing.product_key
-    FROM catalog_products listing
-    WHERE listing.merchant_id = :merchant_id
-      AND listing.source_product_id = ANY(:aliases)
-      AND listing.suppressed_at IS NULL
-      AND listing.suppression_reason IS NULL
+    SELECT product_key
+    FROM catalog_products
+    WHERE merchant_id = :merchant_id
+      AND platform = ANY(:platforms)
+      AND source_product_id = ANY(:aliases)
+      AND suppressed_at IS NULL
+      AND suppression_reason IS NULL
     LIMIT 2
 """
 
+_SIGNATURE_OR_CONTENT_KEY_RE = re.compile(r"(?:sig_|ck_)[0-9a-f]{32}", re.IGNORECASE)
+
+
+def _is_signature_or_content_key_ref(ref: str) -> bool:
+    return bool(_SIGNATURE_OR_CONTENT_KEY_RE.fullmatch(str(ref or "").strip()))
+
 
 async def _merchant_scoped_listing_product_key(db: Any, *, merchant_id: str, aliases: List[str]) -> Optional[str]:
-    """The product_key of the ONE live listing `merchant_id` holds under any of `aliases` as its
-    source_product_id, else None (no listing, or more than one: an ambiguous ref names nothing).
+    """The product_key of the ONE live listing `merchant_id` holds, on a platform in
+    `_MERCHANT_SCOPED_LISTING_PLATFORMS`, under any of `aliases` as its source_product_id, else None
+    (no listing, or more than one: an ambiguous ref names nothing).
 
     For the catalog-offers arm of offers.resolve only, which matches a listing by signature,
     content_key or product_key and so could not reach the listing a (merchant_id, source product
@@ -10607,7 +10629,10 @@ async def _merchant_scoped_listing_product_key(db: Any, *, merchant_id: str, ali
         return None
     try:
         rows = await asyncio.wait_for(
-            db.fetch_all(_MERCHANT_SCOPED_LISTING_STATEMENT, {"merchant_id": scope, "aliases": refs}),
+            db.fetch_all(
+                _MERCHANT_SCOPED_LISTING_STATEMENT,
+                {"merchant_id": scope, "platforms": list(_MERCHANT_SCOPED_LISTING_PLATFORMS), "aliases": refs},
+            ),
             timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
         )
     except Exception as error:  # noqa: BLE001 -- a lookup failure must never cost the answer

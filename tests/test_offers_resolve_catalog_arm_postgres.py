@@ -548,22 +548,33 @@ def test_a_merchant_scoped_source_product_ref_reaches_its_listing_on_postgres(pg
 def test_a_merchant_scoped_ref_needs_the_listings_own_merchant_and_one_live_listing(pg_engine):
     from sqlalchemy import text
 
+    twin_pk = f"ext:retailer:{'beef0000' * 4}"
     _seed_scoped_listing(pg_engine)
     # Without the lookup this ref finds nothing (the control the fix is measured against).
     assert _sourced(_resolve(_SCOPED_SOURCE_ID)) == set(), "no merchant scope: no lookup"
     assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_not_the_seller")) == set()
-    # A second live listing under the same merchant and source id: ambiguous, so it names nothing.
-    # (merchant, platform, source_product_id) is unique (migration 058), so the twin is on another
-    # platform: the only way the lookup can find two.
-    _seed_listing(pg_engine, f"ext:retailer:{'beef0000' * 4}", "sig_scoped_twin", "ck_twin", "m_arm",
+    # A second live listing the same ref also names: (merchant, platform, source_product_id) is unique
+    # (migration 058), so on one platform the only way is another alias of the ref, its bare suffix.
+    _seed_listing(pg_engine, twin_pk, "sig_scoped_twin", "ck_twin", "m_arm",
                   "of_twin", 11.00, "https://twin.example.test/products/1")
     with pg_engine.begin() as conn:
-        conn.execute(text("UPDATE catalog_products SET platform='placeholder_platform', source_product_id=:sid"
-                          " WHERE product_key=:pk"),
-                     {"sid": _SCOPED_SOURCE_ID, "pk": f"ext:retailer:{'beef0000' * 4}"})
-    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == set()
+        conn.execute(text("UPDATE catalog_products SET source_product_id=:sid WHERE product_key=:pk"),
+                     {"sid": _SCOPED_HEX, "pk": twin_pk})
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == set(), "ambiguous: names nothing"
     # Withdraw the twin: one live listing again, and it answers.
     with pg_engine.begin() as conn:
         conn.execute(text("UPDATE catalog_products SET suppressed_at=NOW(), suppression_reason='test_takedown'"
-                          " WHERE product_key=:pk"), {"pk": f"ext:retailer:{'beef0000' * 4}"})
+                          " WHERE product_key=:pk"), {"pk": twin_pk})
     assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == {"of_retailer_cheap", "of_retailer_dear"}
+
+
+def test_a_merchant_scoped_ref_on_a_platform_outside_the_lookup_set_is_not_widened(pg_engine):
+    from sqlalchemy import text
+
+    _seed_scoped_listing(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_products SET platform='placeholder_platform' WHERE product_key=:pk"),
+                     {"pk": _SCOPED_PK})
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == set()
+    # The listing's own key still answers, unscoped: only the scoped widening is bounded.
+    assert _sourced(_resolve(_SCOPED_PK)) == {"of_retailer_cheap", "of_retailer_dear"}
