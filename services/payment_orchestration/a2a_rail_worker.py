@@ -132,8 +132,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                                        as a positive amount in the purchase's currency, at most the ceiling.
                                        Unreadable / another currency / bare number / $0.00: HELD
                                        (`checkout_total_unverified`); above the ceiling: HELD
-                                       (`checkout_total_over_approved`); an order id that is a Luhn-valid
-                                       13..19 digit run (a card echoed back): HELD, never stored
+                                       (`checkout_total_over_approved`); an order id that is or holds
+                                       a Luhn-valid 13..19 digit run, or a cryptogram-shaped run (the card
+                                       or the token's cryptogram echoed back): HELD, never stored
                                        (`checkout_order_id_card_shaped`)
                              payment-reached, no order id  -> HELD `checkout_payment_no_order` (a charge may
                                        exist: a failed purchase would invite the agent to buy again)
@@ -142,6 +143,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                                        missing: a contradiction, HELD (`checkout_result_unrecognised`)
                              timeout / script-error        -> HELD (`checkout_unknown_*`): whether it was
                                        submitted is unknown; never retried
+                             any other status naming payment or completion (`paid`, `payment_reached`,
+                                       `completed`) -> HELD `checkout_payment_reached_unconfirmed`, a
+                                       payment-reached code (never resolved as not charged)
   Every HELD checkout stays held until a human, having checked the provider's side, ends it with
   jobs/a2a_rail_operator.py (`operator_fail_held_checkout`, `operator_confirmed_not_charged`); nothing in
   the worker resolves a hold. docs/agent_purchases_routes.md, "Held A2A checkouts", is the procedure.
@@ -1447,8 +1451,8 @@ CHECKOUT_CONFIRM_ERROR_CARD = "checkout_confirm_error_card"
 #: The checkout reached the payment gateway and named no order: a charge may exist. Held, never `failed`
 #: (a failed purchase invites the agent to buy again).
 CHECKOUT_PAYMENT_NO_ORDER = "checkout_payment_no_order"
-#: The merchant's order id is a Luhn-valid run of 13..19 digits: it may be a card number echoed back.
-#: Never stored; held.
+#: The merchant's order id is, or holds, a Luhn-valid run of 13..19 digits, or a cryptogram-shaped run: it
+#: may be the card number or the token's cryptogram echoed back. Never stored; held.
 CHECKOUT_ORDER_ID_CARD_SHAPED = "checkout_order_id_card_shaped"
 #: The confirm window passed and the cancel's answer did not say the flow was cancelled: the order may
 #: be in. Held.
@@ -1481,7 +1485,9 @@ CHECKOUT_CONFIRM_NOT_SENT = "checkout_confirm_not_sent"
 CHECKOUT_PAYING_WITHOUT_TASK = "checkout_paying_without_task"
 #: Any other confirm 4xx outside the resend and validation sets: held, the write kept.
 CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
-#: The provider said `payment-reached` but its `success` was not true: a charge may exist. Held.
+#: The provider said `payment-reached` but its `success` was not true, or it answered a status we do not
+#: know that speaks of payment or completion (`paid`, `payment_reached`, `completed`): a charge may exist.
+#: Held, as a payment-reached code.
 CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
 _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_UNRESOLVED, CHECKOUT_CONFIRM_UNRECOGNISED, CHECKOUT_TASK_INVALID, CHECKOUT_TASK_MISMATCH,
@@ -1520,6 +1526,11 @@ _CARD_SCAN_MAX_NODES = checkout_amounts.CARD_SCAN_MAX_NODES
 _CONFIRM_NOT_ACCEPTED_4XX = frozenset({400, 422})
 
 _CARD_SHAPED_ORDER_RE = re.compile(r"^\d{13,19}\Z")
+#: A cryptogram's shape inside an order id: a base64 run of 20+ characters that mixes upper case, lower case
+#: and digits (padded or not; the token's own values are not known here, only the relay held them).
+_CRYPTOGRAM_RUN_RE = re.compile(r"[A-Za-z0-9+/]{20,}")
+#: An unrecognised result status that speaks of payment or completion: a charge may exist.
+_PAYMENT_STATUS_RE = re.compile(r"pay|paid|complet")
 #: Result statuses that say the checkout was NOT submitted to the merchant: the purchase fails.
 _CHECKOUT_NOT_SUBMITTED = frozenset({"captcha-failed", "form-error", "pay-disabled"})
 #: Result statuses that leave the submission unknown: held for a human, never retried.
@@ -1710,7 +1721,12 @@ def _definitely_cancelled(result: Any) -> bool:
 
 
 def _card_shaped(value: str) -> bool:
-    return bool(_CARD_SHAPED_ORDER_RE.match(value)) and a2a_rail._luhn(value)
+    """The order id is, or holds, a card number (Luhn-valid 13..19 digits, spaced or dashed) or a
+    cryptogram-shaped run: never stored."""
+    if (_CARD_SHAPED_ORDER_RE.match(value) and a2a_rail._luhn(value)) or a2a_rail._has_card_number(value):
+        return True
+    return any(re.search(r"[A-Z]", run) and re.search(r"[a-z]", run) and re.search(r"[0-9]", run)
+               for run in _CRYPTOGRAM_RUN_RE.findall(value))
 
 
 #: Whether a card's amounts cannot be verified against a ceiling (services/payment_orchestration/checkout_amounts).
@@ -2014,7 +2030,8 @@ async def _checkout_result(s: _Step, card: Any) -> str:
                          s.id, len(data.get("errors") or []) if isinstance(data.get("errors"), list) else 0)
             return await _checkout_hold(s, CHECKOUT_PAYMENT_NO_ORDER)
         if _card_shaped(order_id):
-            # A card number in the order id's place (the provider echoing the card): never stored.
+            # A card number or a cryptogram in (or as) the order id (the provider echoing the card or the
+            # token): never stored.
             return await _checkout_hold(s, CHECKOUT_ORDER_ID_CARD_SHAPED)
         total = checkout_total_minor(data.get("total"), s.row.get("currency"))
         approved = s.row.get("quoted_total_minor")
@@ -2044,6 +2061,10 @@ async def _checkout_result(s: _Step, card: Any) -> str:
         return await _checkout_failed(s, f"checkout_{status.replace('-', '_')}")
     if status in _CHECKOUT_UNKNOWN:
         return await _checkout_hold(s, _CHECKOUT_UNKNOWN[status])
+    if _PAYMENT_STATUS_RE.search(status):
+        # A status we do not know that speaks of payment or completion ("paid", "payment_reached",
+        # "completed"): a charge may exist. Held as payment-reached: an operator never ends it as not charged.
+        return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
     return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
 
 

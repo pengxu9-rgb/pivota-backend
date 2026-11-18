@@ -810,6 +810,23 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
     result.cards = cards
 
 
+#: A word before a short credential value in prose that says it IS the card's (an expiry): "exp 11/29",
+#: "expires 1129", "valid thru 11/29", "card ending ... 11/29".
+_PROSE_CARD_CONTEXT_RE = re.compile(r"(?i)\b(?:exp\w*|valid|thru|through|card)\b\W*(?:\w+\W+){0,2}\Z")
+
+
+def _scrub_prose(text: str, contains: Tuple[str, ...], exact: FrozenSet[str]) -> str:
+    """The token's value and cryptogram removed from prose anywhere; a short value (the expiry "1129" /
+    "11/29") only as a whole token in card context, never inside an amount or an id: "Order total:
+    $1129.00" keeps its amount, so it is read (and refused) like any other."""
+    for needle in sorted(contains, key=len, reverse=True):
+        text = text.replace(needle, " ")
+    for needle in sorted(set(exact) - set(contains), key=len, reverse=True):
+        pattern = re.compile(r"(?<![\w$.,/])" + re.escape(needle) + r"(?![\w.,/])")
+        text = pattern.sub(lambda m: " " if _PROSE_CARD_CONTEXT_RE.search(m.string[:m.start()]) else m.group(0), text)
+    return text
+
+
 def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -> bool:
     """Whether any text part of the agent's answer shows an amount the ceiling cannot be verified against
     (checkout_amounts.text_refused). The token's own values are removed from the text first. No ceiling:
@@ -824,8 +841,7 @@ def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -
             return True
         contains, exact = _scrub_needles(network_token) if isinstance(network_token, Mapping) else ((), frozenset())
         for text in texts:
-            for needle in sorted({*contains, *exact}, key=len, reverse=True):
-                text = text.replace(needle, " ")
+            text = _scrub_prose(text, contains, exact)
             if checkout_amounts.text_refused(text, ceiling):
                 return True
         return False

@@ -193,7 +193,8 @@ check the gate itself.
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
 `checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
-set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`) is refused, whatever the flags
+set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
+written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`) is refused, whatever the flags
 (`payment_reached_recorded`): our own ledger says the order may be placed and paid. **Escalate; the merchant
 refunds.**
 

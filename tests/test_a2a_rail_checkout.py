@@ -2200,7 +2200,6 @@ async def test_the_preview_reads_that_row_by_id_and_says_what_a_resolution_cause
 DISCOUNTED_CARDS = {
     "subtotal_discount_total": {"subtotal": "$45.00", "discount": "-$5.00", "total": "$40.00"},
     "unicode_minus": {"subtotal": "$45.00", "discount": "−$5.00", "total": "$40.00"},
-    "bare_negative_number": {"subtotal": "$45.00", "discount": -500, "total": "$40.00"},
     "discount_money_object": {"subtotal": "$45.00", "discount": {"amount": "-$5.00", "currency": "USD"},
                               "total": "$40.00"},
     "discount_amount_key": {"subtotal": "$45.00", "discountAmount": "-$5.00", "total": "$40.00"},
@@ -2212,8 +2211,10 @@ DISCOUNTED_CARDS = {
     "coupon_amount": {"subtotal": "$45.00", "coupon": {"amount": "-$5.00", "code": "SAVE10"}, "total": "$40.00"},
     "coupon_code_with_digits": {"subtotal": "$45.00", "couponCode": "SAVE10", "total": "$45.00"},
     "percent_off": {"subtotal": "$45.00", "discount": "10% off", "total": "$40.50"},
-    # Large positive savings would push a naive component sum past the ceiling: not summed, so it confirms.
-    "savings_not_summed": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
+    # The sign rule: a negative amount under a pure discount key is taken off, whatever its size (it can
+    # never be a hidden charge). Only an explicit slot (a discount's own amount, the sum of the discounts)
+    # is capped at the ceiling, since a positive there is not summed.
+    "negative_discount_of_any_size": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
 }
 REFUSED_WITH_A_DISCOUNT = {
     "discount_in_eur_symbol": {"subtotal": "$45.00", "discount": "-€5.00", "total": "$40.00"},
@@ -2226,8 +2227,14 @@ REFUSED_WITH_A_DISCOUNT = {
     # A discount never lowers a sum: items past the ceiling still cancel whatever the discount says.
     "discount_does_not_rescue_an_over_sum": {"items": [{"price": "$30.00"}, {"price": "$30.00"}],
                                              "discount": "-$10.00"},
-    # A discount larger than the ceiling is more likely a mislabelled total.
-    "discount_over_the_ceiling": {"subtotal": "$45.00", "discount": "-$999.00", "total": "$40.00"},
+    # A discount slot larger than the ceiling is more likely a mislabelled total.
+    "discount_slot_over_the_ceiling": {"subtotal": "$45.00", "discount": {"amount": "-$999.00"}, "total": "$40.00"},
+    # A bare number under a discount key: its units are unknown, exactly as under a money key (v5: -500 used
+    # to be read as cents and confirm).
+    "bare_negative_number": {"subtotal": "$45.00", "discount": -500, "total": "$40.00"},
+    # A POSITIVE amount under a pure discount key outside an explicit slot is money and is summed (v5: it
+    # used to be ignored): $45 + $10 is past the ceiling.
+    "positive_savings_summed": {"subtotal": "$45.00", "savings": "$10.00", "total": "$40.00"},
 }
 
 
@@ -2274,10 +2281,14 @@ def test_each_pure_discount_spelling_within_the_ceiling_confirms(key):
     assert worker.confirm_card_refused({"subtotal": "$45.00", key: "-$5.00", "total": "$40.00"}, TOTAL) is False
 
 
-def test_a_total_after_discount_is_the_grand_total_not_a_second_component():
+def test_a_total_after_discount_is_a_component_not_the_grand_total():
+    # Only the exact grand-total spellings are grand totals (v5): `totalAfterDiscount` is a component, so
+    # beside a $45 subtotal it adds up past the ceiling. Alone, or beside a discount, it is read as is.
     card = {"subtotal": "$45.00", "discount": "-$5.00", "totalAfterDiscount": "$40.00"}
-    assert worker.confirm_card_refused(card, TOTAL) is False
-    assert worker.confirm_card_refused({**card, "totalAfterDiscount": "$51.50"}, TOTAL) is True
+    assert worker.confirm_card_refused(card, TOTAL) is True
+    assert worker.confirm_card_refused({"discount": "-$5.00", "totalAfterDiscount": "$40.00"}, TOTAL) is False
+    assert worker.confirm_card_refused({"subtotal": "$45.00", "discount": "-$5.00", "total": "$40.00"}, TOTAL) is False
+    assert worker.confirm_card_refused({"totalAfterDiscount": "$51.50"}, TOTAL) is True
     # A discounted unit price still counts for quantity x price.
     assert worker.confirm_card_refused({"items": [{"qty": 2, "discounted_price": "$30.00"}]}, TOTAL) is True
 
@@ -2301,12 +2312,14 @@ def test_under_a_discount_only_its_amount_is_a_discount(card, refused):
     ({"discount_total": "-$5.00"}, False),
     ({"total_discounts": "$999.00"}, True),  # the only money field: a mislabelled total cannot pass
     ({"totalDiscounts": "-$999.00"}, True),
-    ({"discount": -99900}, True),            # a bare integer is read in cents: $999.00
-    ({"discount": -500}, False),             # $5.00
-    ({"discount": -5.5}, False),             # a fraction is read in dollars: $5.50
+    ({"discount": -99900}, True),            # a bare number under a discount key: units unknown
+    ({"discount": -500}, True),              # v5: unreadable, like under a money key (was read as $5.00)
+    ({"discount": -5.5}, True),              # v5: unreadable (was read as $5.50)
     ({"discount": -999.5}, True),
+    ({"discount": {"amount": "-$51.50"}}, True),   # a slot one cent past the ceiling
+    ({"discount": {"amount": "-$51.49"}}, False),  # a slot at the ceiling
 ], ids=["discount_total_999", "discount_total_minus_5", "total_discounts_only", "totalDiscounts_minus_999",
-        "bare_cents_over", "bare_cents_within", "fraction_within", "fraction_over"])
+        "bare_cents_over", "bare_int_within", "bare_fraction_within", "fraction_over", "slot_over", "slot_at"])
 def test_a_discount_larger_than_the_ceiling_cancels(card, refused):
     assert worker.confirm_card_refused(card, TOTAL) is refused
 
@@ -2331,3 +2344,291 @@ def test_a_total_named_discount_key_within_the_ceiling_is_still_read_as_money(ca
 ], ids=["nested_total_negative", "nested_total_bare", "nested_fee_component", "deep_final_price_negative"])
 def test_a_money_child_of_a_discount_within_the_ceiling_is_still_read_as_money(card):
     assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+# ── controller review v5: whole-word keys, exact grand totals, the sign rule, money beats contact ──
+
+def test_keys_are_split_into_whole_words_in_every_spelling():
+    from services.payment_orchestration import checkout_amounts as amounts
+
+    for key in ("totalAfterDiscount", "TOTAL_AFTER_DISCOUNT", "total-after-discount", "total.after.discount",
+                "Total After Discount", "totalafterdiscount", "ＴｏｔａｌＡｆｔｅｒＤｉｓｃｏｕｎｔ", "tоtalAfterDiscount"):
+        assert amounts.key_words(key) == ("total", "after", "discount"), key
+    assert amounts.key_words("DiscountedTotal2") == ("discounted", "total", "2")
+    assert amounts.key_words("address1") == ("address", "1")
+    assert amounts.key_words("grandtotal") == ("grand", "total")       # a run of known words is split
+    assert amounts.key_words("internetDiscount") == ("internet", "discount")  # "internet" holds no "net"
+    assert amounts.key_words("payeeDiscount") == ("payee", "discount")
+
+
+#: A word that merely CONTAINS a qualifier ("internet" / "cabinet" / "network" hold "net", "payee" /
+#: "paypal" hold "pay", "withdrawal" holds "with", "residue" holds "due", "aftercare" holds "after") is not
+#: that word: each is a pure discount, and -$5.00 beside a $40.00 total confirms.
+EMBEDDED_WORD_DISCOUNTS = [
+    "internetDiscount", "cabinetDiscount", "payeeDiscount", "paypalDiscount", "withdrawalRebate",
+    "residueDiscount", "aftercareDiscount", "networkPromo", "discountNetwork",
+]
+
+
+def test_a_word_that_only_contains_a_money_word_is_not_money():
+    # "multiple" holds "tip", "residue" holds "due", "costume" holds "cost": none is a money word, so a
+    # bare number under them is the buyer's data, not an amount with unknown units.
+    assert worker.confirm_card_refused({"multiplePacks": 3, "residue": 2, "costume": "Size 12"}, TOTAL) is False
+    assert worker.confirm_card_refused({"tipAmount": 3}, TOTAL) is True  # the whole word: money
+
+
+@pytest.mark.parametrize("key", EMBEDDED_WORD_DISCOUNTS)
+def test_a_word_that_only_contains_a_qualifier_does_not_make_a_discount_money(key):
+    assert worker.confirm_card_refused({key: "-$5.00", "total": "$40.00"}, TOTAL) is False
+
+
+#: Total-ish keys that are NOT one of the exact grand-total spellings are components: they add up, and
+#: these add up past the $51.49 ceiling (the P1-B table, and words that only contain a qualifier).
+COMPONENT_TOTALS = {
+    "items_and_shipping_after_discount": {"itemsTotalAfterDiscount": "$40.00", "shippingTotalAfterDiscount": "$15.00"},
+    "merchandise_and_shipping_with_tax": {"merchandiseTotalWithTax": "$40.00", "shippingTotalWithTax": "$15.00"},
+    "items_and_shipping_net": {"itemsNetTotal": "$40.00", "shippingNetTotal": "$15.00"},
+    "final_item_and_shipping": {"finalItemTotal": "$40.00", "finalShippingTotal": "$15.00"},
+    "subtotal_and_discounted_shipping": {"subtotal": "$40.00", "discountedShippingTotal": "$15.00"},
+    "line_items_after_discount_and_shipping": {"line_items_total_after_discount": "$40.00", "shipping": "$15.00"},
+    "merchandise_with_tax": {"merchandiseTotalWithTax": "$40.00", "shipping": "$15.00"},
+    "aftercare_total": {"subtotal": "$40.00", "aftercareTotal": "$30.00"},
+    "cabinet_total": {"subtotal": "$40.00", "cabinetTotal": "$30.00"},
+    "internet_service_total": {"subtotal": "$40.00", "internetServiceTotal": "$30.00"},
+    "withholding_total": {"subtotal": "$40.00", "withholdingTotal": "$30.00"},
+    # A subtotal is never the grand total, whatever qualifies it.
+    "subtotal_after_discount": {"subtotalAfterDiscount": "$40.00", "shipping": "$15.00"},
+}
+#: The exact grand-total spellings, in each case and separator: checked alone, never added to their parts.
+GRAND_TOTAL_SPELLINGS = [
+    "total", "grandTotal", "grand_total", "grand-total", "totalAmount", "total_amount", "amountDue", "amount_due",
+    "orderTotal", "order_total", "totalPrice", "total_price", "totalDue", "total_due", "balanceDue", "balance_due",
+    "TOTAL", "GrandTotal",
+]
+
+
+@pytest.mark.parametrize("name", sorted(COMPONENT_TOTALS))
+def test_a_total_that_is_not_an_exact_grand_total_is_a_component_and_adds_up(name):
+    assert worker.confirm_card_refused(COMPONENT_TOTALS[name], TOTAL) is True
+
+
+@pytest.mark.parametrize("key", GRAND_TOTAL_SPELLINGS)
+def test_each_exact_grand_total_beside_its_parts_is_checked_against_the_larger_of_the_two(key):
+    # Parts and their total within the ceiling: confirmed (the total is not added to its parts).
+    assert worker.confirm_card_refused(
+        {"subtotal": "$40.00", "tax": "$5.00", "shipping": "$5.00", key: "$50.00"}, TOTAL) is False
+    # A grand total below the sum of its parts does not hide the parts: max(total, parts) is checked.
+    assert worker.confirm_card_refused({"subtotal": "$45.00", "shipping": "$10.00", key: "$40.00"}, TOTAL) is True
+    # A summary beside the line items is not counted twice.
+    assert worker.confirm_card_refused({"items": [{"price": "$30.00"}], "summary": {key: "$30.00"}}, TOTAL) is False
+    # Each object in a list adds the larger of its grand total and its parts: $45 + $10 is past the ceiling.
+    assert worker.confirm_card_refused(
+        {"orders": [{"subtotal": "$45.00", key: "$5.00"}, {"subtotal": "$10.00", key: "$10.00"}]}, TOTAL) is True
+
+
+def test_a_quote_is_checked_before_its_discount():
+    # The ceiling is the approved quote before any discount (checkout_ceiling): a $55 subtotal at a $50
+    # ceiling cancels even when a $5 discount brings the total to $50.
+    assert worker.confirm_card_refused({"subtotal": "$55.00", "discount": "-$5.00", "total": "$50.00"}, 5000) is True
+    assert worker.confirm_card_refused({"subtotal": "$50.00", "discount": "-$5.00", "total": "$45.00"}, 5000) is False
+
+
+#: P2-A: a money word beats every contact word but an address / contact LAST word. Each of these is money,
+#: and a bare or unmarked amount under it cancels.
+MONEY_WITH_A_CONTACT_WORD = [
+    "serviceFee", "serviceCharge", "merchantFee", "carrierFee", "labelPrice", "currencyTotal", "titleTotal",
+    "descriptionAmount", "totalWithCode", "promoCodeTotal", "barcodePrice", "shippingMethodCost",
+    "shippingServiceCost", "cardSurcharge",
+]
+#: Exempt: an address / contact last word, and the exact code keys.
+CONTACT_DESPITE_A_MONEY_WORD = {
+    "shipping_address": {"shippingAddress": "1 Main St, Austin TX 78701"},
+    "payment_method": {"paymentMethod": "Visa ending 3478"},
+    "shipping_method": {"shippingMethod": "2-Day"},
+    "delivery_date": {"deliveryDate": "2026-11-20"},
+    "tax_id": {"taxId": "12-3456789"},
+    "shipping_zip_code": {"shippingZipCode": "78701"},
+    "coupon_code": {"couponCode": "SAVE10"}, "promo_code": {"promoCode": "2FOR1"},
+    "discount_code": {"discountCode": "SPRING25"},
+    # An all-digit code: under a code key it is a code, never an unmarked amount.
+    "coupon_code_digits": {"couponCode": "2026"}, "promo_code_digits": {"promoCode": "10"},
+}
+
+
+@pytest.mark.parametrize("key", MONEY_WITH_A_CONTACT_WORD)
+def test_a_contact_word_never_beats_a_money_word(key):
+    assert worker.confirm_card_refused({key: 99900}, TOTAL) is True
+    assert worker.confirm_card_refused({key: "999.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({key: "$5.00"}, TOTAL) is False  # readable and within: confirmed
+
+
+@pytest.mark.parametrize("name", sorted(CONTACT_DESPITE_A_MONEY_WORD))
+def test_an_address_or_contact_last_word_and_the_code_keys_stay_contact(name):
+    assert worker.confirm_card_refused({**CONTACT_DESPITE_A_MONEY_WORD[name], "total": "$40.00"}, TOTAL) is False
+
+
+#: P2-B: ordinary discount shapes within the ceiling, none of which may cancel.
+ORDINARY_DISCOUNTS = {
+    "shipping_discount": {"shippingDiscount": "-$5.00"}, "shipping_discount_snake": {"shipping_discount": "-$5.00"},
+    "tax_discount": {"taxDiscount": "-$5.00"}, "fee_discount": {"feeDiscount": "-$5.00"},
+    "price_discount": {"priceDiscount": "-$5.00"},
+    "total_savings": {"totalSavings": "-$5.00"}, "total_savings_positive": {"total_savings": "$5.00"},
+    "total_discount_amount": {"totalDiscountAmount": "-$5.00"},
+    "discount_amount_total": {"discount_amount_total": "-$5.00"},
+    "total_coupon_amount": {"totalCouponAmount": "$5.00"},
+    "discount_with_percent": {"discount": {"amount": "-$5.00", "percent": 10}},
+    "discount_with_percentage": {"discount": {"amount": "-$5.00", "percentage": "10%"}},
+    "discount_with_rate": {"discount": {"amount": "-$5.00", "rate": 10}},
+    "discount_rate": {"discount_rate": 0.1},
+    "coupon_code_string": {"coupon": "SAVE10"}, "promo_code_string": {"promo": "SPRING25"},
+    "voucher_code_string": {"voucher": "GIFT2024"}, "promotion_prose": {"promotion": "Buy 2 get 1 free"},
+    "discount_code_string": {"discount": "SAVE10"}, "spaced_percent": {"discount": "10 % off"},
+    "discount_reason": {"discounts": [{"amount": "-$5.00", "target": "line 2", "reason": "Spend 50 save 5"}]},
+}
+#: P2-C: a positive amount under a discount word outside an explicit slot is MONEY and is summed:
+#: $45 + $10 (or $30 + $30) is past the ceiling.
+CHARGES_UNDER_A_DISCOUNT_WORD = {
+    "coupon_penalty": {"subtotal": "$45.00", "couponPenalty": "$10.00"},
+    "voucher_handling": {"subtotal": "$45.00", "voucherHandling": "$10.00"},
+    "rebate_clawback": {"subtotal": "$45.00", "rebateClawback": "$10.00"},
+    "coupon_redemption": {"subtotal": "$45.00", "couponRedemption": "$10.00"},
+    "promo_bundle": {"subtotal": "$45.00", "promoBundle": "$10.00"},
+    "promo_item": {"subtotal": "$45.00", "promoItem": "$10.00"},
+    "promotional_items": {"promotionalItems": ["$30.00", "$30.00"]},
+    "promo_items_prices": {"promoItems": [{"price": "$30.00"}, {"price": "$30.00"}]},
+    "positive_discount_word": {"subtotal": "$45.00", "discount": "$10.00"},
+    "promo_lines_amounts": {"promo": {"lines": [{"amount": "$30.00"}, {"amount": "$30.00"}]}},
+}
+
+
+@pytest.mark.parametrize("name", sorted(ORDINARY_DISCOUNTS))
+def test_an_ordinary_discount_shape_within_the_ceiling_confirms(name):
+    assert worker.confirm_card_refused({**ORDINARY_DISCOUNTS[name], "total": "$40.00"}, TOTAL) is False
+
+
+@pytest.mark.parametrize("name", sorted(CHARGES_UNDER_A_DISCOUNT_WORD))
+def test_a_positive_amount_under_a_discount_word_is_money_and_is_summed(name):
+    assert worker.confirm_card_refused(CHARGES_UNDER_A_DISCOUNT_WORD[name], TOTAL) is True
+
+
+#: The words that, beside a discount word, make a key what is CHARGED: each key is money, so a negative
+#: cancels, and a positive is summed. (Before v5 each was tested only over the ceiling.)
+CHARGED_BESIDE_A_DISCOUNT_WORD = ["discountNet", "discountWithTax", "promoPay", "couponDue", "promoShipping"]
+
+
+@pytest.mark.parametrize("key", CHARGED_BESIDE_A_DISCOUNT_WORD)
+def test_a_charge_word_beside_a_discount_word_is_money_in_a_sum_and_for_its_sign(key):
+    assert worker.confirm_card_refused({key: "-$5.00", "total": "$40.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({"subtotal": "$40.00", key: "$30.00"}, TOTAL) is True
+    assert worker.confirm_card_refused({key: "$5.00", "total": "$40.00"}, TOTAL) is False
+
+
+@pytest.mark.parametrize("card", [
+    {"discount": -500}, {"discountAmount": -500, "total": "$40.00"}, {"discount": 5}, {"total_discounts": 999},
+    {"discount": float("nan")}, {"discount": {"amount": -500}}, {"coupon": {"value": 5.0}},
+], ids=["discount_int", "discount_amount_int", "discount_positive_int", "total_discounts_int", "nan",
+        "slot_int", "slot_float"])
+def test_a_bare_number_under_a_discount_key_cancels(card):
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+#: Quantity shapes (and the guards no test could fail before v5).
+QUANTITY_SHAPES = {
+    "qty_times_amount": {"items": [{"quantity": 2, "amount": "$30.00"}]},
+    "pcs_key": {"items": [{"pcs": 2, "price": "$30.00"}]},
+    "qty_in_a_list": {"items": [{"qty": [2], "price": "$30.00"}]},
+    "quantity_object": {"items": [{"quantity": {"value": 2}, "price": "$30.00"}]},
+    "two_quantity_keys_the_larger": {"items": [{"qty": 1, "quantity": 2, "price": "$30.00"}]},
+    # The negative-quantity guard is the only one that catches this ($30 x -1 would lower the line sum).
+    "negative_quantity": {"items": [{"qty": -1, "price": "$30.00"}, "$30.00", "$30.00"]},
+    "negative_quantity_in_a_list": {"items": [{"qty": [-1], "price": "$30.00"}, "$30.00", "$30.00"]},
+    # A negative quantity is unreadable whatever it does to the sum (here it cannot lower it).
+    "negative_quantity_alone": {"items": [{"qty": -2, "price": "$1.00"}]},
+}
+
+
+@pytest.mark.parametrize("name", sorted(QUANTITY_SHAPES))
+def test_every_quantity_shape_times_its_unit_price_is_checked(name):
+    assert worker.confirm_card_refused(QUANTITY_SHAPES[name], TOTAL) is True
+
+
+def test_a_quantity_shape_within_the_ceiling_confirms():
+    assert worker.confirm_card_refused({"items": [{"quantity": {"value": 1}, "price": "$51.49"}]}, TOTAL) is False
+    assert worker.confirm_card_refused({"items": [{"qty": [2], "price": "$25.00"}]}, TOTAL) is False
+
+
+def test_an_upper_case_iso_code_in_a_plain_field_makes_an_amount():
+    # M27: only this condition reads "40.00 EUR" in a plain field as an amount (and refuses it).
+    assert worker.confirm_card_refused({"summary": "40.00 EUR"}, TOTAL) is True
+    assert worker.confirm_card_refused({"summary": "Euro 24 Shop"}, TOTAL) is False
+
+
+@pytest.mark.parametrize("prose", [
+    "Your order total is 999.00", "You will pay 999.00", "Charged 999", "Grand total - 999.00", "Total:\n999.00",
+])
+def test_unmarked_prose_near_a_total_word_cancels(prose):
+    from services.payment_orchestration import checkout_amounts as amounts
+
+    assert amounts.text_refused(prose, TOTAL) is True
+    assert worker.confirm_card_refused({"summary": prose}, TOTAL) is True
+
+
+async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
+    # The token's expiry is "1129": "$1129.00" is an amount, not the expiry, and is read (and refused).
+    answer = _task({"kind": "text", "text": "Order total: $1129.00"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+    answer = _task({"kind": "text", "text": "Order total: $1129"},  # no cents: nothing else to read
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+    # In card context the expiry is still scrubbed, and so are the token's value and cryptogram anywhere.
+    answer = _task({"kind": "text", "text": f"Card {DPAN} exp {EXPIRY_RAW} ({CRYPTO}). Total: $51.49"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is False
+
+
+@pytest.mark.parametrize("order_id", [
+    CRYPTO, CRYPTO.rstrip("="), f"ORD-{CRYPTO.rstrip('=')}", f"ORD-{DPAN}", f"#{DPAN}",
+], ids=["cryptogram", "cryptogram_unpadded", "contains_cryptogram", "contains_dpan", "hash_dpan"])
+async def test_an_order_id_that_is_or_holds_the_cryptogram_or_the_token_is_held_never_stored(order_id):
+    # The worker refuses the shape itself (it never sees the token's values: only the relay held them).
+    assert worker._card_shaped(order_id)
+    pid = await _placing()
+    outcome = await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid)
+    # The transport already strips a padded cryptogram and a card number from any answer (the order then
+    # names no order id: held as such); what it lets through, the worker holds as card-shaped.
+    expected = (worker.CHECKOUT_ORDER_ID_CARD_SHAPED if "=" not in order_id and DPAN not in order_id
+                else worker.CHECKOUT_PAYMENT_NO_ORDER)
+    assert outcome == expected
+    row = await _row(pid)
+    assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == ("paying", None, expected)
+    assert expected in worker._CHECKOUT_PAYMENT_REACHED_CODES
+    stored = await _stored_text()
+    assert CRYPTO.rstrip("=") not in stored and DPAN not in stored
+
+
+def test_an_ordinary_order_id_is_not_card_or_cryptogram_shaped():
+    import uuid
+
+    for order_id in ("1001", "ORD-12345", "112-1234567-1234567", str(uuid.uuid4()), uuid.uuid4().hex,
+                     "pvt-ap_01234567.89abcdef.01234567", "SHOP-2026-ABCDEF"):
+        assert not worker._card_shaped(order_id), order_id
+
+
+@pytest.mark.parametrize("status", ["paid", "payment_reached", "completed", "payment-completed"])
+async def test_an_unknown_status_that_speaks_of_payment_is_held_as_payment_reached(status):
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    assert worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED in worker._CHECKOUT_PAYMENT_REACHED_CODES
+
+
+async def test_an_unknown_status_that_does_not_speak_of_payment_stays_unrecognised():
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result("queued-elsewhere")), pid) == (
+        worker.CHECKOUT_RESULT_UNRECOGNISED)
