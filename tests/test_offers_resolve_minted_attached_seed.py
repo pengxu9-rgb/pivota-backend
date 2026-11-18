@@ -88,7 +88,7 @@ def _invoke(monkeypatch, client, *, flag, pdp, seed, mirror_seed=None, market="U
     async def fake_fetch_all(query, values=None):
         q = str(query)
         sent.append((q, dict(values or {})))
-        if arm_error_on and arm_error_on in q:
+        if arm_error_on and _ARM_STATEMENT[arm_error_on](q, values or {}):
             raise asyncio.TimeoutError()
         if "FROM catalog_products" in q and "SELECT source_ref, source_product_id" in q:
             # The existing map read: a minted row has no source_ref and a slug source_product_id.
@@ -96,7 +96,7 @@ def _invoke(monkeypatch, client, *, flag, pdp, seed, mirror_seed=None, market="U
                      "source_product_id": pdp["source_product_id"]}]
         if "FROM external_product_seeds" in q and "id = ANY(:mapped_seed_ids)" in q:
             return [mirror_seed] if mirror_seed else []
-        if "FROM catalog_products" in q and "SELECT product_key" in q:
+        if _ARM_STATEMENT["row_lookup"](q, values or {}):
             assert values["sig_aliases"] == [pdp["pivota_signature_id"]]
             assert "suppressed_at IS NULL" in q and "suppression_reason IS NULL" in q
             if "source_system = :minted_source_system" in q and (
@@ -131,8 +131,17 @@ def _invoke(monkeypatch, client, *, flag, pdp, seed, mirror_seed=None, market="U
     return res.json(), sent
 
 
+# The arm's two statements, told apart by the binds each one sends (never by statement text alone, which
+# another catalog_products read may share): the row lookup binds `sig_aliases` and selects `product_key`;
+# the seed read binds `product_keys`.
+_ARM_STATEMENT = {
+    "row_lookup": lambda q, v: "sig_aliases" in v and "FROM catalog_products" in q and "SELECT product_key" in q,
+    "seed_read": lambda q, v: "product_keys" in v and "FROM external_product_seeds" in q,
+}
+
+
 def _arm_statements(sent):
-    return [q for q, _ in sent if "SELECT product_key" in q or "attached_product_key = ANY(:product_keys)" in q]
+    return [q for q, v in sent if any(match(q, v) for match in _ARM_STATEMENT.values())]
 
 
 def _seed_query(body):
@@ -285,7 +294,7 @@ def test_flag_on_two_currencies_on_one_key_each_go_to_their_own_market(monkeypat
 
 # ── the arm's own failure boundary ────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("failing", ["SELECT product_key", "attached_product_key = ANY(:product_keys)"],
+@pytest.mark.parametrize("failing", ["row_lookup", "seed_read"],
                          ids=["row_lookup_times_out", "seed_read_times_out"])
 def test_flag_on_an_arm_failure_falls_through_to_the_later_lanes(monkeypatch, client, caplog, failing):
     """A timeout in either arm statement costs the request nothing it had with the flag off: the
@@ -296,7 +305,8 @@ def test_flag_on_an_arm_failure_falls_through_to_the_later_lanes(monkeypatch, cl
     with caplog.at_level(logging.WARNING, logger="routes.agent_shop_gateway"):
         body, sent = _invoke(monkeypatch, client, flag="1", pdp=pdp, seed=seed, arm_error_on=failing)
     arm = _arm_statements(sent)
-    assert arm and failing in arm[-1]
+    arm_sent = [(q, v) for q, v in sent if q in arm]
+    assert arm_sent and _ARM_STATEMENT[failing](*arm_sent[-1]), "the statement that failed was the arm's last"
     later = [q for q, _ in sent if q not in arm]
     assert later == [q for q, _ in off_sent]
     assert len(later) > 2, "the lanes after the arm did run"
