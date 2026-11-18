@@ -14,17 +14,13 @@ def series(*values):
     return {"timeSeries": [{"points": [{"value": {"doubleValue": value}} for value in values]}]}
 
 
-def job(name, *, database=False, cloudsql=False, latest=None):
-    env = [{"name": "DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": "DATABASE_URL", "key": "latest"}}}] if database else []
-    annotations = {"run.googleapis.com/cloudsql-instances": "proj:region:db"} if cloudsql else {}
-    return {"metadata": {"name": name}, "status": {"latestCreatedExecution": latest} if latest else {},
-            "spec": {"template": {"metadata": {"annotations": annotations},
-                                  "spec": {"template": {"spec": {"containers": [{"env": env}]}}}}}}
+def job(name, *, latest=None):
+    return {"metadata": {"name": name}, "status": {"latestCreatedExecution": latest} if latest else {}}
 
 
-def execution(job_name, *, done=True):
+def execution(job_name, *, done=True, started="2026-01-02T06:59:30Z"):
     return {"metadata": {"labels": {"run.googleapis.com/job": job_name}},
-            "status": {"completionTime": "2026-01-02T06:59:00Z"} if done else {}}
+            "status": {"completionTime": "2026-01-02T06:59:50Z"} if done else {"startTime": started}}
 
 
 @pytest.mark.parametrize(("hour", "minute", "closed"), [
@@ -52,30 +48,34 @@ def test_closed_without_cpu_points():
         gate.evaluate(QUIET, series={}, executions=[], jobs={})
 
 
-@pytest.mark.parametrize(("name", "spec"), [
-    ("oneoff-12-34", {}), ("reviewed-seed-batch-a", {}), ("reviewed-retailer-c-us-a", {}),
-    ("relgraph-sync", {}), ("retailer-ingest-drain", {}),
-    ("some-cron", {"database": True}), ("other-cron", {"cloudsql": True}),
-])
-def test_closed_while_a_database_job_runs(name, spec):
-    jobs = {name: job(name, **spec)}
-    with pytest.raises(gate.GateClosed, match=name):
-        gate.evaluate(QUIET, series=series(0.01), executions=[execution(name, done=False)], jobs=jobs)
-    latest_only = {name: job(name, latest={"name": name + "-x"}, **spec)}
+@pytest.mark.parametrize("name", ["oneoff-12-34", "reviewed-seed-batch-a", "some-cron", "eval-sql-runner"])
+def test_any_running_job_closes_by_default(name):
+    with pytest.raises(gate.GateClosed, match=f"execution\\(s\\) running: {name}"):
+        gate.evaluate(QUIET, series=series(0.01), executions=[execution(name, done=False)], jobs={})
+    latest_only = {name: job(name, latest={"name": name + "-x", "creationTimestamp": "2026-01-02T06:59:40Z"})}
     with pytest.raises(gate.GateClosed, match=name):
         gate.evaluate(QUIET, series=series(0.01), executions=[], jobs=latest_only)
 
 
-def test_running_job_without_database_does_not_close():
+@pytest.mark.parametrize("started", ["2026-01-02T06:58:59Z", None, "not a time"])
+def test_long_or_undated_run_is_long_running(started):
+    with pytest.raises(gate.GateClosed, match="long-running database job execution\\(s\\): cron"):
+        gate.evaluate(QUIET, series=series(0.01), executions=[execution("cron", done=False, started=started)], jobs={})
+
+
+def test_listed_non_db_job_does_not_close(monkeypatch):
+    monkeypatch.setattr(gate, "NON_DB_JOBS", {"store-probe": "reviewed: no database access"})
     jobs = {"store-probe": job("store-probe", latest={"name": "store-probe-x"})}
-    gate.evaluate(QUIET, series=series(0.01), executions=[execution("store-probe", done=False)], jobs=jobs)
+    gate.evaluate(QUIET, series=series(0.01), executions=[execution("store-probe", done=False, started=None)], jobs=jobs)
 
 
-def test_unknown_or_unlabelled_running_execution_closes():
-    with pytest.raises(gate.GateClosed, match="vanished-job"):
-        gate.evaluate(QUIET, series=series(0.01), executions=[execution("vanished-job", done=False)], jobs={})
+def test_unlabelled_running_execution_closes():
     with pytest.raises(gate.GateClosed, match="without a job label"):
         gate.evaluate(QUIET, series=series(0.01), executions=[{"metadata": {}, "status": {}}], jobs={})
+
+
+def test_reviewed_non_db_list_has_a_reason_per_entry():
+    assert all(isinstance(reason, str) and reason.strip() for reason in gate.NON_DB_JOBS.values())
 
 
 def test_main_prints_gate_open_last_and_exits_zero(monkeypatch, capsys):
@@ -100,12 +100,13 @@ def test_main_retries_only_a_running_job_then_opens(monkeypatch, capsys):
     assert capsys.readouterr().out.splitlines() == ["summary", "GATE_OPEN"]
 
 
-def test_main_does_not_retry_cpu_and_never_prints_open(monkeypatch, capsys):
+@pytest.mark.parametrize("reason", ["pivota-pg CPU peak 0.5 >= 0.2", "long-running database job execution(s): cron"])
+def test_main_does_not_retry_cpu_or_long_runs_and_never_prints_open(monkeypatch, capsys, reason):
     calls = []
 
     def once():
         calls.append(1)
-        raise gate.GateClosed("pivota-pg CPU peak 0.5 >= 0.2")
+        raise gate.GateClosed(reason)
 
     monkeypatch.setattr(gate, "check_once", once)
     assert gate.main(sleep=lambda _: None) == 3

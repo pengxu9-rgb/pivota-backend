@@ -5,8 +5,8 @@ Prints a summary line and then the literal line `GATE_OPEN` (exit 0) only when A
 
   - now (UTC) is outside 05:15-06:15Z and 10:30-11:20Z;
   - pivota-pg CPU utilization is below 0.20 at every point of the last 5 minutes (Cloud Monitoring);
-  - no Cloud Run job execution is running whose job name starts with a guarded prefix, or whose job spec
-    reads the production database (a DATABASE_URL env/secret or a Cloud SQL instance annotation).
+  - no Cloud Run job execution is running, except jobs on the reviewed NON_DB_JOBS list. A short (<= 60 s) run
+    is re-read up to 3 times, 25 s apart (minute crons); a longer run closes the gate at once.
 
     python3 scripts/ops/oneoff_gate.py            # gcloud credentials of the caller (laptop or build SA)
 """
@@ -26,7 +26,6 @@ DATABASE_ID = "pivota-prod:pivota-pg"
 CPU_LIMIT = 0.20
 LOOKBACK = timedelta(minutes=5)
 CLOSED_WINDOWS_UTC = ((5 * 60 + 15, 6 * 60 + 15), (10 * 60 + 30, 11 * 60 + 20))
-GUARDED_PREFIXES = ("oneoff-", "reviewed-seed-batch-", "reviewed-retailer-", "relgraph-sync", "retailer-ingest-drain")
 TIMEOUT_SECONDS = 30
 
 
@@ -91,36 +90,37 @@ def cpu_peak(series: dict) -> float:
     return max(float(value) for value in points)
 
 
-def job_reads_database(job: dict) -> bool:
-    template = job.get("spec", {}).get("template", {})
-    annotations = {**template.get("metadata", {}).get("annotations", {}),
-                   **template.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})}
-    if annotations.get("run.googleapis.com/cloudsql-instances"):
-        return True
-    containers = template.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-    for container in containers:
-        for env in container.get("env", []):
-            secret = env.get("valueFrom", {}).get("secretKeyRef", {}).get("name", "")
-            if "DATABASE_URL" in env.get("name", "") or "DATABASE_URL" in secret:
-                return True
-    return False
+# EVERY Cloud Run job counts as a database job unless it is listed here, by exact name, with a reviewed reason.
+# A new or unknown job therefore closes the gate. Entries need evidence that the job cannot reach pivota-pg.
+NON_DB_JOBS: dict[str, str] = {}
+SHORT_RUN = timedelta(seconds=60)    # a running DB execution older than this closes the gate with no retry
 
 
-def running_guarded(executions: list, jobs: dict) -> list[str]:
-    # Two independent reads: each job's latest execution (covers old long runs) and the most recent executions
-    # across all jobs (covers a second concurrent execution of one job).
-    running = [name for name, job in jobs.items()
-               if (latest := job.get("status", {}).get("latestCreatedExecution")) and not latest.get("completionTimestamp")
-               and (name.startswith(GUARDED_PREFIXES) or job_reads_database(job))]
+def _parse_time(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
+
+
+def running_executions(executions: list, jobs: dict) -> list[tuple[str, datetime | None]]:
+    """(job name, start time) of every running execution. Two independent reads: each job's latest execution
+    (covers an old long run) and the newest executions across all jobs (a second concurrent run of one job)."""
+    running = []
+    for name, job in jobs.items():
+        latest = job.get("status", {}).get("latestCreatedExecution")
+        if latest and not latest.get("completionTimestamp"):
+            running.append((name, _parse_time(latest.get("creationTimestamp"))))
     for execution in executions:
-        if execution.get("status", {}).get("completionTime"):
+        status = execution.get("status", {})
+        if status.get("completionTime"):
             continue
-        job = execution.get("metadata", {}).get("labels", {}).get("run.googleapis.com/job", "")
-        if not job:
+        metadata = execution.get("metadata", {})
+        name = metadata.get("labels", {}).get("run.googleapis.com/job", "")
+        if not name:
             raise GateClosed("running execution without a job label")
-        if job.startswith(GUARDED_PREFIXES) or job not in jobs or job_reads_database(jobs[job]):
-            running.append(job)
-    return sorted(set(running))
+        running.append((name, _parse_time(status.get("startTime") or metadata.get("creationTimestamp"))))
+    return [(name, started) for name, started in running if name not in NON_DB_JOBS]
 
 
 def evaluate(now: datetime, *, series: dict, executions: list, jobs: dict) -> str:
@@ -130,9 +130,14 @@ def evaluate(now: datetime, *, series: dict, executions: list, jobs: dict) -> st
     peak = cpu_peak(series)
     if not peak < CPU_LIMIT:
         raise GateClosed(f"pivota-pg CPU peak {peak} >= {CPU_LIMIT}")
-    running = running_guarded(executions, jobs)
-    if running:
-        raise GateClosed(f"{len(running)} database job execution(s) running: {', '.join(running)}")
+    running = running_executions(executions, jobs)
+    # No start time counts as long-running: fail closed.
+    long = sorted({name for name, started in running if started is None or now - started > SHORT_RUN})
+    if long:
+        raise GateClosed(f"long-running database job execution(s): {', '.join(long)}")
+    names = sorted({name for name, _ in running})
+    if names:
+        raise GateClosed(f"{len(names)} database job execution(s) running: {', '.join(names)}")
     return f"cpu_peak_5m={peak} db_job_executions_running=0 utc={now.strftime('%H:%MZ')}"
 
 
