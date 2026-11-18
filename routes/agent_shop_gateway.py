@@ -7325,6 +7325,16 @@ async def _handle_offers_resolve(
     catalog_started = time.perf_counter()
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
+        # THE LISTING A MERCHANT-SCOPED CALL NAMES. Search hands out `canonical_product_ref` as
+        # (merchant_id, product_id = the listing's source_product_id), and the statement below matches
+        # only a signature, content_key or product_key, so that ref found no catalog offer. The one
+        # listing it names joins by its product_key; none or several add nothing. Never raises.
+        if merchant_scope and product_id_aliases:
+            listing_key = await _merchant_scoped_listing_product_key(
+                database, merchant_id=merchant_scope, aliases=product_id_aliases,
+            )
+            if listing_key and listing_key not in ident_aliases:
+                ident_aliases.append(listing_key)
         catalog_rows = []
         supplemental_exact_offer_ids = set()
         # FRESH PRICE FIRST, in a merged group only (see `_catalog_price_freshness_sql`): empty
@@ -10570,6 +10580,45 @@ def _catalog_offer_entry(r: Dict[str, Any], *, group_mode: bool, redirect_url: O
             "readiness_tier": str(r.get("readiness_tier") or ""),
         },
     }
+
+
+_MERCHANT_SCOPED_LISTING_STATEMENT = """
+    SELECT listing.product_key
+    FROM catalog_products listing
+    WHERE listing.merchant_id = :merchant_id
+      AND listing.source_product_id = ANY(:aliases)
+      AND listing.suppressed_at IS NULL
+      AND listing.suppression_reason IS NULL
+    LIMIT 2
+"""
+
+
+async def _merchant_scoped_listing_product_key(db: Any, *, merchant_id: str, aliases: List[str]) -> Optional[str]:
+    """The product_key of the ONE live listing `merchant_id` holds under any of `aliases` as its
+    source_product_id, else None (no listing, or more than one: an ambiguous ref names nothing).
+
+    For the catalog-offers arm of offers.resolve only, which matches a listing by signature,
+    content_key or product_key and so could not reach the listing a (merchant_id, source product
+    id) ref names. NEVER RAISES: a failed or timed-out lookup is logged and answered None, so the
+    arm runs exactly as it would without it."""
+    scope = str(merchant_id or "").strip()
+    refs = [str(a).strip() for a in (aliases or []) if str(a or "").strip()][:20]
+    if not scope or not refs:
+        return None
+    try:
+        rows = await asyncio.wait_for(
+            db.fetch_all(_MERCHANT_SCOPED_LISTING_STATEMENT, {"merchant_id": scope, "aliases": refs}),
+            timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
+        )
+    except Exception as error:  # noqa: BLE001 -- a lookup failure must never cost the answer
+        logger.warning(
+            "offers.resolve.catalog_offers.merchant_listing_lookup.failed error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    keys = [str(_row_to_dict(row).get("product_key") or "").strip() for row in (rows or [])]
+    keys = [key for key in keys if key]
+    return keys[0] if len(rows or []) == 1 and len(keys) == 1 else None
 
 
 def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:

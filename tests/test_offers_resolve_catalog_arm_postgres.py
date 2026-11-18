@@ -122,7 +122,7 @@ def _seed(engine):
         ), {"sk": sku_key, "pk": _PK, "p": 12.00})
 
 
-def _resolve(product_id, limit=10):
+def _resolve(product_id, limit=10, *, merchant_id=None, market="US"):
     """Drive the REAL handler, so the SQL under test is the one the route sends."""
     from routes.agent_shop_gateway import OffersResolvePayload, _handle_offers_resolve
 
@@ -135,8 +135,9 @@ def _resolve(product_id, limit=10):
         await database.connect()
         try:
             return await _handle_offers_resolve(
-                OffersResolvePayload(product={"product_id": product_id}, limit=limit,
-                                     market="US", tool="*", commerce_surface="agent_api"),
+                OffersResolvePayload(product={"product_id": product_id,
+                                              **({"merchant_id": merchant_id} if merchant_id else {})},
+                                     limit=limit, market=market, tool="*", commerce_surface="agent_api"),
                 None, _BT(),
             )
         finally:
@@ -504,3 +505,65 @@ def test_every_catalog_link_served_is_issued_and_nothing_else_is(pg_engine):
     assert {r["click_id"] for r in rows} == served
     assert all(r["click_count"] == 0 and r["issued_at"] is not None for r in rows)
     assert all(r["agent_id"] is None for r in rows), "no caller key: the link is agent-less"
+
+
+# --- a merchant-scoped (merchant_id, source product id) ref -----------------------------------------
+#
+# Search hands out `canonical_product_ref` as (merchant_id, product_id = the listing's
+# source_product_id). The arm's statement matches only a signature, content_key or product_key, so the
+# handler first looks up the ONE live listing the merchant holds under that source id (a list bind
+# into `= ANY(...)`, which only Postgres proves) and adds its product_key. Made-up ids throughout.
+
+_SCOPED_HEX = "c0ffee00" * 4
+_SCOPED_SOURCE_ID = f"retailer:{_SCOPED_HEX}"
+_SCOPED_PK = f"ext:retailer:{_SCOPED_HEX}"
+
+
+def _seed_scoped_listing(engine):
+    """The arm's fixture, re-keyed as a retailer listing whose source_product_id is not its key."""
+    from sqlalchemy import text
+
+    _seed(engine)
+    with engine.begin() as conn:
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            conn.execute(text(f"UPDATE {table} SET product_key=:new WHERE product_key=:old"),
+                         {"new": _SCOPED_PK, "old": _PK})
+        conn.execute(text("UPDATE catalog_products SET source_product_id=:sid WHERE product_key=:pk"),
+                     {"sid": _SCOPED_SOURCE_ID, "pk": _SCOPED_PK})
+
+
+@pytest.mark.parametrize("market", ["US", None, "SG", "GB", "DE", "ZZ"])
+def test_a_merchant_scoped_source_product_ref_reaches_its_listing_on_postgres(pg_engine, market):
+    _seed_scoped_listing(pg_engine)
+    scoped = _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm", market=market))
+    # Exactly what the listing's own product_key answers, in every market cell.
+    assert scoped == _sourced(_resolve(_SCOPED_PK, market=market)), market
+    # The fixture's offers are US/USD: served for a US buyer or no stated market, never elsewhere.
+    if market in ("US", None):
+        assert scoped == {"of_retailer_cheap", "of_retailer_dear"}, market
+    else:
+        assert scoped == set(), market
+
+
+def test_a_merchant_scoped_ref_needs_the_listings_own_merchant_and_one_live_listing(pg_engine):
+    from sqlalchemy import text
+
+    _seed_scoped_listing(pg_engine)
+    # Without the lookup this ref finds nothing (the control the fix is measured against).
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID)) == set(), "no merchant scope: no lookup"
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_not_the_seller")) == set()
+    # A second live listing under the same merchant and source id: ambiguous, so it names nothing.
+    # (merchant, platform, source_product_id) is unique (migration 058), so the twin is on another
+    # platform: the only way the lookup can find two.
+    _seed_listing(pg_engine, f"ext:retailer:{'beef0000' * 4}", "sig_scoped_twin", "ck_twin", "m_arm",
+                  "of_twin", 11.00, "https://twin.example.test/products/1")
+    with pg_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_products SET platform='placeholder_platform', source_product_id=:sid"
+                          " WHERE product_key=:pk"),
+                     {"sid": _SCOPED_SOURCE_ID, "pk": f"ext:retailer:{'beef0000' * 4}"})
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == set()
+    # Withdraw the twin: one live listing again, and it answers.
+    with pg_engine.begin() as conn:
+        conn.execute(text("UPDATE catalog_products SET suppressed_at=NOW(), suppression_reason='test_takedown'"
+                          " WHERE product_key=:pk"), {"pk": f"ext:retailer:{'beef0000' * 4}"})
+    assert _sourced(_resolve(_SCOPED_SOURCE_ID, merchant_id="m_arm")) == {"of_retailer_cheap", "of_retailer_dear"}
