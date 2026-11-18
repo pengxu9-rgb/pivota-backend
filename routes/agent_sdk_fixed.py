@@ -993,6 +993,7 @@ async def search_products(
         _matches_catalog_surface,
         _normalize_catalog_surface,
         agent_search_products,
+        direct_call_external_seed_only,
     )
 
     normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
@@ -1305,11 +1306,22 @@ async def search_products(
                 limit=limit,
                 offset=offset,
                 allow_external_seed=allow_external_seed,
+                external_seed_only=direct_call_external_seed_only(
+                    caller="sdk_products_search", background_tasks=background_tasks, context=context,
+                    merchant_id=merchant_id, merchant_ids=merchant_ids, search_all_merchants=search_all_merchants,
+                ),
                 allow_stale_cache=allow_stale_cache,
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
                 market=market,
                 serving_market=serving_market,
+                # This route takes no payment context: None, never a route's default object (read as text).
+                psp=None,
+                payment_method_type=None,
+                card_network=None,
+                issuer_name=None,
+                wallet_type=None,
+                installment_provider=None,
                 context=context,
             ),
             delegate_timeout_s,
@@ -1452,6 +1464,9 @@ async def search_products_beauty(
         allow_stale_cache=allow_stale_cache,
         external_seed_strategy=external_seed_strategy,
         fast_mode=fast_mode,
+        # Called as a plain function: passed explicitly, never left as FastAPI's Query default object.
+        market=None,
+        serving_market=None,
         context=context,
     )
 

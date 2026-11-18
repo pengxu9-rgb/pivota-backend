@@ -9,7 +9,9 @@ from services import agent_search_gateway_proxy
 from config.settings import settings as _app_settings
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
+from fastapi import params as fastapi_params
 from fastapi.responses import JSONResponse
+from services.test_merchant_policy import get_excluded_merchant_ids
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Awaitable, Callable
 from decimal import Decimal
@@ -5360,48 +5362,117 @@ def _normalize_serving_market_param(raw: Any) -> Optional[str]:
     return code if code and expected_currency_for_market(code) else None
 
 
+def _plain_argument(value: Any, default: Any) -> Any:
+    """`value`, unless it is a FastAPI parameter object (a route's `Query(...)` / `Depends(...)` default left in
+    by a caller that called a route function as a plain one): then `default`, the value the route would
+    have resolved for an absent parameter."""
+    if isinstance(value, (fastapi_params.Param, fastapi_params.Depends)):
+        return default
+    return value
+
+
+#: The scope of an UNSCOPED search that reaches `agent_search_products` through one of its direct callers
+#: (the SDK search route, the beauty search route, the /products/resolve fallback). Those callers left
+#: `external_seed_only` out, and the Query default object read as True, so since 2026-02-26 they have
+#: searched external seeds only: connected merchants' products_cache rows were never read, and an agent
+#: with an allowed_merchants list got seeds too. Restoring the cross-merchant scope puts those rows back,
+#: and the products_cache arm of this search applies no test-merchant exclusion
+#: (services/test_merchant_policy is not read on it) and no currency guard without a price bound. So:
+#:   off (default, and any unknown value): today's scope -- external_seed_only=True, unchanged;
+#:   shadow: today's scope, plus one count-only log line per unscoped call (merchants it would search,
+#:           and how many of them are test merchants);
+#:   on: the caller's own external_seed_only (False unless asked), i.e. the cross-merchant scope.
+DIRECT_CALL_CROSS_MERCHANT_ENV = "AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT"
+
+
+def direct_call_cross_merchant_mode() -> str:
+    raw = str(os.getenv(DIRECT_CALL_CROSS_MERCHANT_ENV) or "").strip().lower()
+    return raw if raw in {"off", "shadow", "on"} else "off"
+
+
+async def _log_direct_call_scope_shadow(*, caller: str, context: Any) -> None:
+    """Counts only: how many merchants the cross-merchant scope would search, and how many are test merchants."""
+    try:
+        allowed = getattr(context, "allowed_merchants", None)
+        if isinstance(allowed, list) and [m for m in allowed if str(m).strip()]:
+            would = [str(m).strip() for m in allowed if str(m).strip() and str(m).strip() != EXTERNAL_SEED_MERCHANT_ID]
+        else:
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id, business_name FROM merchant_onboarding
+                WHERE status = 'approved'
+                AND psp_connected = true
+                LIMIT 100
+                """
+            )
+            would = [str((_row_as_dict(r) or {}).get("merchant_id") or "").strip() for r in rows]
+            would = [m for m in would if m]
+        excluded = await get_excluded_merchant_ids(database)
+        logger.info(
+            "agent_search.direct_call_scope_shadow %s",
+            json.dumps({
+                "event": "agent_search.direct_call_scope_shadow",
+                "caller": caller,
+                "would_search_merchants": len(would),
+                "would_search_test_merchants": len([m for m in would if m in (excluded or set())]),
+            }, sort_keys=True),
+        )
+    except Exception:
+        logger.debug("agent_search direct-call scope shadow failed", exc_info=True)
+
+
+def direct_call_external_seed_only(
+    *,
+    caller: str,
+    background_tasks: BackgroundTasks,
+    context: Any,
+    merchant_id: Optional[str],
+    merchant_ids: Optional[List[str]],
+    search_all_merchants: Any,
+    requested: bool = False,
+) -> bool:
+    """The `external_seed_only` a direct caller passes, by DIRECT_CALL_CROSS_MERCHANT_ENV (see above)."""
+    mode = direct_call_cross_merchant_mode()
+    if mode == "on":
+        return bool(requested)
+    unscoped = not merchant_id and not merchant_ids and search_all_merchants is not True
+    if mode == "shadow" and unscoped and not requested:
+        background_tasks.add_task(_log_direct_call_scope_shadow, caller=caller, context=context)
+    return True
+
+
 async def agent_search_products(
+    *,
     req: Request,
     background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
-    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
-    search_all_merchants: bool = Query(
-        default=False,
-        description="Opt-in cross-merchant search (requires explicit intent to avoid irrelevant results)",
-    ),
+    merchant_ids: Optional[List[str]] = None,
+    search_all_merchants: bool = False,
     query: Optional[str] = None,
     category: Optional[str] = None,
-    catalog_surface: Optional[str] = Query(
-        default=None,
-        description="Optional search surface. Set to 'beauty' for beauty-only candidate filtering.",
-    ),
+    catalog_surface: Optional[str] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
     in_stock_filter_explicit: Optional[bool] = None,
-    limit: int = Query(default=20, ge=1),
-    offset: int = Query(default=0, ge=0),
-    allow_external_seed: bool = Query(default=True),
-    external_seed_only: bool = Query(default=False),
-    allow_stale_cache: bool = Query(default=True),
-    external_seed_strategy: str = Query(default="legacy"),
-    fast_mode: bool = Query(default=False),
-    market: Optional[str] = Query(default=None),
-    serving_market: Optional[str] = Query(
-        default=None,
-        description=(
-            "The BUYER's market (ISO-2). Decides the currency every served row must be priced in; "
-            "the seed partitions read stay the deployment's (`market`). `market` alone is the storage "
-            "partition, unchanged. Unpriceable or malformed values are ignored."
-        ),
-    ),
-    psp: Optional[str] = Query(default=None),
-    payment_method_type: Optional[str] = Query(default=None),
-    card_network: Optional[str] = Query(default=None),
-    issuer_name: Optional[str] = Query(default=None),
-    wallet_type: Optional[str] = Query(default=None),
-    installment_provider: Optional[str] = Query(default=None),
-    context: AgentContext = Depends(get_agent_context),
+    limit: int = 20,
+    offset: int = 0,
+    allow_external_seed: bool = True,
+    external_seed_only: bool = False,
+    allow_stale_cache: bool = True,
+    external_seed_strategy: str = "legacy",
+    fast_mode: bool = False,
+    # The BUYER's market (ISO-2): decides the currency every served row must be priced in; the seed
+    # partitions read stay the deployment's (`market`). Unpriceable or malformed values are ignored.
+    market: Optional[str] = None,
+    serving_market: Optional[str] = None,
+    psp: Optional[str] = None,
+    payment_method_type: Optional[str] = None,
+    card_network: Optional[str] = None,
+    issuer_name: Optional[str] = None,
+    wallet_type: Optional[str] = None,
+    installment_provider: Optional[str] = None,
+    context: AgentContext,
 ):
     """
     智能产品搜索 - Cross-Merchant Support
@@ -5413,7 +5484,27 @@ async def agent_search_products(
     - 价格区间筛选
     - 分页支持
     - 相关度评分
+
+    NOT A ROUTE. The search routes (routes/agent_sdk_fixed.search_products, agent_search_products_beauty
+    below) and the /products/resolve fallback call this as a plain function, so its defaults are plain
+    Python values. They used to be FastAPI `Query(...)` objects, and a caller that left one out passed the
+    object itself: `external_seed_only` left out read as True (`bool(Query(default=False))`), so an
+    unscoped search was answered from external seeds only. tests/test_route_functions_called_directly.py
+    holds every direct call of a function with FastAPI parameter defaults to passing each one.
     """
+    # Defence in depth: a FastAPI parameter object is a route's default, never a value a caller chose.
+    (merchant_ids, search_all_merchants, catalog_surface, limit, offset, allow_external_seed, external_seed_only,
+     allow_stale_cache, external_seed_strategy, fast_mode, market, serving_market, psp, payment_method_type,
+     card_network, issuer_name, wallet_type, installment_provider) = (
+        _plain_argument(merchant_ids, None), _plain_argument(search_all_merchants, False),
+        _plain_argument(catalog_surface, None), _plain_argument(limit, 20), _plain_argument(offset, 0),
+        _plain_argument(allow_external_seed, True), _plain_argument(external_seed_only, False),
+        _plain_argument(allow_stale_cache, True), _plain_argument(external_seed_strategy, "legacy"),
+        _plain_argument(fast_mode, False), _plain_argument(market, None), _plain_argument(serving_market, None),
+        _plain_argument(psp, None), _plain_argument(payment_method_type, None), _plain_argument(card_network, None),
+        _plain_argument(issuer_name, None), _plain_argument(wallet_type, None),
+        _plain_argument(installment_provider, None),
+    )
     # Preserve whether the caller actually requested a hard stock filter.
     # FastAPI's historical default is True, but omission is discovery intent
     # and must not erase rows whose inventory still needs a live quote.
@@ -7441,6 +7532,10 @@ async def agent_search_products_beauty(
         limit=limit,
         offset=offset,
         allow_external_seed=allow_external_seed,
+        external_seed_only=direct_call_external_seed_only(
+            caller="beauty_products_search", background_tasks=background_tasks, context=context,
+            merchant_id=merchant_id, merchant_ids=merchant_ids, search_all_merchants=search_all_merchants,
+        ),
         allow_stale_cache=allow_stale_cache,
         external_seed_strategy=external_seed_strategy,
         fast_mode=fast_mode,
@@ -7918,22 +8013,43 @@ async def agent_resolve_products(
     if search_query and not candidates_by_key:
         async def _resolve_with_search(*, scoped_merchant: Optional[str], source_name: str) -> bool:
             search_started = time.perf_counter()
+            search_background_tasks = BackgroundTasks()
             try:
                 result = await asyncio.wait_for(
                     agent_search_products(
                         req=req,
-                        background_tasks=BackgroundTasks(),
+                        background_tasks=search_background_tasks,
                         merchant_id=scoped_merchant,
                         merchant_ids=None,
                         search_all_merchants=(scoped_merchant is None),
                         query=search_query,
                         category=None,
+                        catalog_surface=None,
                         min_price=None,
                         max_price=None,
                         in_stock_only=True,
                         in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
+                        allow_external_seed=True,
+                        external_seed_only=direct_call_external_seed_only(
+                            caller="products_resolve", background_tasks=search_background_tasks, context=context,
+                            merchant_id=scoped_merchant, merchant_ids=None,
+                            search_all_merchants=(scoped_merchant is None),
+                        ),
+                        allow_stale_cache=True,
+                        external_seed_strategy="legacy",
+                        fast_mode=False,
+                        # This lookup names no market and no payment context: None, not a route's default object
+                        # (which read as text: a garbage seed partition, so no seed, and a garbage payment context).
+                        market=None,
+                        serving_market=None,
+                        psp=None,
+                        payment_method_type=None,
+                        card_network=None,
+                        issuer_name=None,
+                        wallet_type=None,
+                        installment_provider=None,
                         context=context,
                     ),
                     timeout=search_timeout_s,
