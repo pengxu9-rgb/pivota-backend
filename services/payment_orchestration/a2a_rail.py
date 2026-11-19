@@ -612,8 +612,9 @@ def davv_echo_matcher(davv: str) -> Callable[[Any], bool]:
     "CVV verified. Order 123" is not our code, so the purchase is not cancelled for it. A leading-zero DAVV
     ("077") is also caught without its zeros ("cvv 77"), as it reads once echoed as a number."""
     forms = {davv}
-    if davv.isdigit() and davv.isascii():
-        forms.add(str(int(davv)))
+    short = _davv_short_form(davv)
+    if short is not None:
+        forms.add(short)
     digits = "|".join(r"[\W_]?".join(re.escape(d) for d in form) for form in sorted(forms, key=len, reverse=True))
     code = r"(?<![0-9])(?:" + digits + r")(?![0-9])"
     pattern = re.compile(
@@ -862,10 +863,25 @@ _SCRUB_SUBSTRING_MIN = 8
 
 
 
+def _davv_short_form(davv: str) -> Optional[str]:
+    """A leading-zero DAVV without its zeros ("077" -> "77"), as an echo reads once it went through a number; None
+    when there is no leading zero, or when fewer than TWO digits would remain ("007", "000"): a one-digit needle
+    would cancel on any `quantity: 7`, `errorCount: "0"` or "Ships in 7 days". Such a DAVV is caught verbatim
+    ("007"), and in prose beside a card word as written. RESIDUAL: a short form split across two values
+    ({"a": "7", "b": "7"}) is not caught; nothing stores or sends it."""
+    if not (davv.isdigit() and davv.isascii()):
+        return None
+    short = str(int(davv))
+    return short if short != davv and len(short) >= 2 else None
+
+
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
     expiry (raw and as "MM/YY") and its DAVV (`DAVV_FIELD`) only as a WHOLE value: "715" alone, never inside
-    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context."""
+    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context; a leading-zero
+    DAVV also without its zeros when two digits remain (`_davv_short_form`).
+    ON PURPOSE the needle reads `networkToken.cvv` WITHOUT the dynamicDataType marker: an unmarked cvv is never
+    relayed (davv_missing comes first), and scrubbing it if echoed is only stricter. Do not "fix" it."""
     contains: List[str] = []
     exact = set()
     for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
@@ -873,9 +889,10 @@ def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], F
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
-        if key == DAVV_FIELD and raw.isdigit() and raw.isascii():
+        short = _davv_short_form(raw) if key == DAVV_FIELD else None
+        if short is not None:
             # A leading-zero DAVV ("077") may come back as the number 77 or the string "77": the same code.
-            exact.add(str(int(raw)))
+            exact.add(short)
         # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
         for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
             if len(form) >= _SCRUB_SUBSTRING_MIN and key != DAVV_FIELD:

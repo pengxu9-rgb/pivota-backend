@@ -4013,3 +4013,39 @@ async def test_before_the_confirm_a_leading_zero_davv_echoed_in_prose_without_it
                          ("confirm", "edit", "cancel"), kind="confirm"))
     relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
     assert relay.checkout.card_codes_scrubbed >= 1
+
+
+# ── review of 995c64e8c (P3-1): no one-digit short form for a "00x" DAVV ──────────────────────────
+
+@pytest.mark.parametrize("davv,echo", [
+    ("007", {"quantity": 7}), ("007", {"errorCount": "7"}), ("000", {"errorCount": "0"}), ("000", {"quantity": 0}),
+    ("001", {"quantity": 1}),
+], ids=["007_quantity_7", "007_count_7", "000_count_0", "000_quantity_0", "001_quantity_1"])
+async def test_a_00x_davv_never_becomes_a_one_digit_needle(davv, echo):
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token(cvv=davv)), answer),
+                         setup=_setup(ceiling_minor=100000))
+    assert relay.refused is None and relay.checkout.credential_fields_stripped == 0
+    assert relay.checkout.card("checkout.confirm").data == {"merchant": "merchant.example", **echo}
+
+
+async def test_a_00x_davv_in_prose_ships_in_7_days_does_not_cancel_and_is_caught_verbatim():
+    matches = a2a_rail.davv_echo_matcher("007")
+    assert not matches("Ships in 7 days · CVV verified") and not matches("cvv 7")
+    assert matches("cvv 007") and matches("CVV: 0 0 7")
+    answer = _task({"kind": "text", "text": "Ships in 7 days · CVV verified"},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token(cvv="007")), answer),
+                         setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.card_codes_scrubbed == 0
+    exact = a2a_rail._scrub_needles(_network_token(cvv="007"))[1]
+    assert "007" in exact and "7" not in exact
+
+
+def test_the_short_form_needs_two_digits_left_and_077_still_catches_77():
+    assert a2a_rail._davv_short_form("077") == "77" and a2a_rail._davv_short_form("715") is None
+    assert a2a_rail._davv_short_form("007") is None and a2a_rail._davv_short_form("000") is None
+    exact = a2a_rail._scrub_needles(_network_token(cvv="077"))[1]
+    assert {"077", "77"} <= exact
+    assert a2a_rail.davv_echo_matcher("077")("cvv 77")
