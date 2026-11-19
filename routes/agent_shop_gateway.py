@@ -66,6 +66,12 @@ from services.offer_buyability import (
     availability_is_known_unavailable,
     expected_currency_for_market,
 )
+from services.unknown_stock import (
+    SQL_OUT_OF_STOCK_SPELLINGS,
+    UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG as _UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG,
+    stated_in_stock as _shared_stated_in_stock,
+    unknown_stock_stays_unknown as _shared_unknown_stock_stays_unknown,
+)
 from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
@@ -7376,7 +7382,7 @@ async def _handle_offers_resolve(
                     {"aliases": ident_aliases, "limit": max(limit, 1),
                      "market": market_hint,
                      "buyer_currency": _declared_buyer_currency(market_hint),
-                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+                     "unavailable": _catalog_unavailable_spellings(),
                      **_price_params},
                 ),
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
@@ -10723,7 +10729,13 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     Plus the seed-currency conjunct, read per call: "" with the reader kill switch
     (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off. The conjunct is then dropped and rows and
     plan match the pre-rule statement, but the text (and so its Query Insights digest) differs: the
-    guard's SQL comments stay in it."""
+    guard's SQL comments stay in it.
+
+    The ORDER BY's in-SQL comment ("see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds") holds with
+    OFFERS_UNKNOWN_STOCK_STAYS_UNKNOWN_ENABLED off. With it on, `:unavailable` is the wider list from
+    `_catalog_unavailable_spellings` so the order matches the flag-on `in_stock`; free prose the normalizer
+    flags False cannot be listed and still sorts as sellable (ordering only). The comment is left as is
+    on purpose: editing it would change the statement text (and its Query Insights digest) flag off."""
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
@@ -11059,23 +11071,29 @@ def _seed_offer_matched(src: Dict[str, Any], entries: set, variants: Optional[Li
     return False
 
 
-UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG = "OFFERS_UNKNOWN_STOCK_STAYS_UNKNOWN_ENABLED"
+UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG = _UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG
 
 
 def _unknown_stock_stays_unknown() -> bool:
-    """Default OFF. On: an offer or seed whose availability is missing or not understood says in_stock None
-    (unknown), never True, and carries no invented inventory count. Off: today's behaviour."""
-    return os.getenv(UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG, "").strip().lower() == "true"
+    """Default OFF; case-insensitive "true" after trimming, "1"/"yes"/"on" stay off. On: an offer or seed whose
+    availability is missing or not understood says in_stock None (unknown), never True, and carries no invented
+    inventory count. Off: today's behaviour. Shared with beauty_external_ranking: services.unknown_stock."""
+    return _shared_unknown_stock_stays_unknown()
 
 
 def _stated_in_stock(availability: Any) -> Optional[bool]:
     """True only on an affirmative in-stock statement, False on ANY out-of-stock statement (the catalog arm's
     vocabulary or the seed lane's: "sold out" is sold out in every lane), None when it is missing or says neither."""
-    from utils.availability_vocabulary import IN_STOCK, normalize_availability
+    return _shared_stated_in_stock(availability)
 
-    if _availability_says_out_of_stock(availability):
-        return False
-    return True if normalize_availability(availability) == IN_STOCK else None
+
+def _catalog_unavailable_spellings() -> List[str]:
+    """The `:unavailable` bind of the catalog arm's ORDER BY. Off: OFFER_UNAVAILABLE_AVAILABILITIES (the base
+    list, unchanged). On: the wider list the normalizer calls out of stock (services.unknown_stock), so a
+    "sold out" / schema.org SoldOut / "discontinued" row sorts the way its in_stock flag reads."""
+    if _unknown_stock_stays_unknown():
+        return list(SQL_OUT_OF_STOCK_SPELLINGS)
+    return sorted(OFFER_UNAVAILABLE_AVAILABILITIES)
 
 
 def _availability_says_out_of_stock(value: Any) -> bool:
@@ -11657,7 +11675,7 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
             {"aliases": snap["aliases"], "limit": max(snap["limit"], 1),
              "market": snap["market"],
              "buyer_currency": _declared_buyer_currency(snap["market"]),
-             "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+             "unavailable": _catalog_unavailable_spellings(),
              **price_params},
         )
     record.update(_group_shadow_compute(snap, group, list(rows or [])))
@@ -13912,7 +13930,9 @@ def _prefetched_candidate_availability(candidate: Dict[str, Any]) -> Optional[st
     if candidate.get("availability"):
         return candidate.get("availability")
     if _unknown_stock_stays_unknown():
-        return {True: "in_stock", False: "out_of_stock"}.get(candidate.get("in_stock"))
+        # Identity, not equality: 0/1 are not a stated True/False (a dict lookup would map them).
+        stated = candidate.get("in_stock")
+        return "in_stock" if stated is True else "out_of_stock" if stated is False else None
     return "in_stock" if candidate.get("in_stock") is not False else "out_of_stock"
 
 
