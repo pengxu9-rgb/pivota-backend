@@ -309,7 +309,7 @@ def _max_structural_share() -> float:
 # a LOWER bound: the attached lane reports `refused_currency` only for a seed that reaches its
 # currency check (after no_listing_offer / listing_offer_suppressed / ambiguous_listing_seller /
 # currency_not_read); past that check every such seed is refused whole, whoever wrote its rows
-# (Peng 2026-10-22). Twice it (10%) means reads started disagreeing with the
+# (the owner 2026-10-22). Twice it (10%) means reads started disagreeing with the
 # stored column (a geo-served storefront, an extractor regression), and those seeds silently stop
 # being priced. The structural-share rule cannot see it while the attached lane writes anything.
 # The minimum count keeps a tiny night (1 refusal in 5) from flapping.
@@ -2138,7 +2138,7 @@ def refresh_queue_tier(
     """Where a candidate sits in the refresh queue. Pure; lower sorts first.
 
     Stale before fresh, then a row priced in a SERVED currency before one that is not. A served currency is the
-    partition's own (`seed_serving_currency(market)`, Peng 2026-09-26) or, since 2026-11-05, the currency of any
+    partition's own (`seed_serving_currency(market)`, the owner 2026-09-26) or, since 2026-11-05, the currency of any
     served pricing region (`served_currencies`, from `served_region_currencies()`), IN A PARTITION WHOSE OWN
     CURRENCY IS SERVED. SG rows live in the US partition on purpose, so on the partition alone every SGD seed sorted
     behind every stale USD one, and with the run's limit under the stale served tier it was never read (2,632 SGD

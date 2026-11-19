@@ -2,7 +2,7 @@
 
 **Status:** Accepted in principle (founder sign-off 2026-07-09 — Option B target / Option D increment, incl. the publish-surface addendum; open decisions D1–D4 remain itemized below). Rev 2 — substantially revised after adversarial review, 2026-07-09.
 **Date:** 2026-07-09
-**Deciders:** Commerce-index / Trust & Identity owners (peng)
+**Deciders:** Commerce-index / Trust & Identity owners (Founder)
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-007 (citable index vs commerce overlay), ADR-008 (brand-identity reconciliation), ADR-009 (seller-of-record identity). Companion reference: `docs/IDENTITY_REFERENCE.md`.
 **Supersedes (partially):** ADR-008's deferral of the identity merge primitive — see "Relationship to ADR-008" below.
 

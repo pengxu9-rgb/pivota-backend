@@ -653,7 +653,7 @@ upsert "prod: Cloud Run job failing" "$(policy \
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
 # This is continuous job occupancy (running_executions > 0 for 5h), not per-execution age: one wedged
 # run or runs chained back to back both fire it; two short overlapping runs do not.
-# FIVE HOURS since 2026-10-20 (was two; Peng): the nightly reviews up to 10,000 labels at concurrency
+# FIVE HOURS since 2026-10-20 (was two; the owner): the nightly reviews up to 10,000 labels at concurrency
 # 12 (setup_scheduler.sh relgraph_sync_env). Measured 2026-10-20: 3,000 at 16 in ~37 minutes after a
 # ~31-minute build, so 10,000 at 12 is ~3.0-4.0 h a normal night and four hours left ~40 minutes of
 # margin. Five still warns an hour before the 21600s task timeout ends a wedged attempt.

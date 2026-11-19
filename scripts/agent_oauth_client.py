@@ -23,7 +23,7 @@ PROVISIONING A PARTNER (the secret never passes through a job log):
     ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,MCP_OAUTH_AS_ISSUER=<web's value> \\
       scripts/ops/run_oneoff_job.sh scripts/agent_oauth_client.py provision --agent-id agent_x \\
         --redirect-uri https://claude.ai/api/mcp/auth_callback --client-name "Acme on Claude" \\
-        --registered-by peng --note "Acme connector" --apply
+        --registered-by owner --note "Acme connector" --apply
 
     # 3. hand the partner the client_id, and the secret from Secret Manager, out of band
     gcloud secrets versions access latest --secret oauth-client-agent_x --project pivota-prod
@@ -34,7 +34,7 @@ PROVISIONING A PARTNER (the secret never passes through a job log):
 OTHER COMMANDS
 
     # re-point a client `provision` created (replaces the active registration; history kept)
-    scripts/agent_oauth_client.py register --client-id mcpc_... --agent-id agent_y --registered-by peng --apply
+    scripts/agent_oauth_client.py register --client-id mcpc_... --agent-id agent_y --registered-by owner --apply
 
     # stop crediting a client: the kill switch for a leaked secret. The client keeps working for OAuth;
     # to rotate, provision a new client for the partner and disable this one.

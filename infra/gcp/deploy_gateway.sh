@@ -104,7 +104,7 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 : "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo all)}"
 # UNDER CONFIG=preserve AN UNSET PUBLIC KEEPS WHAT THE SERVICE ALREADY GRANTS (see
 # preserved_public_invoker below): a service that already grants roles/run.invoker to allUsers is
-# redeployed public. The staging gateway became allUsers-invokable on 2026-09-29 (Peng) so partner
+# redeployed public. The staging gateway became allUsers-invokable on 2026-09-29 (the owner) so partner
 # agents (Meitu, Chance AI) can call /ucp/mcp with their agent keys. On 2026-09-30 04:05Z a preserve
 # deploy of staging (d02ff489a) ran --no-allow-unauthenticated and silently REVOKED that binding:
 # every anonymous call got Cloud Run's 403. Same fix as deploy_backend.sh (#2452). An explicit

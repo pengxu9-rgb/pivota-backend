@@ -165,7 +165,7 @@ def test_build_platform_admin_url_skips_untrusted_wix_identifier():
             platform="wix",
             platform_product_id="prod_1",
             store_domains_by_platform={
-                "wix": "peng652.wixsite.com/aydan-1",
+                "wix": "examplesite123.wixsite.com/demo-1",
             },
         )
         is None

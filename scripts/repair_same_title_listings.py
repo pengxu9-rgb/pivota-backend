@@ -46,7 +46,7 @@ over a repair); every touched content_key's served view and eligibility are rebu
   Dry run (default; writes nothing):
     python -m scripts.repair_same_title_listings [--host cocodor.com ...] [--product-key ext:... ...] [--market US]
                                                  [--only-host-alias]
-  Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
+  Apply (the owner's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
   the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
     ... --host <store> [--only-host-alias] --max-groups <n> --expect-digest <plan_digest> --apply
   An --apply re-plans live: it is refused without exactly one --host, or when the plan acts on more than

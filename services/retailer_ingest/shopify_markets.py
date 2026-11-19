@@ -1,7 +1,7 @@
 """source = "shopify_markets": sibling offers in a SERVED market's currency for a Shopify storefront whose base
 currency is another, proven per session. US (USD siblings) since 2026-09-26; SG (SGD siblings) since 2026-10-10.
 
-Multi-market storefronts ADR, Phase 2 (approved by Peng 2026-09-26): "Allow USD offers from non-USD
+Multi-market storefronts ADR, Phase 2 (approved by the owner 2026-09-26): "Allow USD offers from non-USD
 stores that show US buyers USD prices, but only when the store's cart confirms USD for a US session --
 brand stores first." This is `scripts/capture_us_market_offers.py`'s mechanics (lines 19-24, 447-462)
 as a retailer_ingest source, scoped to ONE (storefront, brand) job instead of the no_us_offer cohort.
@@ -23,7 +23,7 @@ never occurred; a few stores send no cookie at all (`currency_unprovable`). This
 2026-08 rule that "a `?country=` query is never evidence": that held for the bare query, whose payload names
 no currency. With the same-response cookie, the query is the stronger proof.
 
-THE TARGET MARKET (Peng 2026-10-10, "Build the SG currency support"): the job's options.market picks it,
+THE TARGET MARKET (the owner 2026-10-10, "Build the SG currency support"): the job's options.market picks it,
 from CAPTURE_MARKETS. Everything above reads with the market substituted -- ships_to names SG, the PUT says
 country_code=SG, /cart.js must report SGD -- and the sibling is (market 'SG', currency 'SGD', source_system
 'shopify_markets_sg_localization', offer id under 'offer:shopify_markets_sg:'). The US capture is byte-
@@ -60,7 +60,7 @@ lane's backoff, like a throttled crawl. A 403, a non-JSON answer where JSON is d
 redirect to another host is UNVERIFIABLE: the job fails with that reason, nothing is written, and
 nothing is retried or worked around.
 
-ROBOTS.TXT IS OBEYED FOR EVERY PATH (Peng's standing rule: never scrape around a crawler block). Every
+ROBOTS.TXT IS OBEYED FOR EVERY PATH (the owner's standing rule: never scrape around a crawler block). Every
 request -- the pinned `.js?country=` reads included -- goes through crawl_politeness.before_request: the crawl's
 own parser, cache and fail-open policy (a robots.txt that 404s, 5xxs or times out is "no restrictions"; only an
 explicit Disallow blocks), with no special case. The fallback session needs both SESSION_PATHS (/localization,
@@ -82,7 +82,7 @@ from services.shopify_storefront_session import MarketsRefused, ShopifyStorefron
 
 SOURCE = "shopify_markets"
 #: The markets this capture proves and writes, each a SERVED market (ADR-024: `market` is the declared
-#: destination). US since 2026-09-26; SG since 2026-10-10 (Peng). The default -- a job with no
+#: destination). US since 2026-09-26; SG since 2026-10-10 (the owner). The default -- a job with no
 #: options.market, every job queued before SG -- is CAPTURE_MARKET.
 CAPTURE_MARKETS = ("US", "SG")
 CAPTURE_MARKET = "US"

@@ -254,7 +254,7 @@ SSRF or RCE there also reaches Cloud SQL's private IP and Memorystore.
 Both scheduler-driven Cloud Run jobs run as the **default compute SA**, which additionally holds
 `storage.objectAdmin` and `cloudbuild.builds.builder`.
 
-`roles/owner → user:peng@woopay.tech` is the **only** human principal across all three projects.
+`roles/owner → user:owner@example.com` is the **only** human principal across all three projects.
 **No break-glass second owner.**
 
 ### 2.6 A client has a Railway hostname hardcoded, and its writes are being lost — DIAGNOSED AND FIXED 2026-08-25

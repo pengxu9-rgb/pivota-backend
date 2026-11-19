@@ -178,14 +178,14 @@ def test_rows_the_readers_withhold_are_not_repriced(source_system):
 
 @pytest.mark.parametrize("source_system", ["catalog_enrichment_agent_v1", "variant_identity_backfill_v1", None])
 def test_a_read_reprices_no_row_of_a_seed_with_no_currency(source_system):
-    """Peng 2026-10-22, after #2657 (M2): a READ of a seed whose currency nobody can state (us.oiolab.co:
+    """The owner 2026-10-22, after #2657 (M2): a READ of a seed whose currency nobody can state (us.oiolab.co:
     column USD, page EUR) re-prices no row, whoever wrote it."""
     plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)], source="refresh")
     assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
 
 
 def test_an_employee_edit_reprices_the_rows_another_writer_owns():
-    """Peng 2026-10-22: an explicit employee edit is a person vouching for the column's currency and
+    """The owner 2026-10-22: an explicit employee edit is a person vouching for the column's currency and
     amount, so it re-prices the listing's enrichment row as on main; the seed-projected row stays refused
     (#2657). The same seed under a refresh writes nothing (above)."""
     rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),

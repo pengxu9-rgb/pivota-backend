@@ -400,7 +400,7 @@ async def test_a_currency_disagreement_is_refused(db):
 
 
 async def test_a_price_nobody_stated_a_currency_for_gets_no_row(db):
-    """Never a USD default (Peng 2026-10-19): this used to write `vcur or offer_currency or "USD"`.
+    """Never a USD default (the owner 2026-10-19): this used to write `vcur or offer_currency or "USD"`.
     A variant price with no currency, on an offer with none, is not a price."""
     await _seed(db, variants=[_variant(currency=None)], offers=[{"currency": None}])
     report = await _run()
