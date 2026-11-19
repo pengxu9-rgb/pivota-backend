@@ -15,7 +15,7 @@ first real Minds/Antom transaction. Cutover window Sep 8–12. See
 ## Bootstrap an environment
 
 ```bash
-gcloud auth login --update-adc            # once, as owner@example.com
+gcloud auth login --update-adc            # once, as <owner-google-account>
 infra/gcp/bootstrap_env.sh staging        # ~15 min (Cloud SQL + Memorystore)
 infra/gcp/bootstrap_env.sh prod
 ```

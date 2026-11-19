@@ -13,14 +13,14 @@ cp "$HOME/Desktop/temp_fix/pivota-merchants-portal/components/RefundHistoryTimel
 
 # 2. Deploy Backend
 echo "🔧 Deploying backend..."
-cd $HOME/Desktop/temp_fix
+cd "$HOME/Desktop/temp_fix"
 git add -A
 git commit -m "feat: add enhanced refund history with timeline view"
 git push origin main
 
 # 3. Deploy Frontend  
 echo "🎨 Deploying frontend..."
-cd $HOME/Desktop/temp_fix/pivota-merchants-portal
+cd "$HOME/Desktop/temp_fix/pivota-merchants-portal"
 git add -A
 git commit -m "feat: add RefundHistoryTimeline component with enhanced UI"
 git push origin main
