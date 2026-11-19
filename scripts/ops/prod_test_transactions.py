@@ -55,7 +55,9 @@ import uuid
 JOB_NAME = "prod-test-transactions"
 ENV = "PROD_TEST_TXN_"
 PREFIX = "PROD_TEST_TXN_RESULT "
-KEY_SECRET = "prod-test-agent-key"
+# The owner's existing test shopping agent key (created 2026-09-24 for testing; mounted by no service or job before
+# this one). Mounted by numbered version only while armed; the job refuses it unless it is in the gateway's ak_ format.
+KEY_SECRET = "test-shopping-agent-api-key"
 KEY_MOUNT_DIR = "/var/run/pivota-test-agent"
 KEY_FILE = "key"
 KEY_PATTERN = re.compile(r"ak_(?:live_)?[0-9a-f]{64}")  # the gateway's own key format
@@ -87,10 +89,15 @@ MAX_SCALAR_CHARS = 120
 #   7d650dce8 (gw#2603 + gw#2604, live 2026-11-19 03:07Z): readOffersResolveMarket reads the same three carriers by
 #     the same rule (first readable two-ASCII code wins; sent-but-unreadable -> market_invalid; unpriced ->
 #     market_not_priced; nothing sent -> no market); merchantPurchasabilityClient is unchanged, so every OR-* holds.
+#   16477d834 (gw#2606 + gw#2607, live 2026-11-19 05:42Z, gateway-01020-nap): only search_catalog / get_product /
+#     get_alternatives now refuse a sent NON-STRING market (commerceToolSurface NON_STRING_MARKET_REFUSED_OPS), and
+#     server.js changes only withDiscoveryBuyerMarket, legacySeedDetailRequestedMarket (same answer for strings), the
+#     kernel upstream carrier and _debug. No offers.resolve, get_offers, checkout or storefront line changed.
 IMAGE_COMMIT_PATH = Path("/app/.image_commit_sha")
 REVIEWED_GATEWAY_DIGESTS = {
     "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31": "080d7297f74e019fe5d88a25e78c3315ebdb080a",
     "sha256:908df3e4b47324610fd535f0969c923f03aa63e145875a93c94e385885c5846d": "7d650dce841828059c060a7593992478ddf4f11d",
+    "sha256:c07e945db5707366c5dd7f0d89ca7edbb845ddbcafa01204837a475220b51088": "16477d8341b125a269dce86fabdc0029bcc430a0",
 }
 # Tool-error codes after which a checkout MAY exist (the gateway failed inside, or does not know): never "nothing
 # created". A JSON-RPC (numeric) error, e.g. the heartbeat's -32603, counts the same.

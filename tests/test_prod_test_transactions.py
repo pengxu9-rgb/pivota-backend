@@ -164,8 +164,10 @@ def test_path_four_needs_a_reviewed_gateway_image_by_digest():
     cases = job.select_cases("OR-DE,MCP-K-US")
     job.require_reviewed_gateway(cases, GW_DIGEST)
     job.require_reviewed_gateway(cases, "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31")
+    job.require_reviewed_gateway(cases, "sha256:c07e945db5707366c5dd7f0d89ca7edbb845ddbcafa01204837a475220b51088")
     assert set(job.REVIEWED_GATEWAY_DIGESTS.values()) == {"080d7297f74e019fe5d88a25e78c3315ebdb080a",
-                                                          "7d650dce841828059c060a7593992478ddf4f11d"}
+                                                          "7d650dce841828059c060a7593992478ddf4f11d",
+                                                          "16477d8341b125a269dce86fabdc0029bcc430a0"}
     for digest in (None, "sha256:" + "0" * 64, "7d650dce841828059c060a7593992478ddf4f11d"):   # a commit is not a digest
         with pytest.raises(job.CaseError, match="reviewed against"):
             job.require_reviewed_gateway(cases, digest)

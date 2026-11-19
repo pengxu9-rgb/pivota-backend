@@ -161,14 +161,14 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 
 ## What the owner sets up (names only; no session reads or creates these)
 
-1. **The test agent and its key.** A first-party agent created for this job only. Its key (`ak_…`) goes in `prod-test-agent-key`.
+1. **The test agent and its key.** The owner's existing test shopping agent, set up for testing (owner, 2026-11-19). Its key lives in the existing secret `test-shopping-agent-api-key`, created 2026-09-24 with versions 1 and 2, and mounted by no other service or job. Pass the valid version as `_KEY_VERSION`. The job refuses the key unless it is in the gateway's `ak_` format.
 2. **The targets.** `prod-test-transactions-targets` holds the JSON above. Review records its sha256 as `TARGETS_SHA256`.
 3. **The test issuer:**
    1. Generate an EC P-256 key pair on your own machine.
    2. Store the private key, as PKCS8 PEM, as `prod-test-agent-user-key`.
    3. Publish the public JWKS (`{"keys":[{…, "kid", "alg": "ES256", "use": "sig"}]}`) on a **Pivota-owned https host**.
    4. Register `{issuer, jwks_uri, audience, algs:["ES256"], authorized_party, required_scopes}` for the **test agent** in the developer portal, then **disable** the binding until the first go.
-4. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` on those three secrets **only**, and nothing else.
+4. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` **only** on `test-shopping-agent-api-key` and `prod-test-transactions-targets`. Add `prod-test-agent-user-key` when the checkout cases come. It gets nothing else.
 5. **Launcher (`sa-ops-launcher`):**
    - `roles/iam.serviceAccountUser` on `sa-prod-test-txn`;
    - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`, **added alongside** the project-wide `roles/logging.viewer` it already has. Keep that viewer: the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`, so removing it would break the seed batch. Trimming it waits until the seed batch reads through a view too (the controller's call, 2026-11-19). Create the view with this filter:
@@ -195,6 +195,7 @@ Every run needs:
 
 ## Known limits (review v5, accepted)
 
+- **If `offers_product_id` becomes unpriced** (`offers_count` 0) or its merchant is no longer a test merchant, the served OR-* cases **fail and report**, with no retry. The fix is a new targets version, its sha in a reviewed PR, and a new go.
 - **The flags come from the service template.** They match what serves only because the gateway step requires serving == latest created. They, and the image pin, are checked at the gateway step, not at execution, which leaves a window of a few minutes. A gateway deploy or env change in that window is serialized away by the controller, which holds the gateway during a run.
 - **A slow gateway can run the job past its 600 s task timeout.** That is possible with 45 s per call. It fails safe: the missing checkout rows become `unknown:<case>`, and the run is not ok.
 - **A named storefront refusal raised after the store built a cart** leaves one seller cart for that case. It expires unpaid and stays inside the approved cart count.
