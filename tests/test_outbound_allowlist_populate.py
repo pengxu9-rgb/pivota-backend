@@ -496,9 +496,9 @@ LISTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "outbound_re
 def _lists_env(path, pin=None) -> dict:
     from hashlib import sha256
 
-    data = open(path, "rb").read() if os.path.exists(path) else b""
-    return {core.REDIRECTOR_LISTS_PATH_ENV: str(path),
-            core.REDIRECTOR_LISTS_SHA256_ENV: sha256(data).hexdigest() if pin is None else pin}
+    if pin is None:
+        pin = sha256(open(path, "rb").read() if os.path.isfile(path) else b"").hexdigest()
+    return {core.REDIRECTOR_LISTS_PATH_ENV: str(path), core.REDIRECTOR_LISTS_SHA256_ENV: pin}
 
 
 @pytest.fixture
@@ -566,19 +566,28 @@ def test_lists_that_miss_their_pin_refuse(tmp_path) -> None:
         assert refused.value.reason == "lists_sha_mismatch"
 
 
-@pytest.mark.parametrize("body", [
-    b"not json", b"[]", b'{"version": 2, "shorteners": [], "affiliate_networks": []}',
-    b'{"version": 1, "shorteners": []}', b'{"version": 1, "shorteners": ["Short.test"], "affiliate_networks": []}',
-    b'{"version": 1, "shorteners": ["short.test", "short.test"], "affiliate_networks": []}',
-    b'{"version": 1, "shorteners": ["https://short.test/"], "affiliate_networks": []}',
-    b'{"version": 1, "version": 1, "shorteners": [], "affiliate_networks": []}',
+@pytest.mark.parametrize("body, why", [
+    (b"not json", "not JSON"), (b"[]", "schema"), (b'{"version": 2, "shorteners": [], "affiliate_networks": []}', "schema"),
+    (b'{"version": 1, "shorteners": []}', "schema"),
+    (b'{"version": 1, "shorteners": ["Short.test"], "affiliate_networks": []}', "schema"),
+    (b'{"version": 1, "shorteners": ["short.test", "short.test"], "affiliate_networks": []}', "schema"),
+    (b'{"version": 1, "shorteners": ["https://short.test/"], "affiliate_networks": []}', "schema"),
+    (b'{"version": 1, "version": 1, "shorteners": [], "affiliate_networks": []}', "not JSON"),
+    (b'{"version": true, "shorteners": [], "affiliate_networks": []}', "schema"),
+    (b'{"version": 1.0, "shorteners": [], "affiliate_networks": []}', "schema"),
+    (b'{"version": "1", "shorteners": [], "affiliate_networks": []}', "schema"),
+    (b'\xef\xbb\xbf{"version": 1, "shorteners": [], "affiliate_networks": []}', "byte-order mark"),  # UTF-8 BOM
+    ('{"version": 1, "shorteners": [], "affiliate_networks": []}'.encode("utf-16"), "byte-order mark"),  # UTF-16 + BOM
+    ('{"version": 1, "shorteners": [], "affiliate_networks": []}'.encode("utf-16-le"), "NUL"),  # UTF-16, no BOM
+    (b'{"version": 1, "shorteners": ["sh\xc3ort.test"], "affiliate_networks": []}', "not UTF-8"),
+    (b'{"version": 1, "shorteners": [], "affiliate_networks": []}\xff', "not UTF-8"),
 ])
-def test_lists_that_are_not_the_schema_refuse(body, tmp_path) -> None:
+def test_lists_that_are_not_the_schema_refuse(body, why, tmp_path) -> None:
     path = tmp_path / "lists.json"
     path.write_bytes(body)
     with pytest.raises(core.Refused) as refused:
         core.load_redirector_lists(_lists_env(path))
-    assert refused.value.reason == "lists_invalid"
+    assert refused.value.reason == "lists_invalid" and why in str(refused.value)
 
 
 def test_the_plan_names_its_lists_and_apply_refuses_other_lists(db, fixture_lists) -> None:
@@ -712,3 +721,100 @@ def test_the_job_plan_run_prints_the_timing_line_first(db, monkeypatch, capsys) 
     doc = core.parse_doc_lines("\n".join(lines), "plan_doc")
     assert doc["redirector_lists_sha256"] == lines[1].split("sha256=")[1].split()[0]
     assert any(line.startswith("OLP plan_doc 1/") for line in lines)
+
+
+# --- P3-2 / P3-3: one no-follow open, a regular file under the cap, absent-at-plan vs present-at-apply, the job's
+# --- approval binding
+
+
+def test_a_directory_a_symlink_or_a_fifo_is_refused(tmp_path) -> None:
+    import shutil
+
+    real = tmp_path / "real.json"
+    shutil.copyfile(LISTS_FIXTURE, real)
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    dangling = tmp_path / "dangling.json"
+    dangling.symlink_to(tmp_path / "gone.json")
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)  # no writer: a blocking open would hang; a non-regular file is refused before any read
+    assert core.load_redirector_lists(_lists_env(real))["sha256"]
+    for path in (tmp_path, link, dangling, fifo):
+        with pytest.raises(core.Refused) as refused:
+            core.load_redirector_lists(_lists_env(path, pin=_lists_env(real)[core.REDIRECTOR_LISTS_SHA256_ENV]))
+        assert refused.value.reason == "lists_invalid", path
+
+
+def test_the_lists_file_size_cap(tmp_path) -> None:
+    body = b'{"version": 1, "shorteners": ["short.test"], "affiliate_networks": []}'
+    path = tmp_path / "lists.json"
+    path.write_bytes(body + b" " * (core.REDIRECTOR_LISTS_LIMIT - len(body)))
+    assert core.load_redirector_lists(_lists_env(path))["shorteners"] == ("short.test",)
+    path.write_bytes(body + b" " * (core.REDIRECTOR_LISTS_LIMIT + 1 - len(body)))
+    with pytest.raises(core.Refused) as refused:
+        core.load_redirector_lists(_lists_env(path))
+    assert refused.value.reason == "lists_invalid" and "too large" in str(refused.value)
+
+
+def test_lists_absent_at_plan_and_present_at_apply_refuse(db, fixture_lists) -> None:
+    async def go():
+        plan = await core.read_plan(db, batch_id="olp-test-1", **LOCAL)
+        assert plan["redirector_lists_sha256"] is None
+        with pytest.raises(core.Refused) as refused:
+            await core.apply_plan(db, plan, lists_sha256=fixture_lists["sha256"], **LOCAL)
+        assert refused.value.reason == "lists_sha_mismatch"
+        assert len(await _rows(db)) == 1, "nothing written"
+
+    asyncio.run(go())
+
+
+def _job_apply_files(monkeypatch, tmp_path, job, plan, approval) -> None:
+    from hashlib import sha256
+
+    for name, doc in (("PLAN", plan), ("APPROVAL", approval)):
+        path = tmp_path / f"{name.lower()}.json"
+        path.write_bytes(json.dumps(doc).encode())
+        monkeypatch.setenv(job.ENV + name + "_PATH", str(path))
+        monkeypatch.setenv(job.ENV + name + "_SHA256", sha256(path.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("case, ok", [
+    ("same_lists", True), ("approval_names_other_lists", False), ("approval_names_no_lists", False),
+    ("approval_omits_lists", False), ("absent_at_plan_present_at_apply", False), ("lists_changed_after_plan", False),
+])
+def test_the_job_apply_binds_the_plans_lists(case, ok, db, monkeypatch, capsys, tmp_path, fixture_lists) -> None:
+    from scripts.ops import outbound_allowlist_populate as job
+
+    release = "a" * 40
+    plan_lists = dict(core.ABSENT_LISTS) if case == "absent_at_plan_present_at_apply" else fixture_lists
+    plan = asyncio.run(core.read_plan(db, batch_id="olp-test-1", lists=plan_lists, **LOCAL))
+    approval = {"mode": "apply", "plan_sha256": plan["plan_sha256"], "lists_sha256": plan["redirector_lists_sha256"],
+                "release_sha": release, "go_reference": "go ref"}
+    if case == "approval_names_other_lists":
+        approval["lists_sha256"] = "0" * 64
+    if case == "approval_names_no_lists":
+        approval["lists_sha256"] = None
+    if case == "approval_omits_lists":
+        del approval["lists_sha256"]
+    _job_apply_files(monkeypatch, tmp_path, job, plan, approval)
+    lists_path = tmp_path / "lists.json"
+    lists_path.write_bytes(open(LISTS_FIXTURE, "rb").read())
+    if case == "lists_changed_after_plan":
+        lists_path.write_bytes(b'{"version": 1, "shorteners": ["other-short.test"], "affiliate_networks": []}')
+    for key, value in _lists_env(lists_path).items():
+        monkeypatch.setenv(key, value)
+    real_apply = core.apply_plan
+
+    async def local_apply(conn, plan_doc, **kwargs):
+        return await real_apply(conn, plan_doc, **kwargs, **LOCAL)
+
+    monkeypatch.setattr(job.core, "apply_plan", local_apply)
+    before = asyncio.run(_rows(db))
+    if ok:
+        assert asyncio.run(job.run("apply", db, release=release)) == 0
+        assert len(asyncio.run(_rows(db))) == len(before) + len(plan["entries"])
+        assert any(line.startswith("OLP receipt ") for line in capsys.readouterr().out.splitlines())
+        return
+    with pytest.raises(core.Refused):
+        asyncio.run(job.run("apply", db, release=release))
+    assert asyncio.run(_rows(db)) == before, "nothing written"

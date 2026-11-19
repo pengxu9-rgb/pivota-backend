@@ -121,15 +121,26 @@ _BATCH = re.compile(r"[a-z0-9][a-z0-9-]{2,62}\Z")
 _KEY_MASK = re.compile(r"[^A-Za-z0-9*_.-]")
 
 RULES_SQL = "SELECT market, destination_url FROM outbound_link_rules WHERE status = 'published'"
-SEEDS_SQL = """
+_SEEDS_SELECT = """
     SELECT market, canonical_url, destination_url, domain,
            seed_data->>'canonical_url' AS sd_canonical_url,
            seed_data->>'destination_url' AS sd_destination_url,
            seed_data->>'domain' AS sd_domain,
-           seed_data->'snapshot' AS snapshot_raw
+           {snapshot} AS snapshot_raw
       FROM external_product_seeds
      WHERE status = 'active'
 """
+# Postgres (production): only the snapshot keys the plan reads. An object snapshot is cut down to them in SQL; a
+# snapshot stored as a JSON string passes through whole, because casting text to jsonb in SQL would abort the whole
+# read on one malformed row; Python parses it with the mint's rule (seed_snapshot). Any other type reads as no snapshot.
+SNAPSHOT_KEYS = ("canonical_url", "destination_url")
+SEEDS_SQL_POSTGRES = _SEEDS_SELECT.format(snapshot="""CASE jsonb_typeof(seed_data->'snapshot')
+             WHEN 'object' THEN jsonb_build_object('canonical_url', seed_data->'snapshot'->'canonical_url',
+                                                   'destination_url', seed_data->'snapshot'->'destination_url')
+             WHEN 'string' THEN seed_data->'snapshot'
+           END""")
+# Local sqlite tests only (production refuses every other dialect): the whole snapshot value.
+SEEDS_SQL = _SEEDS_SELECT.format(snapshot="seed_data->'snapshot'")
 SEED_URL_COLUMNS = ("canonical_url", "destination_url", "sd_canonical_url", "sd_destination_url")
 SEED_HOST_COLUMNS = ("domain", "sd_domain")
 PRESENT_SQL = "SELECT market, domain FROM outbound_link_allowed_domains"
@@ -186,28 +197,48 @@ def load_redirector_lists(environ=None) -> Dict[str, Any]:
     if not path:
         require(not pin, "a redirector lists SHA-256 pin is set but no lists path; nothing written", "lists_missing")
         return dict(ABSENT_LISTS)
+    # One open, never following a final symlink and never blocking on a FIFO; every check is on that descriptor.
     try:
-        mode = os.stat(path).st_mode
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise Refused("the redirector lists path is set but the file is missing; nothing written", "lists_missing") from None
-    except OSError as error:
+    except OSError as error:  # ELOOP for a symlink, EACCES, ...
         raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
-    require(stat.S_ISREG(mode), "redirector lists path is not a regular file", "lists_invalid")
     try:
-        with open(path, "rb") as source:
-            data = source.read(REDIRECTOR_LISTS_LIMIT + 1)
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode), "redirector lists path is not a regular file", "lists_invalid")
+        require(info.st_size <= REDIRECTOR_LISTS_LIMIT, "redirector lists file is too large", "lists_invalid")
+        chunks: List[bytes] = []
+        size = 0
+        while size <= REDIRECTOR_LISTS_LIMIT:
+            chunk = os.read(fd, REDIRECTOR_LISTS_LIMIT + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        data = b"".join(chunks)
     except OSError as error:
         raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
+    finally:
+        os.close(fd)
     require(data, "the redirector lists file is empty; nothing written", "lists_missing")
     require(len(data) <= REDIRECTOR_LISTS_LIMIT, "redirector lists file is too large", "lists_invalid")
     require(isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin) and compare_digest(sha256(data).hexdigest(), pin),
             "redirector lists bytes do not match the SHA-256 pin", "lists_sha_mismatch")
+    require(not data.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")),
+            "redirector lists start with a byte-order mark", "lists_invalid")
     try:
-        doc = json.loads(data, object_pairs_hook=_unique_object)
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refused("redirector lists are not UTF-8", "lists_invalid") from None
+    require("\x00" not in text, "redirector lists hold a NUL (UTF-16?)", "lists_invalid")
+    try:
+        doc = json.loads(text, object_pairs_hook=_unique_object)
     except (ValueError, RecursionError):
         raise Refused("redirector lists are not JSON", "lists_invalid") from None
     require(isinstance(doc, dict) and doc.keys() == {"version", "shorteners", "affiliate_networks"}
-            and doc["version"] == 1 and _valid_list(doc["shorteners"]) and _valid_list(doc["affiliate_networks"]),
+            and type(doc["version"]) is int and doc["version"] == 1
+            and _valid_list(doc["shorteners"]) and _valid_list(doc["affiliate_networks"]),
             "redirector lists do not match the schema", "lists_invalid")
     return {"sha256": pin, "shorteners": tuple(doc["shorteners"]), "affiliate_networks": tuple(doc["affiliate_networks"])}
 
@@ -363,7 +394,7 @@ def _seed_urls(row: Dict[str, Any]) -> List[str]:
 
     urls = {str(row.get(c)).strip() for c in SEED_URL_COLUMNS if isinstance(row.get(c), str) and row.get(c).strip()}
     snapshot = seed_snapshot(row.get("snapshot_raw"))
-    for c in ("canonical_url", "destination_url"):
+    for c in SNAPSHOT_KEYS:
         value = snapshot.get(c)
         if isinstance(value, str) and value.strip():
             urls.add(value.strip())
@@ -561,7 +592,7 @@ async def read_plan(db, *, batch_id: str, require_postgres: bool = True,
     async with db.transaction():
         await _read_only(db, require_postgres=require_postgres)
         rules = [dict(r) for r in await db.fetch_all(RULES_SQL)]
-        seeds = [dict(r) for r in await db.fetch_all(SEEDS_SQL)]
+        seeds = [dict(r) for r in await db.fetch_all(SEEDS_SQL_POSTGRES if _is_postgres(db) else SEEDS_SQL)]
         present = [(dict(r)["market"], dict(r)["domain"]) for r in await db.fetch_all(PRESENT_SQL)]
     read_done = time.monotonic()
     plan = build_plan(batch_id=batch_id, rules=rules, seeds=seeds, present=present, lists=lists)

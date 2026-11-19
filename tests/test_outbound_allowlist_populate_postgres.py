@@ -232,3 +232,32 @@ def test_apply_refuses_when_the_table_lock_times_out_and_writes_nothing() -> Non
 
 class _Rollback(Exception):
     pass
+
+
+def test_postgres_reads_only_the_snapshot_keys_it_needs() -> None:
+    async def go(db):
+        twin = _Twin(db)
+        await db.execute("INSERT INTO olp_twin_external_product_seeds (id, market, seed_data, status) VALUES "
+                         "('s5','US',jsonb_build_object('snapshot', jsonb_build_object('canonical_url', "
+                         "'https://brand-k.test/p', 'title', 'Big', 'description', repeat('x', 5000))),'active'),"
+                         "('s6','US','{\"snapshot\": 7}'::jsonb,'active'),"
+                         "('s7','US','{\"snapshot\": \"{bad\"}'::jsonb,'active')")
+        raws = [dict(r)["snapshot_raw"] for r in await twin.fetch_all(core.SEEDS_SQL_POSTGRES)]
+        objects = [core.seed_snapshot(r) for r in raws if r is not None]
+        assert all(set(o) <= set(core.SNAPSHOT_KEYS) for o in objects if o), "only the needed keys"
+        assert not any("x" * 100 in str(r) for r in raws), "never the rest of the snapshot"
+        assert {"canonical_url": "https://brand-h.test/p"} in objects, "a string snapshot still parses"
+        assert {"canonical_url": "https://brand-k.test/p", "destination_url": None} in objects
+        seen = []
+
+        class Recording(_Twin):
+            async def fetch_all(self, q, v=None):
+                seen.append(q)
+                return await super().fetch_all(q, v)
+
+        plan = await core.read_plan(Recording(db), batch_id="olp-pg-snap")
+        assert core.SEEDS_SQL_POSTGRES in seen and core.SEEDS_SQL not in seen, "production reads the projected query"
+        domains = {e["domain"] for e in plan["entries"]}
+        assert {"brand-d.test", "brand-h.test", "brand-k.test"} <= domains
+
+    asyncio.run(_with_db(go))
