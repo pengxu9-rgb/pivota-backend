@@ -1,12 +1,15 @@
-"""One store, one seller: the seller_id_split hold and the options.seller_merchant_id pin.
+"""One store, one seller: the seller_id_split check and the options.seller_merchant_id pin.
 
 A brand_official offer's seller id is the slug of the job's `brand` (ingestion.derive_merchant_id via
 curated_brand_feed's merchant_inferred), so re-running a brand's own store under another spelling of its brand
-("Brand A" vs "Brand A Cosmetics") writes its offers under a SECOND seller for the same store. The dry run now
-reads the sellers the host already has and holds any the plan would not write under; a brand_official job can
-pin the seller the store already has. Records are built by the real producer
-(curated_brand_feed.shopify_product_to_record) through the real payload normalization.
+("Brand A" vs "Brand A Cosmetics") writes its offers under a SECOND seller for the same store. The dry run reads
+the sellers that sell the cohort's brand LIVE on the host and reports any the plan would not write under: in
+shadow (recorded, no flag) by default, as a BLOCK with RETAILER_INGEST_SELLER_SPLIT_BLOCK_ENABLED=true. A
+brand_official job can pin the seller the store already has. Records are built by the real producer
+(curated_brand_feed.shopify_product_to_record) through the real payload normalization. The SQL itself runs on
+Postgres in tests/test_retailer_ingest_seller_identity_postgres.py; this fake answers each query by its constant.
 """
+import re
 from hashlib import sha256
 
 import pytest
@@ -21,6 +24,7 @@ from tests.services.test_retailer_ingest_pipeline import env, run_flags  # noqa:
 
 OFFICIAL, RETAILER = "brand-a.example", "shop-b.example"
 PRODUCTS = (("Velvet Lip Tint", "LIP TINT", "velvet-lip-tint"), ("Soft Matte Lipstick", "LIPSTICK", "soft-matte"))
+OLD = "agent_seed::brand-a-cosmetics"
 
 
 def _product(title, ptype, handle, vendor):
@@ -30,43 +34,74 @@ def _product(title, ptype, handle, vendor):
             "variants": [{"id": 2 * 10**12 + n, "price": "20.00", "available": True, "sku": handle}]}
 
 
+def _sql_host(value):
+    """What pipeline._host_sql does in SQL: lower-case, drop a trailing `:port` and dot (never `www.`)."""
+    return re.sub(r"[.]?(:[0-9]+)?$", "", str(value or "").lower())
+
+
 class _Catalog:
-    """The catalog the dry run reads: catalog_merchants rows (merchant_id, source_ref) and, optionally, offer
-    sellers already on planned products. Every other read (current listings, ...) sees an empty catalog."""
+    """The catalog the dry run reads, answering each seller query by its constant with the SQL's semantics.
+    merchants: (merchant_id, source_ref). offers: dicts merchant_id / product_key / host / brand, optionally
+    suppressed / product_suppressed. Every other read (current listings, ...) sees an empty catalog."""
 
     is_connected = True
 
-    def __init__(self, merchants=(), offer_sellers=()):
-        self.merchants, self.offer_sellers, self.queries = list(merchants), list(offer_sellers), []
-        self.products = {}  # product_key -> stored merchant_id
+    def __init__(self):
+        self.merchants, self.offers, self.products, self.claims, self.queries = [], [], {}, [], []
+        self.fail = None  # a query constant that raises
+
+    def offer(self, merchant_id, host=OFFICIAL, brand="Brand A", key="ext:old-row::0001", **kw):
+        self.offers.append({"merchant_id": merchant_id, "host": host, "brand": brand, "product_key": key, **kw})
+
+    def _live(self):
+        return [o for o in self.offers if not o.get("suppressed") and not o.get("product_suppressed")]
 
     async def fetch_all(self, query, values=None):
         self.queries.append(query)
+        if query == self.fail:
+            raise ConnectionError("down")
         if query == pipeline.SELLERS_ON_HOST_SQL:
-            return [m for m in self.merchants if str(m["source_ref"] or "").lower() in values["hosts"]]
+            return [{"merchant_id": m} for m, ref in self.merchants if _sql_host(ref) in values["hosts"]]
         if query == pipeline.PINNED_SELLER_SQL:
-            return [m for m in self.merchants if m["merchant_id"] == values["mid"]]
+            return [{"merchant_id": m} for m, _ in self.merchants if m == values["mid"]]
+        if query == pipeline.PINNED_LIVE_HOSTS_SQL:
+            return [{"host": h} for h in sorted({_sql_host(o["host"]) for o in self._live()
+                                                 if o["merchant_id"] == values["mid"]})]
         if query == pipeline.OFFER_SELLERS_ON_PLANNED_SQL:
-            return [{"merchant_id": m} for m in self.offer_sellers]
+            return [{"merchant_id": m} for m in sorted({o["merchant_id"] for o in self.offers
+                                                         if o["product_key"] in values["keys"]})]
+        if query == pipeline.SELLER_LIVE_AT_HOST_SQL:
+            groups = {}
+            for o in self._live():
+                if o["merchant_id"] in values["ids"] and _sql_host(o["host"]) in values["hosts"]:
+                    groups[(o["merchant_id"], o["brand"])] = groups.get((o["merchant_id"], o["brand"]), 0) + 1
+            return [{"merchant_id": m, "brand": b, "offers": n} for (m, b), n in sorted(groups.items())]
         if query == pipeline.PRODUCT_SELLERS_SQL:
             return [{"product_key": k, "merchant_id": m} for k, m in self.products.items() if k in values["keys"]]
+        if query == pipeline.CLAIMED_TENANT_SQL:
+            reg = values["reg"]
+            return [{"merchant_id": m} for m, d in self.claims if d == reg or d.endswith("." + reg)]
         return []
 
 
 @pytest.fixture
 def store(env, monkeypatch):  # noqa: F811 -- the imported fixture
-    """`env` with the crawl answering from a placeholder store, through the real record producer, and a
-    catalog the test fills."""
+    """`env` with the crawl answering from a placeholder store, through the real record producer, a catalog the
+    test fills, and the BLOCK switched on (the shadow tests switch it off)."""
     env.catalog = _Catalog()
     monkeypatch.setattr(cli, "_preflight_database", lambda: (env.catalog, None))
-    env.vendor = "Brand A"
+    monkeypatch.setenv(pipeline.SELLER_SPLIT_BLOCK_ENV, "true")
+    env.vendors = ["Brand A"]
+    env.warnings = []
+    monkeypatch.setattr(pipeline, "logger", type("L", (), {"warning": lambda self, *a: env.warnings.append(a),
+                                                          "info": lambda self, *a: None})())
 
     async def fetch(*, domain, category_path, brand=None, source_role="brand_official", retailer_name=None,
                     seller_merchant_id=None, **kw):
         records = [feed.shopify_product_to_record(
-            _product(*p, vendor=env.vendor), domain=domain, category_path=category_path, brand_override=brand,
+            _product(*p, vendor=v), domain=domain, category_path=category_path, brand_override=brand,
             currency="USD", source_role=source_role, retailer_name=retailer_name, emit_native_variants=True,
-            seller_merchant_id=seller_merchant_id) for p in PRODUCTS]
+            seller_merchant_id=seller_merchant_id) for p in PRODUCTS for v in env.vendors[:1]]
         return feed.ShopifyProductBatch(records, scanned_products=len(records), pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
     return env
@@ -91,30 +126,33 @@ def _seller_check(env):
     return list(env.ledger.runs.values())[-1]["checks"]["seller_identity"]
 
 
+# ---- the split, with the BLOCK on ---------------------------------------------------------------------------
+
 async def test_a_brand_official_store_re_spelled_onto_a_second_seller_is_held(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a-cosmetics", "source_ref": OFFICIAL}]
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD, brand="Brand A Cosmetics")
     out = await pipeline.run_stage(official_job(), db=store.db)
     assert out["status"] == "held", run_flags(store)
     assert _rules(store) == ["seller_id_split"]
     [flag] = [f for f in run_flags(store) if f["rule"] == "seller_id_split"]
-    assert flag["key"] == "seller_id_split:agent_seed::brand-a-cosmetics"
-    assert flag["existing_merchant_id"] == "agent_seed::brand-a-cosmetics"
+    assert flag["key"] == f"seller_id_split:{OLD}" and flag["existing_merchant_id"] == OLD
     assert "agent_seed::brand-a" in flag["planned_merchant_ids"]
-    assert "agent_seed::brand-a-cosmetics" in flag["detail"] and "['agent_seed::brand-a']" in flag["detail"]
+    assert OLD in flag["detail"] and "['agent_seed::brand-a']" in flag["detail"]
     check = _seller_check(store)
-    assert check["status"] == "split" and check["split"] == ["agent_seed::brand-a-cosmetics"]
+    assert check["status"] == "split" and check["mode"] == "block" and check["split"] == [OLD]
     assert check["planned_offer_sellers"] == ["agent_seed::brand-a"]
 
 
 async def test_the_split_is_an_acceptable_key_for_a_store_that_really_changed_sellers(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a-cosmetics", "source_ref": OFFICIAL}]
-    out = await pipeline.run_stage(official_job(accepted_flags=["seller_id_split:agent_seed::brand-a-cosmetics"]),
-                                   db=store.db)
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD)
+    out = await pipeline.run_stage(official_job(accepted_flags=[f"seller_id_split:{OLD}"]), db=store.db)
     assert out["status"] == "apply_due", run_flags(store)
 
 
 async def test_a_retailer_store_with_a_second_seller_is_held_too(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::shop-b-cosmetics", "source_ref": RETAILER}]
+    store.catalog.merchants = [("agent_seed::shop-b-cosmetics", RETAILER)]
+    store.catalog.offer("agent_seed::shop-b-cosmetics", host=RETAILER)
     out = await pipeline.run_stage(retailer_job(), db=store.db)
     assert out["status"] == "held", run_flags(store)
     assert _rules(store) == ["seller_id_split"]
@@ -123,20 +161,33 @@ async def test_a_retailer_store_with_a_second_seller_is_held_too(store):
     assert check["split"] == ["agent_seed::shop-b-cosmetics"]
 
 
-async def test_an_offer_seller_on_the_plan_s_own_products_is_a_split_even_without_a_merchant_row(store):
-    store.catalog.offer_sellers = ["agent_seed::brand-a-cosmetics"]
+async def test_a_seller_on_the_plan_s_own_products_counts_without_a_merchant_row(store):
+    plain = ingest_validated_jsonl([feed.shopify_product_to_record(
+        _product(*PRODUCTS[0], vendor="Brand A"), domain=OFFICIAL, category_path="beauty", brand_override="Brand A",
+        currency="USD")])
+    store.catalog.offer(OLD, key=plain["pdps"][0]["product_key"])
     out = await pipeline.run_stage(official_job(), db=store.db)
     assert out["status"] == "held" and _rules(store) == ["seller_id_split"], run_flags(store)
-    assert _seller_check(store)["existing"] == {"agent_seed::brand-a-cosmetics": ["catalog_offers"]}
+    assert _seller_check(store)["existing"] == {OLD: ["Brand A"]}
 
 
-async def test_the_seller_the_plan_writes_under_is_not_a_split(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a", "source_ref": OFFICIAL}]
-    store.catalog.offer_sellers = ["agent_seed::brand-a"]
-    out = await pipeline.run_stage(official_job(), db=store.db)
-    assert out["status"] == "apply_due", run_flags(store)
-    assert _seller_check(store)["status"] == "clear"
+@pytest.mark.parametrize("job_domain,stored_ref,offer_host", [
+    ("www." + OFFICIAL, OFFICIAL, OFFICIAL), (OFFICIAL, "www." + OFFICIAL, "www." + OFFICIAL),
+    ("WWW." + OFFICIAL.upper(), OFFICIAL + ".", OFFICIAL + ":443")])
+async def test_the_www_apex_dot_and_port_spellings_are_one_store(store, job_domain, stored_ref, offer_host):
+    store.catalog.merchants = [(OLD, stored_ref)]
+    store.catalog.offer(OLD, host=offer_host)
+    out = await pipeline.run_stage(official_job(domain=job_domain), db=store.db)
+    assert "seller_id_split" in _rules(store), run_flags(store)
+    assert out["status"] == "held" and _seller_check(store)["host"] == OFFICIAL
 
+
+def test_host_normalization():
+    assert pipeline._norm_host(" WWW.Brand-A.Example.:443 ") == OFFICIAL
+    assert pipeline._store_hosts("brand-a.example.") == (OFFICIAL, [OFFICIAL, "www." + OFFICIAL])
+
+
+# ---- what is NOT a split ------------------------------------------------------------------------------------
 
 async def test_a_host_with_no_seller_yet_is_not_held(store):
     for job_ in (official_job(), retailer_job()):
@@ -146,35 +197,189 @@ async def test_a_host_with_no_seller_yet_is_not_held(store):
         assert check["status"] == "clear" and check["existing"] == {} and check["split"] == []
 
 
-@pytest.mark.parametrize("job_domain,stored_ref", [("www." + OFFICIAL, OFFICIAL), (OFFICIAL, "www." + OFFICIAL),
-                                                   ("WWW." + OFFICIAL.upper(), OFFICIAL)])
-async def test_the_www_and_apex_spellings_are_one_store(store, job_domain, stored_ref):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a-cosmetics", "source_ref": stored_ref}]
-    out = await pipeline.run_stage(official_job(domain=job_domain), db=store.db)
-    assert "seller_id_split" in _rules(store), run_flags(store)
-    assert out["status"] == "held"
-    assert _seller_check(store)["host"] == OFFICIAL
+async def test_the_seller_the_plan_writes_under_is_not_a_split(store):
+    store.catalog.merchants = [("agent_seed::brand-a", OFFICIAL)]
+    store.catalog.offer("agent_seed::brand-a")
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert _seller_check(store)["status"] == "clear"
 
 
-async def test_a_seller_on_another_host_is_not_this_store_s(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a-cosmetics", "source_ref": "other.example"}]
+@pytest.mark.parametrize("dead", [{"suppressed": True}, {"product_suppressed": True}])
+async def test_a_seller_without_live_offers_at_the_host_is_not_a_split(store, dead):
+    """A retired retailer chain (products suppressed, offers cascade-suppressed) and any other tombstone."""
+    store.catalog.merchants = [(f"agent_seed::retailer::{OFFICIAL}", OFFICIAL), (OLD, OFFICIAL)]
+    store.catalog.offer(f"agent_seed::retailer::{OFFICIAL}", **dead)
+    store.catalog.offer(OLD, **dead)
     out = await pipeline.run_stage(official_job(), db=store.db)
     assert out["status"] == "apply_due", run_flags(store)
 
 
+async def test_a_seller_live_only_on_another_host_is_not_this_store_s(store):
+    store.catalog.merchants = [(OLD, OFFICIAL)]  # last written for this host, but it sells elsewhere
+    store.catalog.offer(OLD, host="other.example")
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+
+
+async def test_per_brand_sellers_of_record_are_never_a_split(store):
+    store.catalog.merchants = [("merch_obs_00000000000000aa", OFFICIAL), ("merch_obs_00000000000000bb", OFFICIAL)]
+    store.catalog.offer("merch_obs_00000000000000aa")
+    store.catalog.offer("merch_obs_00000000000000bb", brand="Brand A Cosmetics")
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert pipeline.SELLER_LIVE_AT_HOST_SQL not in store.catalog.queries  # not even a candidate
+
+
+async def test_a_sibling_brand_or_a_vanished_vendor_on_a_shared_host_is_not_this_cohort_s_split(store):
+    """Another brand's seller on the same host sells ANOTHER brand -- a sibling cohort's, or a vendor the store no
+    longer lists. Only a seller of this cohort's brand under another id is a split."""
+    store.catalog.merchants = [("agent_seed::brand-b", OFFICIAL), ("agent_seed::brand-c", OFFICIAL)]
+    store.catalog.offer("agent_seed::brand-b", brand="Brand B")
+    store.catalog.offer("agent_seed::brand-c", brand="Brand C")  # no longer on the store
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert _seller_check(store)["existing"] == {}
+
+
+async def test_a_verified_claim_s_tenant_is_not_a_split(store):
+    store.catalog.merchants = [("merch_tenant_a", OFFICIAL)]
+    store.catalog.offer("merch_tenant_a")
+    store.catalog.claims = [("merch_tenant_a", "shop." + OFFICIAL)]
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    store.catalog.claims = []
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_id_split"], run_flags(store)
+
+
+async def test_the_old_spelling_a_retire_stale_brand_cohort_retires_is_not_a_split(store):
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD, brand="Brand A Cosmetics")
+    out = await pipeline.run_stage(official_job(retire_stale_brand="Brand A Cosmetics"), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    out = await pipeline.run_stage(official_job(retire_stale_brand="Brand A Kosmetik"), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_id_split"], run_flags(store)
+
+
+async def test_a_planned_product_s_stored_seller_is_kept_and_the_overlap_is_recorded(store):
+    plain = ingest_validated_jsonl([feed.shopify_product_to_record(
+        _product(*PRODUCTS[0], vendor="Brand A"), domain=OFFICIAL, category_path="beauty", brand_override="Brand A",
+        currency="USD")])
+    [key] = [p["product_key"] for p in plain["pdps"]]
+    store.catalog.offer("agent_seed::legacy-a", key=key)
+    store.catalog.products = {key: "agent_seed::legacy-a"}
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    check = _seller_check(store)
+    assert check["status"] == "clear" and check["planned_products"] == 2 and check["planned_products_existing"] == 1
+
+
+# ---- an unread catalog ------------------------------------------------------------------------------------
+
+async def test_an_unread_seller_catalog_holds_and_cannot_be_accepted(store):
+    store.catalog.fail = pipeline.SELLERS_ON_HOST_SQL
+    out = await pipeline.run_stage(official_job(accepted_flags=["seller_ids_unread"]), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_ids_unread"], run_flags(store)
+    [flag] = run_flags(store)
+    assert flag["acceptable"] is False
+    assert _seller_check(store) == {"status": "unchecked", "mode": "block", "host": OFFICIAL,
+                                    "reason": "ConnectionError"}
+
+
+async def test_an_unread_catalog_already_held_by_the_listing_read_adds_no_second_hold(store, monkeypatch):
+    real = cli._plan_with_current_listings
+
+    async def unread_listings(records, **kw):
+        plan = await real(records, **kw)
+        return {**plan, "current_listings": {"status": "unchecked", "reason": "x"}}
+    monkeypatch.setattr(cli, "_plan_with_current_listings", unread_listings)
+    store.catalog.fail = pipeline.SELLERS_ON_HOST_SQL
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["current_listings_unread"], run_flags(store)
+
+
+# ---- shadow: the default ------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [None, "", "false", "1", "yes", " TRUE "])
+async def test_off_the_split_is_recorded_and_logged_but_holds_nothing(store, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(pipeline.SELLER_SPLIT_BLOCK_ENV, raising=False)
+    else:
+        monkeypatch.setenv(pipeline.SELLER_SPLIT_BLOCK_ENV, value)
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD)
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    if value == " TRUE ":  # strip().lower() == "true": on
+        assert out["status"] == "held", run_flags(store)
+        return
+    assert out["status"] == "apply_due", run_flags(store)
+    assert not [f for f in run_flags(store) or [] if f["rule"].startswith("seller")]
+    check = _seller_check(store)
+    assert check["mode"] == "shadow" and check["split"] == [OLD] and check["would_flag"] == [f"seller_id_split:{OLD}"]
+    assert any("seller_identity" in str(w) and OLD in str(w) for w in store.warnings)
+
+
+async def test_off_an_unread_catalog_holds_nothing(store, monkeypatch):
+    monkeypatch.delenv(pipeline.SELLER_SPLIT_BLOCK_ENV, raising=False)
+    store.catalog.fail = pipeline.SELLERS_ON_HOST_SQL
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert _seller_check(store)["status"] == "unchecked"
+
+
+# ---- the pin ------------------------------------------------------------------------------------------------
+
 async def test_a_pinned_seller_takes_every_offer_and_mints_no_merchant_row(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a-cosmetics", "source_ref": OFFICIAL}]
-    pinned = official_job(seller_merchant_id="agent_seed::brand-a-cosmetics")
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD)
+    pinned = official_job(seller_merchant_id=OLD)
     out = await pipeline.run_stage(pinned, db=store.db)
     assert out["status"] == "apply_due", run_flags(store)
-    assert _seller_check(store)["status"] == "clear"
+    assert _seller_check(store)["status"] == "clear" and _seller_check(store)["pinned_live_hosts"] == [OFFICIAL]
     await pipeline.run_stage({**pinned, "status": "apply_due"}, db=store.db)
     [plan] = store.applied
-    assert plan["offers"] and {o["merchant_id"] for o in plan["offers"]} == {"agent_seed::brand-a-cosmetics"}
+    assert plan["offers"] and {o["merchant_id"] for o in plan["offers"]} == {OLD}
     # No offer-seller row at all: the pinned one exists and is left as its lane wrote it, and no slug of the
     # job's brand is minted. The W2 seller-of-record row (merch_obs_*, insert-if-missing) is unchanged.
     assert not [m for m in plan["merchants"] if m["merchant_id"].startswith("agent_seed::")]
     assert {m["merchant_id"][:10] for m in plan["merchants"]} == {"merch_obs_"}
+
+
+@pytest.mark.parametrize("block", ["true", "false"])
+@pytest.mark.parametrize("live_host", [None, "other.example", "shop." + OFFICIAL])
+async def test_a_pinned_seller_with_no_live_offer_on_this_host_is_held(store, monkeypatch, block, live_host):
+    """Whatever catalog_merchants.source_ref says (here: this host, which proves nothing), the pin must sell
+    live on the job's own host; another host or a sibling subdomain is not it. The pin is checked even in shadow."""
+    monkeypatch.setenv(pipeline.SELLER_SPLIT_BLOCK_ENV, block)
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    if live_host:
+        store.catalog.offer(OLD, host=live_host)
+    out = await pipeline.run_stage(official_job(seller_merchant_id=OLD), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_merchant_id_off_host"], run_flags(store)
+
+
+async def test_an_apex_pinned_seller_does_not_pass_a_subdomain_job(store):
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.offer(OLD, host=OFFICIAL)
+    out = await pipeline.run_stage(official_job(domain="us." + OFFICIAL, seller_merchant_id=OLD), db=store.db)
+    assert "seller_merchant_id_off_host" in _rules(store), run_flags(store)
+    assert out["status"] == "held"
+
+
+@pytest.mark.parametrize("ref", [None, ""])
+async def test_a_pinned_seller_with_an_empty_source_ref_and_no_live_offer_is_held(store, ref):
+    store.catalog.merchants = [(OLD, ref)]
+    out = await pipeline.run_stage(official_job(seller_merchant_id=OLD), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_merchant_id_off_host"], run_flags(store)
+
+
+async def test_a_pin_on_an_unread_catalog_holds_even_in_shadow(store, monkeypatch):
+    monkeypatch.delenv(pipeline.SELLER_SPLIT_BLOCK_ENV, raising=False)
+    store.catalog.merchants = [(OLD, OFFICIAL)]
+    store.catalog.fail = pipeline.PINNED_LIVE_HOSTS_SQL
+    out = await pipeline.run_stage(official_job(seller_merchant_id=OLD), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_ids_unread"], run_flags(store)
 
 
 def test_the_pin_does_not_move_a_product_key():
@@ -183,28 +388,22 @@ def test_the_pin_does_not_move_a_product_key():
                                                   brand_override="Brand A", currency="USD", seller_merchant_id=pin)
                    for p in PRODUCTS]
         return ingest_validated_jsonl(records)
-    plain, pinned = plan(None), plan("agent_seed::brand-a-cosmetics")
+    plain, pinned = plan(None), plan(OLD)
     for key in ("pdps", "skus"):
         assert [r["product_key"] for r in plain[key]] == [r["product_key"] for r in pinned[key]]
     assert [r["sku_key"] for r in plain["skus"]] == [r["sku_key"] for r in pinned["skus"]]
     assert {o["merchant_id"] for o in plain["offers"]} == {"agent_seed::brand-a"}
-    assert {o["merchant_id"] for o in pinned["offers"]} == {"agent_seed::brand-a-cosmetics"}
+    assert {o["merchant_id"] for o in pinned["offers"]} == {OLD}
     assert {m["merchant_id"] for m in plain["merchants"]} - {m["merchant_id"] for m in pinned["merchants"]} == {
         "agent_seed::brand-a"}
 
 
 async def test_an_unknown_pinned_seller_is_refused_and_nothing_is_minted(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-a", "source_ref": OFFICIAL}]
+    store.catalog.merchants = [("agent_seed::brand-a", OFFICIAL)]
     out = await pipeline.run_stage(official_job(seller_merchant_id="agent_seed::brand-a-cosmetic"), db=store.db)
     assert out["status"] == "failed" and out["outcome"] == "seller_merchant_id_unknown", out
     assert "agent_seed::brand-a-cosmetic" in out["reason"]
     assert store.applied == []
-
-
-async def test_a_pinned_seller_recorded_for_another_store_is_held(store):
-    store.catalog.merchants = [{"merchant_id": "agent_seed::brand-c", "source_ref": "brand-c.example"}]
-    out = await pipeline.run_stage(official_job(seller_merchant_id="agent_seed::brand-c"), db=store.db)
-    assert out["status"] == "held" and _rules(store) == ["seller_merchant_id_off_host"], run_flags(store)
 
 
 @pytest.mark.parametrize("value", ["agent_seed::Brand-A", "agent_seed::brand_a", "agent_seed::brand--a",
@@ -233,8 +432,8 @@ def test_the_pin_is_for_a_brand_s_own_store_only():
 
 
 def test_the_pin_reaches_the_crawl_payload_and_an_unpinned_payload_is_unchanged():
-    payload = pipeline.ingest_payload(official_job(seller_merchant_id="agent_seed::brand-a-cosmetics"))
-    assert payload["seller_merchant_id"] == "agent_seed::brand-a-cosmetics"
+    payload = pipeline.ingest_payload(official_job(seller_merchant_id=OLD))
+    assert payload["seller_merchant_id"] == OLD
     assert "seller_merchant_id" not in pipeline.ingest_payload(official_job())
     assert validate_pinned_merchant_id("agent_seed::brand-a-2") == "agent_seed::brand-a-2"
 
@@ -250,16 +449,12 @@ def test_the_enqueue_script_accepts_the_pin():
                      "options": {"source_role": "brand_official", "seller_merchant_id": "agent_seed::Brand A"}})
 
 
-async def test_a_planned_product_s_stored_seller_is_kept_not_a_split_and_the_overlap_is_recorded(store):
-    """apply keeps an existing product's stored seller (_prepare_seller_of_record step 1): never a new seller.
-    How many planned products already exist is recorded for the reviewer (a pin with none is a product split)."""
-    plain = ingest_validated_jsonl([feed.shopify_product_to_record(
-        _product(*PRODUCTS[0], vendor="Brand A"), domain=OFFICIAL, category_path="beauty", brand_override="Brand A",
-        currency="USD")])
-    [key] = [p["product_key"] for p in plain["pdps"]]
-    store.catalog.merchants = [{"merchant_id": "merch_obs_00000000000000aa", "source_ref": OFFICIAL}]
-    store.catalog.products = {key: "merch_obs_00000000000000aa"}
-    out = await pipeline.run_stage(official_job(), db=store.db)
-    assert out["status"] == "apply_due", run_flags(store)
-    check = _seller_check(store)
-    assert check["status"] == "clear" and check["planned_products"] == 2 and check["planned_products_existing"] == 1
+def test_the_sql_keeps_its_liveness_and_suffix_predicates():
+    """The fake above answers by constant, so it cannot see the SQL's own predicates; the Postgres test proves
+    their semantics (tests/test_retailer_ingest_seller_identity_postgres.py). This pins that they are there."""
+    for sql in (pipeline.SELLER_LIVE_AT_HOST_SQL, pipeline.PINNED_LIVE_HOSTS_SQL):
+        for predicate in ("o.suppressed_at IS NULL", "o.suppression_reason IS NULL",
+                          "p.suppressed_at IS NULL", "p.suppression_reason IS NULL"):
+            assert predicate in sql
+    assert "LIKE" not in pipeline.CLAIMED_TENANT_SQL.upper()
+    assert "right(lower(coalesce(brand_domain, '')), length(:reg) + 1) = '.' || :reg" in pipeline.CLAIMED_TENANT_SQL
