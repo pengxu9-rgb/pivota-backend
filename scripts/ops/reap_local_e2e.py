@@ -6,6 +6,8 @@ Everything on OUR side is local: a SQLite file (default) or a Postgres on localh
 127.0.0.1, and the poller's own step function driven by hand in this process. The only thing that
 leaves the machine is the poller's calls to `sandbox.api.reap.global`. A HUMAN approves on Reap's
 hosted page; this script prints that page's URL and never opens it. Pivota never sees card data.
+PRECONDITION: AGENPAS_CONSENT_GATE is off (default). With it on, no surface carries Reap's hosted URL
+until the buyer's consent is recorded on the AgenPas page (docs/agent_purchases_routes.md).
 
 ── THE OPERATOR'S SEQUENCE ──────────────────────────────────────────────────────────────────
 

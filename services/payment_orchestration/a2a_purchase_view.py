@@ -26,7 +26,7 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail
+from services.payment_orchestration import a2a_rail, purchase_consent
 
 #: Extra SHA-256 digests (comma-separated, lower-case hex) of hosts the rail serves buyer pages from,
 #: when they are not the API hosts themselves. Configured, not named, like the API host allowlist.
@@ -123,7 +123,19 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
     return view
 
 
-async def owner_view(*, purchase_id: str, agent_id: str, agent_user_ref_hash: str) -> Optional[Dict[str, Any]]:
-    """None when the purchase is not this owner's or does not exist (the same answer)."""
+async def owner_view(
+    *, purchase_id: str, agent_id: str, agent_user_ref_hash: str, consents: Any = purchase_consent.LOOKUP
+) -> Optional[Dict[str, Any]]:
+    """None when the purchase is not this owner's or does not exist (the same answer).
+
+    Every surface takes this rail's hosted URL from here, so the AgenPas consent gate is applied here:
+    with AGENPAS_CONSENT_GATE on and no consent for the page's step, no `hosted_url` and a `buyer_step`
+    marker instead (services/payment_orchestration/purchase_consent.py; `authenticate` is never gated).
+    `consents` is a list page's one-read snapshot."""
     row = await ledger.get_purchase_for_owner(purchase_id, agent_id, agent_user_ref_hash)
-    return build_view(row) if row is not None else None
+    if row is None:
+        return None
+    return await purchase_consent.gate(
+        build_view(row), rail="a2a", rail_purchase_id=str(row.get("id") or purchase_id),
+        rail_state=row.get("state"), agent_id=agent_id, consents=consents,
+    )
