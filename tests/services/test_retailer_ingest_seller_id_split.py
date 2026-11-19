@@ -35,8 +35,8 @@ def _product(title, ptype, handle, vendor):
 
 
 def _sql_host(value):
-    """What pipeline._host_sql does in SQL: lower-case, drop a trailing `:port` and dot (never `www.`)."""
-    return re.sub(r"[.]?(:[0-9]+)?$", "", str(value or "").lower())
+    """What pipeline._host_sql does in SQL: trim, lower-case, drop a trailing `:port` and dot, then a leading `www.`."""
+    return re.sub(r"^www[.]", "", re.sub(r"[.]?(:[0-9]+)?$", "", str(value or "").strip().lower()))
 
 
 class _Catalog:
@@ -458,3 +458,10 @@ def test_the_sql_keeps_its_liveness_and_suffix_predicates():
             assert predicate in sql
     assert "LIKE" not in pipeline.CLAIMED_TENANT_SQL.upper()
     assert "right(lower(coalesce(brand_domain, '')), length(:reg) + 1) = '.' || :reg" in pipeline.CLAIMED_TENANT_SQL
+
+
+def test_the_sql_host_spelling_is_the_python_one():
+    """_host_sql and _norm_host must agree, or DISTINCT over the SQL host returns one store twice (www and apex)."""
+    for raw in ("WWW.Brand-A.Example.:443", " brand-a.example. ", "www.brand-a.example", "brand-a.example:8080"):
+        assert _sql_host(raw) == pipeline._norm_host(raw) == OFFICIAL
+    assert "'^www[.]'" in pipeline._host_sql("x") and "btrim(x)" in pipeline._host_sql("x")

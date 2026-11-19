@@ -1153,9 +1153,11 @@ def seller_split_block_enabled() -> bool:
 
 
 def _host_sql(expr: str) -> str:
-    """`expr` as a host, the way _norm_host spells one: lower-cased, a trailing `:port` and a trailing dot
-    dropped. `www.` is matched by listing both spellings in :hosts."""
-    return f"regexp_replace(lower({expr}), '[.]?(:[0-9]+)?$', '')"
+    """`expr` as a host, exactly the way _norm_host spells one: trimmed, lower-cased, a trailing `:port` and a
+    trailing dot dropped, and a leading `www.` dropped -- so `www.<host>` and `<host>` are ONE value here, and a
+    DISTINCT over it (PINNED_LIVE_HOSTS_SQL) returns each store once. (:hosts still lists both spellings; the
+    `www.` one simply never matches.)"""
+    return f"regexp_replace(regexp_replace(lower(btrim({expr})), '[.]?(:[0-9]+)?$', ''), '^www[.]', '')"
 
 
 _OFFER_HOST = _host_sql("coalesce(o.source_domain, o.offer_payload->>'domain', '')")
