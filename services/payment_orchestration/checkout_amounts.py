@@ -48,14 +48,16 @@ second one, and it does not try to understand arbitrary receipts. Two rules:
       - a quantity is a JSON integer >= 1; a line is an object with exactly its shape's keys; a list of
         lines (or of shipping lines) is not empty;
       - `currency` is "USD" (or "usd").
-    The maths, in cents, for every shape: every amount <= the ceiling; the total <= the ceiling; the total
-    >= sum(quantity x price) + shipping + tax - discounts; discounts >= 0 and <= sum(lines); S2: subtotal ==
+    The maths, in cents, for every shape: every amount <= the ceiling (but compare_at_price, below); the
+    total <= the ceiling; the total >= sum(quantity x price) + shipping + tax - discounts; discounts >= 0
+    and <= sum(lines); S2: subtotal ==
     sum(lines); S3: subtotal_price == sum(lines) - total_discounts (Shopify's documented subtotal is after
     discounts, before shipping and tax; as subtotal_price is never negative, this also holds the discounts
     to at most the lines). EQUALITY, not >=, for the subtotal: a subtotal larger than its
     lines means lines we were not shown, a smaller one means lines it does not count; either way we cannot
     tell what is charged, and the cost is a false cancel before anything is submitted. compare_at_price is
-    display only: checked as an amount, never summed, never the total.
+    DISPLAY ONLY: type-checked like an amount (or null), never summed, never the total, never standing in
+    for a price, and EXEMPT from the ceiling (a list price above what the buyer approved is not charged).
     Anything else is refused: an unknown key, a prose or "$"-marked money string, unexpected nesting, two
     totals, a quantity outside its line, another currency, an amount over the ceiling.
 
@@ -222,8 +224,9 @@ def money_like(data: Any) -> bool:
     return _Scan().money_like(data)
 
 
-def _amount(value: Any, ceiling: int, nullable: bool = False) -> int:
-    """An amount in cents (module docstring, rule 2), at most the ceiling; raises `_Refused` otherwise."""
+def _amount(value: Any, ceiling: int, nullable: bool = False, capped: bool = True) -> int:
+    """An amount in cents (module docstring, rule 2), at most the ceiling unless not `capped` (display only);
+    raises `_Refused` otherwise."""
     if value is None and nullable:
         return 0
     if isinstance(value, bool):
@@ -244,7 +247,7 @@ def _amount(value: Any, ceiling: int, nullable: bool = False) -> int:
         raise _Refused("not a JSON number or a two-decimal string")
     if minor < 0:
         raise _Refused("a negative amount")
-    if minor > ceiling:
+    if capped and minor > ceiling:
         raise _Refused("an amount above the ceiling")
     return minor
 
@@ -257,7 +260,7 @@ def _quantity(value: Any) -> int:
 
 def _lines(value: Any, optional: FrozenSet[str], ceiling: int) -> int:
     """sum(quantity x price) over a non-empty list of lines, each exactly {quantity, price} (+ `optional`,
-    display-only amounts that are checked and never summed)."""
+    display-only amounts: type-checked, exempt from the ceiling, never summed)."""
     if not isinstance(value, list) or not value:
         raise _Refused("line items that are not a non-empty list")
     total = 0
@@ -265,7 +268,7 @@ def _lines(value: Any, optional: FrozenSet[str], ceiling: int) -> int:
         if not isinstance(line, Mapping) or not {"quantity", "price"} <= set(line) <= {"quantity", "price"} | optional:
             raise _Refused("a line that is not exactly its shape")
         for key in optional & set(line):
-            _amount(line[key], ceiling, nullable=True)
+            _amount(line[key], ceiling, nullable=True, capped=False)
         total += _quantity(line["quantity"]) * _amount(line["price"], ceiling)
     return total
 

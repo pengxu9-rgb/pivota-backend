@@ -2474,8 +2474,6 @@ SHAPES_REFUSED = {
     # 2 x $30.00 is $60.00: read without its quantity, the line would match the $30.00 subtotal
     "s2_quantity_times_price_over": _s2(line_items=[{"quantity": 2, "price": "30.00"}], subtotal="30.00"),
     "s3_total_over": _s3(total_price="51.50"), "s3_shipping_line_over": _s3(shipping_lines=[{"price": "51.50"}]),
-    "s3_compare_at_over": _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "51.50"},
-                                          {"quantity": 1, "price": "10.00"}]),
     # short: the total does not cover its parts; the subtotal is not its lines
     "s2_total_short": _s2(total="51.48"), "s2_subtotal_above_lines": _s2(subtotal="41.50"),
     "s2_subtotal_below_lines": _s2(subtotal="41.48"),
@@ -2538,6 +2536,70 @@ def test_a_card_that_is_not_exactly_a_named_shape_within_the_ceiling_cancels(nam
     card = SHAPES_REFUSED[name]
     assert amounts.matched_shape(card, TOTAL) is None
     assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+#: compare_at_price (S3) is display only: exempt from the ceiling, still type-checked, never summed, never the total
+#: and never a price. Each card is S3-shaped; `None` = it proceeds, else the reason it cancels.
+_LINES_50 = [{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "10.00"}]
+COMPARE_AT_CASES = {
+    # exempt from the ceiling: a list price above what the buyer approved proceeds when the rest is S3 in range
+    "over_the_ceiling_string": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "99999.00"},
+                                                {"quantity": 1, "price": "10.00"}]), None),
+    "over_the_ceiling_number": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": 1000000},
+                                                {"quantity": 1, "price": "10.00", "compare_at_price": 75.5}]), None),
+    "one_cent_over_the_ceiling": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "51.50"}]), None),
+    # still type-checked
+    "dollar_string": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "$99.00"}]), "type"),
+    "negative": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "-1.00"}]), "type"),
+    "negative_number": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": -1}]), "type"),
+    "bare_digits": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "9999"}]), "type"),
+    "boolean": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": True}]), "type"),
+    "words": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "was 12"}]), "type"),
+    "object": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": {"amount": "12.00"}}]), "type"),
+    # the price, the total and the sums still cap, whatever the compare_at_price
+    # (a price over the ceiling under a discount that brings every sum within it: only its own cap refuses it)
+    "price_over_the_ceiling": (_s3(line_items=[{"quantity": 1, "price": "51.50", "compare_at_price": "60.00"}],
+                                   subtotal_price="41.50", total_discounts="10.00", shipping_lines=[{"price": "0.00"}],
+                                   total_tax="0.00", total_price="41.50"), "price"),
+    "total_over_the_ceiling": (_s3(total_price="51.50"), "total"),
+    "subtotal_over_the_ceiling": (
+        _s3(line_items=[{"quantity": 2, "price": "30.00", "compare_at_price": "40.00"}], subtotal_price="55.00",
+            total_discounts="5.00", total_price="51.49", total_tax="0.00", shipping_lines=[{"price": "0.00"}]),
+        "sums"),
+    "parts_add_up_past_the_ceiling": (
+        _s3(line_items=[{"quantity": 1, "price": "45.00", "compare_at_price": "90.00"}], subtotal_price="45.00",
+            total_discounts="0.00", shipping_lines=[{"price": "5.00"}], total_tax="2.00", total_price="51.49"),
+        "sums"),
+    # never a price, never summed: a compare_at_price that would make the sums reconcile does not
+    # (read as the price, this line would make every sum reconcile: $45.00 + $4.49 + $2.00 = $51.49)
+    "the_only_amount_of_a_line": (_s3(line_items=[{"quantity": 1, "compare_at_price": "45.00"}],
+                                      total_discounts="0.00"), "shape"),
+    "would_reconcile_a_short_subtotal": (
+        _s3(line_items=[{"quantity": 1, "price": "45.00", "compare_at_price": "30.00"}], subtotal_price="30.00",
+            total_discounts="0.00", total_price="30.00", total_tax="0.00", shipping_lines=[{"price": "0.00"}]), "short"),
+    "would_reconcile_if_added": (
+        _s3(line_items=[{"quantity": 1, "price": "10.00", "compare_at_price": "35.00"}], subtotal_price="45.00",
+            total_discounts="0.00"), "short"),
+    "short_total_beside_a_large_compare_at": (
+        _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "500.00"},
+                        {"quantity": 1, "price": "10.00"}], total_price="51.48"), "short"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(COMPARE_AT_CASES))
+def test_compare_at_price_is_display_only_exempt_from_the_ceiling_and_never_counted(name):
+    card, refused_for = COMPARE_AT_CASES[name]
+    assert amounts.matched_shape(card, TOTAL) == (None if refused_for else "S3")
+    assert worker.confirm_card_refused(card, TOTAL) is (refused_for is not None)
+
+
+async def test_an_over_ceiling_compare_at_price_confirms_end_to_end():
+    pid = await _approving()
+    card = _task(_card("checkout.confirm", COMPARE_AT_CASES["over_the_ceiling_string"][0],
+                       ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=card)
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
 
 
 def test_the_shape_bounds_are_exact_to_the_cent():
