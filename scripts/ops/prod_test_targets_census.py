@@ -18,8 +18,8 @@ SECTIONS (one `PTT_TARGETS {...}` line each)
                     OR-SG cannot be served from it (one row = one currency).
   kernel            kernel_test_merchant: a test merchant whose first merchant_stores row (status active/connected,
                     is_primary first) is a Shopify store with a domain, plus one products_cache product and its first
-                    variant. Reported: whether a store key is present and whether it names a storefront token
-                    (booleans only, the key itself is never selected), the variant id (bare digits are what the kernel
+                    variant. Reported: whether a store key is present (null / length only: the key's CONTENT is
+                    never read, not even by a pattern match), the variant id (bare digits are what the kernel
                     quote wraps as gid://shopify/ProductVariant/N), the currency and availability as cached. The live
                     Shopify answer cannot be proven offline.
   storefront        storefront_seller: merch_obs_ catalog rows from the external seed mirror, live, unsuppressed,
@@ -89,13 +89,12 @@ WHERE merchant_id = ANY($1::text[]) AND (expires_at IS NULL OR expires_at > NOW(
 KERNEL_SQL = f"""
 WITH store AS (
     SELECT DISTINCT ON (ms.merchant_id) ms.merchant_id, lower(ms.platform) AS platform, ms.domain,
-           (ms.api_key IS NOT NULL AND length(ms.api_key) > 0) AS store_key_present,
-           (coalesce(ms.api_key, '') ILIKE '%storefront%') AS store_key_names_storefront
+           (ms.api_key IS NOT NULL AND length(ms.api_key) > 0) AS store_key_present
     FROM merchant_stores ms
     WHERE ms.merchant_id = ANY($1::text[]) AND ms.status IN ('active', 'connected')
     ORDER BY ms.merchant_id, ms.is_primary DESC, ms.connected_at DESC
 )
-SELECT s.merchant_id, s.platform, s.domain, s.store_key_present, s.store_key_names_storefront,
+SELECT s.merchant_id, s.platform, s.domain, s.store_key_present,
        pc.platform_product_id AS product_id,
        coalesce(pc.product_data->'variants'->0->>'variant_id', pc.product_data->'variants'->0->>'id') AS variant_id,
        {ROW_CURRENCY} AS currency,
@@ -106,7 +105,7 @@ FROM store s
 JOIN products_cache pc ON pc.merchant_id = s.merchant_id
 WHERE s.platform = 'shopify' AND coalesce(s.domain, '') <> ''
   AND coalesce(pc.product_data->'variants'->0->>'variant_id', pc.product_data->'variants'->0->>'id', '') ~ '^[0-9]{{6,}}$'
-ORDER BY s.store_key_names_storefront DESC, (CASE WHEN {ROW_CURRENCY} = 'USD' THEN 0 ELSE 1 END), pc.cached_at DESC
+ORDER BY s.store_key_present DESC, (CASE WHEN {ROW_CURRENCY} = 'USD' THEN 0 ELSE 1 END), pc.cached_at DESC
 LIMIT {LIMIT}
 """
 

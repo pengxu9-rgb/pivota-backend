@@ -102,14 +102,12 @@ def test_every_query_is_a_select_bound_to_the_test_merchants_and_the_quarantine_
     assert sum("AND TRUE" in q for q in queries) == 2        # offers' SGD seeds and the storefront seeds
 
 
-def test_no_store_key_is_ever_selected_only_booleans_about_it():
+def test_the_store_key_is_touched_only_by_null_and_length_never_its_content():
+    # Never read a secret value, even partly: no selection, no LIKE / ILIKE / ~ / substring / position on the key.
     import re
 
-    # Every mention of the key column sits inside a boolean test; it is never a selected value.
-    uses = [m.group(0) for m in re.finditer(r"ms\.api_key[^,\n]{0,40}", census.KERNEL_SQL)]
-    assert uses and all(re.match(r"ms\.api_key(?: IS NOT NULL| AND length|\) > 0|, '\'\'\) ILIKE)", u)
-                        or "length(ms.api_key) > 0" in census.KERNEL_SQL for u in uses)
-    assert re.findall(r"ms\.api_key", census.KERNEL_SQL).__len__() == 3
+    expressions = re.findall(r"[^\n]*ms\.api_key[^\n]*", census.KERNEL_SQL)
+    assert expressions == ["           (ms.api_key IS NOT NULL AND length(ms.api_key) > 0) AS store_key_present"]
     for other in (census.OFFERS_SQL, census.STOREFRONT_SQL, census.UNEXPIRED_TEST_ROWS_SQL):
         assert "api_key" not in other
     assert "store_key_present" in census.KERNEL_SQL and "store_key_names_storefront" in census.KERNEL_SQL
