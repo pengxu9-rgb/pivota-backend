@@ -5,12 +5,13 @@
 #   gcloud builds submit --no-source --async --project pivota-prod --region us-west1 --config "$CONFIG" \
 #     --service-account projects/pivota-prod/serviceAccounts/sa-ops-launcher@pivota-prod.iam.gserviceaccount.com \
 #     --substitutions=_RELEASE=<40-hex>,_DIGEST=sha256:<64-hex>,_CONFIG_SHA256=$(shasum -a 256 "$CONFIG" | cut -d" " -f1),\
-#       _CASES=<case-id[,case-id...]|all>,_KEY_VERSION=<n>,_GO_REFERENCE='<where the owner gave the go, and when>'
+#       _CASES=<case-id[,case-id...]|all>,_KEY_VERSION=<n>,_TARGETS_VERSION=<n>,\
+#       _GO_REFERENCE='<where the owner gave the go, and when>'
 #   (add _USER_KEY_VERSION=<n> when a selected case is a checkout case: it mounts the test issuer key; else leave it out)
 #
 # 1 copies scripts/ and this config OUT OF THE RELEASE IMAGE (by digest); 2 the config is the release copy; 3 the digest
 # is the release tag's; 4 the gateway serves one revision and its flags match what the selected cases expect; 5 the
-# lock. Steps 1-5 fail closed with nothing taken or run. 6 run: gate -> armed deploy (key by version) -> execute
+# lock. Steps 1-5 fail closed with nothing taken or run. 6 run: gate -> armed deploy (secrets by version) -> execute
 # --async -> wait BY NAME -> DISARM (no key, no gate, no cases), allowFailure so 7 always runs. 7 publish: log.txt,
 # rows.json, result.json (create-only), then releases the lock only when nothing can still run and the job is disarmed.
 substitutions:
@@ -19,6 +20,7 @@ substitutions:
   _CONFIG_SHA256: ""
   _CASES: ""
   _KEY_VERSION: ""
+  _TARGETS_VERSION: ""
   _USER_KEY_VERSION: ""
   _GO_REFERENCE: ""
 options:
@@ -26,7 +28,7 @@ options:
   dynamicSubstitutions: false
   env:
     - BUILD_ID=$BUILD_ID
-timeout: 2400s
+timeout: 3300s
 steps:
   - id: release-scripts
     name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
@@ -71,11 +73,11 @@ steps:
   - id: run
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
     entrypoint: python3
-    timeout: 1500s
+    timeout: 2100s
     allowFailure: true
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, run, --release, "${_RELEASE}",
            --digest, "${_DIGEST}", --cases, "${_CASES}", --key-version, "${_KEY_VERSION}",
-           --user-key-version, "${_USER_KEY_VERSION}", --go-reference, "${_GO_REFERENCE}"]
+           --targets-version, "${_TARGETS_VERSION}", --user-key-version, "${_USER_KEY_VERSION}", --go-reference, "${_GO_REFERENCE}"]
   - id: publish
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
     entrypoint: python3

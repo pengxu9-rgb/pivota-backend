@@ -1,5 +1,6 @@
-"""Cloud Build launcher for the prod test-transaction job: the config is the release copy, the key goes in by numbered
-version only while armed, the disarmed job has no key, gate or cases, and result.json is ok only for a clean run."""
+"""Cloud Build launcher for the prod test-transaction job: the config is the release copy, secrets go in by numbered
+version only while armed, the disarmed job has none, the wait fits inside the run step, and result.json is ok only for
+a clean run with nothing possibly left open."""
 
 from __future__ import annotations
 
@@ -16,16 +17,17 @@ from scripts.ops import prod_test_transactions_launch as launch
 RELEASE = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 BUILD = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+GW_SHA = "080d7297f74e019fe5d88a25e78c3315ebdb080a"
 CONFIG = Path(__file__).resolve().parents[1] / "infra" / "gcp" / "cloudbuild.prod_test_transactions.yaml"
 GATE = {"verdict": "GATE_OPEN", "observed_at": "2026-01-02T07:00:00+00:00", "summary": "s",
         "source": "scripts/ops/oneoff_gate.py", "cpu_peak_5m": 0.05, "db_job_executions_running": 0}
+HOST_SHA = hashlib.sha256(b"shop.reviewed.example").hexdigest()
 
 
 @pytest.fixture(autouse=True)
 def build_env(monkeypatch, tmp_path):
     monkeypatch.setenv("BUILD_ID", BUILD)
     monkeypatch.setattr(launch, "WORK", tmp_path)
-    monkeypatch.setattr(job, "OFFERS_PRODUCT_ID", "prod_test_reviewed_0001")
 
 
 def flag(args, name):
@@ -38,68 +40,86 @@ def env_of(args):
     return dict(item.split("=", 1) for item in raw[3:].split("@"))
 
 
-def test_config_must_be_the_release_copy_and_parses():
+def spec(cases, **over):
+    kw = dict(release=RELEASE, digest=DIGEST, cases=cases, key_version=4, targets_version=7, gate=GATE, armed=True)
+    kw.update(over)
+    return launch.job_spec_args(**kw)
+
+
+def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     raw = CONFIG.read_bytes()
     launch.config_matches(raw, hashlib.sha256(raw).hexdigest())
     for sha in ("0" * 64, "", "x"):
         with pytest.raises(launch.LaunchRefused):
             launch.config_matches(raw, sha)
     config = yaml.safe_load(raw)
-    assert [s["id"] for s in config["steps"]] == ["release-scripts", "config-is-the-release-config",
-                                                   "digest-is-the-release-tag", "gateway", "lock", "run", "publish"]
-    assert [s for s in config["steps"] if s.get("allowFailure")] == [config["steps"][5]]
+    steps = {s["id"]: s for s in config["steps"]}
+    assert list(steps) == ["release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "gateway",
+                           "lock", "run", "publish"]
+    assert [s for s in config["steps"] if s.get("allowFailure")] == [steps["run"]]
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
-                                            "_USER_KEY_VERSION", "_GO_REFERENCE"}
+                                            "_TARGETS_VERSION", "_USER_KEY_VERSION", "_GO_REFERENCE"}
+    run_step = int(steps["run"]["timeout"].rstrip("s"))
+    # gate (420) + arm deploy and execute (<= 300) + the wait + the disarm (<= 300) must fit inside the run step.
+    assert 420 + 300 + launch.EXECUTION_DEADLINE_SECONDS + 300 <= run_step
+    assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
 
 
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
-def test_key_version_must_be_a_numbered_version(raw):
+def test_versions_must_be_numbered(raw):
     with pytest.raises(launch.LaunchRefused):
-        launch.parse_key_version(raw)
+        launch.parse_version(raw, "_KEY_VERSION")
 
 
-def test_key_version_and_go_reference_accepted():
-    assert launch.parse_key_version("3") == 3
-    assert launch.parse_go_reference("Dark flag session 2026-11-19 02:10Z") .startswith("Dark")
+def test_go_reference():
+    assert launch.parse_go_reference("Dark flag session 2026-11-19 02:10Z").startswith("Dark")
     for raw in ("", "ok", "go; rm -rf /", "x" * 201):
         with pytest.raises(launch.LaunchRefused):
             launch.parse_go_reference(raw)
 
 
-def test_armed_spec_mounts_the_key_by_version_with_the_gate_cases_and_run_id():
-    args = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["OR-US", "OR-DE"], key_version=4, gate=GATE,
-                                armed=True)
+def test_armed_spec_mounts_the_key_and_targets_by_version_without_the_payment_nat():
+    args = spec(["OR-US", "OR-DE"])
     assert args[:5] == ["gcloud", "run", "jobs", "deploy", "prod-test-transactions"]
-    assert flag(args, "--set-secrets") == "/var/run/pivota-test-agent/key=prod-test-agent-key:4"
+    assert flag(args, "--set-secrets") == ("/var/run/pivota-test-agent/key=prod-test-agent-key:4,"
+                                           "/var/run/pivota-test-targets/targets.json=prod-test-transactions-targets:7")
     assert "--clear-secrets" not in args and ":latest" not in " ".join(args)
+    for vpc in ("--network", "--subnet", "--vpc-egress", "--vpc-connector"):
+        assert vpc not in args
     assert flag(args, "--service-account") == "sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com"
     assert flag(args, "--max-retries") == "0" and flag(args, "--tasks") == "1"
-    assert flag(args, "--subnet") == "default" and flag(args, "--vpc-egress") == "all-traffic"
-    assert flag(args, "--image") == f"{launch.REPO}@{DIGEST}"
     env = env_of(args)
     assert env["PROD_TEST_TXN_ARMED"] == "1" and env["PROD_TEST_TXN_CASES"] == "OR-US,OR-DE"
-    assert env["PROD_TEST_TXN_RUN_ID"] == BUILD and env["PROD_TEST_TXN_RELEASE_COMMIT"] == RELEASE
-    assert json.loads(env["PROD_TEST_TXN_GATE"]) == GATE
+    assert env["PROD_TEST_TXN_RUN_ID"] == BUILD and json.loads(env["PROD_TEST_TXN_GATE"]) == GATE
 
 
-def test_disarmed_spec_has_no_key_no_gate_no_cases():
-    args = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=[], key_version=1, gate=None, armed=False)
+def test_the_issuer_key_is_mounted_only_when_a_selected_case_needs_an_end_user():
+    args = spec(["MCP-K-US", "OR-DE"], user_key_version=2)
+    assert flag(args, "--set-secrets").endswith(",/var/run/pivota-test-agent-user/key.pem=prod-test-agent-user-key:2")
+    with pytest.raises(launch.LaunchRefused, match="_USER_KEY_VERSION"):
+        spec(["MCP-K-US"])
+    with pytest.raises(launch.LaunchRefused, match="do not mount"):
+        spec(["OR-DE"], user_key_version=2)
+
+
+def test_disarmed_spec_has_no_secret_no_gate_no_cases():
+    args = spec([], gate=None, armed=False)
     assert "--clear-secrets" in args and "--set-secrets" not in args
-    env = env_of(args)
-    assert set(env) == {"PIVOTA_ENV", "PROD_TEST_TXN_RELEASE_COMMIT"}
+    assert set(env_of(args)) == {"PIVOTA_ENV", "PROD_TEST_TXN_RELEASE_COMMIT"}
 
 
 def test_spec_refusals():
     with pytest.raises(launch.LaunchRefused):
-        launch.job_spec_args(release="x", digest=DIGEST, cases=["OR-US"], key_version=1, gate=GATE, armed=True)
+        spec(["OR-US"], release="x")
     with pytest.raises(launch.LaunchRefused):
-        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["OR-US"], key_version=1, gate=None, armed=True)
+        spec(["OR-US"], gate=None)
     with pytest.raises(job.CaseError):
-        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["NOPE"], key_version=1, gate=GATE, armed=True)
+        spec(["NOPE"])
 
 
-def service(flags=None, *, traffic=None):
+def service(flags=None, *, traffic=None, commit=GW_SHA):
     env = [{"name": k, "value": v} for k, v in (flags or {}).items()]
+    env.append({"name": "PIVOTA_COMMIT_SHA", "value": commit})
     env.append({"name": "SECRET_THING", "valueFrom": {"secretKeyRef": {"name": "s", "key": "latest"}}})
     return {"metadata": {"generation": 7},
             "spec": {"template": {"spec": {"containers": [{"env": env}]}}},
@@ -108,59 +128,130 @@ def service(flags=None, *, traffic=None):
                        "observedGeneration": 7, "conditions": [{"type": "Ready", "status": "True"}]}}
 
 
-def test_gateway_reading_takes_one_serving_revision_and_plain_flag_values(monkeypatch):
-    monkeypatch.setattr(job, "GATEWAY_FLAG_NAMES", ("AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET", "SECRET_THING"))
-    revision, flags = launch.gateway_flags(service({"AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1"}))
-    assert revision == "gateway-1"
-    assert flags == {"AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1", "SECRET_THING": None}  # a secret is never read
+def test_gateway_reading_names_the_gateway_and_reads_only_plain_values():
+    revision, commit, flags = launch.gateway_reading(service({"AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1"}))
+    assert revision == "gateway-1" and commit == GW_SHA
+    assert flags["AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET"] == "1" and "SECRET_THING" not in flags
     split = [{"revisionName": "gateway-1", "percent": 50}, {"revisionName": "gateway-0", "percent": 50}]
-    with pytest.raises(launch.LaunchRefused):
-        launch.gateway_flags(service(traffic=split))
+    with pytest.raises(launch.LaunchRefused, match="the gateway must serve one revision"):
+        launch.gateway_reading(service(traffic=split))
 
 
-def rows_for(cases, *, passes=True, left_open=()):
-    rows = [{"kind": "case", "case": c, "pass": passes, "left_open": list(left_open)} for c in cases]
-    rows.append({"kind": "run", "ok": passes and not left_open})
-    return rows
+def test_the_gateway_step_refuses_path_four_on_an_unreviewed_gateway(monkeypatch, tmp_path):
+    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(service(commit="c" * 40)))
+    args = type("A", (), {"cases": "OR-DE"})()
+    with pytest.raises(job.CaseError, match="reviewed against"):
+        launch.cmd_gateway(args)
+    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(service()))
+    launch.cmd_gateway(args)
+    assert json.loads((tmp_path / "gateway.json").read_text())["commit"] == GW_SHA
+
+
+def test_the_wait_gives_up_inside_its_deadline():
+    clock = {"t": 0.0}
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        return json.dumps({"status": {}})                 # never terminal
+
+    launch_run = launch.run
+    try:
+        launch.run = fake_run
+        state = launch.wait_for_execution("prod-test-transactions-x", sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                                          monotonic=lambda: clock["t"])
+    finally:
+        launch.run = launch_run
+    assert state is None and clock["t"] <= launch.EXECUTION_DEADLINE_SECONDS + launch.EXECUTION_POLL_SECONDS
+
+
+def case_row(case, *, passes=True, left_open=(), expires=()):
+    return {"kind": "case", "case": case, "pass": passes, "left_open": list(left_open),
+            "expires_on_seller": list(expires)}
 
 
 DONE = {"state": "EXECUTION_SUCCEEDED", "execution": "prod-test-transactions-x"}
 
 
+def summary(rows, cases, **over):
+    kw = dict(run_state=DONE, bad_lines=[], lock="l", cases=cases)
+    kw.update(over)
+    return launch.summarise(rows, **kw)
+
+
 def test_result_is_ok_only_for_a_clean_terminal_run_with_every_selected_case():
     cases = ["OR-US", "OR-DE"]
-    assert launch.summarise(rows_for(cases), run_state=DONE, bad_lines=[], lock="l", cases=cases)["ok"] is True
-    bad = [
-        dict(rows=rows_for(cases, passes=False)),
-        dict(rows=rows_for(cases, left_open=["cs_1"])),
-        dict(rows=rows_for(["OR-US"])),                                     # a selected case has no line
-        dict(rows=rows_for(cases) + [{"kind": "run", "ok": True}]),         # two run lines
-        dict(rows=rows_for(cases), run_state={"state": "EXECUTION_FAILED"}),
-        dict(rows=rows_for(cases), bad_lines=["zz"]),
-    ]
-    for over in bad:
-        args = {"rows": rows_for(cases), "run_state": DONE, "bad_lines": [], "lock": "l", "cases": cases, **over}
-        assert launch.summarise(**args)["ok"] is False, over
+    clean = [case_row(c) for c in cases] + [{"kind": "run", "ok": True}]
+    assert summary(clean, cases)["ok"] is True
+    for rows, over in (
+        ([case_row("OR-US", passes=False), case_row("OR-DE"), {"kind": "run", "ok": True}], {}),
+        ([case_row("OR-US", left_open=["cs_1"]), case_row("OR-DE"), {"kind": "run", "ok": True}], {}),
+        ([case_row("OR-US"), {"kind": "run", "ok": True}], {}),
+        (clean + [{"kind": "run", "ok": True}], {}),
+        (clean, {"run_state": {"state": "EXECUTION_FAILED"}}),
+        (clean, {"bad_lines": ["zz"]}),
+    ):
+        assert summary(rows, cases, **over)["ok"] is False
 
 
-def test_left_open_is_collected_from_every_case():
-    rows = [{"kind": "case", "case": "A", "pass": False, "left_open": ["cs_2", "unknown:A"]},
-            {"kind": "case", "case": "B", "pass": False, "left_open": ["cs_1"]}, {"kind": "run", "ok": False}]
-    result = launch.summarise(rows, run_state=DONE, bad_lines=[], lock="l", cases=["A", "B"])
-    assert result["left_open"] == ["cs_1", "cs_2", "unknown:A"] and result["ok"] is False
+def test_a_selected_checkout_case_with_no_row_is_an_unknown_left_open():
+    rows = [case_row("OR-DE"), {"kind": "run", "ok": True}]
+    result = summary(rows, ["OR-DE", "MCP-K-US", "OR-US"], run_state={"state": "EXECUTION_FAILED"})
+    assert result["left_open"] == ["unknown:MCP-K-US"] and result["ok"] is False   # OR-US is a read: nothing to open
 
 
-def test_publish_refuses_loudly_when_anything_was_left_open(monkeypatch, tmp_path):
+def test_expiring_storefront_carts_are_listed_and_the_shadow_check_is_advisory():
+    rows = [case_row("MCP-SF-US", expires=["esc_#1"]), case_row("MCP-K-US"), {"kind": "run", "ok": True}]
+    result = summary(rows, ["MCP-SF-US", "MCP-K-US"], shadow={"advisory": True, "lines": 0})
+    assert result["ok"] is True and result["expires_on_seller"] == ["esc_#1"] and result["shadow_lookup"]["lines"] == 0
+
+
+def test_shadow_check_counts_only_the_reviewed_seller_host_and_never_decides():
+    rows = [{**case_row("MCP-SF-US"), "shadow_lookup": True}, {**case_row("UCP-SF-US"), "shadow_lookup": True}]
+    ours = {"mode": "shadow", "sent": False, "reason": "skipped:no_variant", "seller_host_sha256": HOST_SHA}
+    other = {**ours, "seller_host_sha256": "f" * 64}
+    result = launch.shadow_check(rows, [ours, ours, other, other], HOST_SHA)
+    assert result == {"advisory": True, "wanted": 2, "lines": 2, "all_shadow_unsent": True,
+                      "reasons": ["skipped:no_variant"]}
+    assert launch.shadow_check(rows, [ours, {**ours, "sent": True}], HOST_SHA)["all_shadow_unsent"] is False
+    assert launch.shadow_check(rows, [ours, {**ours, "mode": "enforce"}], HOST_SHA)["all_shadow_unsent"] is False
+    assert launch.shadow_check(rows, None, HOST_SHA)["lines"] is None
+    assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], [], HOST_SHA) is None
+
+
+def test_shadow_lines_keep_only_the_host_hash(monkeypatch):
+    entries = [{"jsonPayload": {"mode": "shadow", "sent": False, "reason": "r", "seller_host": "shop.reviewed.example",
+                                "lines": [{"variant": "gid://x"}]}}]
+    seen = {}
+
+    def fake_run(args, **kw):
+        seen["args"] = args
+        return json.dumps(entries)
+
+    monkeypatch.setattr(launch, "run", fake_run)
+    lines = launch.read_shadow_lines("2026-01-02T07:00:00+00:00", "2026-01-02T07:05:00+00:00")
+    assert lines == [{"mode": "shadow", "sent": False, "reason": "r", "seller_host_sha256": HOST_SHA}]
+    assert flag(seen["args"], "--view") == "prod-test-transactions" and flag(seen["args"], "--bucket") == "_Default"
+
+
+def publish(monkeypatch, tmp_path, rows, state):
     written = {}
     monkeypatch.setattr(launch, "put", lambda prefix, name, content: written.__setitem__(name, content))
     monkeypatch.setattr(launch, "read_log", lambda execution: ("", None))
     monkeypatch.setattr(launch, "release_lock", lambda: "lock 1 released")
     monkeypatch.setattr(launch.sbl, "list_executions", lambda job_name: [])
-    rows = rows_for(["OR-US"], passes=False, left_open=["cs_9"])
+    monkeypatch.setattr(launch, "read_shadow_lines", lambda a, b: [])
     monkeypatch.setattr(launch.job, "parse_result_lines", lambda text: (rows, []))
-    (tmp_path / "run.json").write_text(json.dumps({**DONE, "armed": True, "disarmed": True,
-                                                   "execute_attempted": True, "executions_pre_arm": []}))
-    args = type("A", (), {"cases": "OR-US", "release": RELEASE, "go_reference": "Dark flag session 02:10Z"})()
+    (tmp_path / "run.json").write_text(json.dumps(state))
+    args = type("A", (), {"cases": ",".join(r["case"] for r in rows if r["kind"] == "case"), "release": RELEASE,
+                          "go_reference": "Dark flag session 02:10Z"})()
+    return written, args
+
+
+def test_publish_refuses_loudly_when_anything_may_be_left_open(monkeypatch, tmp_path):
+    rows = [case_row("MCP-K-US", passes=False, left_open=["cs_9"]), {"kind": "run", "ok": False}]
+    written, args = publish(monkeypatch, tmp_path, rows, {**DONE, "armed": True, "disarmed": True,
+                                                         "execute_attempted": True, "executions_pre_arm": []})
     with pytest.raises(launch.LaunchRefused, match="LEFT OPEN: cs_9"):
         launch.cmd_publish(args)
     result = json.loads(written["result.json"])
@@ -168,13 +259,9 @@ def test_publish_refuses_loudly_when_anything_was_left_open(monkeypatch, tmp_pat
 
 
 def test_publish_keeps_the_lock_while_the_job_may_still_be_armed(monkeypatch, tmp_path):
-    written = {}
-    monkeypatch.setattr(launch, "put", lambda prefix, name, content: written.__setitem__(name, content))
-    monkeypatch.setattr(launch, "read_log", lambda execution: ("", None))
-    monkeypatch.setattr(launch.job, "parse_result_lines", lambda text: (rows_for(["OR-US"]), []))
-    (tmp_path / "run.json").write_text(json.dumps({**DONE, "armed": True, "disarmed": False,
-                                                   "execute_attempted": True}))
-    args = type("A", (), {"cases": "OR-US", "release": RELEASE, "go_reference": "Dark flag session 02:10Z"})()
+    rows = [case_row("OR-US"), {"kind": "run", "ok": True}]
+    written, args = publish(monkeypatch, tmp_path, rows, {**DONE, "armed": True, "disarmed": False,
+                                                         "execute_attempted": True})
     with pytest.raises(launch.LaunchRefused):
         launch.cmd_publish(args)
     result = json.loads(written["result.json"])
@@ -182,51 +269,14 @@ def test_publish_keeps_the_lock_while_the_job_may_still_be_armed(monkeypatch, tm
     assert "lock.json" not in written
 
 
-# ------------------------------------------------------------------ checkout runs: the issuer key and the shadow check
-
-@pytest.fixture
-def reviewed(monkeypatch):
-    from tests.test_prod_test_transactions import review_everything
-
-    review_everything(monkeypatch)
-
-
-def test_the_issuer_key_is_mounted_only_when_a_selected_case_needs_an_end_user(reviewed):
-    args = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["MCP-K-US", "OR-DE"], key_version=4,
-                                gate=GATE, armed=True, user_key_version=2)
-    assert flag(args, "--set-secrets") == ("/var/run/pivota-test-agent/key=prod-test-agent-key:4,"
-                                           "/var/run/pivota-test-agent-user/key.pem=prod-test-agent-user-key:2")
-    with pytest.raises(launch.LaunchRefused, match="_USER_KEY_VERSION"):
-        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["MCP-K-US"], key_version=4, gate=GATE, armed=True)
-    with pytest.raises(launch.LaunchRefused, match="do not mount"):
-        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["OR-DE"], key_version=4, gate=GATE, armed=True,
-                             user_key_version=2)
-    disarmed = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=[], key_version=1, gate=None, armed=False)
-    assert "--clear-secrets" in disarmed and "prod-test-agent-user-key" not in " ".join(disarmed)
-
-
-def case_row(case, *, passes=True, shadow=False, expires=()):
-    return {"kind": "case", "case": case, "pass": passes, "left_open": [], "expires_on_seller": list(expires),
-            "shadow_lookup": shadow}
-
-
-def test_shadow_check_wants_one_shadow_line_per_passed_us_storefront_create():
-    rows = [case_row("MCP-SF-US", shadow=True), case_row("UCP-SF-US", shadow=True), case_row("MCP-SF-DE")]
-    line = {"mode": "shadow", "sent": False, "reason": "skipped:no_variant", "tracked": 0}
-    assert launch.shadow_check(rows, [line, line])["pass"] is True
-    assert launch.shadow_check(rows, [line])["pass"] is False                          # one create left no line
-    assert launch.shadow_check(rows, [line, {**line, "sent": True}])["pass"] is False  # shadow must never send
-    assert launch.shadow_check(rows, [line, {**line, "mode": "enforce"}])["pass"] is False
-    assert launch.shadow_check(rows, None)["pass"] is False
-    assert launch.shadow_check([case_row("MCP-SF-US", passes=False, shadow=True)], []) is None
-
-
-def test_expiring_storefront_carts_are_listed_and_do_not_fail_the_run_but_a_failed_shadow_check_does():
-    rows = [case_row("MCP-SF-US", shadow=True, expires=["esc_1"]), case_row("MCP-K-US"),
-            {"kind": "run", "ok": True}]
-    result = launch.summarise(rows, run_state=DONE, bad_lines=[], lock="l", cases=["MCP-SF-US", "MCP-K-US"],
-                              shadow={"pass": True})
-    assert result["ok"] is True and result["expires_on_seller"] == ["esc_1"] and result["left_open"] == []
-    result = launch.summarise(rows, run_state=DONE, bad_lines=[], lock="l", cases=["MCP-SF-US", "MCP-K-US"],
-                              shadow={"pass": False})
-    assert result["ok"] is False
+def test_publish_records_the_targets_sha_and_an_advisory_shadow_result(monkeypatch, tmp_path):
+    rows = [{**case_row("MCP-SF-US", expires=["esc_#1"])},
+            {"kind": "run", "ok": True, "targets_sha256": "d" * 64, "seller_host_sha256": HOST_SHA}]
+    state = {**DONE, "armed": True, "disarmed": True, "execute_attempted": True, "executions_pre_arm": [],
+             "started_at": "2026-01-02T07:00:00+00:00", "finished_at": "2026-01-02T07:05:00+00:00"}
+    written, args = publish(monkeypatch, tmp_path, rows, state)
+    launch.cmd_publish(args)
+    result = json.loads(written["result.json"])
+    assert result["ok"] is True and result["targets_sha256"] == "d" * 64
+    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": True,
+                                       "reasons": []}
