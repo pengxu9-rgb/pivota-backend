@@ -167,16 +167,36 @@ def cpu_peak(pages: list[dict]) -> float:
     return max(values)
 
 
+# An ExecutionReference (a job's latestCreatedExecution) in one of these states has ended.
+ENDED_REFERENCE_STATUSES = frozenset({"EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED"})
+
+
+def execution_finished(execution: dict) -> bool:
+    """Has this execution ended? A completionTime says so; so does a Completed condition of "False" (failed or
+    cancelled, e.g. an image that never imported, which never gets a completionTime), or every task failed or
+    cancelled with none running. "Unknown" (in progress) and anything unreadable are NOT finished."""
+    status = execution.get("status") or {}
+    if status.get("completionTime"):
+        return True
+    if any(isinstance(c, dict) and c.get("type") == "Completed" and c.get("status") == "False"
+           for c in status.get("conditions") or []):
+        return True
+    tasks = (execution.get("spec") or {}).get("taskCount")
+    ended = [status.get("failedCount") or 0, status.get("cancelledCount") or 0]
+    return (type(tasks) is int and tasks > 0 and not status.get("runningCount")
+            and all(type(n) is int for n in ended) and sum(ended) >= tasks)
+
+
 def running_executions(executions: list, jobs: dict, per_job: dict) -> list[tuple[str, datetime | None]]:
     """(job name, start time) of every running execution, from the three reads."""
     running = []
     for name, job in jobs.items():
         latest = job.get("status", {}).get("latestCreatedExecution")
-        if latest and not latest.get("completionTimestamp"):
+        if latest and not latest.get("completionTimestamp") and latest.get("completionStatus") not in ENDED_REFERENCE_STATUSES:
             running.append((name, parse_time(latest.get("creationTimestamp"))))
     for execution in [*executions, *(e for rows in per_job.values() for e in rows)]:
         status = execution.get("status", {})
-        if status.get("completionTime"):
+        if execution_finished(execution):
             continue
         metadata = execution.get("metadata", {})
         name = metadata.get("labels", {}).get("run.googleapis.com/job", "")
