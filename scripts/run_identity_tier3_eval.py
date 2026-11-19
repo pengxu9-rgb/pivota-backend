@@ -56,7 +56,12 @@ def main() -> int:
         print("ABORT: no GEMINI_API_KEY in env — the judge never guesses offline.")
         return 1
 
-    fixture = json.load(open(args.fixture))
+    if not os.path.isfile(args.fixture):
+        print(f"ABORT: --fixture {args.fixture!r} is not a file. The gold-label fixture is kept off main, "
+              "in the private ops bundle; pass its local path.")
+        return 2
+    with open(args.fixture, encoding="utf-8") as fh:
+        fixture = json.load(fh)
     groups = fixture["groups"]
     if args.limit:
         by_label: dict = {}
