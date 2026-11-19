@@ -81,7 +81,12 @@ MAX_BODY_BYTES = 2_000_000
 MAX_SCALAR_CHARS = 120
 # Gateway releases whose answers the read cases were reviewed against: path 4's market refusals need gw#2602
 # (c2ce318d2) and be#2848. A new gateway sha is added here by a reviewed PR before the cases run on it.
-REVIEWED_GATEWAY_SHAS = frozenset({"080d7297f74e019fe5d88a25e78c3315ebdb080a"})
+# 7d650dce8 (gw#2603 + gw#2604, live 2026-11-19 03:07Z): readOffersResolveMarket reads the same three carriers by the
+# same rule (first readable two-ASCII code wins; any sent-but-unreadable -> market_invalid; unpriced ->
+# market_not_priced; nothing sent -> no market), so every OR-* expected answer holds; merchantPurchasabilityClient
+# is unchanged between the two.
+REVIEWED_GATEWAY_SHAS = frozenset({"080d7297f74e019fe5d88a25e78c3315ebdb080a",
+                                   "7d650dce841828059c060a7593992478ddf4f11d"})
 
 
 class CaseError(ValueError):

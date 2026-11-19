@@ -163,6 +163,7 @@ def test_flags_must_match_and_cart_referral_must_be_off():
 def test_path_four_needs_a_reviewed_gateway_release():
     cases = job.select_cases("OR-DE,MCP-K-US")
     job.require_reviewed_gateway(cases, GW_SHA)
+    job.require_reviewed_gateway(cases, "7d650dce841828059c060a7593992478ddf4f11d")   # gw#2603 + gw#2604, re-checked
     for sha in (None, "2b9aa03bac6137f7f689c67f7315e6ed3d4680e5"):
         with pytest.raises(job.CaseError, match="reviewed against"):
             job.require_reviewed_gateway(cases, sha)
