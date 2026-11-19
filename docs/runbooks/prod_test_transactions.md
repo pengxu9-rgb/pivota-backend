@@ -119,8 +119,8 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
       - the issuer key, only for checkout cases.
 
       The gate, the cases and the run id are set.
-   3. The job is executed, and the launcher waits for it by name for **at most 900 s**, counted from the run step's own start. 480 s stay reserved for cancel, its terminal poll and the disarm, inside the 2100 s step. If the wait runs out, the launcher **cancels** the execution, then disarms. The run is then not ok.
-   4. **Disarm.** The job is redeployed with `--clear-secrets` and no gate or cases.
+   3. The job is executed, and the launcher waits for it by name for **at most 840 s**, counted from the run step's own start; the task itself times out at 600 s. No poll starts unless its sleep and a full 60 s describe still fit before the deadline. 495 s stay reserved for the cancel call, its 120 s terminal poll (plus one interval) and the disarm, inside the 2100 s step. If the wait runs out, the launcher **cancels** the execution. The run is then not ok.
+   4. **Disarm, on every exit path.** The job is redeployed with `--clear-secrets` and no gate or cases. This happens whatever happened before: a failed execute, an unfound execution, a lookup or wait error, or a cancel that never reached a terminal state. A running execution keeps what it already mounted, so the disarm only stops a NEW execution from mounting the keys. Whether the lock is released is decided separately: an unidentified or non-terminal execution keeps it HELD.
 5. **Publish.** `log.txt`, `rows.json` and `result.json` are written, create-only, to `gs://pivota-prod-ops-receipts/prod-test-transactions/<build id>/`.
    - The lock is released only when nothing can still run and the job is disarmed.
    - The build fails, naming them, if anything may be **left open**.
@@ -153,8 +153,8 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 - **Storefront cases:** `STRICT`, `MCP_STOREFRONT_ESCALATION` (on `/mcp`) or `UCP_TOOL_DOOR` + `UCP_ESCALATION` (on `/ucp/mcp`), `CURRENCY_FOLLOWS_MARKET` and `MERCHANT_PRICING`, all `1`. Also `SHOPIFY_CATALOG_ATTRIBUTION=shadow`, and `UCP_CART_REFERRAL` off.
 - **MCP-K-US:** `STRICT`, `MCP_STOREFRONT_ESCALATION` and `CURRENCY_FOLLOWS_MARKET`, all `1`, because `/mcp` declares `market` only while the storefront path is on.
 
-**What counts as "nothing created".** Only a 200 tool error whose code is a string other than `UNEXPECTED_ERROR` / `CHECKOUT_OUTCOME_UNKNOWN` / `INTERNAL_ERROR`. Any of these is `unknown:<case>`:
-- a JSON-RPC error such as the heartbeat's `-32603`;
+**What counts as "nothing created".** Only a 200 **tool** error (`result.isError`) whose code is a string other than `UNEXPECTED_ERROR` / `CHECKOUT_OUTCOME_UNKNOWN` / `INTERNAL_ERROR`. Any of these is `unknown:<case>`:
+- a top-level JSON-RPC error, numeric (the heartbeat's `-32603`) or string;
 - a catch-all or unsure code;
 - a non-200;
 - an answer with no code.
@@ -171,7 +171,7 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 4. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` on those three secrets **only**, and nothing else.
 5. **Launcher (`sa-ops-launcher`):**
    - `roles/iam.serviceAccountUser` on `sa-prod-test-txn`;
-   - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`. Check that no project-wide `roles/logging.viewer` is left on `sa-ops-launcher`. **Caveat:** the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`. Removing a project-wide viewer from `sa-ops-launcher` breaks that read unless the seed batch moves to a view too. Decide that before trimming. Create the view with this filter:
+   - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`, **added alongside** the project-wide `roles/logging.viewer` it already has. Keep that viewer: the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`, so removing it would break the seed batch. Trimming it waits until the seed batch reads through a view too (the controller's call, 2026-11-19). Create the view with this filter:
      ```
      (resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions")
      OR (resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
@@ -192,6 +192,12 @@ Every run needs:
 - the owner's go in the session that launches it (`_GO_REFERENCE`);
 - numbered `_KEY_VERSION` and `_TARGETS_VERSION` (never `latest`), plus `_USER_KEY_VERSION` for checkout cases;
 - the gate open, outside 05:15–06:15Z and 10:30–11:20Z.
+
+## Known limits (review v5, accepted)
+
+- **The flags come from the service template.** They match what serves only because the gateway step requires serving == latest created. They, and the image pin, are checked at the gateway step, not at execution, which leaves a window of a few minutes. A gateway deploy or env change in that window is serialized away by the controller, which holds the gateway during a run.
+- **A slow gateway can run the job past its 600 s task timeout.** That is possible with 45 s per call. It fails safe: the missing checkout rows become `unknown:<case>`, and the run is not ok.
+- **A named storefront refusal raised after the store built a cart** leaves one seller cart for that case. It expires unpaid and stays inside the approved cart count.
 
 ## Rollback / cleanup
 

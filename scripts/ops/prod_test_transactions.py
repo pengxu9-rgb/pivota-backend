@@ -470,7 +470,9 @@ def parse_answer(door: str, raw: bytes) -> Any:
     if door == INVOKE or not isinstance(body, dict):
         return body
     if "error" in body and "result" not in body:
-        return {"is_error": True, "data": {"error": {"code": (body["error"] or {}).get("code")}}}
+        # A top-level JSON-RPC error (the transport, not the tool, failed): never a named tool refusal.
+        error = body["error"] if isinstance(body["error"], dict) else {}
+        return {"is_error": True, "rpc_error": True, "data": {"error": {"code": error.get("code")}}}
     result = body.get("result") or {}
     content = result.get("content") or []
     inner = content[0].get("text") if content and isinstance(content[0], dict) else None
@@ -576,6 +578,7 @@ def nothing_created(status: int, answer: Any) -> bool:
     quote: not this."""
     code = dig(answer, "data.error.code")
     return (status == 200 and isinstance(answer, dict) and answer.get("is_error") is True
+            and answer.get("rpc_error") is not True          # only result.isError is a tool's own refusal
             and isinstance(code, str) and bool(code) and code not in UNSURE_ERROR_CODES)
 
 

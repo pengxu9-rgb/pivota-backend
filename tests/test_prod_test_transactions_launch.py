@@ -63,6 +63,8 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     assert run_step == launch.RUN_STEP_SECONDS
     # gate (420) + arm deploy and execute (<= 300) + the wait + cancel/disarm reserve must fit inside the run step.
     assert 420 + 300 + launch.EXECUTION_DEADLINE_SECONDS + launch.DISARM_RESERVE_SECONDS <= run_step
+    # The reserve covers the cancel call (60) + its poll with one interval of slack + the disarm deploy (300).
+    assert launch.DISARM_RESERVE_SECONDS >= 60 + launch.CANCEL_POLL_SECONDS + launch.EXECUTION_POLL_SECONDS + 300
     assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
 
 
@@ -197,6 +199,92 @@ def test_a_wait_that_runs_out_cancels_the_execution_then_disarms(monkeypatch, tm
     assert ["gcloud", "run", "jobs", "executions", "cancel"] in calls
     assert waits == [launch.EXECUTION_DEADLINE_SECONDS, launch.CANCEL_POLL_SECONDS]
     assert calls[-1][:4] == ["gcloud", "run", "jobs", "deploy"]               # the disarm came after the cancel
+
+
+def run_args():
+    return type("A", (), {"cases": "OR-DE", "release": RELEASE, "digest": DIGEST, "key_version": "4",
+                          "targets_version": "7", "user_key_version": "", "go_reference": "Dark flag session 02:10Z",
+                          "scripts": "/x"})()
+
+
+def armed_run(monkeypatch, tmp_path, *, execute=None, wait=None, find=None):
+    """cmd_run with every gcloud call faked; returns (run.json state, the gcloud calls made)."""
+    (tmp_path / "lock.held").write_text(BUILD)
+    (tmp_path / "gateway.json").write_text("{}")
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args[:5])
+        if args[:4] == ["gcloud", "run", "jobs", "execute"]:
+            if execute:
+                raise execute
+            return "prod-test-transactions-abc12\n"
+        return ""
+
+    monkeypatch.setattr(launch, "run", fake_run)
+    monkeypatch.setattr(launch.sbl, "gate_json", lambda out, code, now: GATE)
+    monkeypatch.setattr(launch.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "", "returncode": 0})())
+    monkeypatch.setattr(launch.sbl, "list_executions", lambda job_name: [])
+    if find is not None:
+        monkeypatch.setattr(launch.sbl, "find_started_execution", find)
+    monkeypatch.setattr(launch, "wait_for_execution", wait or (lambda name, *, deadline, **kw: "EXECUTION_SUCCEEDED"))
+    try:
+        launch.cmd_run(run_args(), monotonic=lambda: 0.0)
+    except Exception:  # noqa: BLE001 - the state file is what is asserted
+        pass
+    return json.loads((tmp_path / "run.json").read_text()), calls
+
+
+def disarmed(calls):
+    deploys = [c for c in calls if c[:4] == ["gcloud", "run", "jobs", "deploy"]]
+    return len(deploys) == 2                                         # armed, then the disarm
+
+
+def test_the_disarm_runs_even_when_the_cancelled_execution_never_reaches_a_terminal_state(monkeypatch, tmp_path):
+    state, calls = armed_run(monkeypatch, tmp_path, wait=lambda name, *, deadline, **kw: None)
+    assert state["cancel_requested"] is True and state["state"] is None and state["disarmed"] is True
+    assert disarmed(calls) and launch.sbl.lock_decision(state).startswith("HELD")   # the lock stays held
+
+
+def test_the_disarm_runs_when_execute_failed_and_no_execution_was_found(monkeypatch, tmp_path):
+    state, calls = armed_run(monkeypatch, tmp_path, execute=launch.LaunchRefused("boom"),
+                             find=lambda job_name, before: None)
+    assert state["execution"] is None and state["disarmed"] is True and disarmed(calls)
+    assert launch.sbl.lock_decision(state).startswith("HELD")
+
+
+def test_the_disarm_runs_when_the_lookup_or_the_wait_raises(monkeypatch, tmp_path):
+    def raising_find(job_name, before):
+        raise RuntimeError("list failed")
+
+    state, calls = armed_run(monkeypatch, tmp_path, execute=launch.LaunchRefused("boom"), find=raising_find)
+    assert state["disarmed"] is True and disarmed(calls)
+
+    def raising_wait(name, *, deadline, **kw):
+        raise RuntimeError("describe exploded")
+
+    state, calls = armed_run(monkeypatch, tmp_path, wait=raising_wait)
+    assert state["disarmed"] is True and disarmed(calls) and "describe exploded" in state["error"]
+
+
+def test_a_poll_never_starts_when_its_describe_would_overrun_the_deadline():
+    # W12/W13: every describe may take its full timeout; the wait must still end by its deadline.
+    clock = {"t": 0.0}
+
+    def slow_describe(args, **kw):
+        clock["t"] += launch.DESCRIBE_TIMEOUT_SECONDS
+        return json.dumps({"status": {}})
+
+    launch_run = launch.run
+    try:
+        launch.run = slow_describe
+        for deadline in (launch.EXECUTION_DEADLINE_SECONDS, launch.CANCEL_POLL_SECONDS, 100, 0):
+            clock["t"] = 0.0
+            assert launch.wait_for_execution("x", deadline=deadline, monotonic=lambda: clock["t"],
+                                             sleep=lambda s: clock.__setitem__("t", clock["t"] + s)) is None
+            assert clock["t"] <= max(deadline, launch.DESCRIBE_TIMEOUT_SECONDS)
+    finally:
+        launch.run = launch_run
 
 
 def test_the_wait_gives_up_inside_its_deadline():

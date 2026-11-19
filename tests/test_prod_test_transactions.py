@@ -327,7 +327,7 @@ def test_answers_parse_with_heartbeat_newlines_errors_and_structured_content():
         "is_error": False, "data": {"session_id": "s1"}}
     assert job.parse_answer("/mcp", INTAKE_REFUSAL)["is_error"] is True
     assert job.parse_answer("/mcp", b'{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"m"}}') == {
-        "is_error": True, "data": {"error": {"code": -32601}}}
+        "is_error": True, "rpc_error": True, "data": {"error": {"code": -32601}}}
     assert job.parse_answer("/mcp", b'{"result":{"structuredContent":{"session_id":"s2"}}}')["data"] == {
         "session_id": "s2"}
     assert job.parse_answer(job.INVOKE, b"<html>") == {"unparsed": True}
@@ -449,6 +449,9 @@ def test_the_cancel_note_carries_no_answer_content():
     (200, mcp_answer({"error": {"code": "CHECKOUT_OUTCOME_UNKNOWN"}}, True)),
     (200, mcp_answer({"error": {}}, True)),                         # no code at all
     (500, mcp_answer({"error": {"code": "NO_MERCHANT_OFFER", "detail": {"reason": "market_not_priced"}}}, True)),
+    # V5-P3-1: a top-level JSON-RPC error is the transport failing, never the tool's named refusal (kills W4).
+    (200, b'{"jsonrpc":"2.0","id":1,"error":{"code":"INTERNAL_ERROR","message":"m"}}'),
+    (200, b'{"jsonrpc":"2.0","id":1,"error":{"code":"NO_MERCHANT_OFFER","message":"m"}}'),
 ])
 def test_a_create_whose_outcome_cannot_be_read_is_an_unknown_left_open(create_answer):
     fake = FakeGateway([create_answer])
@@ -466,6 +469,8 @@ def test_only_a_200_named_refusal_counts_as_nothing_created():
                            (200, {"is_error": True, "data": {"error": {"code": "UNEXPECTED_ERROR"}}}),
                            (200, {"is_error": False, "data": {}}), (200, {"unparsed": True}), (200, None)):
         assert not job.nothing_created(status, answer)
+    rpc = job.parse_answer("/mcp", b'{"jsonrpc":"2.0","id":1,"error":{"code":"NO_MERCHANT_OFFER"}}')
+    assert rpc["rpc_error"] is True and not job.nothing_created(200, rpc)
 
 
 def test_the_kernel_case_needs_the_flags_that_declare_market_on_mcp():

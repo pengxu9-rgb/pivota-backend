@@ -60,13 +60,15 @@ LOG_VIEW = "prod-test-transactions"
 WORK = Path(os.getenv("PROD_TEST_TXN_WORKDIR", "/workspace/prod-test-transactions"))
 TASK_TIMEOUT_SECONDS = 600
 # The run step has RUN_STEP_SECONDS (the yaml's `run` timeout). The wait is budgeted FROM THE STEP'S START, leaving
-# DISARM_RESERVE_SECONDS for cancel (60) + its terminal poll (CANCEL_POLL_SECONDS) + the disarm deploy (300), so a slow
-# gate or deploy can never push the disarm past the step's end and leave the keys mounted.
+# DISARM_RESERVE_SECONDS for the cancel call (60) + its terminal poll (CANCEL_POLL_SECONDS + one poll interval) + the
+# disarm deploy (300), so a slow gate or deploy can never push the disarm past the step's end and leave keys mounted.
+# A poll never starts unless its sleep AND its describe (DESCRIBE_TIMEOUT_SECONDS) still fit before its deadline.
 RUN_STEP_SECONDS = 2100
-EXECUTION_DEADLINE_SECONDS = 900
-CANCEL_POLL_SECONDS = 120
-DISARM_RESERVE_SECONDS = 60 + CANCEL_POLL_SECONDS + 300
+EXECUTION_DEADLINE_SECONDS = 840          # the task itself times out at 600 s
 EXECUTION_POLL_SECONDS = 15
+DESCRIBE_TIMEOUT_SECONDS = 60
+CANCEL_POLL_SECONDS = 120
+DISARM_RESERVE_SECONDS = 60 + CANCEL_POLL_SECONDS + EXECUTION_POLL_SECONDS + 300
 
 LaunchRefused = sbl.LaunchRefused
 require = sbl.require
@@ -266,13 +268,13 @@ def wait_for_execution(name: str, *, deadline: float = EXECUTION_DEADLINE_SECOND
     while True:
         try:
             execution = json.loads(run(["gcloud", "run", "jobs", "executions", "describe", name, "--project", PROJECT,
-                                        "--region", REGION, "--format", "json"], timeout=60))
+                                        "--region", REGION, "--format", "json"], timeout=DESCRIBE_TIMEOUT_SECONDS))
             state = sbl.execution_state(execution)
             if state:
                 return state
         except (LaunchRefused, subprocess.TimeoutExpired, ValueError):
             pass
-        if monotonic() - started + EXECUTION_POLL_SECONDS > deadline:
+        if monotonic() - started + EXECUTION_POLL_SECONDS + DESCRIBE_TIMEOUT_SECONDS > deadline:
             return None
         sleep(EXECUTION_POLL_SECONDS)
 
@@ -351,10 +353,10 @@ def cmd_run(args, *, monotonic=None) -> None:
         path.write_text(json.dumps(state))
         raise
     finally:
-        # Disarm once nothing new can start: execute never attempted, the execution is terminal, or it was cancelled
-        # (a running execution keeps what it mounted; the disarm stops any NEW one from mounting the keys).
-        if state["armed"] and (not state["execute_attempted"] or state["state"] is not None
-                               or state.get("cancel_requested")):
+        # ALWAYS disarm an armed job, on every exit path. A running execution keeps what it already mounted, so the
+        # disarm cannot disturb it; it only stops any NEW execution from mounting the keys. Whether the lock may be
+        # released is decided separately (sbl.lock_decision): an unidentified or non-terminal execution keeps it held.
+        if state["armed"]:
             try:
                 run(job_spec_args(**common, cases=[], key_version=1, targets_version=1, gate=None, armed=False))
                 state["disarmed"] = True
