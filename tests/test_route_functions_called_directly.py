@@ -21,6 +21,12 @@ nested in another function) with a FastAPI parameter default. Every reference to
 Anything else (the function stored, passed or returned as a value) could be called later with the defaults
 left in, and fails here. A call that splats `**kwargs` cannot be checked; each one is named below with why it
 is safe, and the list must match exactly.
+
+Known gaps, not handled (none exists in the repo today):
+  * a class-attribute alias (`class C: find = search`, then `self.find(...)`): the assignment is read as an alias
+    of the class body and `self.find` resolves to the class attribute, which is not a target;
+  * a `global` alias (`global find; find = search` in one function, `find(...)` in another);
+  * aliases are flow-insensitive: `find = search; find = print; find(q=...)` is reported (a false positive).
 """
 from __future__ import annotations
 
@@ -259,13 +265,15 @@ class _Scanner:
 
     @staticmethod
     def _own_nodes(body):
-        """Every node of this body, not descending into nested functions or classes."""
-        stack = list(body)
+        """Every node of this body in SOURCE order (depth first), not descending into nested functions or classes.
+
+        Source order matters: an alias chain (`g = f; find = g`) registers `g` before `find = g` is read."""
+        stack = list(reversed(body))
         while stack:
             node = stack.pop()
             yield node
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                stack.extend(ast.iter_child_nodes(node))
+                stack.extend(reversed(list(ast.iter_child_nodes(node))))
 
     def _visit(self, node, rel, scope, aliases, owner, cls) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -567,3 +575,25 @@ def test_fixture_an_alias_bound_inside_a_nested_block(tmp_path, monkeypatch, blo
     scan = _fixture(tmp_path, monkeypatch, {"routes/door.py": _DOOR + "async def caller(flag=True, ctx=None):\n" + block})
     assert [(m[2], m[3]) for m in scan.missing] == [("search", ["only_seeds"])], scan.missing
     assert scan.values == []
+
+
+@pytest.mark.parametrize("block", [
+    "    g = search\n    find = g\n    return await find(q='x')\n",
+    "    if flag:\n        g = search\n        find = g\n    return await find(q='x')\n",
+    "    g = search\n    if flag:\n        find = g\n    return await find(q='x')\n",
+], ids=["chain-top", "chain-nested", "chain-across"])
+def test_fixture_an_alias_chain_in_source_order(tmp_path, monkeypatch, block) -> None:
+    scan = _fixture(tmp_path, monkeypatch, {"routes/door.py": _DOOR + "async def caller(flag=True):\n" + block})
+    assert [(m[2], m[3]) for m in scan.missing] == [("search", ["only_seeds"])], scan.missing
+
+
+@pytest.mark.parametrize("source", [
+    _DOOR + "async def caller(x):\n    match x:\n        case 1:\n            find = search\n            return await find(q='x')\n",
+    _DOOR + "async def caller(ctx):\n    async with ctx:\n        find = search\n    return await find(q='x')\n",
+    _DOOR + "async def caller(it):\n    async for _ in it:\n        find = search\n    return await find(q='x')\n",
+    _DOOR + "async def caller():\n    try:\n        pass\n    finally:\n        find = search\n    return await find(q='x')\n",
+    _DOOR + "import os\nif os.environ.get('X'):\n    find = search\nasync def caller():\n    return await find(q='x')\n",
+], ids=["match-case", "async-with", "async-for", "try-finally", "module-if"])
+def test_fixture_an_alias_in_the_other_block_shapes(tmp_path, monkeypatch, source) -> None:
+    scan = _fixture(tmp_path, monkeypatch, {"routes/door.py": source})
+    assert [(m[2], m[3]) for m in scan.missing] == [("search", ["only_seeds"])], scan.missing
