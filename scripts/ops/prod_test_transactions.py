@@ -16,6 +16,15 @@ Inputs (set ONLY on the armed job by the launcher; the disarmed job has none of 
   PROD_TEST_TXN_RELEASE_COMMIT   must equal /app/.image_commit_sha
   /var/run/pivota-test-agent/key the test agent key, a Secret Manager file mount by version. Read once, kept in memory,
                                  sent only as the X-Agent-API-Key header, never logged, never hashed into output
+  /var/run/pivota-test-agent-user/key.pem
+                                 ONLY when a selected case needs an end user: the EC P-256 private key of the test issuer
+                                 registered to the test agent (federated binding). The job signs a 5-minute ES256
+                                 X-Agent-User-JWT per case (sub = the test buyer, acp_session_id = per run and case);
+                                 create, read back and cancel of one case carry the same token. Never logged.
+
+Storefront checkouts (`esc_...`) cannot be cancelled: the gateway refuses by design and the seller cart expires on its
+own. The owner ACCEPTED that on 2026-11-19 ("JWT, accept expiry"): such ids are reported under `expires_on_seller`,
+never cancel-called, and do not fail the run. Every other created checkout must read back canceled or it is LEFT OPEN.
 
 Output: TEXT lines `PROD_TEST_TXN_RESULT <base64 compact JSON>`: one `"kind": "case"` line per case
 {case, door, pass, expected, got, created, cancelled, left_open, error} and a final `"kind": "run"` line
@@ -64,9 +73,26 @@ ALLOWED_CALLS = {
 FORBIDDEN_MEMBERS = frozenset({"payment", "payment_method", "payment_token", "payment_handlers", "reap", "card",
                                "token", "credential", "cvv", "pan", "confirm", "submit", "order_id"})
 
-# A product the offers.resolve cases read (read-only). Filled in REVIEW with a connected TEST merchant's product id;
-# empty refuses every case that needs it, so an unreviewed run cannot pick its own target.
+USER_KEY_SECRET = "prod-test-agent-user-key"
+USER_KEY_MOUNT_DIR = "/var/run/pivota-test-agent-user"
+USER_KEY_FILE = "key.pem"
+USER_TOKEN_SECONDS = 300
+USER_SUBJECT = "ptt-test-buyer"
+
+# REVIEWED TARGETS. Each is filled in REVIEW (never at run time); empty refuses every case that needs it, so an
+# unreviewed run cannot pick its own target.
+# A product the offers.resolve cases read (read-only): a connected TEST merchant's product id.
 OFFERS_PRODUCT_ID = ""
+# The test issuer registered to the test agent (developer portal, agent_identity_issuers): its iss, aud and the kid of
+# the key in its published JWKS. Not secrets; the private key is USER_KEY_SECRET.
+USER_TOKEN_ISSUER = ""
+USER_TOKEN_AUDIENCE = ""
+USER_TOKEN_KID = ""
+# A connected TEST merchant (TEST_MERCHANT_IDS) product + variant: a kernel checkout that is cancelled.
+KERNEL_TEST_MERCHANT = {"merchant_id": "", "product_id": "", "variant_id": ""}
+# A LIVE US / USD Shopify storefront seller (merch_obs_...): its storefront carts are real carts on that store that
+# expire unpaid. Named here so the owner approves the store in review.
+STOREFRONT_SELLER = {"merchant_id": "", "product_id": "", "variant_id": ""}
 
 
 class CaseError(ValueError):
@@ -92,6 +118,8 @@ class Case:
     requires_flags: dict = field(default_factory=dict)   # gateway env name -> exact plain value
     needs: tuple = ()              # inputs that must be reviewed in before the case can run ("OFFERS_PRODUCT_ID")
     enabled: bool = True           # False: listed for review, refused by select_cases until decided
+    needs_user: bool = False       # carries a signed X-Agent-User-JWT (create/get/cancel are user_ref tools)
+    shadow_lookup: bool = False    # a US storefront create: the shadow catalog lookup runs (publish checks its log)
 
 
 def _offers(market_member: dict | None, outer: dict | None = None) -> dict:
@@ -99,6 +127,41 @@ def _offers(market_member: dict | None, outer: dict | None = None) -> dict:
     if market_member is not None:
         offers.update(market_member)
     return {"operation": "offers.resolve", "payload": {"offers": offers, **(outer or {})}, "metadata": {}}
+
+
+def _refused(code: str, reason: str) -> dict:
+    return {"is_error": True, "data.error.code": code, "data.error.detail.reason": reason}
+
+
+def _target(kind: str) -> dict:
+    return STOREFRONT_SELLER if kind == "storefront" else KERNEL_TEST_MERCHANT
+
+
+def _mcp_quote(kind: str, market: str | None) -> dict:
+    target = _target(kind)
+    arguments = {"quote": {"merchant_id": target["merchant_id"], "items": [
+        {"product_id": target["product_id"], "variant_id": target["variant_id"], "quantity": 1}]}}
+    if market is not None:
+        arguments["market"] = market
+    return arguments
+
+
+def _ucp_checkout(country: str | None) -> dict:
+    item = f"{STOREFRONT_SELLER['product_id']}::v::{STOREFRONT_SELLER['variant_id']}"
+    checkout = {"line_items": [{"item": {"id": item}, "quantity": 1}]}
+    if country is not None:
+        checkout["context"] = {"address_country": country}
+    return {"meta": {}, "checkout": checkout}
+
+
+STOREFRONT_FLAGS_MCP = {"AGENT_CHECKOUT_STRICT": "1", "AGENT_CHECKOUT_MCP_STOREFRONT_ESCALATION_ENABLED": "1",
+                        "AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1",
+                        "AGENT_CHECKOUT_UCP_MERCHANT_PRICING_ENABLED": "1", "SHOPIFY_CATALOG_ATTRIBUTION": "shadow"}
+STOREFRONT_FLAGS_UCP = {"AGENT_CHECKOUT_STRICT": "1", "AGENT_CHECKOUT_UCP_TOOL_DOOR_ENABLED": "1",
+                        "AGENT_CHECKOUT_UCP_ESCALATION_ENABLED": "1", "AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1",
+                        "AGENT_CHECKOUT_UCP_MERCHANT_PRICING_ENABLED": "1", "SHOPIFY_CATALOG_ATTRIBUTION": "shadow"}
+STOREFRONT_NEEDS = ("STOREFRONT_SELLER", "USER_TOKEN")
+KERNEL_NEEDS = ("KERNEL_TEST_MERCHANT", "USER_TOKEN")
 
 
 SERVED = {"error.code": None}
@@ -123,13 +186,47 @@ CASES: tuple[Case, ...] = (
          needs=("OFFERS_PRODUCT_ID",)),
     Case("OR-USA-beside-SG", "/agent/shop/v1/invoke", "read", "offers.resolve",
          _offers({"market": "USA"}, outer={"market": "SG"}), "USA+SG", SERVED, needs=("OFFERS_PRODUCT_ID",)),
-    # Paths 1-3 (UCP checkout currency, /mcp storefront cart with `market`, a store-cart create for the shadow catalog
-    # lookup) need an end-user identity (create/get/cancel are user_ref tools) and a decision on storefront carts,
-    # which cannot be cancelled. They are added once the owner decides; see docs/runbooks/prod_test_transactions.md.
+    # Path 2: /mcp create_checkout_session with `market` (step 6) on the storefront seller; and a kernel checkout on a
+    # connected test merchant, cancelled. Path 3: the US storefront creates run the shadow catalog lookup.
+    *[Case(cid, "/mcp", "checkout", "create_checkout_session", _mcp_quote(seller, market), label, expected,
+           requires_flags=flags, needs=needs, needs_user=True, shadow_lookup=shadow)
+      for cid, seller, market, label, expected, flags, needs, shadow in (
+          ("MCP-SF-US", "storefront", "US", "US", {"is_error": False, "data.status": "completes_on_seller_storefront",
+                                                   "data.currency": "USD", "data.amount_unit": "minor"},
+           STOREFRONT_FLAGS_MCP, STOREFRONT_NEEDS, True),
+          ("MCP-SF-SG", "storefront", "SG", "SG", _refused("NO_MERCHANT_OFFER", "seller_not_priced_in_market_currency"),
+           STOREFRONT_FLAGS_MCP, STOREFRONT_NEEDS, False),
+          ("MCP-SF-DE", "storefront", "DE", "DE", _refused("NO_MERCHANT_OFFER", "market_not_priced"),
+           STOREFRONT_FLAGS_MCP, STOREFRONT_NEEDS, False),
+          ("MCP-SF-none", "storefront", None, "none", _refused("QUOTE_REQUIRED", "market_required_for_seller_storefront"),
+           STOREFRONT_FLAGS_MCP, STOREFRONT_NEEDS, False),
+          ("MCP-SF-USA", "storefront", "USA", "USA", {"is_error": True, "data.error.code": "INVALID_ARGUMENTS"},
+           STOREFRONT_FLAGS_MCP, STOREFRONT_NEEDS, False),
+          ("MCP-K-US", "kernel", "US", "US", {"is_error": False, "data.status": "ready_for_payment",
+                                             "data.currency": "USD"},
+           {"AGENT_CHECKOUT_STRICT": "1"}, KERNEL_NEEDS, False),
+      )],
+    # Path 1: /ucp/mcp create_checkout, the currency rule (step 1) on the storefront seller.
+    *[Case(cid, "/ucp/mcp", "checkout", "create_checkout", _ucp_checkout(country), label, expected,
+           requires_flags=STOREFRONT_FLAGS_UCP, needs=STOREFRONT_NEEDS, needs_user=True, shadow_lookup=shadow)
+      for cid, country, label, expected, shadow in (
+          ("UCP-SF-US", "US", "US", {"is_error": False, "data.status": "requires_escalation", "data.currency": "USD"},
+           True),
+          ("UCP-SF-SG", "SG", "SG", _refused("NO_MERCHANT_OFFER", "seller_not_priced_in_market_currency"), False),
+          ("UCP-SF-DE", "DE", "DE", _refused("NO_MERCHANT_OFFER", "market_not_priced"), False),
+          ("UCP-SF-USA", "USA", "USA", _refused("QUOTE_REQUIRED", "ucp_market_invalid"), False),
+          ("UCP-SF-none", None, "none", {"is_error": False, "data.status": "requires_escalation",
+                                         "data.currency": "USD"}, False),
+      )],
 )
 
 GATEWAY_FLAG_NAMES = tuple(sorted({name for case in CASES for name in case.requires_flags}))
-_REVIEWED_INPUTS = {"OFFERS_PRODUCT_ID": lambda: OFFERS_PRODUCT_ID}
+_REVIEWED_INPUTS = {
+    "OFFERS_PRODUCT_ID": lambda: OFFERS_PRODUCT_ID,
+    "USER_TOKEN": lambda: USER_TOKEN_ISSUER and USER_TOKEN_AUDIENCE and USER_TOKEN_KID,
+    "KERNEL_TEST_MERCHANT": lambda: all(KERNEL_TEST_MERCHANT.values()),
+    "STOREFRONT_SELLER": lambda: all(STOREFRONT_SELLER.values()) and STOREFRONT_SELLER["merchant_id"].startswith("merch_obs_"),
+}
 
 
 def check_case_list(cases: tuple[Case, ...] = CASES) -> None:
@@ -199,7 +296,7 @@ class Transport:
         self._key, self._post, self._base, self._max = key, post or _httpx_post, base, max_calls
         self.calls = 0
 
-    def send(self, door: str, body: dict) -> tuple[int, Any]:
+    def send(self, door: str, body: dict, *, user_jwt: str | None = None) -> tuple[int, Any]:
         require(door in ALLOWED_CALLS, f"door {door} is not allowed")
         name = call_name(door, body)
         require(name in ALLOWED_CALLS[door], f"{name} on {door} is not an allowed call")
@@ -209,8 +306,12 @@ class Transport:
         self.calls += 1
         url = self._base + door
         require(urlsplit(url).hostname in ALLOWED_HOSTS, "host not allowed")
-        status, raw = self._post(url, {"X-Agent-API-Key": self._key, "Content-Type": "application/json",
-                                       "Accept": "application/json, text/event-stream"}, body, CALL_TIMEOUT_SECONDS)
+        headers = {"X-Agent-API-Key": self._key, "Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if user_jwt is not None:
+            require(door != "/agent/shop/v1/invoke", "the user token is sent only on the checkout doors")
+            headers["X-Agent-User-JWT"] = user_jwt
+        status, raw = self._post(url, headers, body, CALL_TIMEOUT_SECONDS)
         require(len(raw) <= MAX_BODY_BYTES, "answer too large")
         return status, parse_answer(door, raw)
 
@@ -264,6 +365,33 @@ def scrub(answer: Any, paths) -> dict:
 
 # ------------------------------------------------------------------ running the cases
 
+def user_session_id(run_id: str, case_id: str) -> str:
+    return f"ptt-{run_id}-{case_id}"
+
+
+def make_user_signer(private_pem: bytes, *, now: Callable[[], datetime]) -> Callable[[str, str], str]:
+    """A signer for the test issuer: (run_id, case_id) -> a 5-minute ES256 X-Agent-User-JWT. The gateway derives the
+    kernel user_ref from (iss, sub) and the session from acp_session_id, so one case's create, read back and cancel
+    share one buyer and one session, and two cases never share a session."""
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    require(USER_TOKEN_ISSUER and USER_TOKEN_AUDIENCE and USER_TOKEN_KID, "the test issuer has not been reviewed in")
+    key = load_pem_private_key(private_pem, password=None)
+    require(isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.name == "secp256r1",
+            "the test issuer key must be an EC P-256 private key")
+
+    def sign(run_id: str, case_id: str) -> str:
+        issued = int(now().timestamp())
+        claims = {"iss": USER_TOKEN_ISSUER, "aud": USER_TOKEN_AUDIENCE, "sub": USER_SUBJECT, "iat": issued,
+                  "nbf": issued, "exp": issued + USER_TOKEN_SECONDS,
+                  "acp_session_id": user_session_id(run_id, case_id)}
+        return jwt.encode(claims, key, algorithm="ES256", headers={"kid": USER_TOKEN_KID})
+
+    return sign
+
+
 def idempotency_key(run_id: str, case_id: str, step: str) -> str:
     return f"ptt-{run_id[:8]}-{case_id}-{step}"
 
@@ -290,19 +418,19 @@ CHECKOUT_DOORS = {
 STOREFRONT_PREFIX = "esc_"     # a stateless storefront checkout: the gateway refuses to cancel it by design
 
 
-def run_checkout(case: Case, transport: Transport, run_id: str, row: dict) -> None:
+def run_checkout(case: Case, transport: Transport, run_id: str, row: dict, user_jwt: str | None = None) -> None:
     """create -> read back -> ALWAYS cancel (kernel sessions) -> read back canceled. Updates `row` as it goes, so a
     failure at any step still reports what was created. A create that fails WITHOUT an answer may still have made a
     session the job cannot name: that is `left_open` as `unknown:<case>` and the run is not ok."""
     door = CHECKOUT_DOORS[case.door]
-    row.update(created=[], cancelled=[], left_open=[], got={})
+    row.update(created=[], cancelled=[], left_open=[], expires_on_seller=[], got={})
     arguments = json.loads(json.dumps(case.request))
     if case.door == "/mcp":
         arguments["idempotency_key"] = idempotency_key(run_id, case.case_id, "create")
     else:
         arguments.setdefault("meta", {})["idempotency-key"] = idempotency_key(run_id, case.case_id, "create")
     try:
-        status, answer = transport.send(case.door, mcp_body(case.call, arguments))
+        status, answer = transport.send(case.door, mcp_body(case.call, arguments), user_jwt=user_jwt)
     except Exception:
         row["left_open"] = [f"unknown:{case.case_id}"]
         raise
@@ -318,25 +446,32 @@ def run_checkout(case: Case, transport: Transport, run_id: str, row: dict) -> No
     row["left_open"] = [session_id]          # until the cancel is confirmed
     read_ok = False
     try:
-        rstatus, read = transport.send(case.door, mcp_body(door["get"], door["get_args"](session_id), 2))
+        rstatus, read = transport.send(case.door, mcp_body(door["get"], door["get_args"](session_id), 2),
+                                       user_jwt=user_jwt)
         got["read_back.status"] = dig(read, door["status"])
         read_ok = rstatus == 200 and got["read_back.status"] == dig(answer, door["status"])
     finally:
-        cancel_checkout(case, transport, run_id, session_id, row)
+        cancel_checkout(case, transport, run_id, session_id, row, user_jwt)
     row["pass"] = (status == 200 and all(got[p] == v for p, v in case.expected.items()) and read_ok
                    and not row["left_open"])
 
 
-def cancel_checkout(case: Case, transport: Transport, run_id: str, session_id: str, row: dict) -> None:
-    """Cancel through /mcp cancel_checkout_session (the kernel's one cancel), then confirm it reads back canceled."""
+def cancel_checkout(case: Case, transport: Transport, run_id: str, session_id: str, row: dict,
+                    user_jwt: str | None = None) -> None:
+    """Cancel through /mcp cancel_checkout_session (the kernel's one cancel), then confirm it reads back canceled.
+    A storefront checkout is never cancel-called: the owner accepted that its seller cart expires (2026-11-19)."""
     if session_id.startswith(STOREFRONT_PREFIX):
-        row["cancel_note"] = "storefront checkout: the gateway refuses to cancel it; the seller cart expires"
-        return                               # stays in left_open: reported, and the run is not ok
+        row["cancel_note"] = "storefront checkout: the gateway refuses to cancel it; the seller cart expires unpaid"
+        row["expires_on_seller"] = [session_id]
+        row["left_open"] = []
+        return
     try:
         cstatus, cancel = transport.send("/mcp", mcp_body("cancel_checkout_session", {
-            "idempotency_key": idempotency_key(run_id, case.case_id, "cancel"), "session_id": session_id}, 3))
+            "idempotency_key": idempotency_key(run_id, case.case_id, "cancel"), "session_id": session_id}, 3),
+            user_jwt=user_jwt)
         canceled = cstatus == 200 and dig(cancel, "data.status") == "canceled"
-        rstatus, read = transport.send("/mcp", mcp_body("get_checkout_session", {"session_id": session_id}, 4))
+        rstatus, read = transport.send("/mcp", mcp_body("get_checkout_session", {"session_id": session_id}, 4),
+                                       user_jwt=user_jwt)
         if canceled and rstatus == 200 and dig(read, "data.status") == "canceled":
             row["cancelled"] = [session_id]
             row["left_open"] = []
@@ -346,12 +481,17 @@ def cancel_checkout(case: Case, transport: Transport, run_id: str, session_id: s
         row["cancel_note"] = f"cancel failed: {type(error).__name__}: {str(error)[:150]}"
 
 
-def run_case(case: Case, transport: Transport, run_id: str) -> dict:
+def run_case(case: Case, transport: Transport, run_id: str, signer: Callable[[str, str], str] | None = None) -> dict:
     row = {"kind": "case", "case": case.case_id, "door": case.door, "call": case.call, "market": case.market,
-           "expected": case.expected, "error": None, "created": [], "cancelled": [], "left_open": [], "got": None}
+           "expected": case.expected, "error": None, "created": [], "cancelled": [], "left_open": [],
+           "expires_on_seller": [], "got": None}
     try:
         if case.kind == "checkout":
-            run_checkout(case, transport, run_id, row)
+            user_jwt = None
+            if case.needs_user:
+                require(signer is not None, f"{case.case_id} needs the test issuer key, which is not mounted")
+                user_jwt = signer(run_id, case.case_id)
+            run_checkout(case, transport, run_id, row, user_jwt)
             return row
         row.update(run_read(case, transport))
     except Exception as error:  # noqa: BLE001 - every failure is reported on the case, never swallowed
@@ -383,16 +523,18 @@ def parse_result_lines(text: str) -> tuple[list[dict], list[str]]:
     return rows, bad
 
 
-def run_all(cases: list[Case], transport: Transport, run_id: str, *, out: Callable[[dict], None] = emit) -> dict:
+def run_all(cases: list[Case], transport: Transport, run_id: str, *, out: Callable[[dict], None] = emit,
+            signer: Callable[[str, str], str] | None = None) -> dict:
     rows = []
     for case in cases:
-        row = run_case(case, transport, run_id)
+        row = run_case(case, transport, run_id, signer)
         rows.append(row)
         out(row)
     left_open = sorted({ref for r in rows for ref in r.get("left_open") or []})
     summary = {"kind": "run", "ok": bool(rows) and all(r["pass"] for r in rows) and not left_open,
                "cases": len(rows), "passed": sum(1 for r in rows if r["pass"]), "calls": transport.calls,
-               "left_open": left_open}
+               "left_open": left_open,
+               "expires_on_seller": sorted({ref for r in rows for ref in r.get("expires_on_seller") or []})}
     out(summary)
     return summary
 
@@ -440,9 +582,18 @@ def read_key(path: Path) -> str:
     return key
 
 
+def read_user_key(path: Path) -> bytes:
+    """The mounted test issuer private key (PEM). Never printed."""
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 4000, "the user key mount is not a small regular file")
+    pem = path.read_bytes()
+    require(pem.lstrip().startswith(b"-----BEGIN ") and b"PRIVATE KEY-----" in pem, "the user key mount is not a PEM key")
+    return pem
+
+
 def main(env: dict | None = None, *, now: Callable[[], datetime] | None = None,
          transport_factory: Callable[[str], Transport] | None = None, key_path: Path | None = None,
-         image_commit_path: Path = Path("/app/.image_commit_sha")) -> int:
+         user_key_path: Path | None = None, image_commit_path: Path = Path("/app/.image_commit_sha")) -> int:
     env = dict(os.environ if env is None else env)
     _EXECUTION["name"] = env.get("CLOUD_RUN_EXECUTION")
     now = now or (lambda: datetime.now(timezone.utc))
@@ -454,11 +605,14 @@ def main(env: dict | None = None, *, now: Callable[[], datetime] | None = None,
         key = read_key(key_path or Path(KEY_MOUNT_DIR) / KEY_FILE)
         transport = (transport_factory or Transport)(key)
         del key
+        signer = None
+        if any(case.needs_user for case in cases):
+            signer = make_user_signer(read_user_key(user_key_path or Path(USER_KEY_MOUNT_DIR) / USER_KEY_FILE), now=now)
     except (CaseError, OSError, ValueError) as error:
-        emit({"kind": "run", "ok": False, "cases": 0, "passed": 0, "calls": 0, "left_open": [],
+        emit({"kind": "run", "ok": False, "cases": 0, "passed": 0, "calls": 0, "left_open": [], "expires_on_seller": [],
               "refused": f"{type(error).__name__}: {str(error)[:300]}"})
         return 3
-    summary = run_all(cases, transport, run_id)
+    summary = run_all(cases, transport, run_id, signer=signer)
     return 0 if summary["ok"] else 1
 
 

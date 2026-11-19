@@ -45,6 +45,8 @@ SERVICE_ACCOUNT = "sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com"
 KEY_SECRET = job.KEY_SECRET
 KEY_MOUNT_DIR = job.KEY_MOUNT_DIR
 KEY_FILE = job.KEY_FILE
+USER_KEY_SECRET = job.USER_KEY_SECRET
+SHADOW_EVENT = "ucp_shopify_catalog_attribution"
 LOCK_OBJECT = "prod-test-transactions.lock"
 RECEIPTS_PREFIX = "prod-test-transactions"
 CONFIG_PATH = "infra/gcp/cloudbuild.prod_test_transactions.yaml"
@@ -90,10 +92,15 @@ def gateway_flags(service: dict) -> tuple[str, dict]:
     return revision, {name: env.get(name) for name in job.GATEWAY_FLAG_NAMES}
 
 
+def needs_user_key(cases: list[str]) -> bool:
+    return any(c.needs_user for c in job.select_cases(",".join(cases))) if cases else False
+
+
 def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: int, gate: dict | None,
-                  armed: bool) -> list[str]:
-    """`gcloud run jobs deploy` args. Armed: the key (by version), the gate, the case ids and the run id.
-    Disarmed: the same job with NO key mount (--clear-secrets), no gate, no cases: a re-execution refuses at once."""
+                  armed: bool, user_key_version: int | None = None) -> list[str]:
+    """`gcloud run jobs deploy` args. Armed: the key (by version), the test issuer key (by version, ONLY when a
+    selected case needs an end user), the gate, the case ids and the run id. Disarmed: the same job with NO secret
+    mount (--clear-secrets), no gate, no cases: a re-execution refuses at once."""
     require(re.fullmatch(r"[0-9a-f]{40}", release) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest),
             "release must be a commit and digest a sha256 digest")
     require((gate is not None) == armed, "an armed job takes the gate; a disarmed one none")
@@ -103,7 +110,13 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
         job.select_cases(",".join(cases))  # the same validation the job applies
         env.update({job.ENV + "ARMED": "1", job.ENV + "CASES": ",".join(cases), job.ENV + "RUN_ID": build_id(),
                     job.ENV + "GATE": json.dumps(gate, separators=(",", ":"))})
-        secrets = ["--set-secrets", f"{KEY_MOUNT_DIR}/{KEY_FILE}={KEY_SECRET}:{key_version}"]
+        mounts = [f"{KEY_MOUNT_DIR}/{KEY_FILE}={KEY_SECRET}:{key_version}"]
+        if needs_user_key(cases):
+            require(user_key_version is not None, "a selected case needs the test issuer key: pass _USER_KEY_VERSION")
+            mounts.append(f"{job.USER_KEY_MOUNT_DIR}/{job.USER_KEY_FILE}={USER_KEY_SECRET}:{user_key_version}")
+        else:
+            require(user_key_version is None, "no selected case needs the test issuer key: do not mount it")
+        secrets = ["--set-secrets", ",".join(mounts)]
     else:
         secrets = ["--clear-secrets"]
     # Egress through the default subnet and pivota-nat: every call leaves from the one reserved prod IP, so the
@@ -119,21 +132,41 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
 
 
-def summarise(rows: list[dict], *, run_state: dict, bad_lines: list[str], lock: str, cases: list[str]) -> dict:
+def shadow_check(case_rows: list[dict], lines: list[dict] | None) -> dict | None:
+    """Path 3: every passed US storefront create ran the shadow catalog lookup. One gateway log line per passed
+    shadow case, every line mode=shadow and sent=false (shadow never changes the cart). None: no such case passed."""
+    wanted = [r for r in case_rows if r.get("shadow_lookup") and r.get("pass") is True]
+    if not wanted:
+        return None
+    if lines is None:
+        return {"pass": False, "wanted": len(wanted), "lines": None, "error": "the gateway log could not be read"}
+    shadow = [line for line in lines if line.get("mode") == "shadow"]
+    ok = len(shadow) >= len(wanted) and len(shadow) == len(lines) and all(line.get("sent") is False for line in lines)
+    return {"pass": ok, "wanted": len(wanted), "lines": len(lines),
+            "reasons": sorted({str(line.get("reason")) for line in lines}),
+            "sent_true": sum(1 for line in lines if line.get("sent") is not False)}
+
+
+def summarise(rows: list[dict], *, run_state: dict, bad_lines: list[str], lock: str, cases: list[str],
+              shadow: dict | None = None) -> dict:
     """The terminal result.json. `ok` only for a terminal execution whose ONE run line says ok, with one line per
-    selected case, every case passed and nothing left open."""
+    selected case, every case passed, nothing left open and (when a US storefront create passed) the shadow lookup
+    logged. Storefront carts that expire on the seller are listed, never a failure (owner decision 2026-11-19)."""
     run_rows = [r for r in rows if r.get("kind") == "run"]
     case_rows = [r for r in rows if r.get("kind") == "case"]
     line = run_rows[0] if len(run_rows) == 1 else None
     left_open = sorted({ref for r in case_rows for ref in (r.get("left_open") or [])})
     ok = (bool(line) and line.get("ok") is True and run_state.get("state") == "EXECUTION_SUCCEEDED" and not bad_lines
           and sorted(r.get("case") for r in case_rows) == sorted(cases)
-          and all(r.get("pass") is True for r in case_rows) and not left_open)
+          and all(r.get("pass") is True for r in case_rows) and not left_open
+          and (shadow is None or shadow.get("pass") is True))
     return {"ok": ok, "execution": run_state.get("execution"), "execution_state": run_state.get("state"),
             "run_error": run_state.get("error"), "run": line, "run_lines": len(run_rows), "bad_lines": bad_lines,
             "cases": [{k: r.get(k) for k in ("case", "pass", "expected", "got", "created", "cancelled", "left_open",
-                                             "error")} for r in case_rows],
-            "left_open": left_open, "lock": lock, "written_at": datetime.now(timezone.utc).isoformat()}
+                                             "expires_on_seller", "error")} for r in case_rows],
+            "left_open": left_open,
+            "expires_on_seller": sorted({ref for r in case_rows for ref in (r.get("expires_on_seller") or [])}),
+            "shadow_lookup": shadow, "lock": lock, "written_at": datetime.now(timezone.utc).isoformat()}
 
 
 # ------------------------------------------------------------------ subcommands (gcloud)
@@ -189,6 +222,9 @@ def cmd_run(args) -> None:
         require((WORK / "gateway.json").exists(), "run needs the gateway step's reading")
         cases = [c.case_id for c in job.select_cases(args.cases)]
         key_version = parse_key_version(args.key_version)
+        user_key_version = parse_key_version(args.user_key_version) if needs_user_key(cases) else None
+        require(needs_user_key(cases) or not args.user_key_version,
+                "no selected case needs the test issuer key: leave _USER_KEY_VERSION empty")
         parse_go_reference(args.go_reference)
         gate_run = subprocess.run([sys.executable, str(Path(args.scripts) / "ops" / "oneoff_gate.py")],
                                   capture_output=True, text=True, timeout=420, check=False)
@@ -200,12 +236,13 @@ def cmd_run(args) -> None:
         state["executions_pre_arm"] = sorted(r["metadata"]["name"] for r in pre_arm)
         state["armed"] = True          # before the deploy: a deploy that fails half-way still gets disarmed
         path.write_text(json.dumps(state))
-        run(job_spec_args(**common, cases=cases, key_version=key_version, gate=gate, armed=True))
+        run(job_spec_args(**common, cases=cases, key_version=key_version, gate=gate, armed=True,
+                          user_key_version=user_key_version))
         rows = sbl.list_executions(JOB_NAME)
         before = sorted(r["metadata"]["name"] for r in rows)
         require(before == state["executions_pre_arm"] and not sbl.unfinished(rows),
                 "an execution started while the job was being armed")
-        state.update(execute_attempted=True, executions_before=before)
+        state.update(execute_attempted=True, executions_before=before, started_at=datetime.now(timezone.utc).isoformat())
         path.write_text(json.dumps(state))
         try:
             out = run(["gcloud", "run", "jobs", "execute", JOB_NAME, "--project", PROJECT, "--region", REGION,
@@ -221,6 +258,7 @@ def cmd_run(args) -> None:
                     "execute failed and exactly one execution since arming could not be found: lock stays held")
         path.write_text(json.dumps(state))
         state["state"] = sbl.wait_for_execution(state["execution"])
+        state["finished_at"] = datetime.now(timezone.utc).isoformat()
         path.write_text(json.dumps(state))
         require(state["state"] is not None, "the execution did not reach a terminal state before the deadline")
     except Exception as error:  # noqa: BLE001 - publish reads run.json whatever happened
@@ -261,6 +299,23 @@ def read_log(execution: str, *, sleep=None, monotonic=None) -> tuple[str, str | 
         sleep(sbl.LOG_POLL_SECONDS)
 
 
+def read_shadow_lines(started_at: str, finished_at: str) -> list[dict] | None:
+    """The gateway's shadow catalog lookup lines in the run's window (plus 3 min: they are written after the lookup
+    settles). Only the fields the check reads; None when the log cannot be read."""
+    from datetime import timedelta
+
+    try:
+        end = (datetime.fromisoformat(finished_at) + timedelta(minutes=3)).isoformat()
+        text = run(["gcloud", "logging", "read",
+                    f'resource.type="cloud_run_revision" AND resource.labels.service_name="gateway" AND '
+                    f'jsonPayload.event="{SHADOW_EVENT}" AND timestamp>="{started_at}" AND timestamp<="{end}"',
+                    "--project", PROJECT, "--limit", "200", "--format", "json"], timeout=120)
+        return [{k: (e.get("jsonPayload") or {}).get(k) for k in ("mode", "sent", "reason", "tracked")}
+                for e in json.loads(text or "[]")]
+    except (LaunchRefused, subprocess.TimeoutExpired, ValueError, TypeError):
+        return None
+
+
 def put(prefix: str, name: str, content: str) -> None:
     (WORK / name).write_text(content)
     run(["gcloud", "storage", "cp", "--if-generation-match=0", str(WORK / name), f"{prefix}/{name}"])
@@ -292,7 +347,14 @@ def cmd_publish(args) -> None:
         if others:
             held = f"HELD: a FOREIGN execution of this job ran during the run: {', '.join(others)}"
     lock = held or "to be released after result.json (outcome in lock.json)"
-    result = summarise(rows, run_state=state, bad_lines=bad, lock=lock, cases=cases)
+    case_rows = [dict(r, shadow_lookup=any(c.shadow_lookup for c in job.CASES if c.case_id == r.get("case")))
+                 for r in rows if r.get("kind") == "case"]
+    shadow = None
+    if any(r["shadow_lookup"] and r.get("pass") is True for r in case_rows):
+        lines = (read_shadow_lines(state["started_at"], state["finished_at"])
+                 if state.get("started_at") and state.get("finished_at") else None)
+        shadow = shadow_check(case_rows, lines)
+    result = summarise(rows, run_state=state, bad_lines=bad, lock=lock, cases=cases, shadow=shadow)
     if (state.get("armed") and state.get("disarmed") is not True) or unsure or (
             held and held.startswith(("HELD: a FOREIGN", "HELD: the execute call failed"))):
         result["ok"] = False
@@ -316,7 +378,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("config", "gateway", "lock", "run", "publish"))
     parser.add_argument("--scripts", default="/workspace/release/scripts")
-    for name in ("release", "digest", "config-sha256", "cases", "key-version", "go-reference"):
+    for name in ("release", "digest", "config-sha256", "cases", "key-version", "user-key-version", "go-reference"):
         parser.add_argument("--" + name, default="")
     args = parser.parse_args(argv)
     WORK.mkdir(parents=True, exist_ok=True)

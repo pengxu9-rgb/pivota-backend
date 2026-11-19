@@ -60,6 +60,44 @@ def reviewed_product(monkeypatch):
     return PRODUCT
 
 
+SELLER = {"merchant_id": "merch_obs_reviewed_seller", "product_id": "prod_sf_1", "variant_id": "var_sf_1"}
+KERNEL = {"merchant_id": "merch_test_reviewed", "product_id": "prod_k_1", "variant_id": "var_k_1"}
+ISSUER, AUDIENCE, KID = "https://test-issuer.example/ptt", "pivota-gateway-test", "ptt-key-1"
+
+
+def review_everything(monkeypatch):
+    """Fill every reviewed target and rebuild the case requests the way a reviewed release would have them."""
+    monkeypatch.setattr(job, "OFFERS_PRODUCT_ID", PRODUCT)
+    monkeypatch.setattr(job, "STOREFRONT_SELLER", dict(SELLER))
+    monkeypatch.setattr(job, "KERNEL_TEST_MERCHANT", dict(KERNEL))
+    monkeypatch.setattr(job, "USER_TOKEN_ISSUER", ISSUER)
+    monkeypatch.setattr(job, "USER_TOKEN_AUDIENCE", AUDIENCE)
+    monkeypatch.setattr(job, "USER_TOKEN_KID", KID)
+    rebuilt = []
+    for case in job.CASES:
+        request = json.loads(json.dumps(case.request))
+        if case.door == "/agent/shop/v1/invoke":
+            request["payload"]["offers"]["product"]["product_id"] = PRODUCT
+        elif case.door == "/mcp":
+            target = SELLER if case.case_id.startswith("MCP-SF") else KERNEL
+            request["quote"] = {"merchant_id": target["merchant_id"], "items": [
+                {"product_id": target["product_id"], "variant_id": target["variant_id"], "quantity": 1}]}
+        else:
+            request["checkout"]["line_items"][0]["item"]["id"] = f"{SELLER['product_id']}::v::{SELLER['variant_id']}"
+        rebuilt.append(job.Case(**{**case.__dict__, "request": request}))
+    monkeypatch.setattr(job, "CASES", tuple(rebuilt))
+
+
+def ec_key_pem():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption())
+    return key, pem
+
+
 # ------------------------------------------------------------------ the case list
 
 def test_case_list_is_valid_and_every_case_states_its_expected_outcome():
@@ -84,6 +122,9 @@ def test_selection_refuses_unknown_repeated_disabled_and_unreviewed_cases(monkey
         job.select_cases("OR-US")                          # the product id has not been reviewed in
     monkeypatch.setattr(job, "OFFERS_PRODUCT_ID", PRODUCT)
     assert [c.case_id for c in job.select_cases("OR-US,OR-DE")] == ["OR-US", "OR-DE"]
+    with pytest.raises(job.CaseError, match="needs"):
+        job.select_cases("all")                            # `all` includes checkout cases whose targets are unreviewed
+    review_everything(monkeypatch)
     assert len(job.select_cases("all")) == len([c for c in job.CASES if c.enabled])
     for raw, message in (("", "no cases"), ("OR-US,OR-US", "repeats"), ("OR-NOPE", "unknown case")):
         with pytest.raises(job.CaseError, match=message):
@@ -209,7 +250,8 @@ def test_a_non_200_or_a_transport_error_fails_the_case_and_the_run(reviewed_prod
     summary = job.run_all(cases, job.Transport(KEY, post=fake), RUN_ID, out=rows.append)
     assert [r["pass"] for r in rows[:2]] == [False, False]
     assert rows[1]["error"].startswith("TimeoutError")
-    assert summary == {"kind": "run", "ok": False, "cases": 2, "passed": 0, "calls": 2, "left_open": []}
+    assert summary == {"kind": "run", "ok": False, "cases": 2, "passed": 0, "calls": 2, "left_open": [],
+                       "expires_on_seller": []}
 
 
 # ------------------------------------------------------------------ checkout cases: cancel ALWAYS
@@ -295,14 +337,17 @@ def test_a_designed_refusal_creates_nothing_and_passes_on_its_reason():
     assert row["pass"] is True and row["created"] == [] and row["left_open"] == [] and len(fake.calls) == 1
 
 
-def test_a_storefront_checkout_is_never_cancel_called_and_stays_reported_left_open():
+def test_a_storefront_checkout_is_never_cancel_called_and_is_reported_as_expiring():
+    # The owner accepted on 2026-11-19 that a storefront cart expires on the seller: reported, never cancel-called.
     fake = FakeGateway([(200, mcp_answer({"session_id": "esc_abc", "status": "completes_on_seller_storefront"})),
                         (200, mcp_answer({"session_id": "esc_abc", "status": "completes_on_seller_storefront"}))])
     rows = []
     summary = job.run_all([checkout_case(**{"data.status": "completes_on_seller_storefront"})],
                           job.Transport(KEY, post=fake), RUN_ID, out=rows.append)
-    assert len(fake.calls) == 2 and rows[0]["left_open"] == ["esc_abc"] and "expires" in rows[0]["cancel_note"]
-    assert summary["ok"] is False
+    assert [c[2]["params"]["name"] for c in fake.calls] == ["create_checkout_session", "get_checkout_session"]
+    assert rows[0]["pass"] is True and rows[0]["left_open"] == [] and rows[0]["expires_on_seller"] == ["esc_abc"]
+    assert "expires" in rows[0]["cancel_note"]
+    assert summary["ok"] is True and summary["expires_on_seller"] == ["esc_abc"]
 
 
 # ------------------------------------------------------------------ the job's preconditions and output
@@ -357,7 +402,7 @@ def test_main_runs_the_selected_cases_and_never_prints_the_key(reviewed_product,
     assert code == 0 and len(fake.calls) == 2
     assert [r["kind"] for r in rows] == ["case", "case", "run"]
     assert rows[-1] == {"kind": "run", "ok": True, "cases": 2, "passed": 2, "calls": 2, "left_open": [],
-                        "scope": job.JOB_NAME, "execution": "prod-test-transactions-abc12"}
+                        "expires_on_seller": [], "scope": job.JOB_NAME, "execution": "prod-test-transactions-abc12"}
     assert KEY not in out and KEY[3:20] not in base64.b64decode(out.split(job.PREFIX)[1].split()[0]).decode()
     for row in rows[:2]:
         assert KEY not in json.dumps(row)
@@ -376,3 +421,130 @@ def test_main_exits_nonzero_when_a_case_fails(reviewed_product, tmp_path, capsys
     code, rows, _, _ = run_main(tmp_path, capsys, armed_env(), [
         (200, json.dumps(SERVED_ANSWER).encode()), (200, json.dumps(SERVED_ANSWER).encode())])
     assert code == 1 and rows[-1]["ok"] is False and rows[-1]["passed"] == 1
+
+
+# ------------------------------------------------------------------ checkout cases (paths 1-3) and the user token
+
+def test_checkout_cases_need_every_reviewed_target(monkeypatch):
+    monkeypatch.setattr(job, "OFFERS_PRODUCT_ID", PRODUCT)
+    for case_id, need in (("MCP-SF-US", "STOREFRONT_SELLER"), ("MCP-K-US", "KERNEL_TEST_MERCHANT"),
+                          ("UCP-SF-SG", "STOREFRONT_SELLER")):
+        with pytest.raises(job.CaseError, match=need):
+            job.select_cases(case_id)
+    review_everything(monkeypatch)
+    monkeypatch.setattr(job, "USER_TOKEN_KID", "")
+    with pytest.raises(job.CaseError, match="USER_TOKEN"):
+        job.select_cases("MCP-K-US")
+    review_everything(monkeypatch)
+    monkeypatch.setattr(job, "STOREFRONT_SELLER", {**SELLER, "merchant_id": "merch_connected_live"})
+    with pytest.raises(job.CaseError, match="STOREFRONT_SELLER"):
+        job.select_cases("MCP-SF-US")                       # a storefront target must be an observed seller
+
+
+def test_checkout_case_requests_carry_the_market_where_each_door_reads_it(monkeypatch):
+    review_everything(monkeypatch)
+    by_id = {c.case_id: c for c in job.select_cases("all")}
+    assert by_id["MCP-SF-SG"].request["market"] == "SG" and "market" not in by_id["MCP-SF-none"].request
+    assert by_id["MCP-SF-USA"].request["market"] == "USA"
+    assert by_id["MCP-K-US"].request["quote"]["merchant_id"] == KERNEL["merchant_id"]
+    assert by_id["UCP-SF-DE"].request["checkout"]["context"] == {"address_country": "DE"}
+    assert "context" not in by_id["UCP-SF-none"].request["checkout"]
+    assert by_id["UCP-SF-US"].request["checkout"]["line_items"][0]["item"]["id"] == "prod_sf_1::v::var_sf_1"
+    assert {c.case_id for c in by_id.values() if c.shadow_lookup} == {"MCP-SF-US", "UCP-SF-US"}
+    for case in by_id.values():
+        job.forbidden_members(case.request)
+        assert case.needs_user is (case.kind == "checkout")
+        assert "buyer" not in json.dumps(case.request) and "email" not in json.dumps(case.request)
+
+
+def test_storefront_cases_refuse_unless_attribution_is_still_shadow(monkeypatch):
+    review_everything(monkeypatch)
+    cases = job.select_cases("MCP-SF-US,UCP-SF-US")
+    live = {"AGENT_CHECKOUT_STRICT": "1", "AGENT_CHECKOUT_MCP_STOREFRONT_ESCALATION_ENABLED": "1",
+            "AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1", "AGENT_CHECKOUT_UCP_MERCHANT_PRICING_ENABLED": "1",
+            "AGENT_CHECKOUT_UCP_TOOL_DOOR_ENABLED": "1", "AGENT_CHECKOUT_UCP_ESCALATION_ENABLED": "1",
+            "SHOPIFY_CATALOG_ATTRIBUTION": "shadow"}
+    job.require_flags(cases, live)
+    for name, value in (("SHOPIFY_CATALOG_ATTRIBUTION", "enforce"), ("AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET", None)):
+        with pytest.raises(job.CaseError):
+            job.require_flags(cases, {**live, name: value})
+
+
+def test_the_user_token_verifies_like_the_gateway_checks_it(monkeypatch):
+    import jwt
+
+    review_everything(monkeypatch)
+    key, pem = ec_key_pem()
+    sign = job.make_user_signer(pem, now=lambda: NOW)
+    token = sign(RUN_ID, "MCP-K-US")
+    assert jwt.get_unverified_header(token) == {"alg": "ES256", "kid": KID, "typ": "JWT"}
+    claims = jwt.decode(token, key.public_key(), algorithms=["ES256"], audience=AUDIENCE, issuer=ISSUER,
+                        options={"verify_exp": False})
+    assert claims == {"iss": ISSUER, "aud": AUDIENCE, "sub": "ptt-test-buyer", "iat": int(NOW.timestamp()),
+                      "nbf": int(NOW.timestamp()), "exp": int(NOW.timestamp()) + 300,
+                      "acp_session_id": f"ptt-{RUN_ID}-MCP-K-US"}
+    assert sign(RUN_ID, "MCP-SF-US") != token                # a session per case
+
+
+def test_the_signer_refuses_a_non_p256_key_and_an_unreviewed_issuer(monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    review_everything(monkeypatch)
+    other = ec.generate_private_key(ec.SECP384R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    with pytest.raises(job.CaseError, match="P-256"):
+        job.make_user_signer(other, now=lambda: NOW)
+    monkeypatch.setattr(job, "USER_TOKEN_ISSUER", "")
+    with pytest.raises(job.CaseError, match="issuer"):
+        job.make_user_signer(ec_key_pem()[1], now=lambda: NOW)
+
+
+def test_the_user_token_rides_every_step_of_a_checkout_and_never_an_invoke_call():
+    fake = FakeGateway([(200, mcp_answer({"session_id": "cs_7", "status": "ready_for_payment"})),
+                        (200, mcp_answer({"session_id": "cs_7", "status": "ready_for_payment"})),
+                        (200, mcp_answer({"session_id": "cs_7", "status": "canceled"})),
+                        (200, mcp_answer({"session_id": "cs_7", "status": "canceled"}))])
+    case = job.Case(**{**checkout_case().__dict__, "needs_user": True})
+    row = job.run_case(case, job.Transport(KEY, post=fake), RUN_ID, signer=lambda run, cid: f"tok-{cid}")
+    assert row["pass"] is True
+    assert [c[1].get("X-Agent-User-JWT") for c in fake.calls] == ["tok-CO-1"] * 4
+    transport = job.Transport(KEY, post=FakeGateway([]))
+    with pytest.raises(job.CaseError, match="only on the checkout doors"):
+        transport.send("/agent/shop/v1/invoke", {"operation": "offers.resolve", "payload": {}}, user_jwt="t")
+
+
+def test_a_checkout_case_without_the_mounted_issuer_key_fails_before_any_call():
+    fake = FakeGateway([])
+    case = job.Case(**{**checkout_case().__dict__, "needs_user": True})
+    row = job.run_case(case, job.Transport(KEY, post=fake), RUN_ID, signer=None)
+    assert row["pass"] is False and "issuer key" in row["error"] and fake.calls == []
+
+
+def test_main_signs_with_the_mounted_issuer_key_and_never_prints_it(monkeypatch, tmp_path, capsys):
+    review_everything(monkeypatch)
+    _, pem = ec_key_pem()
+    user_key = tmp_path / "key.pem"
+    user_key.write_bytes(pem)
+    commit = tmp_path / "commit"
+    commit.write_text(RELEASE)
+    key_path = tmp_path / "key"
+    key_path.write_text(KEY)
+    fake = FakeGateway([(200, mcp_answer({"error": {"code": "NO_MERCHANT_OFFER",
+                                                    "detail": {"reason": "market_not_priced"}}}, True))])
+    code = job.main(armed_env(**{job.ENV + "CASES": "MCP-SF-DE"}), now=lambda: NOW, key_path=key_path,
+                    user_key_path=user_key, image_commit_path=commit,
+                    transport_factory=lambda k: job.Transport(k, post=fake))
+    out = capsys.readouterr().out
+    rows, _ = job.parse_result_lines(out)
+    assert code == 0 and rows[-1]["ok"] is True and rows[0]["created"] == []
+    token = fake.calls[0][1]["X-Agent-User-JWT"]
+    decoded = "".join(json.dumps(r) for r in rows)
+    for secret in (KEY, token, pem.decode()):
+        assert secret not in out and secret not in decoded
+    missing = tmp_path / "absent.pem"
+    code = job.main(armed_env(**{job.ENV + "CASES": "MCP-SF-DE"}), now=lambda: NOW, key_path=key_path,
+                    user_key_path=missing, image_commit_path=commit,
+                    transport_factory=lambda k: job.Transport(k, post=FakeGateway([])))
+    rows, _ = job.parse_result_lines(capsys.readouterr().out)
+    assert code == 3 and rows[0]["ok"] is False

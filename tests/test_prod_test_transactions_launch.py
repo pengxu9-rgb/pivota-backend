@@ -49,7 +49,7 @@ def test_config_must_be_the_release_copy_and_parses():
                                                    "digest-is-the-release-tag", "gateway", "lock", "run", "publish"]
     assert [s for s in config["steps"] if s.get("allowFailure")] == [config["steps"][5]]
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
-                                            "_GO_REFERENCE"}
+                                            "_USER_KEY_VERSION", "_GO_REFERENCE"}
 
 
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
@@ -180,3 +180,53 @@ def test_publish_keeps_the_lock_while_the_job_may_still_be_armed(monkeypatch, tm
     result = json.loads(written["result.json"])
     assert result["ok"] is False and result["job_armed"] is True and result["lock"].startswith("HELD")
     assert "lock.json" not in written
+
+
+# ------------------------------------------------------------------ checkout runs: the issuer key and the shadow check
+
+@pytest.fixture
+def reviewed(monkeypatch):
+    from tests.test_prod_test_transactions import review_everything
+
+    review_everything(monkeypatch)
+
+
+def test_the_issuer_key_is_mounted_only_when_a_selected_case_needs_an_end_user(reviewed):
+    args = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["MCP-K-US", "OR-DE"], key_version=4,
+                                gate=GATE, armed=True, user_key_version=2)
+    assert flag(args, "--set-secrets") == ("/var/run/pivota-test-agent/key=prod-test-agent-key:4,"
+                                           "/var/run/pivota-test-agent-user/key.pem=prod-test-agent-user-key:2")
+    with pytest.raises(launch.LaunchRefused, match="_USER_KEY_VERSION"):
+        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["MCP-K-US"], key_version=4, gate=GATE, armed=True)
+    with pytest.raises(launch.LaunchRefused, match="do not mount"):
+        launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=["OR-DE"], key_version=4, gate=GATE, armed=True,
+                             user_key_version=2)
+    disarmed = launch.job_spec_args(release=RELEASE, digest=DIGEST, cases=[], key_version=1, gate=None, armed=False)
+    assert "--clear-secrets" in disarmed and "prod-test-agent-user-key" not in " ".join(disarmed)
+
+
+def case_row(case, *, passes=True, shadow=False, expires=()):
+    return {"kind": "case", "case": case, "pass": passes, "left_open": [], "expires_on_seller": list(expires),
+            "shadow_lookup": shadow}
+
+
+def test_shadow_check_wants_one_shadow_line_per_passed_us_storefront_create():
+    rows = [case_row("MCP-SF-US", shadow=True), case_row("UCP-SF-US", shadow=True), case_row("MCP-SF-DE")]
+    line = {"mode": "shadow", "sent": False, "reason": "skipped:no_variant", "tracked": 0}
+    assert launch.shadow_check(rows, [line, line])["pass"] is True
+    assert launch.shadow_check(rows, [line])["pass"] is False                          # one create left no line
+    assert launch.shadow_check(rows, [line, {**line, "sent": True}])["pass"] is False  # shadow must never send
+    assert launch.shadow_check(rows, [line, {**line, "mode": "enforce"}])["pass"] is False
+    assert launch.shadow_check(rows, None)["pass"] is False
+    assert launch.shadow_check([case_row("MCP-SF-US", passes=False, shadow=True)], []) is None
+
+
+def test_expiring_storefront_carts_are_listed_and_do_not_fail_the_run_but_a_failed_shadow_check_does():
+    rows = [case_row("MCP-SF-US", shadow=True, expires=["esc_1"]), case_row("MCP-K-US"),
+            {"kind": "run", "ok": True}]
+    result = launch.summarise(rows, run_state=DONE, bad_lines=[], lock="l", cases=["MCP-SF-US", "MCP-K-US"],
+                              shadow={"pass": True})
+    assert result["ok"] is True and result["expires_on_seller"] == ["esc_1"] and result["left_open"] == []
+    result = launch.summarise(rows, run_state=DONE, bad_lines=[], lock="l", cases=["MCP-SF-US", "MCP-K-US"],
+                              shadow={"pass": False})
+    assert result["ok"] is False

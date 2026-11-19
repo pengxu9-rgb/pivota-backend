@@ -47,7 +47,7 @@ Both checks run before anything is sent, and the tests pin them.
 
 The job egresses through the default subnet and pivota-nat, so the gateway logs attribute every call to the one reserved prod IP.
 
-**Output.** One `PROD_TEST_TXN_RESULT <base64 JSON>` line per case, with these fields: `case`, `door`, `market`, `expected`, `got`, `pass`, `created`, `cancelled`, `left_open`, `error`. A final `run` line carries `ok`, `cases`, `passed`, `calls` and `left_open`.
+**Output.** One `PROD_TEST_TXN_RESULT <base64 JSON>` line per case, with these fields: `case`, `door`, `market`, `expected`, `got`, `pass`, `created`, `cancelled`, `left_open`, `error`. A final `run` line carries `ok`, `cases`, `passed`, `calls`, `left_open` and `expires_on_seller`.
 
 `got` holds only the asserted fields, each a scalar. The key and response bodies are never printed.
 
@@ -63,47 +63,98 @@ The job egresses through the default subnet and pivota-nat, so the gateway logs 
 
 The `offers.resolve` cases need `OFFERS_PRODUCT_ID`, which is **filled in at review**: one connected test merchant's product. While it is empty, every such case refuses.
 
-## Not in this release: checkout cases (paths 1–3), pending the owner's decisions
+## Checkout cases (paths 1–3)
 
-Paths 1–3 are the UCP checkout currency, the `/mcp` storefront cart with `market`, and a store-cart create for the shadow catalog lookup. Two things block them.
+Two owner decisions, made 2026-11-19 ("JWT, accept expiry"), shape these cases.
 
-### 1. End-user identity
+### End-user identity
 
-`create`/`get`/`cancel` checkout are `user_ref` tools. An API key alone gets `USER_AUTH_REQUIRED`. There are two options:
+The checkout tools (create, get, cancel) need a signed-in end user. The job provides one as follows:
+- **Issuer.** A test issuer is registered to the **test agent only**, as a federated binding (developer portal: `PUT /agents/{agent_id}/identity-issuers`, table `agent_identity_issuers`).
+- **Token.** For each case, the job signs a 5-minute ES256 `X-Agent-User-JWT`. Its claims are `iss`, `aud`, `sub=ptt-test-buyer`, `iat`, `nbf`, `exp` and `acp_session_id=ptt-<run id>-<case id>`, and its header carries `kid`.
+- **One token per case.** The gateway derives the user from `(iss, sub)`, and the session from `acp_session_id`. A case's create, read-back and cancel all carry the same token, so the gateway accepts them as the same user and session.
+- **Signing key.** The job signs with an EC P-256 private key from Secret Manager (`prod-test-agent-user-key`). It is mounted by version only while the job is armed, and only when a selected case needs it.
 
-- **(recommended)** A test issuer registered as the test agent's federated binding. The job then signs a short-lived `X-Agent-User-JWT` with a second Secret Manager key, mounted the same way. This affects only the test agent.
-- **(not recommended)** The gateway's test-identity window (`AGENT_CHECKOUT_ALLOW_TEST_IDENTITY=1` + `AGENT_CHECKOUT_TEST_IDENTITY_WINDOW=1`). It would let every API-key caller assert any `user_ref`.
+### Storefront carts
 
-### 2. Storefront carts
+A storefront checkout (`esc_…`) cannot be cancelled: the gateway refuses by design, and the seller's cart expires unpaid. The owner accepted this. Such ids are:
+- never cancel-called;
+- listed under `expires_on_seller`;
+- not a failure of the run.
 
-A storefront checkout (`esc_…`) cannot be cancelled: the gateway refuses it by design, and the seller's cart expires on its own. `/ucp/mcp` has no cancel tool. The job reports such a cart as `left_open`, and the run is not ok, until the owner decides one of these:
-- accept unpaid carts that expire; or
-- target test storefronts only.
+Every other created checkout must read back `canceled`, or it is reported `left_open` and the run fails. If a create fails with no answer, it is reported `left_open: unknown:<case>`, with no retry.
 
-Kernel checkouts are cancelled through `/mcp` `cancel_checkout_session`, then read back as `canceled`. If a create fails with no answer, the result is reported as `left_open: unknown:<case>`, because a session may exist that the job cannot name.
+### Cases
 
-The machinery for these cases (`run_checkout`, `cancel_checkout`) is in the job and tested against fakes, including a failed create, a failed cancel and a failed read-back.
+**`/mcp` `create_checkout_session` (step 6).** Flags: `STRICT`, `MCP_STOREFRONT_ESCALATION`, `CURRENCY_FOLLOWS_MARKET`, `MERCHANT_PRICING` all `1`, and `SHOPIFY_CATALOG_ATTRIBUTION=shadow`.
+
+| Case | Target | Market | Expected |
+|---|---|---|---|
+| MCP-SF-US | storefront seller | US | `completes_on_seller_storefront`, USD, `amount_unit=minor`; the cart expires on the seller; runs the shadow lookup |
+| MCP-SF-SG | storefront seller | SG | refused `NO_MERCHANT_OFFER` / `seller_not_priced_in_market_currency`; nothing created |
+| MCP-SF-DE | storefront seller | DE | refused `NO_MERCHANT_OFFER` / `market_not_priced` |
+| MCP-SF-none | storefront seller | (none) | refused `QUOTE_REQUIRED` / `market_required_for_seller_storefront` |
+| MCP-SF-USA | storefront seller | USA | refused `INVALID_ARGUMENTS` |
+| MCP-K-US | connected test merchant | US | `ready_for_payment`, USD → cancel → reads back `canceled` |
+
+MCP-K-US needs `STRICT=1` only.
+
+**`/ucp/mcp` `create_checkout` (step 1).** Flags: `STRICT`, `UCP_TOOL_DOOR`, `UCP_ESCALATION`, `CURRENCY_FOLLOWS_MARKET`, `MERCHANT_PRICING` all `1`, and attribution `shadow`.
+
+| Case | Market | Expected |
+|---|---|---|
+| UCP-SF-US | US | `requires_escalation`, USD; the cart expires on the seller; runs the shadow lookup |
+| UCP-SF-SG | SG | `NO_MERCHANT_OFFER` / `seller_not_priced_in_market_currency` |
+| UCP-SF-DE | DE | `NO_MERCHANT_OFFER` / `market_not_priced` |
+| UCP-SF-USA | USA | `QUOTE_REQUIRED` / `ucp_market_invalid` |
+| UCP-SF-none | (none) | `requires_escalation`, USD (`market_assumed`, D-10); the cart expires |
+
+On `/ucp/mcp`, the market is sent as `checkout.context.address_country`.
+
+**Path 3, the shadow catalog lookup.** If MCP-SF-US or UCP-SF-US passes, publish reads the gateway's `ucp_shopify_catalog_attribution` lines for the run's window, plus 3 minutes. It requires one line per passed create, and every line must show `mode=shadow` and `sent=false`, because shadow never changes the cart. The check goes into `result.json` as `shadow_lookup` and counts toward `ok`. The storefront cases refuse to run unless the gateway still has `SHOPIFY_CATALOG_ATTRIBUTION=shadow`.
+
+No case sends a buyer email, an address, a payment or a Reap member.
+
+### Reviewed targets (filled in REVIEW, never at run time; empty refuses every case that needs it)
+
+| Constant | What | Why it is named |
+|---|---|---|
+| `OFFERS_PRODUCT_ID` | a connected test merchant's product | read only |
+| `KERNEL_TEST_MERCHANT` | `merchant_id`, `product_id`, `variant_id` of a connected **test** merchant (`TEST_MERCHANT_IDS`) | its checkout is created and cancelled |
+| `STOREFRONT_SELLER` | `merchant_id` (must start `merch_obs_`), `product_id`, `variant_id` of a **live** US/USD Shopify storefront seller | its storefront carts are real carts on that store that **expire unpaid**: the owner approves the store here |
+| `USER_TOKEN_ISSUER`, `USER_TOKEN_AUDIENCE`, `USER_TOKEN_KID` | the registered test issuer's `iss`, `aud` and key id | must match the binding |
 
 ## What the owner sets up (names only; no session reads or creates these)
 
 1. **Secret:** `prod-test-agent-key` in pivota-prod Secret Manager. It holds the test agent's key (format `ak_…`), for a first-party agent created for this job only.
 2. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` on `prod-test-agent-key` **only**, and nothing else.
 3. **Launcher:** `sa-ops-launcher` needs `roles/iam.serviceAccountUser` on `sa-prod-test-txn` so it can deploy the job as it. It already has the run, storage and logging roles it uses for the seed batch.
-4. **Later, if decided:** the identity signing secret and its binding (see the decisions above).
+4. **The test issuer, for checkout cases:**
+   1. Generate an EC P-256 key pair on your own machine.
+   2. Store the private key, as PKCS8 PEM, as `prod-test-agent-user-key` in pivota-prod Secret Manager.
+   3. Grant `sa-prod-test-txn` `secretAccessor` on that secret only.
+   4. Publish the public key as a JWKS (`{"keys":[{… "kid": "<kid>", "alg": "ES256", "use": "sig"}]}`) at a public **https** URL whose host resolves only to public IPs.
+   5. Register `{issuer, jwks_uri, audience, algs:["ES256"]}` for the **test agent** in the developer portal. Registration refuses an issuer that is reserved or already registered to another agent, and fetches the JWKS at once.
+   6. Put the iss, aud and kid into the reviewed targets.
 
 ## First-run order
 
 1. **One case.** Run `_CASES=OR-DE`, a refusal that creates nothing. Review `result.json` with the controller.
 2. **The rest of path 4.** Run `_CASES=all` on a new go.
-3. **Checkout cases.** These come only after a reviewed PR adds them, once the decisions above are made, and again one case first.
+3. **Checkout cases.** Pass `_USER_KEY_VERSION=<n>` as well, and again start with one case:
+   1. **MCP-SF-DE**, a refusal that creates nothing and proves the token is accepted.
+   2. **MCP-K-US**: create, then cancel.
+   3. **MCP-SF-US** and **UCP-SF-US**: a live storefront cart that expires, plus the shadow check.
+   4. Then the rest.
 
 Every run needs:
 - the owner's go in the session that launches it, recorded in `_GO_REFERENCE`;
-- a numbered `_KEY_VERSION`, never `latest`;
+- a numbered `_KEY_VERSION`, never `latest`, plus `_USER_KEY_VERSION` whenever a checkout case is selected;
 - the gate open, outside 05:15–06:15Z and 10:30–11:20Z.
 
 ## Rollback / cleanup
 
 The job holds no state. If a build is interrupted, `result.json` and the lock say what to check:
 - **An armed job left behind:** redeploy it disarmed with `job_spec_args(armed=False)`.
-- **A `left_open` id:** cancel it through `/mcp` `cancel_checkout_session`, using the same test identity.
+- **A `left_open` id:** cancel it through `/mcp` `cancel_checkout_session`, using the same test identity: the same `sub` and the same `acp_session_id=ptt-<run id>-<case id>`.
+- **An `expires_on_seller` id:** nothing to do; the seller cart expires unpaid.
