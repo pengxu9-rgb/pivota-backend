@@ -279,6 +279,8 @@ was set up, and the purchase can be resolved as above.
 all read or write production, so each is a **production one-off**: run it through the one-off gate (`oneoff_gate.sh`,
 GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **the owner's go for that purchase**. The tool does not
 check the gate itself.
+`--lookup` also sends a provider call (one read-only checkout lookup), so it is a production one-off under the
+same rule; the go for the preview does not cover it unless it names --lookup.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,

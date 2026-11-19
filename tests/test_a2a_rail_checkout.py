@@ -136,8 +136,15 @@ def _visa_page(token="ptk_1"):
 
 
 def _network_token(**over):
-    return {"brand": "Visa", "eci": "05", "cryptogram": CRYPTO, "expiryDate": "1129", "value": DPAN,
-            a2a_rail.DAVV_FIELD: DAVV, **over}
+    """The provider's documented token-result `networkToken` (11-19): the DAVV in `cvv`, marked by
+    dynamicDataType "DAVV", an empty cryptogram and no ECI. Placeholder DPAN and DAVV."""
+    return {"brand": "visa", "value": DPAN, "expiryDate": "1129", "cvv": DAVV, "cryptogram": "", "eci": None,
+            "dynamicDataType": "DAVV", **over}
+
+
+#: The older shape, with a cryptogram (the TAVV) and an ECI: neither is ever sent, the cryptogram never as cvv.
+def _network_token_with_cryptogram(**over):
+    return _network_token(cryptogram=CRYPTO, eci="05", **over)
 
 
 def _token_result(token="ptk_1", status="ACTIVE", network_token=None, brand="visa"):
@@ -1295,7 +1302,7 @@ def _echo_result(order_id="1001"):
 
 
 async def test_the_relay_scrubs_the_tokens_own_values_from_an_echoing_confirm_card():
-    provider = _Provider(_token_result(), ECHO_CONFIRM)
+    provider = _Provider(_token_result(network_token=_network_token_with_cryptogram()), ECHO_CONFIRM)
     relay = await _relay(provider)
     confirm = relay.checkout.card("checkout.confirm")
     assert confirm is not None and "confirm" in confirm.action_ids()
@@ -2218,7 +2225,8 @@ async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
     # In card context the expiry is still scrubbed, and so are the token's value and cryptogram anywhere.
     answer = _task({"kind": "text", "text": f"Card {DPAN} exp {EXPIRY_RAW} ({CRYPTO}). Total: $51.49"},
                    _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
-    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token_with_cryptogram()), answer),
+                         setup=_setup(ceiling_minor=TOTAL))
     assert relay.checkout.text_amounts_refused is False
 
 
@@ -2911,9 +2919,13 @@ async def test_the_worker_fails_closed_as_davv_missing_before_anything_reaches_t
 
 
 async def test_the_card_is_exactly_the_five_normal_card_keys_and_never_the_cryptogram_or_eci():
-    card = a2a_rail.checkout_card_from_network_token(_network_token(), brand="visa", name="Pat Example")
+    # THE ONE CASE with a non-empty cryptogram and an ECI ("05"): neither is sent, the cryptogram never as cvv.
+    token = _network_token_with_cryptogram()
+    assert (token["cryptogram"], token["eci"]) == (CRYPTO, "05")
+    card = a2a_rail.checkout_card_from_network_token(token, brand="visa", name="Pat Example")
     assert card == {"number": DPAN, "expiry": "11/29", "cvv": DAVV, "name": "Pat Example", "brand": "visa"}
-    provider = _Provider(_token_result(), CONFIRM_CARD)
+    assert a2a_rail.davv_from_network_token({**token, "cvv": None}) is None  # no fallback to the cryptogram
+    provider = _Provider(_token_result(network_token=token), CONFIRM_CARD)
     await _relay(provider)
     setup = provider.sent()[1]["payload"]
     assert set(setup["card"]) == {"number", "expiry", "cvv", "name", "brand"}
@@ -3913,3 +3925,91 @@ async def test_the_preview_looks_up_only_a_held_row():
     _, [preview] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_placing",
                                    "--lookup", client=_client(rail))
     assert preview["lookup"] == {"ran": False, "reason": "no such held checkout"} and rail.sent == []
+
+
+# ── the provider's documented token-result (11-19): the DAVV is networkToken.cvv, marked dynamicDataType "DAVV" ──
+
+PROVIDER_DAVV = "077"  # a leading-zero placeholder DAVV
+
+
+def _provider_token_result(**over):
+    """The documented token-result, placeholder values: {component: payment.token-result, paymentTokenId,
+    status, paymentBrand, providerId, networkToken: {brand, value, expiryDate, cvv, cryptogram "", eci null,
+    dynamicDataType "DAVV"}}."""
+    network_token = _network_token(cvv=PROVIDER_DAVV, **over)
+    data = {"paymentTokenId": "ptk_1", "status": "ACTIVE", "paymentBrand": "visa", "providerId": "prov_test_1",
+            "networkToken": network_token}
+    return _task(_card("payment.token-result", data))
+
+
+async def test_the_documented_token_result_relays_its_leading_zero_davv_as_the_three_char_cvv():
+    assert a2a_rail.DAVV_FIELD == "cvv"
+    provider = _Provider(_provider_token_result(), CONFIRM_CARD)
+    relay = await _relay(provider)
+    assert relay.refused is None
+    setup = provider.sent()[1]["payload"]
+    assert setup["card"]["cvv"] == "077" and isinstance(setup["card"]["cvv"], str)
+    assert set(setup["card"]) == {"number", "expiry", "cvv", "name", "brand"}
+
+
+@pytest.mark.parametrize("marker", [None, "absent", "CVV", "davv", "Davv", " DAVV", "DAVV ", "TAVV", 1],
+                         ids=["null", "absent", "CVV", "lower_davv", "title_davv", "padded_left", "padded_right",
+                              "TAVV", "int"])
+async def test_a_cvv_on_a_token_not_marked_davv_is_never_read_or_relayed(marker):
+    # Condition 1: a cvv leaf without the exact DAVV marker could be a real CVV: davv_missing, nothing sent.
+    token = _network_token(cvv=PROVIDER_DAVV)
+    if marker == "absent":
+        token.pop("dynamicDataType")
+    else:
+        token["dynamicDataType"] = marker
+    assert a2a_rail.davv_from_network_token(token) is None
+    assert a2a_rail.checkout_card_from_network_token(token, brand="visa", name="Pat Example") is None
+    provider = _Provider(_token_result(network_token=token), CONFIRM_CARD)
+    relay = await _relay(provider)
+    assert relay.refused == "davv_missing"
+    assert [x for x in provider.sent() if x["payload"].get("card")] == []  # nothing went to the checkout
+
+
+@pytest.mark.parametrize("cvv", [77, 715, 77.0, "77", "0770", None], ids=["int_77", "int_715", "float", "two_chars",
+                                                                         "four_chars", "null"])
+async def test_a_davv_that_is_not_a_three_char_string_is_missing(cvv):
+    # Condition 2: an int (its leading zero lost) or any other form is davv_missing.
+    token = _network_token(cvv=cvv)
+    assert a2a_rail.davv_from_network_token(token) is None
+    relay = await _relay(_Provider(_token_result(network_token=token), CONFIRM_CARD))
+    assert relay.refused == "davv_missing"
+
+
+@pytest.mark.parametrize("echo", [{"code": 77}, {"code": "77"}, {"code": "077"}, {"cvv": 77}],
+                         ids=["int_77", "string_77", "string_077", "cvv_int_77"])
+async def test_a_leading_zero_davv_echoed_as_77_or_077_is_scrubbed_and_the_answer_refused(echo):
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=100000))
+    assert relay.checkout.credential_fields_stripped >= 1
+
+
+async def test_a_leading_zero_davv_inside_other_values_is_kept():
+    # The leading-zero equivalents of the "$715.00" / "Suite 715" guards: never a whole value, never scrubbed.
+    echo = {"ref": "$77.00", "suite": "Apt 77", "n": "77 units", "total": "$0.77"}
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=100000))
+    assert relay.checkout.credential_fields_stripped == 0
+    assert {k: relay.checkout.card("checkout.confirm").data[k] for k in echo} == echo
+
+
+def test_the_echo_matcher_on_a_leading_zero_davv_catches_it_without_its_zero():
+    matches = a2a_rail.davv_echo_matcher("077")
+    for text in ("cvv 077", "cvv 77", "CVV: 0 7 7", "security code 7-7", "77 (cvv)", "dcvv 77"):
+        assert matches(text), text
+    for text in ("Apt 77", "Total $77.00", "77 items in stock", "cvv 177", "cvv 770", "cvv verified, order 7"):
+        assert not matches(text), text
+    plain = a2a_rail.davv_echo_matcher("715")  # a DAVV with no leading zero is unchanged
+    assert plain("cvv 715") and not plain("cvv 15")
+
+
+async def test_before_the_confirm_a_leading_zero_davv_echoed_in_prose_without_its_zero_cancels():
+    answer = _task({"kind": "text", "text": "Card verified, cvv 77"},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.card_codes_scrubbed >= 1
