@@ -447,6 +447,7 @@ def test_the_cancel_note_carries_no_answer_content():
     (200, b'\n\n{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal"}}'),
     (200, mcp_answer({"error": {"code": "UNEXPECTED_ERROR"}}, True)),
     (200, mcp_answer({"error": {"code": "CHECKOUT_OUTCOME_UNKNOWN"}}, True)),
+    (200, mcp_answer({"error": {"code": "INTERNAL_ERROR"}}, True)),   # V6-P3-1: inside result.isError (kills W4)
     (200, mcp_answer({"error": {}}, True)),                         # no code at all
     (500, mcp_answer({"error": {"code": "NO_MERCHANT_OFFER", "detail": {"reason": "market_not_priced"}}}, True)),
     # V5-P3-1: a top-level JSON-RPC error is the transport failing, never the tool's named refusal (kills W4).
