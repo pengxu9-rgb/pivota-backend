@@ -10605,7 +10605,7 @@ def _catalog_offer_entry(r: Dict[str, Any], *, group_mode: bool, redirect_url: O
         "availability": availability,
         # In a resolved group, the seed lane's wider vocabulary too ("sold out", the
         # schema.org OutOfStock URL...), so a sold-out retailer is never best price.
-        "in_stock": not (
+        "in_stock": _stated_in_stock(availability) if _unknown_stock_stays_unknown() else not (
             _availability_says_out_of_stock(availability) if group_mode
             else availability_is_known_unavailable(availability)
         ),
@@ -11057,6 +11057,25 @@ def _seed_offer_matched(src: Dict[str, Any], entries: set, variants: Optional[Li
         elif stored is not None and stored_entry_answers_to(stored, entry):
             return True
     return False
+
+
+UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG = "OFFERS_UNKNOWN_STOCK_STAYS_UNKNOWN_ENABLED"
+
+
+def _unknown_stock_stays_unknown() -> bool:
+    """Default OFF. On: an offer or seed whose availability is missing or not understood says in_stock None
+    (unknown), never True, and carries no invented inventory count. Off: today's behaviour."""
+    return os.getenv(UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG, "").strip().lower() == "true"
+
+
+def _stated_in_stock(availability: Any) -> Optional[bool]:
+    """True only on an affirmative in-stock statement, False on ANY out-of-stock statement (the catalog arm's
+    vocabulary or the seed lane's: "sold out" is sold out in every lane), None when it is missing or says neither."""
+    from utils.availability_vocabulary import IN_STOCK, normalize_availability
+
+    if _availability_says_out_of_stock(availability):
+        return False
+    return True if normalize_availability(availability) == IN_STOCK else None
 
 
 def _availability_says_out_of_stock(value: Any) -> bool:
@@ -13525,9 +13544,11 @@ def _external_seed_to_shop_product(
     ingredient_ids = _normalize_external_seed_structured_ingredient_ids(row, seed_data)
     product_type = _normalize_external_seed_product_type(row, seed_data)
 
-    in_stock = True
+    in_stock: Optional[bool] = True
     if isinstance(availability, str):
         in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
+    if _unknown_stock_stays_unknown():
+        in_stock = _stated_in_stock(availability)
 
     # Structured brand so agents can cite "<brand>'s <product>" without parsing the
     # title. External seeds carry brand/vendor in seed_data; fall back to the
@@ -13566,7 +13587,8 @@ def _external_seed_to_shop_product(
         "currency": price_currency,
         "image_url": image_url,
         "product_type": product_type or None,
-        "inventory_quantity": 999 if in_stock else 0,
+        # No invented count for an unknown: an in-stock-only filter that trusts a quantity must not count it.
+        "inventory_quantity": (999 if in_stock else 0) if in_stock is not None else None,
         "platform": "external",
         "availability": availability,
         "in_stock": in_stock,
@@ -13883,6 +13905,17 @@ def _normalize_prefetched_external_seed_candidates(
     return normalized
 
 
+def _prefetched_candidate_availability(candidate: Dict[str, Any]) -> Optional[str]:
+    """The availability a prefetched candidate's seed row is rebuilt with. Off: a missing one is read off
+    `in_stock` and anything not False becomes "in_stock". On: only a stated True/False is translated; a missing
+    or unknown one stays None (unknown)."""
+    if candidate.get("availability"):
+        return candidate.get("availability")
+    if _unknown_stock_stays_unknown():
+        return {True: "in_stock", False: "out_of_stock"}.get(candidate.get("in_stock"))
+    return "in_stock" if candidate.get("in_stock") is not False else "out_of_stock"
+
+
 async def _build_prefetched_external_seed_wrappers(
     request_metadata: Optional[Dict[str, Any]],
     *,
@@ -14053,7 +14086,7 @@ async def _build_prefetched_external_seed_wrappers(
             "image_url": candidate.get("image_url"),
             "price_amount": candidate.get("price"),
             "price_currency": candidate.get("currency"),
-            "availability": candidate.get("availability") or ("in_stock" if candidate.get("in_stock") is not False else "out_of_stock"),
+            "availability": _prefetched_candidate_availability(candidate),
             "attached_product_key": candidate.get("attached_product_key"),
             "attached_variant_id": candidate.get("attached_variant_id"),
         }
