@@ -22,10 +22,19 @@ second one, and it does not try to understand arbitrary receipts. Two rules:
         "feedback" and "summary": fail closed). A list item's own key is the list's key. An OBJECT under a
         money word ("shipping" holding the buyer's address) is not itself money: its leaves are judged by
         (a)-(c). Booleans, None and empty strings are never money-like.
-    A string that is JSON (or a Python literal) inside ("{...}", "[...]") is parsed and judged the same way.
-    RESIDUAL, accepted because the token cap is primary: a bare digit string under a non-money key
-    ({"x": "1500"}: cents as text?) is NOT money-like and proceeds. So do zip codes, phone numbers and a
-    card's last four ("94303", "+15125550100", "4399"), which is why the line is drawn there.
+    (b) also counts (P1-K) a string leaf that the prose rule (KEEP) itself reads as an amount (`_prose_amounts`:
+        a total word within three words before a number, or a currency mark next to it: "Your total is 999",
+        "You will pay 999"), a plural currency word next to a number or a lower-case eur / gbp spaced from
+        one ("999 dollars", "999 bucks", "999 eur"), a three-decimal or decimal-comma number ("999.000", "999,00", "1.234,56"), or
+        any non-ASCII digit ("٩٩٩").
+    A string that is JSON (or a Python literal) inside ("{...}", "[...]"), or base64 that decodes to one, is
+    parsed and judged the same way. Card data that is not an object (a string, a list) is refused outright.
+    RESIDUAL, accepted because the token cap is primary (the owner's decision: a known gap, the token cap the
+    backstop): a bare digit string under a non-money key ({"x": "1500"}: cents as text?) is NOT money-like and
+    proceeds. So do zip codes, phone numbers and a card's last four ("94303", "+15125550100", "4399"), which is
+    why the line is drawn there. Also accepted and pinned as PROCEED (tests/test_a2a_rail_checkout.py,
+    RULE_1_RESIDUAL): "999.5", "60.0", "1e3", "Rs 999", "nine hundred ninety-nine dollars" and "1 000" with a
+    thin space, each under a plain key.
 
   RULE 2. A money-like card proceeds only when it is EXACTLY one of three named shapes (`_SHAPES`):
       S1 flat total          {total, currency}
@@ -49,8 +58,10 @@ second one, and it does not try to understand arbitrary receipts. Two rules:
         lines (or of shipping lines) is not empty;
       - `currency` is "USD" (or "usd").
     The maths, in cents, for every shape: every amount <= the ceiling (but compare_at_price, below); the
-    total <= the ceiling; the total >= sum(quantity x price) + shipping + tax - discounts; discounts >= 0
-    and <= sum(lines); S2: subtotal ==
+    total <= the ceiling; the parts BEFORE any discount, sum(quantity x price) + shipping + tax, <= the ceiling
+    (the ceiling is the approved quote before any discount: a discount not honoured at submit would charge
+    them; in S2, which has no discount, the total covering its parts already holds this); the total >=
+    sum(quantity x price) + shipping + tax - discounts; discounts >= 0 and <= sum(lines); S2: subtotal ==
     sum(lines); S3: subtotal_price == sum(lines) - total_discounts (Shopify's documented subtotal is after
     discounts, before shipping and tax; as subtotal_price is never negative, this also holds the discounts
     to at most the lines). EQUALITY, not >=, for the subtotal: a subtotal larger than its
@@ -79,12 +90,13 @@ been submitted.
 from __future__ import annotations
 
 import ast
+import base64
 import decimal
 import json
 import math
 import re
 import unicodedata
-from typing import Any, FrozenSet, Mapping, Optional
+from typing import Any, FrozenSet, Iterator, List, Mapping, Optional, Tuple
 
 #: The card's data is depth 0; a leaf at depth 8 is read, at 9 refused. 2000 values are read, 2001 refused.
 CARD_SCAN_MAX_DEPTH = 8
@@ -165,6 +177,45 @@ def _money_pattern(text: str) -> bool:
                 or _TWO_DECIMALS_RE.search(text))
 
 
+#: (b, P1-K) A plural currency word next to a number ("999 dollars", "999bucks"), or a lower-case eur / gbp code
+#: (usd is caught in any case above) SPACED from a number ("999 eur", "gbp 40"): never glued to one, so an email
+#: or an id ("aud1@...", "eur2buy") is not money. Not "pound" ("30 pound bag") nor "Euro" ("Euro 24 Shop").
+_PLURAL_CURRENCY_WORDS = "dollars|bucks|euros|cents"
+_LOWER_CODES = "eur|gbp"
+_CURRENCY_WORD_NEXT_TO_DIGIT_RE = re.compile(
+    rf"(?<![^\W\d_])(?:{_PLURAL_CURRENCY_WORDS})\s*\d|\d\s*(?:{_PLURAL_CURRENCY_WORDS})(?![^\W\d_])"
+    rf"|(?<![^\W\d_])(?:{_LOWER_CODES})\s+\d|\d\s+(?:{_LOWER_CODES})(?![^\W\d_])", re.IGNORECASE)
+#: (b, P1-K) Three decimals ("999.000", "1.234") or a decimal comma ("999,00", "1.234,56").
+_OTHER_DECIMAL_RE = re.compile(r"(?<![\d.,])\d+[.,]\d{3}(?!\d)|(?<![\d,])\d+(?:\.\d{3})*,\d{2}(?![\d,])")
+#: A string that may be base64 (P3-v8-1): judged as embedded data only when it decodes to JSON / a literal.
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/_-]{16,}={0,2}\Z")
+
+
+def _prose_money(text: str) -> bool:
+    """(b, P1-K): what the prose rule (KEEP) itself reads as an amount (`_prose_amounts`: a total word or a
+    currency mark next to a number), a plural currency word or a lower-case code next to a number, a three-decimal
+    or decimal-comma number, or any non-ASCII digit."""
+    text = normalise(text)
+    if any(ch.isdigit() and not ch.isascii() for ch in text):
+        return True
+    if _CURRENCY_WORD_NEXT_TO_DIGIT_RE.search(text) or _OTHER_DECIMAL_RE.search(text):
+        return True
+    return next(_prose_amounts(text), None) is not None
+
+
+def _decoded_base64(text: str) -> Optional[str]:
+    """`text` decoded as base64 (standard or URL-safe) to UTF-8 text, or None."""
+    if not _BASE64_RE.match(text) or len(text) > CARD_SCAN_MAX_JSON_CHARS:
+        return None
+    padded = text + "=" * (-len(text) % 4)
+    for decode in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return decode(padded.encode("ascii")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return None
+
+
 def _parse_embedded(text: str) -> Optional[Any]:
     """JSON, or a Python literal, inside a string; None when it is neither."""
     for parse in (json.loads, ast.literal_eval):
@@ -213,9 +264,14 @@ class _Scan:
                 parsed = _parse_embedded(text)
                 if parsed is not None:
                     return self.money_like(parsed, depth + 1, key)
+            decoded = _decoded_base64(text)
+            if decoded is not None and decoded.strip()[:1] in ("{", "["):
+                parsed = _parse_embedded(decoded.strip())
+                if parsed is not None:
+                    return self.money_like(parsed, depth + 1, key)  # P3-v8-1: base64 JSON is embedded data
             if not text:
                 return False
-            return _money_pattern(text) or (key is not None and _money_key(key))
+            return _money_pattern(text) or _prose_money(text) or (key is not None and _money_key(key))
         return True  # (a): a number, or any other non-JSON leaf
 
 
@@ -335,6 +391,10 @@ def _s3(card: Mapping[str, Any], ceiling: int) -> None:
     tax = _amount(card["total_tax"], ceiling) if "total_tax" in card else 0
     discounts = _amount(card["total_discounts"], ceiling) if "total_discounts" in card else 0
     total = _amount(card["total_price"], ceiling)
+    if lines + shipping + tax > ceiling:
+        # P1-L: the ceiling is the approved quote BEFORE any discount. A discount the merchant does not honour at
+        # submit (a code past its limit, expired, recomputed away) would charge the parts before it.
+        raise _Refused("the parts before their discount above the ceiling")
     # discounts <= sum(lines) follows: subtotal_price is an amount (never negative) equal to their difference.
     if subtotal != lines - discounts:
         raise _Refused("a subtotal that is not its lines less the discounts")
@@ -372,6 +432,8 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
     """True when the card must NOT be confirmed (module docstring). Pure."""
     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
         return True
+    if not isinstance(data, Mapping):
+        return True  # P1-K: card data that is not an object (a string, a list) is never read as "nothing money-like"
     try:
         if not money_like(data):
             return False  # rule 1: nothing money-like; the token cap decides
@@ -427,11 +489,11 @@ def _total_word_before(text: str, start: int) -> bool:
     return any(_skeleton(w).lower() in _TOTAL_WORDS for w in words)
 
 
-def _prose_check(raw: str, ceiling: int) -> None:
-    """Raises `_Refused` for an amount-shaped number in prose that is not a USD amount within `ceiling`."""
-    text = normalise(raw)
-    if any(ch.isdigit() and not ch.isascii() for ch in text):
-        raise _Refused("a non-ASCII digit")
+def _prose_amounts(text: str) -> Iterator[Tuple[str, str, str, List[str], List[str], bool, Any, Any, bool]]:
+    """THE prose rule's amount-shape test: each number in (normalised) `text` that is amount-shaped (next to a
+    currency symbol, an upper-case ISO code or `usd`, a dollar sign, or within three words after a total word),
+    as (token, left, right, raw_words, words, symbol, dollar, foreign_dollar, marked). Shared by `_prose_check`
+    and the card scan's rule 1, so the two never disagree on what an amount looks like."""
     for match in _NUMBER_TOKEN_RE.finditer(text):
         token = match.group(0).rstrip(".,")
         start, end = match.start(), match.start() + len(token)
@@ -449,8 +511,16 @@ def _prose_check(raw: str, ceiling: int) -> None:
                    for w in raw_words)
             or any(w in _TOTAL_WORDS for w in words) or _total_word_before(text, start)
         )
-        if not amount_shaped:
-            continue
+        if amount_shaped:
+            yield token, left, right, raw_words, words, symbol, dollar, foreign_dollar, marked
+
+
+def _prose_check(raw: str, ceiling: int) -> None:
+    """Raises `_Refused` for an amount-shaped number in prose that is not a USD amount within `ceiling`."""
+    text = normalise(raw)
+    if any(ch.isdigit() and not ch.isascii() for ch in text):
+        raise _Refused("a non-ASCII digit")
+    for token, left, right, raw_words, words, symbol, dollar, foreign_dollar, marked in _prose_amounts(text):
         if symbol:
             raise _Refused("another currency symbol")
         if foreign_dollar is not None and _skeleton(foreign_dollar.group(1)).lower() != "us":

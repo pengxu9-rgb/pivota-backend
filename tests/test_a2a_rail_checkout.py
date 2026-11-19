@@ -2332,12 +2332,13 @@ def _s2(**kw):
 
 
 def _s3(**kw):
-    """$50.00 of lines less a $5.00 discount, $4.49 shipping, $2.00 tax: $51.49 (Shopify's REST Order fields)."""
+    """$45.00 of lines less a $5.00 discount, $4.49 shipping, $2.00 tax: $46.49; before the discount $51.49, the
+    ceiling (P1-L). Shopify's REST Order fields."""
     return {**MEASURED_CARD,
             "line_items": [{"quantity": 2, "price": "20.00", "compare_at_price": "25.00"},
-                           {"quantity": 1, "price": "10.00", "compare_at_price": None}],
-            "subtotal_price": "45.00", "shipping_lines": [{"price": "4.49"}], "total_tax": "2.00",
-            "total_discounts": "5.00", "total_price": "51.49", "currency": "USD", **kw}
+                           {"quantity": 1, "price": "5.00", "compare_at_price": None}],
+            "subtotal_price": "40.00", "shipping_lines": [{"price": "4.49"}], "total_tax": "2.00",
+            "total_discounts": "5.00", "total_price": "46.49", "currency": "USD", **kw}
 
 
 def _without(card, *keys):
@@ -2377,9 +2378,9 @@ NOT_MONEY_LIKE = {
     "zip_plus4": {"shipping": {**MEASURED_SHIPPING, "zip_code": "00000-1234"}},
     "phone_formatted": {"shipping": {**MEASURED_SHIPPING, "phone": "(555) 010-0000"}},
     "version_string": {"note": "Version 7.1.5"}, "one_decimal": {"note": "1.5 lbs"},
-    "three_decimals": {"weightKg": "1.234"}, "suite": {"note": "Suite 715"},
+    "suite": {"note": "Suite 715"},
     "title_case_code_word": {"shipping": {**MEASURED_SHIPPING, "address1": "12 Top St"}},
-    "lower_case_code_not_usd": {"note": "eur 40"},
+    "lower_case_code_glued_in_an_email": {"shipping": {**MEASURED_SHIPPING, "email": "eur2buy@example.com"}},
     "object_under_a_money_word": {"delivery": {"city": "Sampleville", "window": "3-5"}},
     "embedded_without_money": {"meta": '{"sku": "A-1"}'},
 }
@@ -2395,6 +2396,7 @@ MONEY_LIKE = {
     "code_glued": {"note": "15EUR"}, "usd_lower": {"note": "usd15"}, "usd_title": {"note": "Usd 15"},
     "two_decimals": {"x": "15.00"}, "grouped": {"x": "1,234.56"}, "in_prose": {"note": "Total: 40.00 today"},
     "invisible_inside": {"x": "$​15"}, "arabic_indic": {"x": "٤٠.٠٠"},
+    "three_decimals": {"weightKg": "1.234"}, "lower_case_eur": {"note": "eur 40"},  # P1-K
     "key_holds_an_amount": {"$15.00": "x"}, "key_holds_a_code_amount": {"USD15": "x"},
     "embedded_json": {"meta": '{"total": 15}'}, "embedded_literal": {"meta": "{'x': 15}"},
     "address_with_an_amount": {"shipping": {**MEASURED_SHIPPING, "address2": "Fee $5.00"}},
@@ -2433,7 +2435,7 @@ def test_every_iso_code_next_to_a_digit_is_money_like(code):
     for text in (f"{code} 15", f"15{code}", f"15 {code}"):
         assert amounts.money_like({"note": text}) is True, text
     assert amounts.money_like({"note": f"{code}X 15"}) is False  # not a whole word
-    assert amounts.money_like({"note": f"{code.lower()} 15"}) is (code == "USD")
+    assert amounts.money_like({"note": f"{code.lower()} 15"}) is (code in ("USD", "EUR", "GBP"))  # P1-K: eur, gbp
 
 
 #: Within the ceiling, exactly a named shape: proceeds (shape name expected).
@@ -2446,11 +2448,11 @@ SHAPES_WITHIN = {
     "s2_numbers": ("S2", _s2(line_items=[{"quantity": 1, "price": 41.49}], subtotal=41.49, shipping=5, tax=5.0,
                              total=51.49)),
     "s2_total_above_its_parts": ("S2", _s2(tax="1.00")),
-    "s3": ("S3", _s3()), "s3_no_compare_at": ("S3", _s3(line_items=[{"quantity": 5, "price": "10.00"}])),
-    "s3_minimal": ("S3", _without(_s3(subtotal_price="50.00", total_price="50.00"), "shipping_lines", "total_tax",
+    "s3": ("S3", _s3()), "s3_no_compare_at": ("S3", _s3(line_items=[{"quantity": 9, "price": "5.00"}])),
+    "s3_minimal": ("S3", _without(_s3(subtotal_price="45.00", total_price="45.00"), "shipping_lines", "total_tax",
                                   "total_discounts")),
     "s3_compare_at_above_the_price": ("S3", _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "51.49"},
-                                                            {"quantity": 1, "price": "10.00"}])),
+                                                            {"quantity": 1, "price": "5.00"}])),
 }
 
 
@@ -2477,12 +2479,28 @@ SHAPES_REFUSED = {
     # short: the total does not cover its parts; the subtotal is not its lines
     "s2_total_short": _s2(total="51.48"), "s2_subtotal_above_lines": _s2(subtotal="41.50"),
     "s2_subtotal_below_lines": _s2(subtotal="41.48"),
-    "s3_total_short": _s3(total_price="51.48"), "s3_subtotal_before_discounts": _s3(subtotal_price="50.00"),
-    "s3_discount_above_lines": _s3(total_discounts="50.01", subtotal_price="0.00"),
+    "s3_total_short": _s3(total_price="46.48"), "s3_subtotal_before_discounts": _s3(subtotal_price="45.00"),
+    "s3_discount_above_lines": _s3(total_discounts="45.01", subtotal_price="0.00"),
+    # P1-L: the parts BEFORE the discount above the ceiling (the earlier standard fixture: $56.49 before $5.00 off)
+    "s3_old_fixture_56_49_before_the_discount": _s3(
+        line_items=[{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "10.00"}], subtotal_price="45.00",
+        total_price="51.49"),
+    "s3_reviewers_102_98_before_the_discount": _s3(
+        line_items=[{"quantity": 1, "price": "51.49"}], total_discounts="51.49", subtotal_price="0.00",
+        shipping_lines=[{"price": "51.49"}], total_tax="0.00", total_price="51.49"),
+    "s3_2x30_less_10": _s3(line_items=[{"quantity": 2, "price": "30.00"}], total_discounts="10.00",
+                           subtotal_price="50.00", shipping_lines=[{"price": "0.00"}], total_tax="0.00",
+                           total_price="50.00"),
+    "s3_2x50_less_50": _s3(line_items=[{"quantity": 2, "price": "50.00"}], total_discounts="50.00",
+                           subtotal_price="50.00", shipping_lines=[{"price": "0.00"}], total_tax="0.00",
+                           total_price="50.00"),
+    "s3_one_cent_over_before_the_discount": _s3(
+        line_items=[{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "5.01"}], subtotal_price="40.01",
+        total_price="46.50"),
     # an extra key: at the top, in a line, in a shipping line, in the address
     "s1_extra_charge": _s1(shipping_cost="5.00"), "s1_extra_plain_key": _s1(note="thanks"),
     "s2_extra_discount": _s2(discount="5.00"), "s2_line_title": _s2(line_items=_line(title="Widget"), subtotal="41.49"),
-    "s3_line_sku": _s3(line_items=[{"quantity": 5, "price": "10.00", "sku": "A-1"}]),
+    "s3_line_sku": _s3(line_items=[{"quantity": 9, "price": "5.00", "sku": "A-1"}]),
     "s3_shipping_line_title": _s3(shipping_lines=[{"price": "4.49", "title": "Ground"}]),
     "s1_address_extra_key": _s1(shipping={**MEASURED_SHIPPING, "company": "Example Co"}),
     "s3_address_extra_key": _s3(shipping={**MEASURED_SHIPPING, "method": "ground"}),
@@ -2497,7 +2515,7 @@ SHAPES_REFUSED = {
     "s2_dollar_shipping": _s2(shipping="$5.00"),
     "s3_bare_price": _s3(line_items=[{"quantity": 1, "price": "40"}], subtotal_price="40.00", total_discounts="0.00"),
     "s3_bare_total": _s3(total_price="45"), "s3_negative_discount": _s3(total_discounts="-5.00"),
-    "s3_compare_at_dollar": _s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "$12.00"}]),
+    "s3_compare_at_dollar": _s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "$12.00"}]),
     "quantity_string": _s2(line_items=_line(quantity="2"), subtotal="41.49"),
     "quantity_float": _s2(line_items=_line(quantity=2.0), subtotal="41.49"),
     "quantity_zero": _s2(line_items=_line(quantity=0), subtotal="1.49"),
@@ -2540,24 +2558,24 @@ def test_a_card_that_is_not_exactly_a_named_shape_within_the_ceiling_cancels(nam
 
 #: compare_at_price (S3) is display only: exempt from the ceiling, still type-checked, never summed, never the total
 #: and never a price. Each card is S3-shaped; `None` = it proceeds, else the reason it cancels.
-_LINES_50 = [{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "10.00"}]
 COMPARE_AT_CASES = {
     # exempt from the ceiling: a list price above what the buyer approved proceeds when the rest is S3 in range
     "over_the_ceiling_string": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "99999.00"},
-                                                {"quantity": 1, "price": "10.00"}]), None),
+                                                {"quantity": 1, "price": "5.00"}]), None),
     "over_the_ceiling_number": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": 1000000},
-                                                {"quantity": 1, "price": "10.00", "compare_at_price": 75.5}]), None),
-    "one_cent_over_the_ceiling": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "51.50"}]), None),
+                                                {"quantity": 1, "price": "5.00", "compare_at_price": 75.5}]), None),
+    "one_cent_over_the_ceiling": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "51.50"}]), None),
     # still type-checked
-    "dollar_string": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "$99.00"}]), "type"),
-    "negative": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "-1.00"}]), "type"),
-    "negative_number": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": -1}]), "type"),
-    "bare_digits": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "9999"}]), "type"),
-    "boolean": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": True}]), "type"),
-    "words": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": "was 12"}]), "type"),
-    "object": (_s3(line_items=[{"quantity": 5, "price": "10.00", "compare_at_price": {"amount": "12.00"}}]), "type"),
+    "dollar_string": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "$99.00"}]), "type"),
+    "negative": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "-1.00"}]), "type"),
+    "negative_number": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": -1}]), "type"),
+    "bare_digits": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "9999"}]), "type"),
+    "boolean": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": True}]), "type"),
+    "words": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "was 12"}]), "type"),
+    "object": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": {"amount": "12.00"}}]), "type"),
     # the price, the total and the sums still cap, whatever the compare_at_price
-    # (a price over the ceiling under a discount that brings every sum within it: only its own cap refuses it)
+    # (a price over the ceiling under a discount that brings the charged sums within it: its own cap and the cap
+    # before the discount both refuse it)
     "price_over_the_ceiling": (_s3(line_items=[{"quantity": 1, "price": "51.50", "compare_at_price": "60.00"}],
                                    subtotal_price="41.50", total_discounts="10.00", shipping_lines=[{"price": "0.00"}],
                                    total_tax="0.00", total_price="41.50"), "price"),
@@ -2573,16 +2591,16 @@ COMPARE_AT_CASES = {
     # never a price, never summed: a compare_at_price that would make the sums reconcile does not
     # (read as the price, this line would make every sum reconcile: $45.00 + $4.49 + $2.00 = $51.49)
     "the_only_amount_of_a_line": (_s3(line_items=[{"quantity": 1, "compare_at_price": "45.00"}],
-                                      total_discounts="0.00"), "shape"),
+                                      total_discounts="0.00", subtotal_price="45.00", total_price="51.49"), "shape"),
     "would_reconcile_a_short_subtotal": (
         _s3(line_items=[{"quantity": 1, "price": "45.00", "compare_at_price": "30.00"}], subtotal_price="30.00",
             total_discounts="0.00", total_price="30.00", total_tax="0.00", shipping_lines=[{"price": "0.00"}]), "short"),
     "would_reconcile_if_added": (
         _s3(line_items=[{"quantity": 1, "price": "10.00", "compare_at_price": "35.00"}], subtotal_price="45.00",
-            total_discounts="0.00"), "short"),
+            total_discounts="0.00", total_price="51.49"), "short"),
     "short_total_beside_a_large_compare_at": (
         _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "500.00"},
-                        {"quantity": 1, "price": "10.00"}], total_price="51.48"), "short"),
+                        {"quantity": 1, "price": "5.00"}], total_price="46.48"), "short"),
 }
 
 
@@ -2608,10 +2626,10 @@ def test_the_shape_bounds_are_exact_to_the_cent():
     assert worker.confirm_card_refused(_s1(total="51.49"), TOTAL - 1) is True
     assert worker.confirm_card_refused(_s2(), TOTAL) is False and worker.confirm_card_refused(_s2(), TOTAL - 1) is True
     assert worker.confirm_card_refused(_s3(), TOTAL) is False and worker.confirm_card_refused(_s3(), TOTAL - 1) is True
-    assert worker.confirm_card_refused(_s3(total_discounts="50.00", subtotal_price="0.00", total_price="6.49"), TOTAL) is False
+    assert worker.confirm_card_refused(_s3(total_discounts="45.00", subtotal_price="0.00", total_price="6.49"), TOTAL) is False
     # compare_at_price is display only: never summed (the lines would not reach the subtotal), never the total.
     shown = _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "30.00"},
-                            {"quantity": 1, "price": "10.00", "compare_at_price": "11.00"}])
+                            {"quantity": 1, "price": "5.00", "compare_at_price": "11.00"}])
     assert amounts.matched_shape(shown, TOTAL) == "S3"
     assert worker.confirm_card_refused(_s3(total_price="51.49", total_tax="30.00"), TOTAL) is True  # parts 79.49
 
@@ -2703,3 +2721,70 @@ async def test_a_status_split_on_any_punctuation_or_a_chargeback_is_payment_reac
                                     "not.completed", "no,charge", "uncaptured", "payment.failed"])
 def test_a_negated_status_split_on_any_punctuation_stays_unrecognised(status):
     assert not worker._status_says_paid(status)
+
+
+# ── scan v8 review: P1-K (rule 1 reads what the prose rule reads as an amount), P3-v8-1 (base64 JSON) ──
+
+#: Amount strings the v8 rule 1 let through under a plain key: each is money-like now, and the card cancels.
+RULE_1_ESCAPES = ["Total charged: 999 dollars", "Your total is 999", "You will pay 999 at delivery", "999 dollars",
+                  "999 bucks", "999 euros", "999 eur", "999,00", "1.234,56", "999.000", "٩٩٩"]
+#: THE PINNED RESIDUAL (the owner's decision: a known gap; the token cap is the backstop): still not money-like
+#: under a plain key, so the card PROCEEDS. Any change to one of these shows here.
+RULE_1_RESIDUAL = ["999.5", "60.0", "1e3", "Rs 999", "nine hundred ninety-nine dollars", "1 000"]
+#: Ordinary strings that must stay not money-like (the measured card's own fields among them).
+RULE_1_BENIGN = ["visa", "4399", "merchant.example.com", "buyer@example.com", "Test", "Buyer", "+15550100000", "US",
+                 "100 Example Way", "Unit 2", "Sampleville", "CA", "00000", "00000-1234", "(555) 010-0000",
+                 "100 Euro Plaza", "Euro 24 Shop", "30 pound bag", "3-5 days", "Size 10", "5 stars", "v1.2.3",
+                 "2.5 lb", "Rating 4.5", "2026-11-19", "11/19/2026", "Nov 19, 2026", "12 Top St", "Apt 4",
+                 "Gel Pen 12 pack", "Ships in 7 days", "SKU-40000000001", "Order #1001", "Suite 715", "Version 7.1.5",
+                 "Dog food 30 pound bag", "Gate code 1234", "2-Day", "3M", "Size 10.5", "Pack of 12", "7 items"]
+
+
+@pytest.mark.parametrize("text", RULE_1_ESCAPES)
+def test_an_amount_the_prose_rule_would_read_is_money_like_on_a_card_leaf_and_cancels(text):
+    card = {**MEASURED_CARD, "note": text}
+    assert amounts.money_like(card) is True
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+@pytest.mark.parametrize("text", RULE_1_RESIDUAL)
+def test_the_pinned_rule_1_residual_still_proceeds(text):
+    card = {**MEASURED_CARD, "note": text}
+    assert amounts.money_like(card) is False
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+@pytest.mark.parametrize("text", RULE_1_BENIGN)
+def test_ordinary_strings_stay_not_money_like(text):
+    assert amounts.money_like({**MEASURED_CARD, "note": text}) is False
+
+
+def test_the_escape_and_benign_measurement_is_11_of_17_and_0_of_42():
+    assert len(RULE_1_ESCAPES) + len(RULE_1_RESIDUAL) == 17 and len(RULE_1_BENIGN) == 42
+    assert sum(amounts.money_like({"note": t}) for t in RULE_1_ESCAPES + RULE_1_RESIDUAL) == 11
+    assert sum(amounts.money_like({"note": t}) for t in RULE_1_BENIGN) == 0
+
+
+@pytest.mark.parametrize("data", ["Total charged: 999 dollars", "hello", ["x"], [], 5, None],
+                         ids=["string_with_an_amount", "plain_string", "list", "empty_list", "number", "none"])
+def test_card_data_that_is_not_an_object_cancels(data):
+    assert worker.confirm_card_refused(data, TOTAL) is True
+
+
+def test_a_base64_json_blob_is_judged_like_embedded_data():
+    import base64
+
+    blob = base64.b64encode(json.dumps({"total": 999}).encode()).decode()
+    urlsafe = base64.urlsafe_b64encode(json.dumps({"note": "Your total is 999"}).encode()).decode().rstrip("=")
+    plain = base64.b64encode(json.dumps({"sku": "A-1"}).encode()).decode()
+    assert amounts.money_like({**MEASURED_CARD, "blob": blob}) is True
+    assert amounts.money_like({**MEASURED_CARD, "blob": urlsafe}) is True
+    assert amounts.money_like({**MEASURED_CARD, "blob": plain}) is False
+    # An id that merely looks like base64 is not data: never money-like for it.
+    assert amounts.money_like({**MEASURED_CARD, "ref": "AgAAAAAABk4DWZ4C28yUQAAAAAA"}) is False
+
+
+def test_the_prose_rule_and_rule_1_share_one_amount_shape_test():
+    # Reused, not copied: the prose rule refuses what rule 1 now reads as money (and the prose rule is unchanged).
+    for text in ("Your total is 999", "You will pay 999 at delivery", "Total charged: 999 dollars"):
+        assert amounts.text_refused(text, TOTAL) is True and amounts._prose_money(text) is True
