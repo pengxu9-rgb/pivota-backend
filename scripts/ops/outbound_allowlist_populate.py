@@ -11,7 +11,9 @@ Inputs (Secret Manager file mounts pinned by sha256 envs, or envs the launcher s
   OUTBOUND_ALLOWLIST_POPULATE_APPROVAL_PATH / _SHA256  apply: {mode, plan_sha256, lists_sha256, release_sha, go_reference};
                                                        rollback: {mode, receipt_sha256, release_sha, go_reference}
   OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_PATH / _SHA256   plan/apply: the PRIVATE shortener / affiliate-network host lists
-                                                       (optional; absent = no list marks; apply needs the plan's lists)
+                                                       (optional: path unset or blank = absent, no list marks; a set
+                                                       path with no file, an empty file, or a pin without a path refuses
+                                                       lists_missing; apply needs the plan's lists)
   OUTBOUND_ALLOWLIST_POPULATE_GATE                 {verdict, observed_at, ...} from a real scripts/ops/oneoff_gate.py run
   OUTBOUND_ALLOWLIST_POPULATE_RELEASE_COMMIT       must equal /app/.image_commit_sha
   OUTBOUND_ALLOWLIST_POPULATE_WRITE_ENABLED=1      apply/rollback only

@@ -516,12 +516,11 @@ def test_the_lists_load_pinned_and_print_counts_only(fixture_lists) -> None:
     assert ".test" not in line, "never a host"
 
 
-@pytest.mark.parametrize("case", ["unset", "missing_file", "empty_file"])
-def test_absent_lists_give_no_list_marks_and_no_failure(case, tmp_path) -> None:
-    env = {"unset": {}, "missing_file": _lists_env(tmp_path / "nope.json", pin="0" * 64)}.get(case)
-    if case == "empty_file":
-        (tmp_path / "empty.json").write_bytes(b"")
-        env = _lists_env(tmp_path / "empty.json")
+@pytest.mark.parametrize("env", [
+    {}, {core.REDIRECTOR_LISTS_PATH_ENV: ""}, {core.REDIRECTOR_LISTS_PATH_ENV: "  "},
+    {core.REDIRECTOR_LISTS_PATH_ENV: "", core.REDIRECTOR_LISTS_SHA256_ENV: ""},
+])
+def test_unset_lists_are_absent_no_list_marks_and_no_failure(env) -> None:
     lists = core.load_redirector_lists(env)
     assert lists["sha256"] is None and core.lists_line(lists) == "OLP lists=absent"
     assert core.redirector_marks("https://short.test/3abcde", lists) == set()
@@ -529,6 +528,35 @@ def test_absent_lists_give_no_list_marks_and_no_failure(case, tmp_path) -> None:
     plan = core.build_plan(batch_id="olp-redir", rules=[{"market": "US", "destination_url": "https://short.test/3abcde"}],
                            seeds=[], present=[], lists=lists)
     assert plan["redirector_lists_sha256"] is None and "shortener_host" not in plan["entries"][0]["marks"]
+
+
+@pytest.mark.parametrize("case", ["set_missing_file", "set_empty_file", "pin_without_path", "pin_blank_path"])
+def test_configured_lists_that_are_not_there_refuse_lists_missing(case, tmp_path) -> None:
+    (tmp_path / "empty.json").write_bytes(b"")
+    env = {
+        "set_missing_file": _lists_env(tmp_path / "nope.json", pin="0" * 64),
+        "set_empty_file": _lists_env(tmp_path / "empty.json"),
+        "pin_without_path": {core.REDIRECTOR_LISTS_SHA256_ENV: "0" * 64},
+        "pin_blank_path": {core.REDIRECTOR_LISTS_PATH_ENV: " ", core.REDIRECTOR_LISTS_SHA256_ENV: "0" * 64},
+    }[case]
+    with pytest.raises(core.Refused) as refused:
+        core.load_redirector_lists(env)
+    assert refused.value.reason == "lists_missing"
+
+
+@pytest.mark.parametrize("mode", ["plan", "apply"])
+def test_the_job_refuses_lists_missing_and_writes_nothing(mode, db, monkeypatch, capsys, tmp_path) -> None:
+    from scripts.ops import outbound_allowlist_populate as job
+
+    monkeypatch.setenv(core.REDIRECTOR_LISTS_PATH_ENV, str(tmp_path / "unmounted.json"))
+    monkeypatch.setenv(core.REDIRECTOR_LISTS_SHA256_ENV, "0" * 64)
+    monkeypatch.setenv(job.ENV + "BATCH_ID", "olp-test-1")
+    monkeypatch.setattr(job, "read_pinned", lambda name: json.dumps({"plan_sha256": "p" * 64}).encode())
+    before = asyncio.run(_rows(db))
+    with pytest.raises(core.Refused) as refused:
+        asyncio.run(job.run(mode, db, release="a" * 40))
+    assert refused.value.reason == "lists_missing"
+    assert asyncio.run(_rows(db)) == before and capsys.readouterr().out == ""
 
 
 def test_lists_that_miss_their_pin_refuse(tmp_path) -> None:

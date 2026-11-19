@@ -81,8 +81,9 @@ _PATH_EXTENSIONS = (".php", ".html", ".htm", ".asp", ".aspx", ".jsp", ".cgi", ".
 # Link shorteners and affiliate-network click domains beyond outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES (which is
 # also read) are PRIVATE: no real host is in the repository. They load at run time from a reviewed JSON file, its
 # path and SHA-256 pin in two envs (the private-manifest pattern of services/exact_retailer_cohorts.py and
-# services/external_seed_review_pilot.py). Read only. Unset path, a missing file or an empty file: no list marks, and
-# the plan says `OLP lists=absent`. A file whose bytes miss the pin, or that is not the schema, refuses the run.
+# services/external_seed_review_pilot.py). Read only. Path env unset or blank (and no pin): no list marks, and the plan
+# says `OLP lists=absent`. Path set but the file missing or empty, or a pin without a path: refused (`lists_missing`).
+# A file whose bytes miss the pin, or that is not the schema, refuses the run.
 # Shape: {"version": 1, "shorteners": [host suffix, ...], "affiliate_networks": [host suffix, ...]}.
 REDIRECTOR_LISTS_PATH_ENV = "OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_PATH"
 REDIRECTOR_LISTS_SHA256_ENV = "OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_SHA256"
@@ -176,17 +177,19 @@ def _valid_list(value: Any) -> bool:
 
 
 def load_redirector_lists(environ=None) -> Dict[str, Any]:
-    """The private shortener / affiliate-network host lists, read only, pinned by SHA-256. ABSENT_LISTS when the path
-    is unset, the file is missing or it is empty (no list marks). Refuses (`lists_sha_mismatch`, `lists_invalid`) a
-    file that misses its pin or the schema: a pinned list that silently stopped marking would be worse than a stop."""
+    """The private shortener / affiliate-network host lists, read only, pinned by SHA-256. ABSENT_LISTS (no list
+    marks) ONLY when the path env is unset or blank and no pin is set. A configured list that is not there (path set
+    but the file missing or empty, or a pin with no path) refuses `lists_missing`: a failed mount must not silently
+    drop every mark. A file that misses its pin or the schema refuses `lists_sha_mismatch` / `lists_invalid`."""
     env = os.environ if environ is None else environ
-    path, pin = env.get(REDIRECTOR_LISTS_PATH_ENV), env.get(REDIRECTOR_LISTS_SHA256_ENV)
+    path, pin = (env.get(REDIRECTOR_LISTS_PATH_ENV) or "").strip(), (env.get(REDIRECTOR_LISTS_SHA256_ENV) or "").strip()
     if not path:
+        require(not pin, "a redirector lists SHA-256 pin is set but no lists path; nothing written", "lists_missing")
         return dict(ABSENT_LISTS)
     try:
         mode = os.stat(path).st_mode
     except FileNotFoundError:
-        return dict(ABSENT_LISTS)
+        raise Refused("the redirector lists path is set but the file is missing; nothing written", "lists_missing") from None
     except OSError as error:
         raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
     require(stat.S_ISREG(mode), "redirector lists path is not a regular file", "lists_invalid")
@@ -195,8 +198,7 @@ def load_redirector_lists(environ=None) -> Dict[str, Any]:
             data = source.read(REDIRECTOR_LISTS_LIMIT + 1)
     except OSError as error:
         raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
-    if not data:
-        return dict(ABSENT_LISTS)
+    require(data, "the redirector lists file is empty; nothing written", "lists_missing")
     require(len(data) <= REDIRECTOR_LISTS_LIMIT, "redirector lists file is too large", "lists_invalid")
     require(isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin) and compare_digest(sha256(data).hexdigest(), pin),
             "redirector lists bytes do not match the SHA-256 pin", "lists_sha_mismatch")
