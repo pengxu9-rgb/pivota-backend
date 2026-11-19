@@ -37,7 +37,7 @@ when no refresh or sweep execution is running (gcloud run jobs executions list -
 It needs the MERGED image: the lane is imported, never restated. No at-sign anywhere in this file:
 run_oneoff_job.sh picks its --args delimiter from a fixed set.
 
-Launch (Peng; pg CPU gate first):
+Launch (the owner; pg CPU gate first):
   SUBNET=pivota-crawl ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,CATALOGUE_PLAN_EGRESS=pivota-crawl,TOP_HOSTS=20 \\
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/plan_shopify_catalogue_refresh.py)"
 

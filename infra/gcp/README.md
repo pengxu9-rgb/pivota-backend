@@ -6,7 +6,7 @@ first real Minds/Antom transaction. Cutover window Sep 8–12. See
 
 | thing | value |
 |---|---|
-| Google account | `peng@woopay.tech` (credit lives here) |
+| Google account | `<owner-google-account>` (credit lives here) |
 | billing account | `01C8A5-869AD4-2872C8` ($100k GFS Scale Y1 + $12k support, to 2027-08-19) |
 | org | `peng-org` (867785023602) |
 | projects | `pivota-prod`, `pivota-staging`, `pivota-shared` (images/Cloud Build) |
@@ -15,7 +15,7 @@ first real Minds/Antom transaction. Cutover window Sep 8–12. See
 ## Bootstrap an environment
 
 ```bash
-gcloud auth login --update-adc            # once, as peng@woopay.tech
+gcloud auth login --update-adc            # once, as <owner-google-account>
 infra/gcp/bootstrap_env.sh staging        # ~15 min (Cloud SQL + Memorystore)
 infra/gcp/bootstrap_env.sh prod
 ```

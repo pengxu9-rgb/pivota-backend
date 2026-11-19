@@ -283,7 +283,7 @@ def test_an_seo_line_is_not_stored_as_the_served_description(monkeypatch):
 
 
 def test_an_seo_line_fills_only_an_empty_description_tagged_and_never_the_served_one(monkeypatch):
-    """Peng 2026-10-15: SEO copy may fill a seed with NO description, tagged so real copy replaces
+    """The owner 2026-10-15: SEO copy may fill a seed with NO description, tagged so real copy replaces
     it later; it never reaches `snapshot.description`, which the gateway serves first."""
     row = _seed_row(seed_data=_polluted_seed_data())
     stored = _refresh(monkeypatch, row, _snapshot(_page_html(jsonld_description=None)))

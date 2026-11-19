@@ -7,7 +7,7 @@
 > IP (then 34.82.199.35) across all shops since ~00:00Z 2026-09-30. "Closed" means **at least 24 h with
 > no crawl-backoff 429 bursts and no IP-throttle breaker trips** on the crawlers already sharing that
 > address -- the external-referral refresh, the external-seed destination sweep,
-> `tierb-cart-link-eligibility` and `merchant-purchasability-sweep` -- **plus Peng's go**.
+> `tierb-cart-link-eligibility` and `merchant-purchasability-sweep` -- **plus the owner's go**.
 > **THE 24 h WINDOW RESTARTS ON THE NEW IP.** On 2026-10-16 the crawl NAT moved to 136.67.250.98
 > (`pivota-crawl-egress-ip-2`; the old 34.82.199.35 stays reserved for rollback) after Cloudflare
 > challenge-listed the old address, together with strict global pacing on the refresh
@@ -208,7 +208,7 @@ infra/gcp/setup_reap_cart_proof_jobs.sh $ENV $TAG
 
 # ⛔ STOP HERE until the HARD GATE at the top of this runbook (>= 24 h with no crawl-backoff 429 bursts
 #    and no breaker trips on the referral refresh, the destination sweep, Tier B and the purchasability
-#    sweep, plus Peng's go; #2474 merged, both lanes wired through it, and
+#    sweep, plus the owner's go; #2474 merged, both lanes wired through it, and
 #    CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true on both jobs) and the PRECONDITIONS 1-4 above all hold.
 
 # 2. FIRST DRY RUN: ONE SMALL STORE PER LANE, not all 42. `--args` replaces the job's args for this
@@ -240,7 +240,7 @@ infra/gcp/setup_reap_cart_proof_jobs.sh $ENV $TAG --enable
 Step 3's one-off apply writes cursors too (it is an apply), so step 4's first scheduled run resumes
 wherever step 3 stopped.
 
-Then prod with `ENV=prod PROJECT=pivota-prod`. **Steps 3 and 4 write to production: Peng's go
+Then prod with `ENV=prod PROJECT=pivota-prod`. **Steps 3 and 4 write to production: the owner's go
 first.** Announce each prod apply to the owner of the lane it writes (the Reap rail).
 
 `--wait` returns non-zero for any non-zero exit; the exit code alone does not say which (gcloud

@@ -3,7 +3,7 @@
 ## Context
 
 Project: Pivota — AI commerce enablement platform.
-Working dir: `/Users/pengchydan/dev/pivota-backend-receipt-suppress-fix`
+Working dir: `~/dev/pivota-backend-receipt-suppress-fix`
 Architecture spec: `docs/monetization/Pivota_Monetization_System_v1.3_Blueprint.docx`
 
 This task was identified during Wave 3 review. **Design gap:** v1.3 introduces the column `commerce_attribution_edges.gross_attributed_gmv_cents` and T6's GMV aggregation reads from it, but nothing in the current commerce-payment flow populates it. Without T9, T7's invoice generation runs against empty data and the v1.3 pipeline can't be tested end-to-end.

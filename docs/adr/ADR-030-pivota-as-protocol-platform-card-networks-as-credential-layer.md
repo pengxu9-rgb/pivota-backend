@@ -2,7 +2,7 @@
 
 **Status:** Proposed (draft 6), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later". Draft 6 applies D11 beyond the pilot, and records the answers to owner questions 2, 3 and 5.
 
-**Decision owner:** peng. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
+**Decision owner:** Founder. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
 **Direction already decided by the owner (2026-11-10):**
 - Go protocol-native.

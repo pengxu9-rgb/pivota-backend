@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-09
-**Deciders:** Founder (peng)
+**Deciders:** Founder
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-008 (prevent-at-intake), ADR-010 (resolver-owned canonical identity — signed off in principle 2026-07-09, incl. publish-surface addendum D-5/D-6).
 **Scope:** the *intake side* of ADR-010 — this ADR operationalizes "prevent-at-intake" as a uniform, enforced contract at every door. It changes no serving behavior.
 

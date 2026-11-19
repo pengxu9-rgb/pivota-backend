@@ -325,7 +325,7 @@ def seed_offer_currency_and_market(
 ) -> Tuple[Optional[str], str]:
     """The currency and market the mirror offer is written with: the seed's own, never a default.
 
-    Peng 2026-10-19: a market or currency is never defaulted. This writer used to bind
+    The owner 2026-10-19: a market or currency is never defaulted. This writer used to bind
     `price_currency or "USD"` and `market or "US"`; prod 2026-10-19 still serves USD mirror offers
     stamped that way on seeds priced in SGD (nourwish.com, 23 serving products). So:
 
@@ -948,12 +948,12 @@ def plan_attached_listing_offer_writes(
     # payload hides the page read (seed_currency_of carries the SQL's answer on the sync path).
     #   * Its SEED-PROJECTED rows, which every reader withholds, are never re-priced (#2657).
     #   * A READ (`refresh`, and any source but an employee edit) re-prices nothing: no amount it holds can
-    #     be vouched for in any currency (Peng 2026-10-22). The nightly refresh already projects only a
+    #     be vouched for in any currency (the owner 2026-10-22). The nightly refresh already projects only a
     #     read in the column's currency, so this is a guard against a read that reaches here anyway (a
     #     whitespace-only disagreement, a concurrent write), not a change to tonight's writes.
     #   * An explicit EMPLOYEE EDIT (`employee_edit`) is a person vouching for the column's currency and
     #     amount: it re-prices and stamps the listing rows another writer owns as on main, attributed
-    #     `price_read_source = employee_edit` (Peng 2026-10-22). Otherwise a human has no way to correct
+    #     `price_read_source = employee_edit` (the owner 2026-10-22). Otherwise a human has no way to correct
     #     such a listing (setting the column to the page's currency turns every row into a mismatch).
     # Refused rows are NOT suppressed: they keep their last price and their price_checked_at ages.
     seed_states_currency = seed_currency_of(seed) is not None

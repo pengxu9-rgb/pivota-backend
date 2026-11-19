@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-18
-**Deciders:** Founder (peng) — positioning; Commerce / Trust owners
+**Deciders:** Founder — positioning; Commerce / Trust owners
 **Supersedes:** **ADR-013** (AP2 Settlement Model) — whose adopted Option A ("an internal, Pivota-held agent ledger that `confirm` debits") makes Pivota custody agent funds, contradicting the positioning decided here.
 **Part of:** the agent-protocol interoperability model — **ADR-014** (meta). This ADR fixes the **settlement layer's** money boundary (Pivota routes, never executes) and names a concern the positioning makes load-bearing: **attribution**.
 **Relationship:** aligns with **ADR-007** (Pivota is the citable index + decision layer) and **ADR-012** (the API-key ACP rail already settles via the *merchant's* PSP — Pivota orchestrates, never holds). Companion: `docs/AP2_ENABLEMENT.md`.

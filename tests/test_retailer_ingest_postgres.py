@@ -77,7 +77,7 @@ async def test_approval_bookkeeping_is_not_scope(db):
 async def test_approval_merges_refiles_next_to_exclusions(db):
     job_id = await _enqueue(db, brand="REFILE", options={"vendors": ["X"], "refile_to_sets": ["a-set"]})
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
-    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["x"], accepted_flags=[],
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=["x"], accepted_flags=[],
                                 refile_handles=["b-duo"], db=db)
     row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
     import json as _json
@@ -86,12 +86,12 @@ async def test_approval_merges_refiles_next_to_exclusions(db):
     # an approval that names no re-file does not write the key (an older drain refuses it as unknown)
     job2 = await _enqueue(db, brand="NOREFILE", options={"vendors": ["X"]})
     await ledger.transition(job2, status="held", reason="flag", run_id=None, db=db)
-    assert await ledger.approve(job2, approved_by="peng", exclude_handles=[], accepted_flags=[], db=db)
+    assert await ledger.approve(job2, approved_by="owner", exclude_handles=[], accepted_flags=[], db=db)
     row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job2})
     options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
     assert "refile_to_sets" not in options
     with pytest.raises(ValueError):
-        await ledger.approve(job2, approved_by="peng", exclude_handles=[], accepted_flags=[], refile_handles=[" "], db=db)
+        await ledger.approve(job2, approved_by="owner", exclude_handles=[], accepted_flags=[], refile_handles=[" "], db=db)
 
 
 async def test_one_claim_per_due_job_and_an_expired_lease_is_reclaimed(db):
@@ -124,9 +124,9 @@ async def test_approval_merges_exclusions_and_makes_the_job_due(db):
     await _only_ours_due(db)
     job_id = await _enqueue(db)
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
-    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["3ce-tone-up-tint-40ml"],
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=["3ce-tone-up-tint-40ml"],
                                 accepted_flags=[], db=db)
-    assert not await ledger.approve(job_id, approved_by="peng", exclude_handles=[], accepted_flags=[], db=db)
+    assert not await ledger.approve(job_id, approved_by="owner", exclude_handles=[], accepted_flags=[], db=db)
     claimed = await ledger.claim_due_job(lease_seconds=60, db=db)
     assert claimed["status"] == "apply_due"
     assert claimed["options"]["exclude_handles"] == ["3ce-tone-up-tint-40ml"]
@@ -171,7 +171,7 @@ async def test_a_transition_is_conditional_on_the_claimed_status(db):
     claimed = await ledger.claim_due_job(lease_seconds=3600, db=db)
     assert claimed["id"] == job_id
     # an operator cannot cancel a job whose stage is running...
-    assert not await ledger.cancel(job_id, by="peng", reason="mid-crawl", db=db)
+    assert not await ledger.cancel(job_id, by="owner", reason="mid-crawl", db=db)
     # ...and if the status changed anyway, the stage's verdict does not overwrite it
     await db.execute("UPDATE retailer_ingest_jobs SET status='cancelled' WHERE id=:id", {"id": job_id})
     assert not await ledger.transition(job_id, status="apply_due", reason="clean", run_id=None,
@@ -519,8 +519,8 @@ async def test_approve_validates_and_is_null_safe(db):
     job_id = await _enqueue(db, brand="NULLS", options={"vendors": ["X"], "exclude_handles": None})
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
     with pytest.raises(ValueError):
-        await ledger.approve(job_id, approved_by="peng", exclude_handles=[""], accepted_flags=[], db=db)
-    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["x"], accepted_flags=["k"], db=db)
+        await ledger.approve(job_id, approved_by="owner", exclude_handles=[""], accepted_flags=[], db=db)
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=["x"], accepted_flags=["k"], db=db)
     row = await db.fetch_one("SELECT options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
     import json as _json
     options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
@@ -542,7 +542,7 @@ async def test_a_refile_moves_a_handle_an_earlier_approval_excluded_and_back(db)
     # Review of #2316: appending left the handle in BOTH lists; the drain then failed the job for good.
     job_id = await _enqueue(db, brand="MOVE", options={"vendors": ["X"], "exclude_handles": ["Cream-Duo", "other"]})
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
-    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=[], accepted_flags=[],
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=[], accepted_flags=[],
                                 refile_handles=["cream-duo/"], db=db)
 
     async def options():
@@ -554,9 +554,9 @@ async def test_a_refile_moves_a_handle_an_earlier_approval_excluded_and_back(db)
     from services.retailer_ingest.pipeline import validate_options
     validate_options(dict(got))  # the drain accepts what the approval wrote
     await ledger.transition(job_id, status="held", reason="flag", run_id=None, db=db)
-    assert await ledger.approve(job_id, approved_by="peng", exclude_handles=["CREAM-DUO"], accepted_flags=[], db=db)
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=["CREAM-DUO"], accepted_flags=[], db=db)
     got = await options()
     assert got["exclude_handles"] == ["other", "CREAM-DUO"] and got["refile_to_sets"] == []
     with pytest.raises(ValueError, match="both re-filed and excluded"):
-        await ledger.approve(job_id, approved_by="peng", exclude_handles=["a"], accepted_flags=[],
+        await ledger.approve(job_id, approved_by="owner", exclude_handles=["a"], accepted_flags=[],
                              refile_handles=["A/"], db=db)

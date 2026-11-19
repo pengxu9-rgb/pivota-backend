@@ -25,7 +25,7 @@ class SettlementFileError(Exception):
 
 
 class SettlementTransfersDisabledError(SettlementFileError):
-    """SETTLEMENT_FILE_TRANSFER_ENABLED is not literally 'true' (FIX_PLAN O-05; Peng's decision on
+    """SETTLEMENT_FILE_TRANSFER_ENABLED is not literally 'true' (FIX_PLAN O-05; the owner's decision on
     W3 F1). Raised before any read, write or Stripe call, so the file row is unchanged."""
 
 

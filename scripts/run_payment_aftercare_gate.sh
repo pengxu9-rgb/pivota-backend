@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-BACKEND_REPO="${PIVOTA_BACKEND_REPO:-/Users/pengchydan/dev/Pivota-cursor-create-project-directory-structure-8344/pivota-backend}"
+BACKEND_REPO="${PIVOTA_BACKEND_REPO:-$HOME/dev/Pivota-cursor-create-project-directory-structure-8344/pivota-backend}"
 
 if [[ ! -d "$BACKEND_REPO" ]]; then
   echo "missing backend repo directory: $BACKEND_REPO" >&2

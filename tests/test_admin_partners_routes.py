@@ -514,7 +514,7 @@ def test_settlement_retry_409_transfers_disabled_sends_nothing_and_keeps_the_row
     monkeypatch: pytest.MonkeyPatch,
     flag: str | None,
 ) -> None:
-    # O-05, Peng's decision on W3 F1: with SETTLEMENT_FILE_TRANSFER_ENABLED not literally 'true'
+    # O-05, the owner's decision on W3 F1: with SETTLEMENT_FILE_TRANSFER_ENABLED not literally 'true'
     # the staff retry answers 409 TRANSFERS_DISABLED, calls Stripe zero times, and leaves the
     # file exactly as it was (still `failed`, its error intact).
     fake_db.add_partner()

@@ -48,7 +48,7 @@ worker. The silence alert cannot detect a never-armed rail and ages out after
 
 Preparation can continue while merchant fetching is gated. Before any actual
 merchant request, require crawl-controller confirmation that the IP incident
-has remained closed for at least 24 hours and Peng's explicit go. Re-read
+has remained closed for at least 24 hours and the owner's explicit go. Re-read
 actual schedules and executions at that time; do not treat the sample October
 2 run time as clearance.
 

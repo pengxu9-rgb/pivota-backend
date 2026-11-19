@@ -5,7 +5,7 @@ plan, run the guards, read every row, apply only a clean cohort through the appl
 the written rows back. Every stage writes one `retailer_ingest_runs` row, including the ones that
 end early, so "why did store X not land?" is answered by the ledger, not by log archaeology.
 
-Policy (Peng, 2026-09-23): a dry run with zero BLOCK flags is applied automatically; any BLOCK flag
+Policy (the owner, 2026-09-23): a dry run with zero BLOCK flags is applied automatically; any BLOCK flag
 holds the job until someone approves it (optionally excluding handles or accepting flag keys).
 The apply stage re-crawls and RE-RUNS every check before writing, so a store that changed between
 its dry run and its apply cannot slip a new row past the review.
@@ -50,7 +50,7 @@ _OPTION_TYPES = {
     "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
     "only_resolved_category": bool, "lip_title_evidence": bool, "lash_nail_title_evidence": bool,
     "exclude_handles": list,
-    # Reviewer decision (Peng 2026-09-25): a bundle of different products the store filed on a
+    # Reviewer decision (the owner 2026-09-25): a bundle of different products the store filed on a
     # single-product shelf ("Cologne & Hand Cream Duo" under fragrance/perfume) is RE-FILED to the
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
     # are filed under REFILE_SETS_LEAF before any check runs.
@@ -65,7 +65,7 @@ _OPTION_TYPES = {
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
     # or "shopify_markets" (services/retailer_ingest/shopify_markets.py: USD SIBLING offers, read inside
     # a US-localized session whose /cart.js proves USD, for products a base-currency crawl of the same
-    # storefront already wrote; multi-market storefronts ADR Phase 2). Since 2026-10-10 (Peng: "Build the
+    # storefront already wrote; multi-market storefronts ADR Phase 2). Since 2026-10-10 (the owner: "Build the
     # SG currency support") its options.market may be SG too: SGD siblings from an SG-localized session.
     "source": str, "feed": dict,
     # Storefront crawls only (2026-10-10): refuse the crawl (status `nothing`) unless the store's own
@@ -102,7 +102,7 @@ _OPTION_TYPES = {
     "retire_stale_brand": str,
     # Fold a store's per-shade / per-size listings into their base listing's variants
     # (curated_brand_feed.fold_shade_listings(extended=True): "<Line> - Ruby" beside "<Line>"). Opt-in per
-    # cohort (Peng approved 2026-10-12): a retailer storefront crawl only, and a cohort whose fold would
+    # cohort (the owner approved 2026-10-12): a retailer storefront crawl only, and a cohort whose fold would
     # supersede listings that already have LIVE rows on the host is held (fold_supersedes_live_rows) -- the
     # retire of those rows is a follow-up, so a fold may only take over a store it has not ingested per shade.
     "fold_shades": bool,
@@ -116,13 +116,13 @@ DEFAULT_MARKET = "US"
 #: writer that declares one. normalize_curated_brand_payload accepts exactly this list from this lane.
 INGEST_MARKETS = ("US", "AU", "JP", "SG")
 #: The ingest markets that are SERVED, not acquired: a job's rows must read back serving-eligible. SG
-#: (Peng 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
+#: (the owner 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
 #: list crawled SG stores). Its rows are written like every other market's: catalog_offers.market 'SG' priced
 #: in SGD, and the seed in the "US" partition (ingestion.SEED_PARTITION_MARKET) -- where SG buyers already
 #: find SGD seeds by currency (external_seed_search serving currency, #2389). Only the offer stamp is new:
 #: jsmbeauty.sg / makeupforever.sg, written before this, carry market 'US' with SGD (INSERT-only column).
 SERVED_INGEST_MARKETS = tuple(m for m in INGEST_MARKETS if m not in ACQUISITION_MARKETS)
-#: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
+#: Multi-market storefronts ADR Phase 2 (approved by the owner 2026-09-26): ACQUISITION markets. A job for
 #: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
 #: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
 #: served regions (index_pipeline_state has_serving_region_offer, PIVOTA_SERVING_PRICING_REGIONS = US,SG):
@@ -308,8 +308,8 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"options.source = shopify_markets captures the {' and '.join(CAPTURE_MARKETS)} "
                              f"markets only")
         if options.get("source_role") != "brand_official" and job_market(options) != "SG":
-            # Brand stores first (Peng 2026-09-26) still holds for the US: US retailers follow later.
-            # SG retailers are allowed (Peng 2026-10-10, "Build the SG currency support": nearly every SG
+            # Brand stores first (the owner 2026-09-26) still holds for the US: US retailers follow later.
+            # SG retailers are allowed (the owner 2026-10-10, "Build the SG currency support": nearly every SG
             # pair the coverage wave found is a retailer). The gate is the
             # MARKET, in code, not an env or a job option: an env would have to match on the enqueue runner
             # and on the drain (whose image and env have a single writer), and a job option is the operator
@@ -317,7 +317,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             # base offer (merchant_id, offer_type, offer_mode redirect), so nothing new is claimed for it.
             raise ValueError("options.source = shopify_markets supports source_role = retailer for market SG "
                              "only; a US capture is source_role = brand_official only (brand stores first, "
-                             "Peng 2026-09-26; US retailers follow later)")
+                             "the owner 2026-09-26; US retailers follow later)")
     elif job_market(options) in ACQUISITION_MARKETS and source != "storefront":
         # An acquisition job is the BASE-CURRENCY crawl of a storefront (ADR Phase 2, operator step 1):
         # the rows a shopify_markets capture later prices in USD. A feed has no such storefront.
@@ -559,7 +559,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
         that types an offer brand_direct) -- us.examplebrand.example for "Example Brand";
       * Tier B: the store's own /meta.json (`storefront`, from the crawl) names the brand, ships to
         the job's `market` and prices in its currency (storefront_tier_b) -- brand-store.example.com,
-        "Example Brand Naturals USA", for "Example Brand". Peng approved it as automatic on 2026-09-26;
+        "Example Brand Naturals USA", for "Example Brand". The owner approved it as automatic on 2026-09-26;
       * otherwise a human accepts the flag (a host whose name is not the brand's, with no /meta.json
         that proves it): held, never auto-applied. A failed Tier B yields exactly that flag, same key.
 
@@ -617,7 +617,7 @@ def verified_brand_storefront(job: Dict[str, Any], checks: Optional[Dict[str, An
     brand_official_domain_unproven key (a human vouched). A known retailer, a job that is not
     source_role=brand_official, or evidence for another domain proves nothing. Only a proven brand's
     rows on this host get 'self' seeds (catalog_enrichment_agent.apply.VerifiedBrandStorefront), which
-    lets trust serve them without a manual live-read promotion (Peng, 2026-09-29)."""
+    lets trust serve them without a manual live-read promotion (the owner, 2026-09-29)."""
     from services.catalog_enrichment_agent.apply import VerifiedBrandStorefront, _storefront_host
 
     o = job.get("options") or {}
@@ -2281,7 +2281,7 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     """One stage of a source=shopify_markets job (services/retailer_ingest/shopify_markets.py).
 
     Same shape as a crawl job: the dry run proves the session in the job's market (US, or SG since
-    2026-10-10) and reads every price, writing nothing; a clean dry run is applied automatically (Peng's
+    2026-10-10) and reads every price, writing nothing; a clean dry run is applied automatically (the owner's
     policy); the apply RE-proves the session, re-reads every price, and only then writes the siblings
     (USD/US or SGD/SG) under the catalog write lock, republishes the touched content_keys and reads them
     back. A store that does not confirm the market's currency is a clean refusal (status `nothing`, the

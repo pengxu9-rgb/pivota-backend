@@ -1,7 +1,7 @@
 # ADR-022: The merchant-promotions lane is deleted; any rebuild must follow checkout authority
 
 **Status:** Accepted (2026-08-11). Rebuild trigger amended by ADR-027 (2026-10-30).
-**Decision owner:** peng
+**Decision owner:** Founder
 **Supersedes:** the manual promo-type gate from #1728 / PIVOTA-Agent #1954 (both now deleted along with the routes they guarded)
 
 ## Context
