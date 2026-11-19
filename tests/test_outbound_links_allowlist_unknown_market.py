@@ -77,3 +77,124 @@ def test_the_employee_preview_is_unchanged_for_a_listed_or_absent_market(monkeyp
     out = _preview(monkeypatch, market, snapshot_fails=snapshot_fails)
     assert out["preview"]["domain_allowed"] is True
     assert "domain_allowed_reason" not in out["preview"]
+
+
+# --- the minters that do call _is_domain_allowed --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("market, reason", [("USA", "allowlist_market_unknown"), ("*", "allowlist_market_unknown"),
+                                            ("ſg", "allowlist_market_unknown"), ("US", None), (None, None)])
+def test_links_resolve_refuses_a_rule_under_a_market_the_registry_does_not_list(monkeypatch, empty_allowlists, market, reason) -> None:
+    from fastapi.testclient import TestClient
+
+    from main import app
+    service, asked = empty_allowlists
+
+    async def fake_rule(**_kw: Any) -> dict:
+        return {"id": "rule_1", "destination_url": "https://shop.example.com/p/1"}
+
+    monkeypatch.setattr(service, "_select_best_rule", fake_rule)
+    body = {"tool": "*", "candidates": {}, **({} if market is None else {"market": market})}
+    res = TestClient(app).post("/api/links/resolve", json=body)
+    assert res.status_code == 200, res.text
+    out = res.json()
+    if reason:
+        assert out == {"matched": False, "resolved": None, "reason": reason}
+        assert asked == [], "no allowlist is read for it"
+    else:
+        assert out["matched"] is True and "/r?token=" in out["resolved"]["redirectUrl"]
+
+
+@pytest.fixture
+def employee_client(monkeypatch: pytest.MonkeyPatch):
+    from unittest.mock import AsyncMock
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import routes.employee_products as ep
+
+    async def override_employee():
+        return {"employee_id": "emp_test", "email": "test@example.com"}
+
+    app = FastAPI()
+    app.include_router(ep.router)
+    app.dependency_overrides[ep.get_current_employee] = override_employee
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_get_primary_offer", AsyncMock(return_value=None))
+    minted: List[Any] = []
+
+    async def fake_mint(**kw: Any) -> str:
+        minted.append(kw["market"])
+        return f"https://example.com/r?token={kw['market']}"
+
+    monkeypatch.setattr(ep, "_make_redirect_url", fake_mint)
+    return TestClient(app), ep, minted
+
+
+def _rows(*markets: str) -> List[dict]:
+    from tests.test_employee_external_seed_pdp import _seed_row
+
+    return [_seed_row(id=f"eps_{i}", market=m) for i, m in enumerate(markets)]
+
+
+@pytest.mark.parametrize("path", [
+    "/employee/products/external_seed%7Cexternal%7Cext_test_1/offers",
+    "/employee/products/external_seed%7Cexternal%7Cext_test_1/external-links",
+])
+def test_a_mixed_partition_list_refuses_only_the_rows_the_allowlist_cannot_key(monkeypatch, employee_client, path) -> None:
+    client, ep, minted = employee_client
+    rows = _rows("US", "*", "EU-DE", "SG")
+
+    async def fake_fetch_all(query: Any, values: Any = None):
+        return [dict(r) for r in rows] if "FROM external_product_seeds" in str(query) else []
+
+    monkeypatch.setattr(ep.database, "fetch_all", fake_fetch_all)
+    res = client.get(path, headers={"Authorization": "Bearer test-token"})
+    assert res.status_code == 200, res.text
+    items = {i.get("seed_id") or i.get("id"): i for i in (res.json().get("items") or res.json().get("links") or [])}
+    assert set(items) == {"eps_0", "eps_1", "eps_2", "eps_3"}, "every row is still listed"
+    for sid in ("eps_0", "eps_3"):
+        assert items[sid]["action"]["redirect_url"].startswith("https://example.com/r?token=")
+        assert "redirect_refused_reason" not in items[sid]["action"]
+    for sid in ("eps_1", "eps_2"):
+        assert items[sid]["action"]["redirect_url"] is None
+        assert items[sid]["action"]["redirect_refused_reason"] == "allowlist_market_unknown"
+    assert sorted(minted) == ["SG", "US"], "only the listed rows are minted"
+
+
+@pytest.mark.parametrize("market, refused", [("*", True), ("EU-DE", True), ("US", False)])
+def test_refresh_answers_a_named_refusal_after_its_write_never_a_400(monkeypatch, employee_client, market, refused) -> None:
+    client, ep, minted = employee_client
+    wrote: List[str] = []
+
+    async def fake_refresh(seed_id: str) -> dict:
+        wrote.append(seed_id)
+        return {"status": "success", "market": market, "tool": "*", "canonical_url": "https://example.com/p/1",
+                "dest": "https://example.com/p/1", "utm_template": None, "attached_product_key": None,
+                "attached_variant_id": None, "disclosure_text": "d"}
+
+    monkeypatch.setattr(ep, "_refresh_external_seed_by_id", fake_refresh)
+    res = client.post("/employee/products/external-seeds/eps_9/refresh", headers={"Authorization": "Bearer test-token"})
+    assert res.status_code == 200, res.text
+    assert wrote == ["eps_9"]
+    action = res.json()["action"]
+    if refused:
+        assert action["redirect_url"] is None and action["redirect_refused_reason"] == "allowlist_market_unknown"
+        assert minted == []
+    else:
+        assert action["redirect_url"].startswith("https://example.com/r?token=") and "redirect_refused_reason" not in action
+
+
+def test_the_preview_still_refuses_a_lookalike_when_the_allowlist_read_fails(monkeypatch, empty_allowlists) -> None:
+    import routes.employee_products as ep
+
+    async def boom(**_kw: Any) -> bool:
+        raise RuntimeError("allowlist read failed")
+
+    monkeypatch.setattr(ep, "_is_domain_allowed", boom)
+    out = _preview(monkeypatch, "ſg")
+    assert out["preview"]["domain_allowed"] is False, "the fail-open never opens a market the allowlist cannot key"
+    assert out["preview"]["domain_allowed_reason"] == "allowlist_market_unknown"
+    out = _preview(monkeypatch, "US")
+    assert out["preview"]["domain_allowed"] is True, "a listed market keeps the fail-open, as before"

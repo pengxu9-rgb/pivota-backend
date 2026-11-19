@@ -920,6 +920,10 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     dest_with_utm = apply_utm(dest, utm_template, tokens)
     dest_with_tracking = apply_pvt_params(dest_with_utm, attribution)
 
+    # A rule filed under a market key the registry does not list allows no destination (POST /api/links/resolve
+    # answers matched:false with this reason); a listed market's allowlist is enforced as before.
+    if allowlist_market_refusal(market) is not None:
+        raise ValueError(ALLOWLIST_MARKET_UNKNOWN_REASON)
     if not await _is_domain_allowed(market=market, destination_url=dest_with_tracking):
         raise ValueError("DOMAIN_NOT_ALLOWED")
 
