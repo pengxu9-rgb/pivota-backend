@@ -2,7 +2,7 @@
 
     python -m jobs.a2a_rail_operator list-held    [--limit 50]
     python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <hold code>
-        [--apply --operator <handle> --expect-env <PIVOTA_ENV> --provider-checked]
+        [--lookup | --apply --operator <handle> --expect-env <PIVOTA_ENV> --provider-checked]
 
 In production it runs as a one-off Cloud Run job (scripts/ops/run_oneoff_job.sh, behind the one-off gate);
 see docs/agent_purchases_routes.md, "Held A2A checkouts".
@@ -29,7 +29,10 @@ WHAT A RESOLUTION CAUSES. The purchase keeps its token id: the next worker tick'
 token on the rail when a voider is configured (a second rail call, caused by this write).
 
 DRY RUN BY DEFAULT. `resolve-held` without `--apply` reads THAT row (by id) and reports its code, how long
-it has been held, and whether the apply would be accepted and why not. `--apply` additionally requires:
+it has been held, and whether the apply would be accepted and why not. With `--lookup` it also sends ONE
+read-only lookup by our idempotency key (worker.operator_lookup_preview) and shows only the answer's state,
+result_status, total, currency and task_id, labelled bound or "UNBOUND: this answer may belong to another
+purchase; not verified as ours"; read then, never stored. `--apply` additionally requires:
   * `--operator <handle>` (logged with the decision);
   * `--expect-env <PIVOTA_ENV>`, EXACTLY this process's PIVOTA_ENV;
   * `--provider-checked`: the operator's statement that they checked the provider's side for this purchase.
@@ -74,6 +77,8 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--operator")
     resolve.add_argument("--expect-env")
     resolve.add_argument("--provider-checked", action="store_true")
+    resolve.add_argument("--lookup", action="store_true",
+                         help="dry run only: ONE read-only lookup, its safe fields shown (bound or UNBOUND), nothing stored")
     return parser
 
 
@@ -96,7 +101,7 @@ async def _held(limit: int) -> List[Dict[str, Any]]:
     return [row for row in rows if str(row.get("last_error_code") or "") in codes]
 
 
-async def run(argv: List[str], out=sys.stdout) -> int:
+async def run(argv: List[str], out=sys.stdout, client: Any = None) -> int:
     try:
         args = _parser().parse_args(argv)
     except SystemExit:
@@ -134,6 +139,19 @@ async def run(argv: List[str], out=sys.stdout) -> int:
             }
             if reason == "payment_reached_recorded":
                 preview["message"] = "payment was reported for this purchase: escalate; the merchant refunds"
+            if args.lookup:
+                # Read now, shown, never stored (worker.operator_lookup_preview). An answer for a task the row
+                # never recorded is labelled UNBOUND: it may be another purchase's.
+                if client is None:
+                    from services.payment_orchestration import a2a_rail
+
+                    client = a2a_rail.from_env()
+                try:
+                    # The full row is read for the lookup's own use (member and task ids); it is never printed.
+                    full = await ledger.get_purchase_internal(args.purchase_id) if row is not None else None
+                    preview["lookup"] = await worker.operator_lookup_preview(client, full)
+                except Exception as exc:  # noqa: BLE001 - a failed read never stops the preview
+                    preview["lookup"] = {"ran": False, "reason": f"lookup failed: {type(exc).__name__}"}
             print(json.dumps(preview, default=str, sort_keys=True), file=out)
             return EXIT_OK if eligible else EXIT_REFUSED
         result = await worker.operator_fail_held_checkout(

@@ -834,42 +834,6 @@ async def record_checkout_task_as_holder(
     return _purchase(await database.fetch_one(_RECORD_CHECKOUT_TASK_SQL_SQLITE, values))
 
 
-# A held checkout looked up by our idempotency key (a2a_rail_worker._checkout_lookup) adopts the task id the
-# provider names, and the lookup's answer resolves whatever checkout write nobody saw the answer to (it is
-# never resent). Only a `paying` row this worker holds, with no task yet, and with no pending write or a
-# checkout write pending.
-_ADOPT_CHECKOUT_TASK_SQL = """
-    UPDATE a2a_rail_purchases
-       SET checkout_task_id = :checkout_task_id,
-           pending_write = NULL,
-           pending_write_at = NULL,
-           updated_at = clock_timestamp()
-     WHERE id = :id
-       AND state = 'paying'
-       AND claimed_by = :holder
-       AND checkout_task_id IS NULL
-       AND (pending_write IS NULL OR pending_write LIKE 'checkout.%')
-    RETURNING *
-"""
-_ADOPT_CHECKOUT_TASK_SQL_SQLITE = _ADOPT_CHECKOUT_TASK_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
-
-
-async def adopt_checkout_task_as_holder(
-    purchase_id: str, worker_id: str, *, checkout_task_id: str
-) -> Optional[Dict[str, Any]]:
-    """Record the task id a lookup found, resolving a pending checkout write. None when the row is not held
-    in `paying` by this worker, already has a task, or has a non-checkout write pending. Malformed values
-    raise before any SQL."""
-    values = {
-        "id": purchase_id,
-        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
-        "checkout_task_id": _rail_ref(_require(_RAIL_REF_RE, checkout_task_id, "checkout_task_id"), "checkout_task_id"),
-    }
-    if IS_POSTGRES:
-        return _purchase(await database.fetch_one(_ADOPT_CHECKOUT_TASK_SQL, values))
-    return _purchase(await database.fetch_one(_ADOPT_CHECKOUT_TASK_SQL_SQLITE, values))
-
-
 # A held checkout's lookups, counted WRITE-AHEAD (before the read goes out), so a step that crashes in the
 # middle of one still counts it: at most `max_tries` per row, ever. Fenced on the holder and `paying`.
 _COUNT_CHECKOUT_LOOKUP_SQL = """
