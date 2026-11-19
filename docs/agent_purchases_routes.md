@@ -187,7 +187,7 @@ was set up, and the purchase can be resolved as above.
 
 **Who may run it.** `list-held`, the preview (`resolve-held` without `--apply`) and `resolve-held --apply`
 all read or write production, so each is a **production one-off**: run it through the one-off gate (`oneoff_gate.sh`,
-GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **Peng's go for that purchase**. The tool does not
+GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **the owner's go for that purchase**. The tool does not
 check the gate itself.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
