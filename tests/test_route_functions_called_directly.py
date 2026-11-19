@@ -30,6 +30,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 FASTAPI_PARAMS = {"Query", "Body", "Path", "Header", "Cookie", "Depends", "Form", "File", "Security"}
 HANDOFF_CALLS = {"Depends", "Security"}
@@ -245,7 +247,9 @@ class _Scanner:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and owner != scope.get(node.name, ("",))[0]:
                 scope[node.name] = (owner, node.name)
-        for node in body:
+        # An alias (`g = f`) binds in its whole function (or module) body, wherever it sits: inside an if/with/try/for
+        # block too, not only at the top of the body. Nested functions and classes keep their own scopes.
+        for node in self._own_nodes(body):
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 key = self._resolve(node.value, scope, aliases, cls)
                 if key in self.targets:
@@ -550,3 +554,16 @@ def test_fixture_dependency_overrides_and_signature_reads(tmp_path, monkeypatch)
         ),
     })
     assert scan.values == [] and scan.missing == []
+
+
+@pytest.mark.parametrize("block", [
+    "    if flag:\n        find = search\n    return await find(q='x')\n",
+    "    with ctx():\n        find = search\n    return await find(q='x')\n",
+    "    try:\n        find = search\n    except Exception:\n        find = search\n    return await find(q='x')\n",
+    "    for _ in range(1):\n        find = search\n    return await find(q='x')\n",
+    "    if flag:\n        pass\n    else:\n        while True:\n            find = search\n            break\n    return await find(q='x')\n",
+], ids=["if", "with", "try", "for", "else-while"])
+def test_fixture_an_alias_bound_inside_a_nested_block(tmp_path, monkeypatch, block) -> None:
+    scan = _fixture(tmp_path, monkeypatch, {"routes/door.py": _DOOR + "async def caller(flag=True, ctx=None):\n" + block})
+    assert [(m[2], m[3]) for m in scan.missing] == [("search", ["only_seeds"])], scan.missing
+    assert scan.values == []
