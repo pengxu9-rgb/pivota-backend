@@ -947,6 +947,14 @@ async def startup_event():
         log_crawl_fresh_config(_crawl_fresh_service_name() or "web")
     except Exception:  # noqa: BLE001 -- a log line never blocks boot
         pass
+    # The AgenPas consent gate's state, once per boot at WARNING on web AND worker: the gate is decided by the
+    # process that builds or sends a body (the worker sends purchase.* webhooks), so a mismatch shows here.
+    try:
+        from config.platform import service_name as _consent_service_name
+        from services.payment_orchestration.purchase_consent import log_boot_state
+        log_boot_state(_consent_service_name() or "web")
+    except Exception:  # noqa: BLE001 -- a log line never blocks boot
+        pass
 
     try:
         from services.audit_scheduler import start_scheduler
