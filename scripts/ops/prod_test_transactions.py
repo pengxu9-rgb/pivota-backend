@@ -87,6 +87,7 @@ MAX_SCALAR_CHARS = 120
 #   7d650dce8 (gw#2603 + gw#2604, live 2026-11-19 03:07Z): readOffersResolveMarket reads the same three carriers by
 #     the same rule (first readable two-ASCII code wins; sent-but-unreadable -> market_invalid; unpriced ->
 #     market_not_priced; nothing sent -> no market); merchantPurchasabilityClient is unchanged, so every OR-* holds.
+IMAGE_COMMIT_PATH = Path("/app/.image_commit_sha")
 REVIEWED_GATEWAY_DIGESTS = {
     "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31": "080d7297f74e019fe5d88a25e78c3315ebdb080a",
     "sha256:908df3e4b47324610fd535f0969c923f03aa63e145875a93c94e385885c5846d": "7d650dce841828059c060a7593992478ddf4f11d",
@@ -774,13 +775,13 @@ def read_user_key(path: Path) -> bytes:
 def main(env: dict | None = None, *, now: Callable[[], datetime] | None = None,
          transport_factory: Callable[[str], Transport] | None = None, key_path: Path | None = None,
          user_key_path: Path | None = None, targets_path: Path | None = None,
-         image_commit_path: Path = Path("/app/.image_commit_sha")) -> int:
+         image_commit_path: Path | None = None) -> int:
     env = dict(os.environ if env is None else env)
     _EXECUTION["name"] = env.get("CLOUD_RUN_EXECUTION")
     now = now or (lambda: datetime.now(timezone.utc))
     try:
         check_case_list()
-        run_id = check_environment(env, image_commit_path.read_text().strip())
+        run_id = check_environment(env, (image_commit_path or IMAGE_COMMIT_PATH).read_text().strip())
         cases = select_cases(env.get(ENV + "CASES", ""))
         check_gate(env.get(ENV + "GATE"), now())
         targets = parse_targets(_small_file(targets_path or Path(TARGETS_MOUNT_DIR) / TARGETS_FILE, 20_000, "targets"),
