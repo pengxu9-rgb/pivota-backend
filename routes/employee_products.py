@@ -56,6 +56,7 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     _is_domain_allowed,
+    allowlist_market_refusal,
     apply_utm,
     make_redirect_token,
     request_market_observed,
@@ -4162,6 +4163,9 @@ async def preview_external_seed(
 ):
     market = _normalize_market(body.market)
     dest = _require_http_url(body.destination_url)
+    # A market the allowlist cannot key allows no domain, named, on every answer below (allowlist_market_refusal).
+    domain_refusal = allowlist_market_refusal(market)
+    domain_refusal_fields = {"domain_allowed_reason": domain_refusal} if domain_refusal else {}
 
     snapshot = None
     try:
@@ -4188,7 +4192,8 @@ async def preview_external_seed(
                 "price_currency": None,
                 "availability": None,
                 "variants": [],
-                "domain_allowed": True,
+                "domain_allowed": domain_refusal is None,
+                **domain_refusal_fields,
             },
         }
 
@@ -4204,6 +4209,8 @@ async def preview_external_seed(
         domain_allowed = await _is_domain_allowed(market=market, destination_url=canonical_url)
     except Exception:
         domain_allowed = True
+    if domain_refusal:
+        domain_allowed = False
 
     variants = []
     image_urls: list[str] = []
@@ -4259,6 +4266,7 @@ async def preview_external_seed(
             "availability": getattr(snapshot, "availability", None),
             "variants": variants,
             "domain_allowed": domain_allowed,
+            **domain_refusal_fields,
         },
     }
 
