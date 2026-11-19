@@ -1,4 +1,4 @@
-"""services/deal_code_retention.py: ADR-027 Q18 retention of crawled codes (peng 2026-11-07).
+"""services/deal_code_retention.py: ADR-027 Q18 retention of crawled codes (the owner 2026-11-07).
 
 Pinned: each rule deletes exactly what it names and nothing else; only merchant_published rows are touched; opt-out
 matches every form; batches and the per-run cap bound the work; a second run is a no-op; the kill switch stops it;

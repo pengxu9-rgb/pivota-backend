@@ -207,7 +207,7 @@ _AUD_PAGE = "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, 
 
 
 async def test_a_read_of_such_a_seed_reprices_no_enrichment_row(scoped_db, monkeypatch):
-    """Peng 2026-10-22, after #2657 (M2): a refresh of a seed whose column and page read disagree
+    """The owner 2026-10-22, after #2657 (M2): a refresh of a seed whose column and page read disagree
     re-prices and stamps none of the enrichment lane's rows (this fixture's own shape). Nothing is
     suppressed: every row keeps its last price."""
     await _load(scoped_db)
@@ -222,7 +222,7 @@ async def test_a_read_of_such_a_seed_reprices_no_enrichment_row(scoped_db, monke
 
 
 async def test_an_employee_edit_of_the_same_seed_reprices_them_as_main(scoped_db, monkeypatch):
-    """Peng 2026-10-22: the same seed under an explicit employee edit re-prices and stamps the enrichment
+    """The owner 2026-10-22: the same seed under an explicit employee edit re-prices and stamps the enrichment
     lane's product row, attributed `price_read_source = employee_edit`."""
     await _load(scoped_db)
     await scoped_db.execute(_AUD_PAGE, {"id": SEED_ID})

@@ -29,7 +29,7 @@ Scope choices (Decision 4 from PDP_ONBOARDING_PLAYBOOK.md):
                    high recall surface area, ROI per Gemini call is
                    highest.
   merchant_owned — pdp_scope='merchant_owned'. Lazy tier — only run
-                   when peng explicitly invokes (e.g. monthly).
+                   when the owner explicitly invokes (e.g. monthly).
   all            — both. Defensive: don't use without --limit.
 
 Confidence gate:

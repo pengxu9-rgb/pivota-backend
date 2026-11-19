@@ -45,7 +45,7 @@ questions (review of #2532, 2026-10-08):
    redirects to, to confirm a product can be bought. Shopify's default robots.txt disallows `/cart`
    and `/checkouts/` for every User-Agent. A declared, signed PivotaBot fetching them contradicts the
    registration form's attestation ("will operate in accordance with ... the robots.txt directives
-   published by individual stores"). This is for Peng and counsel
+   published by individual stores"). This is for the owner and counsel
    (reports/shopify_crawl_access_2026_10_08/LEGAL_QUESTIONS.md, question 7).
 2. **Tier B verdicts.** A checkout that answers a declared bot with a challenge is recorded
    `BLOCKED_UNKNOWN`, which is a definite verdict and overwrites ELIGIBLE. That would drop merchants
@@ -89,7 +89,7 @@ proxy transport: `crawl_transport(httpx.AsyncHTTPTransport(proxy=...))`.
 which form it accepts. Start with `string`. If signed requests still get `local_rate_limited` while
 the directory check passes, try `dictionary` on one job before concluding anything.
 
-## Setup (Peng runs; Claude never sees the private key)
+## Setup (the owner runs; Claude never sees the private key)
 
 1. Generate the key on your machine, into a file only you can read:
    ```bash

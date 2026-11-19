@@ -797,7 +797,7 @@ def test_a_myshopify_host_is_shopify_even_without_a_platform_label() -> None:
 
 # ---------------------------------------------------------------- the NAMED-variant cart proof
 #
-# Option 1 (Peng, 2026-09-29): a multi-variant product is buyable through the Reap cart link when
+# Option 1 (the owner, 2026-09-29): a multi-variant product is buyable through the Reap cart link when
 # the seed NAMES one variant and the backfill's products.js fetch proves that variant exists and is
 # available. Every case is built from REAL shapes: the live judydoll products.js (8 shades,
 # trimmed), the live seed (staging epsv_38ad88d436c32e24ba7c6446, trimmed), and the proof the

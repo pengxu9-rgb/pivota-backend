@@ -1,4 +1,4 @@
-"""Retention of crawled discount codes (ADR-027 Q18, peng 2026-11-07), enforced at the end of every refresh run.
+"""Retention of crawled discount codes (ADR-027 Q18, the owner 2026-11-07), enforced at the end of every refresh run.
 
 Applies ONLY to rows the crawl writer created (services/deal_code_capture_writer.py): `source = 'merchant_published'`
 AND a deal_id that starts with the writer's own prefix (CRAWL_DEAL_ID_PREFIX, "dlc_"), and to their verification rows.

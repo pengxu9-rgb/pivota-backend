@@ -134,7 +134,7 @@ from services.shopify_variant_identity import (
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
 # Imported, never re-implemented -- see `_mirror_seller_ref`.
 from services.seller_identity import resolve_seed_seller_identity
-# THE seed-currency rule for offers copied off a seed (Peng 2026-10-19), in its Python twin: these
+# THE seed-currency rule for offers copied off a seed (the owner 2026-10-19), in its Python twin: these
 # statements stay one text on both dialects, and the SQL predicate is Postgres-only.
 from services.seed_offer_currency import (
     is_seed_projected_offer,

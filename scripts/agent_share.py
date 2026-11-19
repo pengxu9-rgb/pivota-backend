@@ -3,7 +3,7 @@
 
     # set an agent's share of Pivota's commission, from a moment on (forward-only)
     scripts/agent_share.py set-rate --agent-id agent_x --share-bp 2500 \\
-        --effective-from 2026-10-01T00:00:00Z --created-by peng --note "pilot" --apply
+        --effective-from 2026-10-01T00:00:00Z --created-by owner --note "pilot" --apply
 
     # bring one invoiced line's ledger to its target, or every line whose state moved in N days
     scripts/agent_share.py accrue --line-id 1234                   # dry run: prints the entry it would write

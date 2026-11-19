@@ -22,7 +22,7 @@ It plans as if it does (the refresh's normal case) and says so on the summary li
 
 No at-sign anywhere in this file: run_oneoff_job.sh picks its --args delimiter from a fixed set.
 
-Launch (Peng; pg CPU gate first):
+Launch (the owner; pg CPU gate first):
   ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600 \\
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/plan_mirror_variant_reprice.py)"
 

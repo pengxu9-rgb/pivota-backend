@@ -263,7 +263,7 @@ async def test_an_acquisition_readback_on_postgres(db):
     assert not leak["ok"] and "must never serve" in leak["problems"][0]["problem"]
 
 
-# ------------------------------------------------------------------ SG (Peng 2026-10-10)
+# ------------------------------------------------------------------ SG (the owner 2026-10-10)
 
 async def test_an_sg_capture_reads_a_usd_retailers_listing_rows_and_never_an_sgd_row(db):
     """The same CANDIDATES_SQL with capture_currency SGD: the USD/US base rows of a retailer's listing are
