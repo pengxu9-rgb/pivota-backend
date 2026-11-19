@@ -19,8 +19,9 @@ catalog-offer lane (`catalog_offers` destinations) and the connected-merchant pr
 mint-side "would refuse" count must be taken from the mints themselves (see the design's enable checklist).
 
 THE ENTRY RULE (keep the exact host when in doubt): the entry is the source host itself, lower-cased; only a host that
-is its registrable domain or `www.` + it collapses to the registrable domain (marked `widened`, since that entry also
-admits the registrable's other subdomains). A bare public or platform suffix (co.uk, myshopify.com, ...) is never an
+is its registrable domain or `www.` + it collapses to the registrable domain (`www.` + it is marked `widened`). Any entry
+that IS a registrable domain is marked `apex`: it admits every subdomain under it (the mint matches subdomains), so the
+review sees each one, an uncurated platform's apex included. A bare public or platform suffix (co.uk, myshopify.com, ...) is never an
 entry (`public_suffix`). Every entry matches the mint check for its source hosts (`_domain_matches`: equal, or a
 subdomain), pinned by a test.
 
@@ -34,19 +35,24 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+import os
 import re
+import stat
 from collections import Counter, defaultdict
 from hashlib import sha256
+from hmac import compare_digest
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlparse
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # 3: the plan names the redirector lists it was built with (redirector_lists_sha256)
 OPERATION = "outbound_allowlist_populate"
 CREATED_BY_PREFIX = "allowlist_populate:"
 STAGED_STATUS = "disabled"
 MAX_ENTRIES = 5000
 LINE_PREFIX = "OLP "
 DOC_CHUNK_BYTES = 150_000  # base64 text per log line, well under Cloud Logging's 256 KB entry limit
+LOCK_TIMEOUT = "2s"
+MULTI_MARKET_THRESHOLD = 3
 
 SKIP_NO_URL = "no_url"
 SKIP_UNPARSABLE = "unparsable_url"
@@ -64,43 +70,185 @@ SKIP_REASONS = (SKIP_NO_URL, SKIP_UNPARSABLE, SKIP_NON_HTTPS, SKIP_IP_HOST, SKIP
 # A URL that forwards elsewhere: our allowlist would bound the forwarder, not the final destination. Heuristics only;
 # a mark for the review, never a skip.
 _REDIRECT_QUERY_KEYS = frozenset({"url", "u", "redirect", "redirect_url", "redirect_uri", "redir", "dest",
-                                  "destination", "target", "to", "goto", "out", "link", "murl", "r"})
-_REDIRECT_PATH_HEADS = frozenset({"r", "go", "out", "redirect", "redir", "click", "track", "link", "l", "aff", "ref"})
-MULTI_MARKET_THRESHOLD = 3
+                                  "destination", "target", "to", "goto", "out", "link", "murl", "r", "ued", "dl",
+                                  "deeplink", "deep_link", "next", "continue", "return_url", "returnurl", "return_to",
+                                  "lp", "adurl", "href", "q", "rurl", "forward", "jump", "landing"})
+_REDIRECT_PATH_HEADS = frozenset({"r", "go", "out", "redirect", "redir", "click", "clk", "track", "trk", "link", "l",
+                                  "aff", "ref", "jump", "away", "exit", "outbound", "visit", "deeplink"})
+# An opaque-id head: `/c/<id>`, `/t/<id>`, ... on a host that is only a link (marked only with a following id).
+_OPAQUE_ID_HEADS = frozenset({"c", "t", "s", "x", "y"})
+_PATH_EXTENSIONS = (".php", ".html", ".htm", ".asp", ".aspx", ".jsp", ".cgi", ".pl")
+# Link shorteners and affiliate-network click domains beyond outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES (which is
+# also read) are PRIVATE: no real host is in the repository. They load at run time from a reviewed JSON file, its
+# path and SHA-256 pin in two envs (the private-manifest pattern of services/exact_retailer_cohorts.py and
+# services/external_seed_review_pilot.py). Read only. Path env unset or blank (and no pin): no list marks, and the plan
+# says `OLP lists=absent`. Path set but the file missing or empty, or a pin without a path: refused (`lists_missing`).
+# A file whose bytes miss the pin, or that is not the schema, refuses the run.
+# Shape: {"version": 1, "shorteners": [host suffix, ...], "affiliate_networks": [host suffix, ...]}.
+REDIRECTOR_LISTS_PATH_ENV = "OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_PATH"
+REDIRECTOR_LISTS_SHA256_ENV = "OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_SHA256"
+REDIRECTOR_LISTS_LIMIT = 262_144
+REDIRECTOR_LISTS_MAX_HOSTS = 2000
+_LIST_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z")
+ABSENT_LISTS: Dict[str, Any] = {"sha256": None, "shorteners": (), "affiliate_networks": ()}
+
+
+def _host_has_suffix(host: str, suffixes: Iterable[str]) -> bool:
+    return any(host == s or host.endswith("." + s) for s in suffixes)
+
+
+def _looks_like_url(value: str) -> bool:
+    """A redirect target: a URL with a scheme or `//`, a scheme-less `host.tld/...`, or base64 of either."""
+    from urllib.parse import unquote
+
+    text = unquote(unquote(value or "")).strip()
+    low = text.lower()
+    if "://" in low or low.startswith("//"):
+        return True
+    if re.match(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?/", low):
+        return True
+    if len(text) >= 12 and re.fullmatch(r"[A-Za-z0-9+/_=-]+", text):
+        try:
+            decoded = base64.b64decode(text + "=" * (-len(text) % 4), altchars=b"-_" if ("-" in text or "_" in text) else None)
+            dec = decoded.decode("utf-8", "strict").lower()
+        except Exception:
+            return False
+        return "://" in dec or dec.startswith("//")
+    return False
+
 
 _BATCH = re.compile(r"[a-z0-9][a-z0-9-]{2,62}\Z")
 _KEY_MASK = re.compile(r"[^A-Za-z0-9*_.-]")
 
 RULES_SQL = "SELECT market, destination_url FROM outbound_link_rules WHERE status = 'published'"
-SEEDS_SQL = """
+_SEEDS_SELECT = """
     SELECT market, canonical_url, destination_url, domain,
            seed_data->>'canonical_url' AS sd_canonical_url,
            seed_data->>'destination_url' AS sd_destination_url,
            seed_data->>'domain' AS sd_domain,
-           seed_data->'snapshot'->>'canonical_url' AS snap_canonical_url,
-           seed_data->'snapshot'->>'destination_url' AS snap_destination_url
+           {snapshot} AS snapshot_raw
       FROM external_product_seeds
      WHERE status = 'active'
 """
-SEED_URL_COLUMNS = ("canonical_url", "destination_url", "sd_canonical_url", "sd_destination_url",
-                    "snap_canonical_url", "snap_destination_url")
+# Postgres (production): only the snapshot keys the plan reads. An object snapshot is cut down to them in SQL; a
+# snapshot stored as a JSON string passes through whole, because casting text to jsonb in SQL would abort the whole
+# read on one malformed row; Python parses it with the mint's rule (seed_snapshot). Any other type reads as no snapshot.
+SNAPSHOT_KEYS = ("canonical_url", "destination_url")
+SEEDS_SQL_POSTGRES = _SEEDS_SELECT.format(snapshot="""CASE jsonb_typeof(seed_data->'snapshot')
+             WHEN 'object' THEN jsonb_build_object('canonical_url', seed_data->'snapshot'->'canonical_url',
+                                                   'destination_url', seed_data->'snapshot'->'destination_url')
+             WHEN 'string' THEN seed_data->'snapshot'
+           END""")
+# Local sqlite tests only (production refuses every other dialect): the whole snapshot value.
+SEEDS_SQL = _SEEDS_SELECT.format(snapshot="seed_data->'snapshot'")
+SEED_URL_COLUMNS = ("canonical_url", "destination_url", "sd_canonical_url", "sd_destination_url")
 SEED_HOST_COLUMNS = ("domain", "sd_domain")
 PRESENT_SQL = "SELECT market, domain FROM outbound_link_allowed_domains"
+# The table the unqualified INSERT will hit (to_regclass resolves it by the search_path, so its own schema), and a
+# valid, NON-partial, non-expression unique index on exactly (market, domain) in that order.
 UNIQUE_INDEX_SQL = """
-    SELECT count(*) AS n FROM pg_indexes
-     WHERE tablename = 'outbound_link_allowed_domains'
-       AND indexdef ILIKE 'CREATE UNIQUE INDEX%'
-       AND replace(indexdef, ' ', '') ILIKE '%(market,domain)%'
+    SELECT count(*) AS n
+      FROM pg_index i
+     WHERE i.indrelid = to_regclass('outbound_link_allowed_domains')
+       AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
+       AND i.indnkeyatts = 2
+       AND (SELECT array_agg(a.attname::text ORDER BY k.ord)
+              FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+             WHERE k.ord <= 2) = ARRAY['market', 'domain']
 """
 
 
 class Refused(RuntimeError):
-    """A guard refused. Before a transaction opens nothing was written; inside one, it rolls back."""
+    """A guard refused. Before a transaction opens nothing was written; inside one, it rolls back. `reason`, when
+    set, is the job's `reason=` token (else the class name)."""
+
+    def __init__(self, message: str, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
-def require(test: Any, message: str) -> None:
+def require(test: Any, message: str, reason: Optional[str] = None) -> None:
     if not test:
-        raise Refused(message)
+        raise Refused(message, reason)
+
+
+def _unique_object(pairs):
+    out: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def _valid_list(value: Any) -> bool:
+    return (isinstance(value, list) and len(value) <= REDIRECTOR_LISTS_MAX_HOSTS
+            and all(isinstance(h, str) and _LIST_HOST.fullmatch(h) for h in value) and len(set(value)) == len(value))
+
+
+def load_redirector_lists(environ=None) -> Dict[str, Any]:
+    """The private shortener / affiliate-network host lists, read only, pinned by SHA-256. ABSENT_LISTS (no list
+    marks) ONLY when the path env is unset or blank and no pin is set. A configured list that is not there (path set
+    but the file missing or empty, or a pin with no path) refuses `lists_missing`: a failed mount must not silently
+    drop every mark. A file that misses its pin or the schema refuses `lists_sha_mismatch` / `lists_invalid`."""
+    env = os.environ if environ is None else environ
+    path, pin = (env.get(REDIRECTOR_LISTS_PATH_ENV) or "").strip(), (env.get(REDIRECTOR_LISTS_SHA256_ENV) or "").strip()
+    if not path:
+        require(not pin, "a redirector lists SHA-256 pin is set but no lists path; nothing written", "lists_missing")
+        return dict(ABSENT_LISTS)
+    # One open, never following a final symlink and never blocking on a FIFO; every check is on that descriptor.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise Refused("the redirector lists path is set but the file is missing; nothing written", "lists_missing") from None
+    except OSError as error:  # ELOOP for a symlink, EACCES, ...
+        raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode), "redirector lists path is not a regular file", "lists_invalid")
+        require(info.st_size <= REDIRECTOR_LISTS_LIMIT, "redirector lists file is too large", "lists_invalid")
+        chunks: List[bytes] = []
+        size = 0
+        while size <= REDIRECTOR_LISTS_LIMIT:
+            chunk = os.read(fd, REDIRECTOR_LISTS_LIMIT + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        data = b"".join(chunks)
+    except OSError as error:
+        raise Refused(f"redirector lists unreadable ({type(error).__name__})", "lists_invalid") from None
+    finally:
+        os.close(fd)
+    require(data, "the redirector lists file is empty; nothing written", "lists_missing")
+    require(len(data) <= REDIRECTOR_LISTS_LIMIT, "redirector lists file is too large", "lists_invalid")
+    require(isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin) and compare_digest(sha256(data).hexdigest(), pin),
+            "redirector lists bytes do not match the SHA-256 pin", "lists_sha_mismatch")
+    require(not data.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")),
+            "redirector lists start with a byte-order mark", "lists_invalid")
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refused("redirector lists are not UTF-8", "lists_invalid") from None
+    require("\x00" not in text, "redirector lists hold a NUL (UTF-16?)", "lists_invalid")
+    try:
+        doc = json.loads(text, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
+        raise Refused("redirector lists are not JSON", "lists_invalid") from None
+    require(isinstance(doc, dict) and doc.keys() == {"version", "shorteners", "affiliate_networks"}
+            and type(doc["version"]) is int and doc["version"] == 1
+            and _valid_list(doc["shorteners"]) and _valid_list(doc["affiliate_networks"]),
+            "redirector lists do not match the schema", "lists_invalid")
+    return {"sha256": pin, "shorteners": tuple(doc["shorteners"]), "affiliate_networks": tuple(doc["affiliate_networks"])}
+
+
+def lists_line(lists: Dict[str, Any]) -> str:
+    """Counts only, never a host."""
+    if not lists.get("sha256"):
+        return f"{LINE_PREFIX}lists=absent"
+    return (f"{LINE_PREFIX}lists sha256={lists['sha256']} shorteners={len(lists['shorteners'])} "
+            f"affiliate={len(lists['affiliate_networks'])}")
 
 
 def compact(value: Any) -> str:
@@ -168,35 +316,88 @@ def derive(url: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     return entry, host, None
 
 
+def is_apex(entry: str) -> bool:
+    """An entry that is a registrable domain admits EVERY subdomain under it (the mint matches subdomains). Marked
+    `apex` so the review sees each one, including an uncurated platform's own apex, which would admit every tenant."""
+    from services.seller_identity import etld1
+
+    return bool(entry) and etld1(entry) == entry
+
+
 def derive_entry(url: Any) -> Tuple[Optional[str], Optional[str]]:
     entry, _, reason = derive(url)
     return entry, reason
 
 
-def redirector_marks(url: str) -> Set[str]:
-    """Why a source URL may forward elsewhere (heuristics, for the review)."""
+def redirector_marks(url: str, lists: Optional[Dict[str, Any]] = None) -> Set[str]:
+    """Why a source URL may forward elsewhere (heuristics, advisory marks for the review; never a skip). `lists`: the
+    private host lists (load_redirector_lists); without them only the in-code heuristics and the existing
+    outbound_warm_handoff list mark."""
+    from urllib.parse import unquote
+
+    from services.outbound_links_service import url_domain
     from services.outbound_warm_handoff import is_affiliate_destination
 
+    lists = ABSENT_LISTS if lists is None else lists
     marks: Set[str] = set()
     try:
         parsed = urlparse(url)
     except ValueError:
         return marks
-    if is_affiliate_destination(url):
+    host = url_domain(url)
+    if is_affiliate_destination(url) or _host_has_suffix(host, lists["affiliate_networks"]):
         marks.add("affiliate_host")
-    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
-        if key.lower() in _REDIRECT_QUERY_KEYS and ("://" in value or value.lower().startswith(("http", "%2f%2f", "//"))):
-            marks.add("query_" + key.lower())
-    head = (parsed.path or "/").strip("/").split("/", 1)[0].lower()
-    if head in _REDIRECT_PATH_HEADS:
-        marks.add("path_" + head)
+    if _host_has_suffix(host, lists["shorteners"]):
+        marks.add("shortener_host")
+    for where, text in (("query", parsed.query), ("fragment", parsed.fragment)):
+        for key, value in parse_qsl(text, keep_blank_values=False):
+            if key.lower() in _REDIRECT_QUERY_KEYS and _looks_like_url(value):
+                marks.add(f"{where}_{key.lower()}")
+        if where == "fragment" and text and "=" not in text and _looks_like_url(text):
+            marks.add("fragment_url")
+    segments = [seg for seg in (parsed.path or "").split("/") if seg]
+    for seg in segments[:2]:
+        head = seg.lower()
+        for ext in _PATH_EXTENSIONS:
+            if head.endswith(ext):
+                head = head[: -len(ext)]
+                break
+        if head in _REDIRECT_PATH_HEADS:
+            marks.add("path_" + head)
+    if len(segments) >= 2 and segments[0].lower() in _OPAQUE_ID_HEADS and re.fullmatch(r"[A-Za-z0-9_-]{4,}", segments[1]):
+        marks.add("path_" + segments[0].lower() + "_id")
+    decoded_path = unquote(unquote(parsed.path or ""))
+    if re.search(r"/(?:https?:)?//", decoded_path) or re.search(r"/https?:/", decoded_path):
+        marks.add("path_url")
     return marks
+
+
+def seed_snapshot(raw: Any) -> Dict[str, Any]:
+    """The seed's snapshot as the mint reads it: `seed_data` is parsed, then `seed_data["snapshot"]` goes through the
+    mint's `_ensure_json_obj` (an object, or a JSON object stored as a string). `raw` is the driver's value of
+    `seed_data->'snapshot'`: JSON text (Postgres jsonb, sqlite), or an already decoded value."""
+    from services.external_seed_search import ensure_json_obj  # the same rule as the mints' _ensure_json_obj
+
+    value = raw
+    if isinstance(raw, (bytes, bytearray)):
+        value = raw.decode("utf-8", "replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)  # the jsonb value itself: an object, or a string holding one
+        except ValueError:
+            return {}
+    return ensure_json_obj(value)
 
 
 def _seed_urls(row: Dict[str, Any]) -> List[str]:
     from services.outbound_links_service import normalize_shop_host
 
     urls = {str(row.get(c)).strip() for c in SEED_URL_COLUMNS if isinstance(row.get(c), str) and row.get(c).strip()}
+    snapshot = seed_snapshot(row.get("snapshot_raw"))
+    for c in SNAPSHOT_KEYS:
+        value = snapshot.get(c)
+        if isinstance(value, str) and value.strip():
+            urls.add(value.strip())
     for c in SEED_HOST_COLUMNS:
         value = row.get(c)
         if isinstance(value, str) and value.strip():
@@ -207,9 +408,12 @@ def _seed_urls(row: Dict[str, Any]) -> List[str]:
 
 
 def build_plan(*, batch_id: str, rules: Iterable[Dict[str, Any]], seeds: Iterable[Dict[str, Any]],
-               present: Iterable[Tuple[Any, Any]], markets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+               present: Iterable[Tuple[Any, Any]], markets: Optional[Iterable[str]] = None,
+               lists: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The plan document (pure). `rules` / `seeds`: row dicts as RULES_SQL / SEEDS_SQL return them; `present`:
-    (market, domain) pairs already in the allowlist, in any status."""
+    (market, domain) pairs already in the allowlist, in any status; `lists`: the private redirector lists (their sha
+    is recorded in the plan, so apply can refuse other lists)."""
+    lists = ABSENT_LISTS if lists is None else lists
     require(isinstance(batch_id, str) and _BATCH.fullmatch(batch_id), "batch id must be a lowercase slug")
     scope = set(markets if markets is not None else pricing_markets())
     have = {(str(m or "").strip().upper(), str(d or "").strip().lower().lstrip(".")) for m, d in present}
@@ -237,7 +441,9 @@ def build_plan(*, batch_id: str, rules: Iterable[Dict[str, Any]], seeds: Iterabl
             hosts[(key, entry)].add(host)
             if host != entry:
                 marks[(key, entry)].add("widened")
-            marks[(key, entry)].update(redirector_marks(url))
+            if is_apex(entry):
+                marks[(key, entry)].add("apex")
+            marks[(key, entry)].update(redirector_marks(url, lists))
         for entry in found:
             counts[(key, entry)][source] += 1
 
@@ -256,7 +462,7 @@ def build_plan(*, batch_id: str, rules: Iterable[Dict[str, Any]], seeds: Iterabl
         mk = set(marks[(key, entry)])
         if markets_per_entry[entry] >= MULTI_MARKET_THRESHOLD:
             mk.add("multi_market")
-        if any(m.startswith(("affiliate_", "query_", "path_")) for m in mk):
+        if any(m.startswith(("affiliate_", "shortener_", "query_", "fragment_", "path_")) for m in mk):
             mk.add("redirector_suspect")
         entries.append({"market": key, "domain": entry, "rules": c["rules"], "seeds": c["seeds"],
                         "hosts": len(hosts[(key, entry)]), "marks": sorted(mk)})
@@ -266,6 +472,7 @@ def build_plan(*, batch_id: str, rules: Iterable[Dict[str, Any]], seeds: Iterabl
         "operation": OPERATION,
         "batch_id": batch_id,
         "status": STAGED_STATUS,
+        "redirector_lists_sha256": lists.get("sha256"),
         "entries": entries,
         "skips": [{"market": m, "reason": r, "count": n} for (m, r), n in sorted(skips.items())],
     }
@@ -277,6 +484,9 @@ def verify_plan(plan: Any) -> Dict[str, Any]:
     require(isinstance(plan, dict) and plan.get("schema_version") == SCHEMA_VERSION and plan.get("operation") == OPERATION,
             "not an allowlist populate plan")
     require(plan.get("status") == STAGED_STATUS, "a populate plan only stages rows")
+    lists_sha = plan.get("redirector_lists_sha256", "missing")
+    require(lists_sha is None or (isinstance(lists_sha, str) and re.fullmatch(r"[0-9a-f]{64}", lists_sha)),
+            "plan does not name its redirector lists")
     require(isinstance(plan.get("batch_id"), str) and _BATCH.fullmatch(plan["batch_id"]), "bad batch id")
     require(plan.get("plan_sha256") == digest({k: v for k, v in plan.items() if k != "plan_sha256"}),
             "plan document does not match its own sha")
@@ -360,20 +570,41 @@ async def _write_guard(db, *, require_postgres: bool = True) -> None:
         require(not require_postgres, "apply and rollback run on Postgres only")
         return
     await db.execute("SET LOCAL statement_timeout = '30s'")
-    await db.execute("SET LOCAL lock_timeout = '2s'")
+    await db.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+    # The lock first: it blocks every other writer AND a DROP INDEX, so the index checked below stays.
+    try:
+        await db.execute("LOCK TABLE outbound_link_allowed_domains IN SHARE ROW EXCLUSIVE MODE")
+    except Exception as error:
+        raise Refused(f"the allowlist table lock was not acquired within {LOCK_TIMEOUT} ({type(error).__name__}); "
+                      "nothing written") from error
     found = await db.fetch_one(UNIQUE_INDEX_SQL)
-    require(found is not None and int(dict(found)["n"]) >= 1, "the (market, domain) unique index is missing; nothing written")
-    await db.execute("LOCK TABLE outbound_link_allowed_domains IN SHARE ROW EXCLUSIVE MODE")
+    require(found is not None and int(dict(found)["n"]) >= 1,
+            "no valid, non-partial unique index on exactly (market, domain) for this table; nothing written")
 
 
-async def read_plan(db, *, batch_id: str, require_postgres: bool = True) -> Dict[str, Any]:
-    """Read the sources inside one READ ONLY transaction and build the plan. Never writes."""
+async def read_plan(db, *, batch_id: str, require_postgres: bool = True,
+                    timing: Optional[Dict[str, Any]] = None, lists: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read the sources inside one READ ONLY transaction and build the plan. Never writes. `timing`, when given, is
+    filled with the read and build times and the row counts (printed as the `OLP timing` line, never in the plan)."""
+    import time
+
+    started = time.monotonic()
     async with db.transaction():
         await _read_only(db, require_postgres=require_postgres)
         rules = [dict(r) for r in await db.fetch_all(RULES_SQL)]
-        seeds = [dict(r) for r in await db.fetch_all(SEEDS_SQL)]
+        seeds = [dict(r) for r in await db.fetch_all(SEEDS_SQL_POSTGRES if _is_postgres(db) else SEEDS_SQL)]
         present = [(dict(r)["market"], dict(r)["domain"]) for r in await db.fetch_all(PRESENT_SQL)]
-    return build_plan(batch_id=batch_id, rules=rules, seeds=seeds, present=present)
+    read_done = time.monotonic()
+    plan = build_plan(batch_id=batch_id, rules=rules, seeds=seeds, present=present, lists=lists)
+    if timing is not None:
+        timing.update({"read_ms": int((read_done - started) * 1000), "build_ms": int((time.monotonic() - read_done) * 1000),
+                       "rules": len(rules), "seeds": len(seeds), "present": len(present)})
+    return plan
+
+
+def timing_line(timing: Dict[str, Any]) -> str:
+    return (f"{LINE_PREFIX}timing ms={timing['read_ms'] + timing['build_ms']} read_ms={timing['read_ms']} "
+            f"build_ms={timing['build_ms']} rules={timing['rules']} seeds={timing['seeds']} present={timing['present']}")
 
 
 def notes_for(batch_id: str) -> str:
@@ -396,9 +627,12 @@ def receipt_line(receipt: Dict[str, Any]) -> str:
             f"receipt_sha256={receipt['receipt_sha256']}")
 
 
-async def apply_plan(db, plan: Dict[str, Any], *, require_postgres: bool = True) -> Dict[str, Any]:
-    """Insert the plan's rows (status disabled, tagged with the batch) in ONE transaction; never update or delete."""
+async def apply_plan(db, plan: Dict[str, Any], *, lists_sha256: Optional[str], require_postgres: bool = True) -> Dict[str, Any]:
+    """Insert the plan's rows (status disabled, tagged with the batch) in ONE transaction; never update or delete.
+    `lists_sha256`: the redirector lists loaded for this run; they must be the ones the plan was built with."""
     plan = verify_plan(plan)
+    require(plan["redirector_lists_sha256"] == lists_sha256,
+            "the redirector lists differ from the plan's; re-plan (nothing written)", "lists_sha_mismatch")
     batch_id, created_by = plan["batch_id"], CREATED_BY_PREFIX + plan["batch_id"]
     wanted = [(e["market"], e["domain"]) for e in plan["entries"]]
     inserted: List[Tuple[int, str, str]] = []

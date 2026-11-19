@@ -8,16 +8,21 @@ Inputs (Secret Manager file mounts pinned by sha256 envs, or envs the launcher s
   OUTBOUND_ALLOWLIST_POPULATE_BATCH_ID             plan: the batch slug
   OUTBOUND_ALLOWLIST_POPULATE_PLAN_PATH / _SHA256      apply: the reviewed plan document (the plan run's plan_doc)
   OUTBOUND_ALLOWLIST_POPULATE_RECEIPT_PATH / _SHA256   rollback: the apply run's receipt_doc
-  OUTBOUND_ALLOWLIST_POPULATE_APPROVAL_PATH / _SHA256  apply/rollback: {mode, plan_sha256 | receipt_sha256, release_sha,
-                                                       go_reference}
+  OUTBOUND_ALLOWLIST_POPULATE_APPROVAL_PATH / _SHA256  apply: {mode, plan_sha256, lists_sha256, release_sha, go_reference};
+                                                       rollback: {mode, receipt_sha256, release_sha, go_reference}
+  OUTBOUND_ALLOWLIST_REDIRECTOR_LISTS_PATH / _SHA256   plan/apply: the PRIVATE shortener / affiliate-network host lists
+                                                       (optional: path unset or blank = absent, no list marks; a set
+                                                       path with no file, an empty file, or a pin without a path refuses
+                                                       lists_missing; apply needs the plan's lists)
   OUTBOUND_ALLOWLIST_POPULATE_GATE                 {verdict, observed_at, ...} from a real scripts/ops/oneoff_gate.py run
   OUTBOUND_ALLOWLIST_POPULATE_RELEASE_COMMIT       must equal /app/.image_commit_sha
   OUTBOUND_ALLOWLIST_POPULATE_WRITE_ENABLED=1      apply/rollback only
 
-Output: lines starting `OLP `. Plan: the per-market counts, every entry with its marks, the skips, and the plan document
+Output: lines starting `OLP `. Plan: `OLP timing ...`, `OLP lists sha256=<sha> shorteners=<n> affiliate=<n>` (counts
+only, never a host) or `OLP lists=absent`, the per-market counts, every entry with its marks, the skips, and the plan document
 as `OLP plan_doc <i>/<n> <sha256> <base64 chunk>` lines (each under Cloud Logging's 256 KB entry limit). Apply:
 `OLP receipt ...` and `OLP receipt_doc ...` lines. Rollback: `OLP rollback ...`. Any refusal, including a database
-error: one `OLP refused mode=<m> reason=<type> detail=<text>` line and exit 2, never a traceback.
+error: one `OLP refused mode=<m> reason=<token or type> detail=<text>` line and exit 2, never a traceback.
 """
 
 from __future__ import annotations
@@ -85,9 +90,9 @@ def check_gate(now: datetime) -> dict:
     return seed_batch_check_gate(os.getenv(ENV + "GATE"), now)
 
 
-def check_approval(mode: str, *, release: str, pinned_key: str, pinned_sha: str) -> dict:
+def check_approval(mode: str, *, release: str, pinned_key: str, pinned_sha: str, extra: dict | None = None) -> dict:
     approval = json.loads(read_pinned("APPROVAL"))
-    expected = {"mode": mode, pinned_key: pinned_sha, "release_sha": release}
+    expected = {"mode": mode, pinned_key: pinned_sha, "release_sha": release, **(extra or {})}
     core.require(isinstance(approval, dict) and approval.keys() == {*expected, "go_reference"}
                  and all(approval[key] == value for key, value in expected.items())
                  and isinstance(approval["go_reference"], str) and 0 < len(approval["go_reference"].strip()) <= 160,
@@ -98,7 +103,11 @@ def check_approval(mode: str, *, release: str, pinned_key: str, pinned_sha: str)
 async def run(mode: str, db, *, release: str) -> int:
     if mode == "plan":
         batch_id = os.getenv(ENV + "BATCH_ID", "")
-        plan = await core.read_plan(db, batch_id=batch_id)
+        lists = core.load_redirector_lists()
+        timing: dict = {}
+        plan = await core.read_plan(db, batch_id=batch_id, timing=timing, lists=lists)
+        out(core.timing_line(timing))
+        out(core.lists_line(lists))
         for line in core.plan_lines(plan):
             out(line)
         for line in core.doc_lines("plan_doc", plan):
@@ -107,8 +116,11 @@ async def run(mode: str, db, *, release: str) -> int:
     if mode == "apply":
         plan_bytes = read_pinned("PLAN")
         plan = json.loads(plan_bytes)
-        check_approval("apply", release=release, pinned_key="plan_sha256", pinned_sha=plan.get("plan_sha256"))
-        receipt = await core.apply_plan(db, plan)
+        lists = core.load_redirector_lists()
+        check_approval("apply", release=release, pinned_key="plan_sha256", pinned_sha=plan.get("plan_sha256"),
+                       extra={"lists_sha256": plan.get("redirector_lists_sha256")})
+        out(core.lists_line(lists))
+        receipt = await core.apply_plan(db, plan, lists_sha256=lists["sha256"])
         out(core.receipt_line(receipt))
         for line in core.doc_lines("receipt_doc", receipt):
             out(line)
@@ -140,7 +152,8 @@ async def main(argv) -> int:
             await db.disconnect()
     except Exception as error:  # every refusal (ours, the reused seed-batch guards', a database error) is one line
         detail = " ".join(str(error).split())[:300]
-        out(f"{core.LINE_PREFIX}refused mode={mode} reason={type(error).__name__} detail={detail}")
+        reason = getattr(error, "reason", None) or type(error).__name__
+        out(f"{core.LINE_PREFIX}refused mode={mode} reason={reason} detail={detail}")
         return 2
 
 
