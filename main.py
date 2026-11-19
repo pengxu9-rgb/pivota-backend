@@ -291,6 +291,7 @@ from routes.platform_connector_prefix import (
 from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
+from routes.employee_affiliate_programs import router as employee_affiliate_programs_router
 from routes.employee_products import router as employee_products_router
 from routes.employee_pdp_governance import router as employee_pdp_governance_router
 from routes.employee_content import router as employee_content_router
@@ -1252,6 +1253,8 @@ app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
+# Affiliate program registry (developer earnings, manual stage). Dark: AFFILIATE_PROGRAM_REGISTRY_ENABLED.
+app.include_router(employee_affiliate_programs_router)
 app.include_router(employee_settlement_router)
 app.include_router(employee_content_router)
 app.include_router(admin_fix_agents_router)  # Admin fix agents data
