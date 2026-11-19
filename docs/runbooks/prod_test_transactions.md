@@ -139,10 +139,10 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 
 | Case | Door | Market | Expected |
 |---|---|---|---|
-| OR-US, OR-SG, OR-us-lower, OR-none | invoke `offers.resolve` | US / SG / us / (none) | `status=success`, `offers_count ≥ 1` |
+| OR-US, OR-us-lower, OR-none | invoke `offers.resolve` | US / us / (none) | `status=success`, `offers_count ≥ 1` |
+| ~~OR-SG~~, ~~OR-USA-beside-SG~~ (**disabled**) | invoke `offers.resolve` | SG / USA+SG | Served in SG needs an SGD source for the reviewed product. The 2026-11-19 census found none (USD only), so both are listed for review only until a reviewed SGD source exists. |
 | OR-USA, OR-long-s | invoke `offers.resolve` | USA / ſg | `status=error`, `MARKET_INVALID` / `market_invalid` |
 | OR-DE | invoke `offers.resolve` | DE | `status=error`, `MARKET_NOT_PRICED` / `market_not_priced` |
-| OR-USA-beside-SG | invoke `offers.resolve` | `offers.market=USA`, `payload.market=SG` | served |
 | MCP-SF-US | `/mcp` storefront | US | `completes_on_seller_storefront`, USD, minor, reviewed host; the cart expires; shadow lookup |
 | MCP-SF-SG / DE / none / USA | `/mcp` storefront | SG / DE / – / USA | `NO_MERCHANT_OFFER/seller_not_priced_in_market_currency` / `NO_MERCHANT_OFFER/market_not_priced` / `QUOTE_REQUIRED/market_required_for_seller_storefront` / `INVALID_ARGUMENTS` |
 | MCP-K-US | `/mcp` test merchant | US | `ready_for_payment`, USD → cancel → reads back `canceled` |
@@ -183,7 +183,7 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 ## First-run order (each run is its own go; enable the issuer binding before, disable it after)
 
 1. **`_CASES=OR-DE`:** a refusal that creates nothing. Review `result.json` with the controller.
-2. **`_CASES=OR-US,OR-SG,OR-us-lower,OR-none,OR-USA,OR-long-s,OR-USA-beside-SG`:** the rest of path 4.
+2. **`_CASES=OR-US,OR-us-lower,OR-none,OR-USA,OR-long-s`:** the rest of path 4 (OR-SG and OR-USA-beside-SG are disabled). The reviewed test product's cache rows expire **2026-11-26**; after that, the served cases fail and report until the rows are refreshed or a new targets version is reviewed.
 3. **Checkout cases.** Add `_USER_KEY_VERSION`:
    1. **MCP-SF-DE:** a refusal that proves the token and the email are accepted.
    2. **MCP-K-US:** create, then cancel.

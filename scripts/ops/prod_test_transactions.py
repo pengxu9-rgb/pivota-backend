@@ -64,8 +64,10 @@ KEY_PATTERN = re.compile(r"ak_(?:live_)?[0-9a-f]{64}")  # the gateway's own key 
 TARGETS_SECRET = "prod-test-transactions-targets"
 TARGETS_MOUNT_DIR = "/var/run/pivota-test-targets"
 TARGETS_FILE = "targets.json"
-# sha256 of the reviewed targets file, filled in REVIEW. Empty refuses every run.
-TARGETS_SHA256 = ""
+# sha256 of the reviewed targets file, filled in REVIEW. Empty refuses every run. Version 1 of the secret
+# (created 2026-11-19 15:20Z from the controller's private file): placeholder user_token (no issuer yet), so the
+# checkout cases need a new targets version and a new sha before they can run.
+TARGETS_SHA256 = "8a10e364b076c14806a45685d0fbf911727cbe80f054d796c01d8ab0deade60c"
 USER_KEY_SECRET = "prod-test-agent-user-key"
 USER_KEY_MOUNT_DIR = "/var/run/pivota-test-agent-user"
 USER_KEY_FILE = "key.pem"
@@ -176,7 +178,7 @@ class Case:
     needs_user: bool = False
     storefront: bool = False       # a storefront create: the continue_url host must be the reviewed seller host
     shadow_lookup: bool = False    # a US storefront create: the shadow catalog lookup runs (advisory check)
-    enabled: bool = True
+    enabled: bool = True           # False: listed for review only; select_cases refuses it and `all` skips it
     reviewed_gateway: bool = False  # the expected answers hold only on REVIEWED_GATEWAY_DIGESTS
 
 
@@ -232,7 +234,11 @@ INVOKE = "/agent/shop/v1/invoke"
 
 CASES: tuple[Case, ...] = (
     # Path 4: offers.resolve market refusals (gw#2601 / gw#2602; be#2843 / be#2848). Read only.
-    *[Case(cid, INVOKE, "read", "offers.resolve", build, label, expected, reviewed_gateway=True)
+    # OR-SG and OR-USA-beside-SG (which resolves as SG) are DISABLED: the targets census (2026-11-19 15:15Z) found
+    # the reviewed test product only in USD, with no SGD seed or cache source, and offers.resolve drops a non-SGD
+    # offer for SG, so neither can be served from a test merchant. They come back with a reviewed SGD source.
+    *[Case(cid, INVOKE, "read", "offers.resolve", build, label, expected, reviewed_gateway=True,
+           enabled=cid not in ("OR-SG", "OR-USA-beside-SG"))
       for cid, build, label, expected in (
           ("OR-US", _offers({"market": "US"}), "US", SERVED),
           ("OR-SG", _offers({"market": "SG"}), "SG", SERVED),
