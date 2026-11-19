@@ -152,12 +152,25 @@ def test_parity_fixture_is_whole_and_names_no_store():
 def test_availability_spellings_parity(monkeypatch, case):
     """Shared parity fixture: tests/fixtures/availability_spellings_parity.json. PIVOTA-Agent (the gateway) carries
     an IDENTICAL copy and runs the same cases through its own classifier; both copies must change together.
-    Regenerate from utils/availability_vocabulary.normalize_availability (gen.py), never hand-edit."""
+    Regenerate with scripts/generate_availability_parity_fixture.py, never hand-edit."""
     assert normalize_availability(case["input"]) == case["expected"]
     monkeypatch.setenv(FLAG, "true")
     expected_stated = {"in_stock": True, "out_of_stock": False, None: None}[case["expected"]]
     assert gateway._stated_in_stock(case["input"]) is expected_stated
     assert unknown_stock.stated_in_stock(case["input"]) is expected_stated
+
+
+def test_the_parity_fixture_is_what_its_generator_writes():
+    """The fixture is generated, not hand-edited: the generator's output must equal the committed file byte
+    for byte (so a vocabulary edit that changes a verdict fails here until the fixture is regenerated)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    out = subprocess.run([sys.executable, str(root / "scripts" / "generate_availability_parity_fixture.py")],
+                         capture_output=True, check=True, cwd=str(root)).stdout
+    assert out == (root / "tests" / "fixtures" / "availability_spellings_parity.json").read_bytes()
 
 
 # P3-1: the catalog arm's ORDER BY bind.
