@@ -58,7 +58,7 @@ async def test_email_fallback_when_merchant_id_row_has_no_customer(monkeypatch):
 
     async def fake_onboarding(merchant_id):
         assert merchant_id == "merch_x"
-        return {"contact_email": "Peng@Chydan.com"}
+        return {"contact_email": "Buyer@Example.com"}
 
     monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
     monkeypatch.setattr(billing, "get_merchant_onboarding", fake_onboarding)
@@ -76,7 +76,7 @@ async def test_returns_empty_when_no_customer_anywhere(monkeypatch):
         return {}
 
     async def fake_onboarding(_merchant_id):
-        return {"contact_email": "peng@chydan.com"}
+        return {"contact_email": "buyer@example.com"}
 
     monkeypatch.setattr(billing, "_fetch_merchant_billing_row", fake_fetch_billing_row)
     monkeypatch.setattr(billing, "get_merchant_onboarding", fake_onboarding)

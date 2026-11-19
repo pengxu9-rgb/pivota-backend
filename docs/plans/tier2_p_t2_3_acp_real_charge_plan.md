@@ -102,7 +102,7 @@ Swap to live keys for exactly one real merchant (allowlist). Real money, low vol
 - Decision on open-questions #1 (capture target: merchant connected Stripe vs Connect+application_fee) and #2 (tokenization surface).
 - Test-mode Stripe keys for `pivota-acp` + a test merchant with a test-mode PSP in `merchant_psps`.
 - A Pivota test Shopify store connected as that merchant.
-- Confirmation to modify the `pivota-acp` repo (`github.com/pengxu9-rgb/pivota-acp`; local `/Users/pengchydan/dev/pivota-acp-revert`).
+- Confirmation to modify the `pivota-acp` repo (`github.com/pengxu9-rgb/pivota-acp`; local `~/dev/pivota-acp-revert`).
 
 ## Explicitly NOT doing (v1)
 At-source take split unless open-question #1 forces Connect+application_fee (would be a topology change, flag separately); UCP/AP2 (P-T2.4); un-pausing T7; any live charge before .4 is clean.

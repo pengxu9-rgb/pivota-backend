@@ -671,7 +671,7 @@ async def retry_settlement_transfer(
                     "transfer_status": transfer_status,
                 },
             )
-        # O-05 (Peng, W3 F1): with transfers off the retry sends nothing and leaves the row
+        # O-05 (the owner, W3 F1): with transfers off the retry sends nothing and leaves the row
         # `failed` — checked BEFORE the reset below. settlement_file_service.transfer checks
         # the same flag itself, so no caller can bypass it.
         if not settlement_file_service.transfers_enabled():

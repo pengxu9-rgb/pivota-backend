@@ -121,9 +121,9 @@ handed-back new keys. The new keys go back to shadow.
 
 - **Backend web/CLI:** deploys on merge.
 - **Drain:** the `retailer-ingest-drain` Cloud Run job runs a pinned image (still 908d9a93a as of 10-09), so
-  it needs a re-image to at least this merge. That is the drain owner's / Peng's call (single writer).
+  it needs a re-image to at least this merge. That is the drain owner's / the owner's call (single writer).
 - **Tower 28's 8 sets:** need a prod write. First a dry-run plan with the CLI (one-off job). Then, with
-  Peng's explicit go, `--apply` with `--stale-brand "Tower 28 Beauty"`, which performs the handover and the
+  the owner's explicit go, `--apply` with `--stale-brand "Tower 28 Beauty"`, which performs the handover and the
   retire in one transaction. Alternatively, wait for a drain re-run of tower28beauty.com on the re-imaged
   drain.
 

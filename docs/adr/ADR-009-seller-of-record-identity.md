@@ -3,7 +3,7 @@
 **Status:** Accepted — decisions ratified by founder 2026-07-07, with the no-fallback
 amendment to open decision 1 (see "Resolved decisions")
 **Date:** 2026-07-05
-**Deciders:** Commerce-index / Trust & Identity owners (peng)
+**Deciders:** Commerce-index / Trust & Identity owners (Founder)
 **Builds on:** ADR-007 (citable index vs commerce overlay), ADR-008 (brand-identity
 reconciliation). Companion reference: `docs/IDENTITY_REFERENCE.md`.
 

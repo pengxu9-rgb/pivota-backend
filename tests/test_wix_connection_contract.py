@@ -28,7 +28,7 @@ def test_normalize_wix_site_id_extracts_url_query_param() -> None:
 
 def test_normalize_wix_site_id_rejects_url_without_site_id() -> None:
     with pytest.raises(WixConnectionValidationError) as exc_info:
-        normalize_wix_site_id("https://peng652.wixsite.com/aydan-1")
+        normalize_wix_site_id("https://examplesite123.wixsite.com/demo-1")
 
     assert exc_info.value.code == "WIX_SITE_ID_NOT_FOUND_IN_URL"
 

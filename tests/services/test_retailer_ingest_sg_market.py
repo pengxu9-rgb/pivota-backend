@@ -1,4 +1,4 @@
-"""SG is a SERVED ingest market (Peng 2026-09-29): "SG is legit serving region as we have crawled and ingested
+"""SG is a SERVED ingest market (the owner 2026-09-29): "SG is legit serving region as we have crawled and ingested
 based on Meitu's merchant list".
 
 Unlike AU/JP (acquisition: stored, never served), an SG job's rows must read back SERVING-ELIGIBLE -- priced in

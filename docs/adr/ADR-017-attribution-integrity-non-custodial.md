@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-18
-**Deciders:** Founder (peng) — attribution/monetization; Commerce / Trust owners
+**Deciders:** Founder — attribution/monetization; Commerce / Trust owners
 **Builds on:** **ADR-016** (Pivota is non-custodial — attribution + trust brokering is *how* Pivota captures value, since it never touches money). Companion: the attribution-loop audit folded into ADR-016 ("Attribution — current state", 2026-07-18).
 **Part of:** the agent-protocol interoperability model — **ADR-014**. Attribution is the **fifth concern** the non-custodial positioning makes load-bearing, alongside discovery / identity / authorization / settlement.
 **Scope:** how Pivota reliably proves "our index/decision drove this merchant sale" while sitting **outside the fund flow** (and, increasingly, outside the checkout). Does not change the money boundary (ADR-016) or identity/consent (ADR-012).

@@ -7,7 +7,7 @@ mirror).
 
 - Status: **Step 1 PROPOSED — starter JSONL drafted, full curation pending**
 - Created: 2026-05-08
-- Owner: TBD (codex execution + peng review)
+- Owner: TBD (codex execution + owner review)
 - Estimated cost: 2–4 hours hand-curation + 30 min run + 30 min probe
 
 ---
@@ -130,7 +130,7 @@ Designed to:
 Land in this order:
 
 1. **Starter JSONL (this PR)** — 15 entries. Doc-only + data file. No
-   ingestion, no DB writes. Codex / peng review the curation quality
+   ingestion, no DB writes. Codex / the owner review the curation quality
    before any prod call.
 2. **Stage 2 validation run** (codex):
    ```bash
@@ -156,7 +156,7 @@ Land in this order:
 ## Verification gates
 
 - [ ] Each starter JSONL entry's brand + product_name corresponds to a
-      real, currently-sold product (codex / peng visual sanity check)
+      real, currently-sold product (codex / owner visual sanity check)
 - [ ] Stage 2 validator validates all 15 entries (≥80% should hit a
       real URL; entries that don't validate get dropped, not hand-fixed)
 - [ ] Stage 3 dry-run shows expected row counts: 15 PDPs, 15 SKUs,

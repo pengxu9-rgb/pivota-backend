@@ -3,7 +3,7 @@
 ## Context
 
 Project: Pivota — AI commerce enablement platform.
-Working dir: `/Users/pengchydan/dev/pivota-backend-receipt-suppress-fix`
+Working dir: `~/dev/pivota-backend-receipt-suppress-fix`
 Stack: Python (FastAPI), Postgres (Railway), Stripe (already wired as PSP).
 Architecture spec: `docs/monetization/Pivota_Monetization_System_v1.3_Blueprint.docx` — implement v1.3 exactly, do not improvise on architecture.
 

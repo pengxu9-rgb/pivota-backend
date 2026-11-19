@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-03
-**Deciders:** Commerce-index / Trust & Identity owners (peng)
+**Deciders:** Commerce-index / Trust & Identity owners (Founder)
 
 ## Context
 

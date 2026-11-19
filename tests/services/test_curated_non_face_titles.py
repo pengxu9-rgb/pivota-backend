@@ -54,7 +54,7 @@ def test_an_unresolved_row_carries_the_feed_default_confidence():
 
 def test_an_unresolved_answer_is_a_cohort_block_by_design():
     """"" is `category_unresolved`, which require_primary_plan refuses for the whole brand-host
-    cohort. That is the chosen trade (Peng, 2026-09-22): a refused cohort over a lash serum
+    cohort. That is the chosen trade (the owner, 2026-09-22): a refused cohort over a lash serum
     served as a face serum. Pinned so a change to it is a decision, not an accident."""
     rec = feed.shopify_product_to_record({
         "title": "ETUDE My Lash Serum 9g", "product_type": "Eye Lash Serum", "handle": "ls",

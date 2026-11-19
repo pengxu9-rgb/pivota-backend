@@ -3619,7 +3619,7 @@ async def test_a_mirror_row_with_no_fresh_storefront_proof_is_refused(client, mo
     assert resp.status_code == 409 and _error(resp) == "row_variant_unverified"
 
 
-# ── option 1: a MULTI-variant product whose seed NAMES one variant (Peng, 2026-09-29) ────────
+# ── option 1: a MULTI-variant product whose seed NAMES one variant (the owner, 2026-09-29) ────────
 #
 # The live judydoll row as it really is: 8 shades on the storefront (tests/fixtures/judydoll_*
 # products_js), a seed naming 07 BURGUNDY INK (tests/fixtures/judydoll_*_seed, staging), and the
@@ -4203,7 +4203,7 @@ async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offe
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-# ── an offer copied off a seed is a price only in that seed's currency (Peng 2026-10-19) ──────
+# ── an offer copied off a seed is a price only in that seed's currency (the owner 2026-10-19) ──────
 #
 # US search served SKINTIFIC's set at USD 23.56: 20 offers the variant backfill copied off
 # seed_data.variants, after the seed was re-read in AUD. This route reads the seller's offers
