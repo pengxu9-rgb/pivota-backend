@@ -45,6 +45,35 @@ spelled, so the drain writes each row under the host spelling (`www.` or not) it
 (`checks.listing_spellings`, and `listing_respellings` in the plan). Without that read, a job queued under the other
 spelling would write a second offer and seed for every row it re-crawls. Fix the database access and re-run.
 
+## `seller_id_split:<existing merchant_id>` -- a second seller for one store
+
+A brand_official offer's seller is `agent_seed::<slug of the job's brand>` (`ingestion.derive_merchant_id`), so a store
+re-run under another spelling of its brand ("Brand A" vs "Brand A Cosmetics") would write its offers under a second
+seller. The dry run (and the apply's re-check) reads, on one SELECT-only connection, every seller the host already
+has -- `catalog_merchants.source_ref` equal to the host or its `www.` twin, and offer sellers already on the plan's
+products there -- and holds each one the plan would not write under. Not a split: the plan's own sellers, a planned
+product's stored seller, a verified brand claim's tenant, and the old spelling `retire_stale_brand` retires.
+`checks.seller_identity` names both sides. Retailer jobs are checked too.
+
+- A re-spelled brand's own store: cancel the job and re-enqueue it with `options.seller_merchant_id` set to the existing
+  `agent_seed::<slug>` (brand_official only). Every offer is written under it and no offer-seller row is minted. An
+  id `catalog_merchants` does not hold fails the stage (`seller_merchant_id_unknown`), so a typo can't mint a
+  seller. A pinned id recorded for another host holds as `seller_merchant_id_off_host`.
+- Accept the key only if the store really changed sellers.
+
+Products do NOT follow the pin. `product_key` is `ext:<slug(record brand + title)>`, and the record brand is the job's
+`brand` wherever the vendor names the same brand. A re-spelled job brand therefore mints NEW product keys beside the
+store's existing ones: the same split, one level down. So for a pinned job, also set the job `brand` to the spelling
+the store's existing products carry (`catalog_products.brand`), then check `checks.seller_identity.planned_products_
+existing` against `planned_products`. None existing on a store that already has products means the spelling is still
+wrong. Proposed, not built: a BLOCK when a host with existing `ext:` products shares no planned `product_key`. It
+needs a `catalog_products` read by host, which has no index yet.
+
+## `seller_ids_unread` -- never acceptable
+
+The seller read above failed (and the plan's own listing read did not already hold the job). Fix the database access
+and re-run.
+
 ## CLI (`scripts/onboard_curated_brands.py`)
 
 - `--apply` always reads the rows' listings and exits 2 (`current_listings_unread`, or `listing_spellings_unread`

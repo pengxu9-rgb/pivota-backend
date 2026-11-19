@@ -636,6 +636,9 @@ def _validated_offers(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             "in_stock": _observed_stock(offer.get("in_stock")),
             "validated_at": str(offer.get("validated_at") or "").strip() or None,
         })
+        if offer.get("seller_merchant_id"):
+            # Carried only when the job pinned it, so every other offer dict is exactly what it was.
+            offers[-1]["seller_merchant_id"] = str(offer["seller_merchant_id"])
     return offers
 
 
@@ -1529,12 +1532,38 @@ def derive_offer_id(product_key: str, sku_key: str, destination_url: str) -> str
     return f"offer:{AGENT_VERSION}:{digest}"
 
 
+#: A brand's own store pinned to the offer seller it ALREADY has (retailer_ingest options.seller_merchant_id):
+#: `agent_seed::<slug>` exactly as the branch below spells one -- lower-case letters and digits joined by
+#: single hyphens -- and short enough for catalog_merchants.merchant_id (VARCHAR(64)). A retailer's
+#: `agent_seed::retailer::<host>` id is derived from its host and never pinned.
+PINNED_MERCHANT_ID_RE = re.compile(r"agent_seed::[a-z0-9]+(?:-[a-z0-9]+)*")
+PINNED_MERCHANT_ID_MAX = 64
+
+
+def validate_pinned_merchant_id(value: Any) -> str:
+    """The pinned offer seller id, or ValueError. Shape only: whether the seller EXISTS is the dry run's
+    to read (retailer_ingest refuses an unknown id there, so a typo cannot mint a seller)."""
+    text = value if isinstance(value, str) else ""
+    if not PINNED_MERCHANT_ID_RE.fullmatch(text) or len(text) > PINNED_MERCHANT_ID_MAX:
+        raise ValueError(f"seller_merchant_id must be agent_seed::<slug> (lower-case letters, digits and single "
+                         f"hyphens, at most {PINNED_MERCHANT_ID_MAX} chars), got {value!r}")
+    return text
+
+
 def derive_merchant_id(merchant_inferred: Optional[str], domain: Optional[str], *,
-                       seller_domain: Optional[str] = None) -> str:
+                       seller_domain: Optional[str] = None, pinned: Optional[str] = None) -> str:
     """Stable merchant_id derived from the validated retailer name (or
     domain as fallback). Format: 'agent_seed::<slug>'. Two offers from
     the same retailer collapse to the same merchant_id, which is what
-    Phase 6's seller_count rule needs to compute pdp_scope correctly."""
+    Phase 6's seller_count rule needs to compute pdp_scope correctly.
+
+    `pinned`: a brand_official offer's seller id named by the job (options.seller_merchant_id), used
+    as is -- the store already sells under it, and a re-spelled brand must not mint a second seller for
+    the same store. Never combined with a retailer's seller_domain."""
+    if pinned:
+        if seller_domain:
+            raise ValueError("a pinned seller id is for a brand's own store, not a retailer offer")
+        return validate_pinned_merchant_id(pinned)
     if seller_domain:
         # Explicit retailer identity cannot collapse across same-named stores or
         # punctuation-equivalent hosts. Existing official IDs take the old branch.
@@ -1643,7 +1672,12 @@ def _build_merchant_upserts(
     for offer in offers:
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(offer.get("canonical_url") or offer.get("destination_url"))
-        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"),
+                                         pinned=offer.get("seller_merchant_id"))
+        if offer.get("seller_merchant_id"):
+            # A pinned seller already exists (the dry run refuses an unknown one): its row is the store's own,
+            # written by whichever lane created it, and this lane neither mints nor rewrites it.
+            continue
         if merchant_id in seen:
             continue
         seen[merchant_id] = {
@@ -1731,7 +1765,8 @@ def _build_offer_inserts(
         seen_offer_ids.add(offer_id)
         merchant_inferred = str(offer.get("merchant_inferred") or "").strip() or None
         domain = _domain_of(canonical_url or destination_url)
-        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"))
+        merchant_id = derive_merchant_id(merchant_inferred, domain, seller_domain=offer.get("seller_domain"),
+                                         pinned=offer.get("seller_merchant_id"))
         availability = _availability(_observed_stock(offer.get("in_stock")))
         price = offer.get("price")
         try:

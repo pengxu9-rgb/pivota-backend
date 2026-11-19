@@ -106,6 +106,13 @@ _OPTION_TYPES = {
     # supersede listings that already have LIVE rows on the host is held (fold_supersedes_live_rows) -- the
     # retire of those rows is a follow-up, so a fold may only take over a store it has not ingested per shade.
     "fold_shades": bool,
+    # A brand's own store that ALREADY sells under an `agent_seed::<slug>` offer seller another lane wrote
+    # (2026-11-19): every offer of the cohort is written under exactly this id, and no new catalog_merchants
+    # row is minted for it. brand_official only; the dry run refuses an id catalog_merchants does not hold
+    # (a typo must not mint a seller). Without it the offer seller is the slug of the job's `brand`, so a
+    # re-spelled brand ("Brand A" vs "Brand A Cosmetics") lands as a second seller for the same store --
+    # which the seller_id_split check holds. product_key derivation does not read it.
+    "seller_merchant_id": str,
 }
 SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
 MARKETS_SOURCE = "shopify_markets"
@@ -293,6 +300,12 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if market not in INGEST_MARKETS:
             raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)})")
         options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    if "seller_merchant_id" in options:
+        from services.catalog_enrichment_agent.ingestion import validate_pinned_merchant_id
+        if options.get("source_role") != "brand_official" or source != "storefront":
+            # A retailer's offer seller is derived from its host (agent_seed::retailer::<host>): nothing to pin.
+            raise ValueError("options.seller_merchant_id supports only a brand_official storefront cohort")
+        options["seller_merchant_id"] = validate_pinned_merchant_id(options["seller_merchant_id"])
     if options.get("fold_shades") and (source != "storefront" or options.get("source_role", "retailer") != "retailer"):
         # The supersede preview derives each folded listing's old key as an ext:retailer: listing key; a brand's
         # own store keys rows by (brand, title), and a feed or a capture crawls no /products.json to fold.
@@ -670,6 +683,8 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         "max_pdp_inci_fetches": (DRAIN_PDP_INCI_FETCHES if o.get("max_pdp_inci_fetches") is None
                                  else int(o["max_pdp_inci_fetches"])),
         "pdp_inci_budget_s": DRAIN_PDP_INCI_BUDGET_S,
+        # Only when pinned: an unpinned job's payload stays exactly what it was.
+        **({"seller_merchant_id": o["seller_merchant_id"]} if o.get("seller_merchant_id") else {}),
     }
 
 
@@ -996,6 +1011,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         if report.get("status") in ("conflicts", "error"):
             flags.append({"key": name, "rule": name, "severity": detectors.BLOCK, "acceptable": False,
                           "detail": json.dumps(report, default=str)[:600]})
+    # One store, one seller: an existing seller id on this host that the plan would not write under is a
+    # second seller for the same store (seller_id_split). Runs for every role; reads only.
+    flags.extend(await _seller_identity_checks(job, plan, checks))
 
     row_flags = detectors.detect(records, store_verdict=store_verdict)
     if refiled:
@@ -1116,6 +1134,162 @@ async def _catalog_read(sql: str, values: Dict[str, Any]) -> tuple:
     """One read on its own connection: (rows as dicts, None), or (None, why)."""
     async with _catalog_reader() as read:
         return await read(sql, values)
+
+
+#: The sellers catalog_merchants ties to a store: every lane that mints a seller writes the host it sells
+#: on into source_ref -- ingestion._build_merchant_upserts (offer sellers, `agent_seed::<slug>` and
+#: `agent_seed::retailer::<host>`: the offer URL's host, `www.` dropped) and the W2 seller of record
+#: (`merch_obs_*`: the registrable domain, which IS the host on an apex store). Small table, no index needed.
+SELLERS_ON_HOST_SQL = """
+SELECT merchant_id, source_ref
+FROM catalog_merchants
+WHERE lower(source_ref) = ANY(:hosts)
+"""
+#: Offer sellers already on the plan's own products at this host, whatever minted them -- a seller another
+#: path wrote without a catalog_merchants row on the host still shows here. catalog_offers.product_key is
+#: indexed; the host is the offer's source_domain, else the domain its payload recorded.
+OFFER_SELLERS_ON_PLANNED_SQL = """
+SELECT DISTINCT merchant_id
+FROM catalog_offers
+WHERE product_key = ANY(:keys)
+  AND lower(coalesce(source_domain, offer_payload->>'domain', '')) = ANY(:hosts)
+"""
+#: The plan's products that already exist, with their stored seller: apply keeps it (apply._prepare_seller_of_record
+#: step 1), so it is never a new seller. How many exist is recorded too (checks.seller_identity.planned_products_
+#: existing): a pinned seller with none of its store's products is the same split one level down (a re-spelled
+#: record brand mints new product_keys), for the reviewer to see.
+PRODUCT_SELLERS_SQL = """
+SELECT product_key, merchant_id
+FROM catalog_products
+WHERE product_key = ANY(:keys)
+"""
+#: A VERIFIED brand claim's tenant for the store's registrable domain: apply attaches the rows to it
+#: (apply._prepare_seller_of_record step 3, the same predicate), so it is never a new seller either.
+CLAIMED_TENANT_SQL = """
+SELECT merchant_id
+FROM brand_claims
+WHERE verification_status = :verified
+  AND (lower(coalesce(brand_domain, '')) = :reg OR lower(coalesce(brand_domain, '')) LIKE '%.' || :reg)
+"""
+PINNED_SELLER_SQL = """
+SELECT merchant_id, source_ref
+FROM catalog_merchants
+WHERE merchant_id = :mid
+"""
+
+
+def _store_hosts(domain: Optional[str]) -> tuple:
+    """(host, every spelling of it a seller row may carry): the job's host as the payload normalizes it
+    (lower-cased, trailing dot dropped), `www.` dropped as ingestion._domain_of drops it, plus its `www.`
+    twin -- `www.brand-a.example` and `brand-a.example` are one store."""
+    host = str(domain or "").strip().lower().rstrip(".").removeprefix("www.")
+    return host, (sorted({host, f"www.{host}"}) if host else [])
+
+
+def _planned_sellers(plan: Dict[str, Any]) -> Dict[str, List[str]]:
+    """The seller ids the plan writes: its offers' sellers and its products' sellers of record."""
+    offers = sorted({str(r.get("merchant_id") or "") for r in plan.get("offers") or []} - {""})
+    of_record = sorted({str(r.get("merchant_id") or "") for r in (plan.get("pdps") or []) + (plan.get("skus") or [])}
+                       - {""})
+    return {"offers": offers, "of_record": of_record}
+
+
+def _stale_spelling_sellers(job: Dict[str, Any], registrable: str) -> set:
+    """options.retire_stale_brand re-spells a store on purpose: its OLD spelling's sellers are expected on the
+    host (the retire handles their rows), so they are not a split."""
+    stale = str((job.get("options") or {}).get("retire_stale_brand") or "").strip()
+    if not stale:
+        return set()
+    from services.catalog_enrichment_agent.ingestion import derive_merchant_id
+    from services.seller_identity import make_observed_merchant_id
+    out = {derive_merchant_id(stale, None)}
+    with contextlib.suppress(ValueError):
+        out.add(make_observed_merchant_id(stale, registrable))
+    return out
+
+
+async def _seller_identity_checks(job: Dict[str, Any], plan: Dict[str, Any],
+                                  checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """seller_id_split: hold a cohort that would write a store's rows under a seller id other than the one(s)
+    the store already has. Measured 2026-11-19: one brand's own store carried offers under the slugs of two
+    spellings of its brand, because the offer seller is the slug of the job's `brand`. Every read runs on ONE
+    SELECT-only catalog connection (_catalog_reader), the stage's read handle; nothing is written.
+
+    A seller on the host is "existing" if catalog_merchants ties it to the host (source_ref) or it already
+    sells one of the plan's products there (catalog_offers). It is NOT a split when the plan writes under it,
+    when it is the stored seller of a planned product (apply keeps that), when it is a verified claim's tenant
+    (apply attaches to that), or when it is the old spelling options.retire_stale_brand retires. Each split is
+    one BLOCK flag per existing id (acceptable: a store that really changed hands). An unread catalog holds
+    (not acceptable): without it a split cannot be told from a first ingest.
+
+    options.seller_merchant_id (brand_official): the id must already be in catalog_merchants -- the stage
+    fails otherwise, so a typo can never mint a seller."""
+    from db.brand_claims import STATUS_VERIFIED
+    from services.seller_identity import etld1
+
+    o = job.get("options") or {}
+    pinned = o.get("seller_merchant_id")
+    host, hosts = _store_hosts(job.get("domain"))
+    planned = _planned_sellers(plan)
+    keys = sorted({str(p.get("product_key") or "") for p in plan.get("pdps") or []} - {""})
+    if not host or not (planned["offers"] or planned["of_record"]):
+        checks["seller_identity"] = {"status": "not_applicable", "host": host}
+        return []
+    registrable = etld1(host)
+    async with _catalog_reader() as read:
+        pinned_rows, unread = ([], None)
+        if pinned:
+            pinned_rows, unread = await read(PINNED_SELLER_SQL, {"mid": pinned})
+        on_host, why_host = await read(SELLERS_ON_HOST_SQL, {"hosts": hosts})
+        on_offers, why_offers = (await read(OFFER_SELLERS_ON_PLANNED_SQL, {"keys": keys, "hosts": hosts})
+                                 if keys else ([], None))
+        stored, why_stored = (await read(PRODUCT_SELLERS_SQL, {"keys": keys})) if keys else ([], None)
+        claimed, why_claimed = (await read(CLAIMED_TENANT_SQL, {"verified": STATUS_VERIFIED, "reg": registrable})
+                                if registrable else ([], None))
+    why = unread or why_host or why_offers or why_stored or why_claimed
+    if why:
+        checks["seller_identity"] = {"status": "unchecked", "host": host, "reason": why}
+        if any((plan.get(k) or {}).get("status") in ("unchecked", "error")
+               for k in ("current_listings", "listing_spellings")):
+            return []  # the plan's own listing read already holds this unread catalog (not acceptable either)
+        return [{"key": "seller_ids_unread", "rule": "seller_ids_unread", "severity": detectors.BLOCK,
+                 "acceptable": False,
+                 "detail": f"could not read the sellers {host} already has ({why}): a second seller for the "
+                           f"store cannot be told from a first ingest"}]
+    if pinned and not pinned_rows:
+        checks["seller_identity"] = {"status": "pinned_unknown", "host": host, "pinned": pinned}
+        raise _Stop("seller_merchant_id_unknown", "failed",
+                    f"options.seller_merchant_id {pinned!r} is not a seller in catalog_merchants: the pin names "
+                    f"the seller the store ALREADY has and never mints one -- fix the id, then re-queue",
+                    checks=checks)
+    existing: Dict[str, List[str]] = {}
+    for r in on_host or []:
+        existing.setdefault(str(r.get("merchant_id") or ""), []).append(f"catalog_merchants:{r.get('source_ref')}")
+    for r in on_offers or []:
+        existing.setdefault(str(r.get("merchant_id") or ""), []).append("catalog_offers")
+    existing.pop("", None)
+    allowed = (set(planned["offers"]) | set(planned["of_record"])
+               | {str(r.get("merchant_id") or "") for r in stored or []}
+               | {str(r.get("merchant_id") or "") for r in claimed or []}
+               | _stale_spelling_sellers(job, registrable))
+    splits = sorted(m for m in existing if m not in allowed)
+    checks["seller_identity"] = {
+        "status": "split" if splits else "clear", "host": host, "pinned": pinned,
+        "planned_offer_sellers": planned["offers"], "planned_sellers_of_record": planned["of_record"],
+        "existing": {m: sorted(set(v)) for m, v in sorted(existing.items())}, "split": splits,
+        "planned_products": len(keys),
+        "planned_products_existing": len({str(r.get("product_key") or "") for r in stored or []} - {""}),
+    }
+    flags = detectors.seller_split_flags(host, splits, existing, planned)
+    if pinned:
+        # The pin names THIS store's seller: one whose row says it sells elsewhere is held for a look.
+        ref = str((pinned_rows[0] or {}).get("source_ref") or "").strip().lower().removeprefix("www.")
+        if ref and ref not in (host, registrable):
+            flags.append({"key": f"seller_merchant_id_off_host:{pinned}", "rule": "seller_merchant_id_off_host",
+                          "severity": detectors.BLOCK, "existing_merchant_id": pinned,
+                          "detail": f"options.seller_merchant_id {pinned} is recorded for {ref}, not {host}: "
+                                    f"accept this key only if that seller really is this store's"})
+    return flags
 
 
 async def _superseded_rows(keys: List[str], read: Any = None) -> tuple:

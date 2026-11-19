@@ -438,6 +438,32 @@ def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[s
     return flags
 
 
+def seller_split_flags(host: str, splits: Iterable[str], existing: Dict[str, Any],
+                       planned: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """seller_id_split: one BLOCK flag per seller id the store already has that the plan would NOT write under
+    (pipeline._seller_identity_checks decides which). The flag names both sides: the existing id (and where it
+    was found) and the ids the plan writes. Accepting `seller_id_split:<existing id>` lets the cohort write
+    beside that seller -- only right when the store really changed sellers; a re-spelled brand is answered by
+    options.seller_merchant_id (brand_official) or by the job brand the store's rows already use."""
+    offer_ids, of_record = list(planned.get("offers") or []), list(planned.get("of_record") or [])
+    return [{
+        "key": f"seller_id_split:{mid}",
+        "rule": "seller_id_split",
+        "severity": BLOCK,
+        "handle": None,
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "existing_merchant_id": mid,
+        "planned_merchant_ids": offer_ids + [m for m in of_record if m not in offer_ids],
+        "detail": (f"{host} already has seller {mid} (found in {sorted(set(existing.get(mid) or []))}); this "
+                   f"cohort writes its offers under {offer_ids[:5]} and its products under {of_record[:5]}: a "
+                   f"second seller for one store. Pin the existing offer seller (options.seller_merchant_id) or "
+                   f"set the job brand to the spelling the store's rows use; accept this key only if the store "
+                   f"really changed sellers"),
+    } for mid in sorted(set(splits or []))]
+
+
 def listing_move_flags(moves: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """listing_moved: a row names a listing on this host that the crawl does not carry, so the plan held
     every record of it (ingestion.ingest_validated_jsonl never moves a row). Always BLOCK and never covered
