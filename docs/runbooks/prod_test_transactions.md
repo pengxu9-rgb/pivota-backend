@@ -161,7 +161,9 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 
 ## What the owner sets up (names only; no session reads or creates these)
 
-1. **The test agent and its key.** The owner's existing test shopping agent, set up for testing (owner, 2026-11-19). Its key lives in the existing secret `test-shopping-agent-api-key`, created 2026-09-24 with versions 1 and 2, and mounted by no other service or job. Pass the valid version as `_KEY_VERSION`. The job refuses the key unless it is in the gateway's `ak_` format.
+1. **The test agent and its key.** The owner's existing test shopping agent, set up for testing (owner, 2026-11-19). Its key lives in the existing secret `test-shopping-agent-api-key`, created 2026-09-24 with versions 1 and 2, and mounted by no other service or job. Pass the valid version as `_KEY_VERSION` (version **2**, the one the live Pivota shopping agent uses). The job refuses the key unless it is in the gateway's `ak_` format.
+   - **This is a LIVE agent** (owner, 2026-11-19: "Live agent, fine"). The test calls count against its rate limit and quota and show in its attribution.
+   - For the checkout cases, the test issuer's binding attaches to this agent, so the per-run enable and the disable afterwards (then waiting out the registry lag) are mandatory, never optional.
 2. **The targets.** `prod-test-transactions-targets` holds the JSON above. Review records its sha256 as `TARGETS_SHA256`.
 3. **The test issuer:**
    1. Generate an EC P-256 key pair on your own machine.
