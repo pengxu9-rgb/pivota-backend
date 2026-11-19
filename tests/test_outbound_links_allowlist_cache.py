@@ -70,3 +70,22 @@ def test_is_destination_domain_allowed_honors_allowlist() -> None:
         destination_url="https://any-domain.com/p/1",
         allowed_domains=[],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("market, key", [("ſg", "ſg"), ("uſ", "uſ"), ("ＳＧ", "ＳＧ"), ("sg", "SG"), (" SG ", "SG"), (None, "US"), ("", "US")])
+async def test_the_allowlist_is_keyed_ascii_first_and_a_lookalike_never_reads_sgs(
+    monkeypatch: pytest.MonkeyPatch, isolated_allowlist_cache, market, key
+) -> None:
+    # Upcasing first read 'ſg' as SG and handed it SG's allowlist. Absent still keys US.
+    outbound_links_service = isolated_allowlist_cache
+    asked: list = []
+
+    async def fake_fetch(cache_market: str):
+        asked.append(cache_market)
+        return ["example.com"] if cache_market == "SG" else []
+
+    monkeypatch.setattr(outbound_links_service, "_fetch_allowed_domains_for_market", fake_fetch)
+    domains = await outbound_links_service.get_allowed_domains_for_market(market=market)
+    assert asked == [key]
+    assert (domains == ["example.com"]) is (key == "SG")

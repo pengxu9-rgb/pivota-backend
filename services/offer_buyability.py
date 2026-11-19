@@ -60,7 +60,10 @@ NO_CURRENCY = "(none)"
 
 
 def _norm_market(value: Any) -> str:
-    return str(value or "").strip().upper()
+    # Only an ASCII value is upper-cased: case mapping reads a look-alike ('ſg') as a real market ('SG').
+    # A non-ASCII value stays as sent, maps to no currency and is never the default serving market.
+    text = str(value or "").strip()
+    return text.upper() if text.isascii() else text
 
 
 def expected_currency_for_market(serving_market: Any) -> Optional[str]:

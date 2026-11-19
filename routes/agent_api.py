@@ -5360,6 +5360,36 @@ def _normalize_serving_market_param(raw: Any) -> Optional[str]:
     return code if code and expected_currency_for_market(code) else None
 
 
+#: The `metadata.reason_code`s of a search page refused for its serving market (`_serving_market_refusal`). A
+#: caller that replaces an empty page with another lane's (the SDK door's merchant-scoped legacy fallback)
+#: must pass these through: the other lane has no market filter and would serve the market that was refused.
+SERVING_MARKET_REFUSAL_REASONS = frozenset({"market_invalid", "market_not_priced"})
+
+
+def _serving_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
+    """Why a SENT `serving_market` cannot be served, or None (absent, blank, or a market Pivota prices).
+
+    Only a string is a sent value. Anything else is ABSENT: over HTTP FastAPI hands this a str or None, and a
+    route that calls `agent_search_products` as a plain function and omits the argument leaves FastAPI's
+    `Query(...)` default object in place (the `isinstance(..., str)` coercion routes/merchant_products.py
+    uses for the same reason). Read with `str()`, that object was refused as market_invalid on every call.
+
+    `market_invalid`: not two ASCII letters (a locale, a list, 'USA', a Unicode look-alike such as 'ſg', which
+    case-folding would read as SG); the value is never repeated back. `market_not_priced`: a well-formed code
+    nothing is priced in (DE, ZZ); the code is named. The cross-door tokens offers.resolve and get_offers use.
+    Before, either was ignored and the page held to the partition's currency: a buyer who named a market was
+    silently served another one's."""
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text:
+        return None
+    code = iso2_market(text)
+    if code is None:
+        return {"reason_code": "market_invalid"}
+    if not expected_currency_for_market(code):
+        return {"reason_code": "market_not_priced", "serving_market": code}
+    return None
+
+
 async def agent_search_products(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -5392,7 +5422,9 @@ async def agent_search_products(
         description=(
             "The BUYER's market (ISO-2). Decides the currency every served row must be priced in; "
             "the seed partitions read stay the deployment's (`market`). `market` alone is the storage "
-            "partition, unchanged. Unpriceable or malformed values are ignored."
+            "partition, unchanged. A value that is not a two-letter code, or one nothing is priced in, is "
+            "answered with no products and a named `metadata.reason_code` (`market_invalid` / "
+            "`market_not_priced`); it is never read as the partition's market."
         ),
     ),
     psp: Optional[str] = Query(default=None),
@@ -5430,9 +5462,37 @@ async def agent_search_products(
     # gateway's find_products_multi lane -- which binds the deployment's partitions and filters by
     # the buyer's currency -- serves SGD rows. This surfaces the same split on this door. The
     # expected currency follows the serving market when named, else the partition, as before.
+    started = time.perf_counter()
+    # A serving market that was SENT and cannot be served is answered here, with no products and its reason
+    # named, before anything is read. The empty-page shape this door already gives a request it cannot scope
+    # (`no_merchant_scope`), so a caller reading `products` sees an empty page, not an error.
+    serving_refusal = _serving_market_refusal(serving_market)
+    if serving_refusal is not None:
+        background_tasks.add_task(log_agent_request, context=context, status_code=200, merchant_id="serving_market_refused")
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {
+                "total_count": 0, "limit": limit, "offset": offset, "page": (offset // limit) + 1,
+                "total_pages": 0, "has_more": False,
+            },
+            "search_context": {
+                "merchant_id": None, "merchant_ids": [], "merchants_searched": [], "cross_merchant_search": False,
+                "catalog_surface": catalog_surface,
+            },
+            "filters_applied": {
+                "query": query, "category": category, "catalog_surface": catalog_surface,
+                "min_price": min_price, "max_price": max_price, "in_stock_only": in_stock_only,
+            },
+            "metadata": _finalize_search_metadata({
+                "source": "agent_search_products",
+                **serving_refusal,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "external_seed_returned_count": 0,
+            }),
+        }
     normalized_serving_market = _normalize_serving_market_param(serving_market)
     expected_price_currency = expected_currency_for_market(normalized_serving_market or market)
-    started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
     auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
     rate_limit_check_ms = max(0, int(getattr(getattr(req, "state", None), "agent_rate_limit_check_ms", 0) or 0))
@@ -7934,6 +7994,10 @@ async def agent_resolve_products(
                         in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
+                        # Called as a plain function: every argument the search reads is passed, never left
+                        # as FastAPI's Query default object. This lookup names no market.
+                        market=None,
+                        serving_market=None,
                         context=context,
                     ),
                     timeout=search_timeout_s,

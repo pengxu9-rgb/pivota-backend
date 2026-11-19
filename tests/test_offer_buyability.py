@@ -338,3 +338,16 @@ def test_currency_partitioning_is_case_and_whitespace_insensitive():
         "US",
     )
     assert [o["merchant_id"] for o in out if o["is_buy_pick"]] == ["usd_80"]
+
+
+# --- a Unicode look-alike is no market ---------------------------------------
+
+def test_a_lookalike_serving_market_is_priced_as_nothing_and_never_the_default():
+    # Case mapping read 'ſg' as SG (SGD) and 'ﬁ' as FI (EUR). Only an ASCII value is upper-cased.
+    for raw in ("ſg", "ﬁ", "uſ", "ＵＳ"):
+        assert expected_currency_for_market(raw) is None, raw
+    assert expected_currency_for_market("sg") == "SGD"
+    # A SENT look-alike is not the default serving market either: a US offer is cross-border to it.
+    assert offer_market_availability("US", "uſ") == MARKET_CROSS_BORDER
+    assert offer_market_availability("SG", "ſg") == MARKET_CROSS_BORDER
+    assert offer_market_availability("SG", "sg") == MARKET_DOMESTIC
