@@ -137,3 +137,24 @@ def test_sitemap_continuation_keeps_blocked_prefix_and_reaches_an_ordinary_child
     assert receipt["coverage"]["sitemap"]["prefix_failed_source_count"] == 1
     assert receipt["coverage"]["status"] == "blocked"
     assert manifest.resume(second, [receipt], "fixture-round-three")["queries"]
+
+
+
+@pytest.mark.parametrize(("query", "title", "score"), [
+    # filler or generic words in the line name no longer block a current same-line title
+    ("the glow sculptor lipstick & lipgloss", "berry juicy glow sculptor lipstick & lip gloss", 2),
+    ("glow sculptor", "berry juicy glow sculptor lipstick & lip gloss", 3),
+    ("Velvet Cloud Lip", "Velvet Cloud Lip", 4),
+    ("Velvet Cloud Lip", "Velvet Cloud Lipstick", 2),
+    # a title that adds a bundle, size or format word the query did not name is still rejected
+    ("Velvet Cloud Lip", "Velvet Cloud Lip Mini", 0),
+    ("Velvet Cloud Lip", "Velvet Cloud Liquid Lip", 0),
+    ("Velvet Cloud Lip", "Velvet Cloud Lip Kit", 0),
+    # a distinctive word missing from the title is still no match
+    ("Velvet Cloud Lip", "Velvet Dream Lip", 0),
+    # a line name made only of generic words never matches
+    ("MATTE", "Matte Lipstick", 0),
+    ("the lip gloss", "Shine Lip Gloss", 0),
+])
+def test_rule_a_matches_on_the_line_names_distinctive_words(query, title, score):
+    assert scan.match_score(query, title) == score
