@@ -50,7 +50,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
-from services.payment_orchestration import a2a_purchase_view, purchase_view
+from services.payment_orchestration import a2a_purchase_view, purchase_consent, purchase_view
 from services.payment_orchestration import router as rail_router
 from services.payment_orchestration.rails import A2A_STATE_MAP, RAIL_ID_PREFIX
 
@@ -114,10 +114,12 @@ async def _parent_for(purchase_id: str, agent_id: str, owner: str) -> Optional[D
         raise _LedgerUnavailable() from None
 
 
-async def _unified_for(parent: Mapping[str, Any], agent_id: str, owner: str):
-    """(body, None) on success, (None, response) when the purchase cannot be answered."""
+async def _unified_for(parent: Mapping[str, Any], agent_id: str, owner: str, consents: Any = purchase_consent.LOOKUP):
+    """(body, None) on success, (None, response) when the purchase cannot be answered. `consents`: a page's
+    one-read AgenPas consent snapshot (purchase_consent.snapshot); by default the rail view reads its own."""
+    extra: Dict[str, Any] = {} if consents is purchase_consent.LOOKUP else {"consents": consents}
     body, problem = await purchase_view.unified_purchase(
-        parent, agent_id=agent_id, agent_user_ref_hash=owner
+        parent, agent_id=agent_id, agent_user_ref_hash=owner, **extra
     )
     if problem == "not_found":
         return None, reap_routes._not_found()
@@ -189,9 +191,11 @@ async def list_purchases(
     # ONE ANSWER FOR THE WHOLE PAGE. A row whose rail state has no unified word fails the page with the
     # same 503 the single read gives, rather than vanishing from the owner's history (a caller
     # reconciling history would read a missing row as a purchase that does not exist).
+    # ONE AgenPas consent read for the page (the gate's; nothing is read while it is off).
+    consents = await purchase_consent.snapshot(agent_id, [(p["rail"], str(p["rail_purchase_id"])) for p in parents])
     out = []
     for parent in parents:
-        body, error = await _unified_for(parent, agent_id, owner)
+        body, error = await _unified_for(parent, agent_id, owner, consents)
         if body is not None:
             out.append(body)
         elif error is not None and error.status_code == 503:
