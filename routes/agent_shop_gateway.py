@@ -3655,7 +3655,9 @@ class OffersResolveProductRef(BaseModel):
 class OffersResolvePayload(BaseModel):
     product: OffersResolveProductRef
     limit: int = Field(10, ge=1, le=30, description="Max offers to return")
-    market: Optional[str] = Field(None, description="Market for outbound allowlist and UTM")
+    # Any, not str: a market that is not a string (123, a list) is refused by name in the handler
+    # (`market_invalid`) instead of failing validation as a 500.
+    market: Optional[Any] = Field(None, description="Market for outbound allowlist and UTM")
     tool: Optional[str] = Field(None, description="Tool identifier for outbound allowlist and UTM")
     commerce_surface: Optional[str] = Field(
         None,
@@ -4954,7 +4956,16 @@ async def _handle_offers_resolve(
 
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
-    market_hint = str(payload.market or "").strip() or None
+    # THE BUYER MARKET, read as the gateway's get_offers reads one (trimmed, upper-cased: 'us' is US) and
+    # refused by name, before any read, when it is not a market this registry prices: `market_invalid` for a
+    # value that is not a two-letter code ('USA', 'EU-DE', 123), `market_not_priced` for a well-formed code that
+    # is not a registry pricing region (DE, ZZ; NZ, listed but not priced). Never defaulted and never answered
+    # as another market. Absent, null or blank names no market (the gateway's rule, D-10's marketIsUnnamed):
+    # no market, exactly as before.
+    market_refusal = _offers_resolve_market_refusal(payload.market)
+    if market_refusal is not None:
+        return market_refusal
+    market_hint = _normalized_offers_resolve_market(payload.market)
     # DECISION D-10: a market the gateway ASSUMED (US, `marketAssumed`) is the market this answer is decided for --
     # the cart gate, the currency filter and the served market all use `market_hint` -- but it was never NAMED, so
     # every `market_observed` / cart-pin decision below reads this instead: None, exactly as for no market.
@@ -9965,6 +9976,62 @@ def _offer_destination_host(url: Optional[str]) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+_OFFERS_RESOLVE_MARKET_CODE = re.compile(r"[A-Z]{2}")
+
+
+def _offers_resolve_market_unnamed(raw: Any) -> bool:
+    """Absent, null or a blank string: the request names no market (the gateway's marketIsUnnamed)."""
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+def _normalized_offers_resolve_market(raw: Any) -> Optional[str]:
+    """The caller's market as a code (trimmed, upper-cased), or None when it names none."""
+    if _offers_resolve_market_unnamed(raw) or not isinstance(raw, str):
+        return None
+    return market_registry.normalize_market(raw)
+
+
+def _offers_resolve_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
+    """offers.resolve's named refusal for a market it cannot answer for, or None (unnamed, or listed).
+
+    The vocabulary is the gateway get_offers door's: `market_invalid` (not a two-letter code; the value is
+    never echoed) and `market_not_priced` (a well-formed code that is not one of the market registry's
+    pricing regions: not listed (DE, ZZ), or listed without pricing (NZ))."""
+    if _offers_resolve_market_unnamed(raw):
+        return None
+    code = market_registry.normalize_market(raw) if isinstance(raw, str) else ""
+    if not _OFFERS_RESOLVE_MARKET_CODE.fullmatch(code):
+        return {
+            "status": "error",
+            "offers": [],
+            "offers_count": 0,
+            "error": {
+                "code": "MARKET_INVALID",
+                "reason": "market_invalid",
+                "message": "`market` is not an ISO 3166-1 alpha-2 country code; nothing was looked up. "
+                           "Send the buyer's country as two letters; a market is never guessed.",
+            },
+        }
+    # PRICED = a measured pricing region of the registry (pricing_region_currency, the gateway's
+    # BUYER_REGION_CURRENCY map), not merely listed: NZ is listed with pricing_region false, the gateway
+    # prices nothing there, and this door answers it as the gateway does. Read here only; the registry and
+    # its other readers are unchanged.
+    if code not in market_registry.pricing_region_currency():
+        return {
+            "status": "error",
+            "offers": [],
+            "offers_count": 0,
+            "market": code,
+            "error": {
+                "code": "MARKET_NOT_PRICED",
+                "reason": "market_not_priced",
+                "message": f"No offer is priced for a buyer in {code}; nothing was looked up, and a request for "
+                           f"{code} is never answered as another market.",
+            },
+        }
+    return None
+
+
 def _declared_buyer_currency(market_hint: Optional[str]) -> Optional[str]:
     """The currency of the market the caller declared, or None when it declared none or the
     market registry does not list it (then no currency rule applies)."""
@@ -12402,22 +12469,40 @@ def _named_seed_variant_pdp_url(
     ):
         return family_url
 
-    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_VARIANTS
+    from services.external_seed_review_pilot import LISTINGS, NAMED_REFERRAL_LISTINGS, NAMED_REFERRAL_VARIANTS
 
     additions = NAMED_REFERRAL_VARIANTS.get(seed_id, {}) if listing is None else {}
-    listing = listing or LISTINGS.get(seed_id)
+    # A private (manifest v2) listing never went through code or draft review, so its "existing" variants
+    # are held to the same live GTIN + SKU match as additions.
+    private = False
+    if listing is None:
+        listing = LISTINGS.get(seed_id)
+        if listing is None:
+            listing = NAMED_REFERRAL_LISTINGS.get(seed_id)
+            private = listing is not None
     if (
         listing is None
         or seller_ref != listing.seller_ref
         or family_url != listing.url
     ):
         return family_url
-    if not any(native_id == variant_id for variant_id, *_ in listing.variants):
+    existing = next((row for row in listing.variants if row[0] == native_id), None)
+    if existing is None:
         reviewed_identity = additions.get(native_id)
         if reviewed_identity is None:
             return family_url
         gtin, sku = reviewed_identity
         if validated_source_gtin(variant.get("barcode")) != gtin or variant.get("sku") != sku:
+            return family_url
+    elif private:
+        # Never None == None: an unreadable reviewed GTIN or a missing SKU is a mismatch (the loader also refuses it).
+        reviewed_gtin = validated_source_gtin(existing[1])
+        if (
+            reviewed_gtin is None
+            or not existing[3]
+            or validated_source_gtin(variant.get("barcode")) != reviewed_gtin
+            or variant.get("sku") != existing[3]
+        ):
             return family_url
     selected_url = f"{listing.url}?variant={native_id}"
     return selected_url if variant.get("url") == selected_url else family_url

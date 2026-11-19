@@ -1,0 +1,93 @@
+# Reviewed seed batch launcher (pivota-prod). Runs ENTIRELY in Google Cloud; nothing runs on a laptop.
+#
+#   CONFIG=infra/gcp/cloudbuild.seed_batch.yaml   # from a checkout of the RELEASE commit
+#   gcloud builds submit --no-source --async --project pivota-prod --region us-west1 --config "$CONFIG" \
+#     --service-account projects/pivota-prod/serviceAccounts/sa-ops-launcher@pivota-prod.iam.gserviceaccount.com \
+#     --substitutions=_MODE=plan,_BATCH_ID=<slug>,_RELEASE=<40-hex>,_DIGEST=sha256:<64-hex>,_NAMED_SHA256=<64-hex>,\
+#       _CONFIG_SHA256=$(shasum -a 256 "$CONFIG" | cut -d" " -f1),_MANIFEST='["seed-batch-manifest",<v>,"<sha256>"]',\
+#       _NAMED='["named-referral-variants-manifest",<v>,"<sha256>"]'
+#   (apply adds _PLAN and _APPROVAL; rollback adds _RECEIPTS; each '["<secret>",<version>,"<sha256>"]')
+#
+# 1 copies scripts/, services/ and this config OUT OF THE RELEASE IMAGE (by digest). The next step refuses unless the
+#   submitted config's sha is the release copy's: that catches a stale checkout, not a deliberate mismatch. Every
+#   later step runs the release's own launcher code.
+# 2 the digest is the release tag's digest. 3 web's serving revision runs that digest with the batch's named pin.
+# 4 the batch lock. Steps 1-4 fail closed with nothing taken or run.
+# 5 run: gate -> armed deploy -> execute --async -> wait BY NAME -> disarm (allowFailure, so 6 always runs).
+# 6 publish: log.txt, rows.json, result.json (create-only), then releases the lock only when nothing can still run
+#   and the job is disarmed; the release outcome goes to lock.json.
+substitutions:
+  _MODE: ""
+  _BATCH_ID: ""
+  _RELEASE: ""
+  _DIGEST: ""
+  _NAMED_SHA256: ""
+  _CONFIG_SHA256: ""
+  _MANIFEST: ""
+  _PLAN: ""
+  _RECEIPTS: ""
+  _NAMED: ""
+  _APPROVAL: ""
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: false
+  env:
+    - BUILD_ID=$BUILD_ID
+timeout: 4200s
+steps:
+  - id: release-scripts
+    name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
+    entrypoint: bash
+    timeout: 120s
+    env: ["RELEASE=${_RELEASE}"]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        test "$$(cat /app/.image_commit_sha)" = "$$RELEASE"
+        mkdir -p /workspace/release/infra/gcp /workspace/seed-batch
+        cp -r /app/scripts /workspace/release/scripts
+        cp -r /app/services /workspace/release/services
+        cp /app/infra/gcp/cloudbuild.seed_batch.yaml /workspace/release/infra/gcp/cloudbuild.seed_batch.yaml
+  - id: config-is-the-release-config
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: python3
+    timeout: 60s
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, config, --config-sha256, "${_CONFIG_SHA256}"]
+  - id: digest-is-the-release-tag
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: bash
+    timeout: 120s
+    env: ["RELEASE=${_RELEASE}", "DIGEST=${_DIGEST}"]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        [[ "$$RELEASE" =~ ^[0-9a-f]{40}$$ && "$$DIGEST" =~ ^sha256:[0-9a-f]{64}$$ ]]
+        tag_digest="$$(gcloud artifacts docker images describe "us-west1-docker.pkg.dev/pivota-shared/pivota/backend:$$RELEASE" --format 'value(image_summary.digest)')"
+        test "$$tag_digest" = "$$DIGEST"
+  - id: web
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: python3
+    timeout: 120s
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, web, --digest, "${_DIGEST}", --named-sha256, "${_NAMED_SHA256}"]
+  - id: lock
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: python3
+    timeout: 120s
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, lock, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}"]
+  - id: run
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: python3
+    timeout: 2700s
+    allowFailure: true
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, run, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}",
+           --release, "${_RELEASE}", --digest, "${_DIGEST}", --named-sha256, "${_NAMED_SHA256}",
+           --manifest, "${_MANIFEST}", --plan, "${_PLAN}", --receipts, "${_RECEIPTS}", --named, "${_NAMED}",
+           --approval, "${_APPROVAL}"]
+  - id: publish
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: python3
+    timeout: 600s
+    args: [/workspace/release/scripts/ops/seed_batch_launch.py, publish, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}",
+           --release, "${_RELEASE}"]
