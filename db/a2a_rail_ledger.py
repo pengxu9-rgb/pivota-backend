@@ -1033,8 +1033,13 @@ _PARK_FOR_SHIPPING_ADDRESS_SQL = """
     UPDATE a2a_rail_purchases
        SET claimed_by = NULL,
            claimed_at = NULL,
-           buyer_action_expires_at = COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)),
-           last_error_code = 'shipping_address_required',
+           -- The buyer's submit can land while this worker holds the row (it takes no claim): when both parts
+           -- are there by now, the wait is over. The code and the deadline are cleared, never re-armed, so the
+           -- expiry sweep can never end a purchase whose contact is complete.
+           buyer_action_expires_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                THEN NULL ELSE COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)) END,
+           last_error_code = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                THEN NULL ELSE 'shipping_address_required' END,
            next_poll_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
                 THEN clock_timestamp() ELSE CAST(:next_poll_at AS TIMESTAMPTZ) END,
            updated_at = clock_timestamp()

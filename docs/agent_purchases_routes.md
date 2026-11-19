@@ -86,11 +86,17 @@ The partner agent sends the buyer's shipping address; when it does not, AgenPas 
 it. Same router as the read above: the same dial (`AGENPAS_INTERNAL_READ_ENABLED`, at startup), the same
 key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read and ignored.
 
-- **Capture.** While the dial is on, `POST /agent/v2/commerce/purchases` on the A2A rail accepts a body
-  without `buyer.email` and/or `buyer.shipping_address`. One that is given is read by the Reap rules, plus,
-  for the US, a real state or DC in `region` and a ZIP (12345 or 12345-6789) in `postalCode`
-  (`invalid_address`). Off: both stay required, exactly as before. A request the router hands to Reap is
-  parsed by Reap's own model, which still requires both.
+- **Capture** is ONE predicate (`a2a_shipping_address.capture_enabled`), read by the door, the view and the
+  worker alike: this dial AND the checkout step AND the token step. Only then does the worker wait for a
+  missing contact, so only then does `POST /agent/v2/commerce/purchases` on the A2A rail accept a body
+  without `buyer.email` and/or `buyer.shipping_address`, and only then does the view ask for it. One that is
+  given is read by the Reap rules, plus, for the US, a real state or DC in `region` and a ZIP (12345 or
+  12345-6789) in `postalCode` (`invalid_address`). Capture off (any of the three dials off, e.g. this read
+  dial on before the checkout dial): both stay required and every answer is exactly as before. A request the
+  router hands to Reap is parsed by Reap's own model, which still requires both.
+- **Market.** The address's country; with no address, the one market of the purchase's own currency
+  (`expected_currency`), never a default: none (or several) is 400 `shipping_market_unknown`. The A2A pilot
+  is the US, in code: any other market on the A2A rail is 400 `shipping_country_unsupported`.
 - **Waiting.** The purchase stays `opened` (unified `routing`), and the worker sends NOTHING for it, not even
   a card read, until its email and address are complete. The email is listed first: the card binding needs
   it. `last_error_code` is `shipping_address_required`, and the deadline is 30 minutes from creation
@@ -106,12 +112,16 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   in `fields_missing`); a part that is sent is read whole. US only. Region is one of the 50 states or DC.
 - **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
   deadline not passed, the contact never purged) and fills only an empty part. The purchase is then due
-  at once.
+  at once. A submit that lands while the worker holds the row is never undone: the worker's park then finds
+  the contact complete and clears the code and the deadline, so the expiry sweep cannot end it.
 - **Answers.**
   - 200: the unified view (as the read).
   - The same contact sent again: 200.
   - 409 `shipping_address_conflict`: the purchase no longer waits and holds something else, the
-    email or address sent differs from the stored one, or it is not an A2A-rail purchase.
+    email or address sent differs from the stored one, or it is not an A2A-rail purchase. The body is the
+    error middleware's wrapper: `{"status": "error", "error": {"code": "CONFLICT", "message":
+    "shipping_address_conflict", "details": {"error": "shipping_address_conflict"}, "documentation_url":
+    ...}, "detail": {"error": "shipping_address_conflict"}, "metadata": {...}}`: read `detail.error`.
   - 422 `{"status": "error", "error": "invalid_shipping_address", "field_errors": {field: code}}`.
     The codes are `required`, `invalid`, `too_long` and `unsupported`; a submitted value is never
     echoed.

@@ -82,6 +82,8 @@ def _dials(monkeypatch):
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
+    # Shipping capture is the read dial AND both steps (a2a_shipping_address.capture_enabled): on with them here.
+    monkeypatch.setenv("AGENPAS_INTERNAL_READ_ENABLED", "1")
     # The rail's own per-currency cap (the create route needs it set; the ceiling must fit it too).
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000")
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(HOST.encode()).hexdigest()}))

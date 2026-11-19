@@ -23,7 +23,7 @@ never stores a partner's credentials, so the gateway reads the purchase here, se
          the unknown-route 404 before the key is looked at (other methods then answer 405 until the restart).
 
 `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address`: the buyer's own shipping address and
-email, from the gateway's form, for an A2A-rail purchase the agent opened without them (Peng's decision: the
+email, from the gateway's form, for an A2A-rail purchase the agent opened without them (the owner's decision: the
 agent sends it; if not, AgenPas asks). SAME router, so the same dial (registered only when it is on at build),
 the same key and the same (agent id, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read and ignored.
 

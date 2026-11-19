@@ -119,7 +119,8 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
     ):
         view["hosted_url"] = row["buyer_action_url"]
         view["hosted_url_expires_at"] = row.get("buyer_action_expires_at")
-    if state == "opened":
+    if state == "opened" and a2a_shipping_address.capture_enabled():
+        # Asked for only while the worker waits for it (the same predicate as the door and the worker).
         missing = a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))
         if missing and not row.get("contact_purged_at"):
             required: Dict[str, Any] = {"fields_missing": missing}

@@ -1,6 +1,6 @@
 """The buyer's shipping address and email on the A2A rail: what is missing, and how a submitted one is read.
 
-Peng's decision: the partner agent sends the buyer's shipping address; when it does not, AgenPas
+The owner's decision: the partner agent sends the buyer's shipping address; when it does not, AgenPas
 asks the buyer for it. Three readers share these rules, so they cannot come to disagree:
 
   the door      routes/agent_commerce_purchases (POST on the A2A rail): email and address are OPTIONAL while
@@ -16,8 +16,16 @@ THE FIELDS are the door's own (the Reap client's vocabulary): email, firstName, 
 addressLine1, addressLine2 (optional), city, region, postalCode, country. Pilot: the US only; region is one of
 the 50 states or DC (territories refused), postalCode a ZIP (12345 or 12345-6789).
 
-CAPTURE is on while AGENPAS_INTERNAL_READ_ENABLED is (the dial of the internal read, whose router carries the
-write): with it off nothing here changes what the door accepts, and the write is not registered.
+CAPTURE (`capture_enabled`) is ONE predicate, read by the door, the view and the worker alike: the internal read's
+dial AGENPAS_INTERNAL_READ_ENABLED (whose router carries the write) AND the checkout step AND the token step.
+Only then does the worker wait for a missing contact, so only then may the door accept a purchase without one
+or the view ask the buyer for it. With any of the three off nothing here changes what the door accepts (with
+the read dial off the write is not registered either).
+
+THE MARKET of an A2A purchase is the address's country; with no address it comes from the purchase's own
+currency (`market_for_currency`: one market per currency), never a default. The pilot is the US: any other
+market is refused on the A2A path by name, `shipping_country_unsupported`; no market at all (no address and
+no currency that names one) is `shipping_market_unknown`.
 
 No function here logs, and no error carries a submitted value: a field error is a short code (`required`,
 `invalid`, `too_long`, `unsupported`).
@@ -40,6 +48,11 @@ _TRUTHY = frozenset({"1", "true", "on", "yes"})
 SHIPPING_ADDRESS_REQUIRED = "shipping_address_required"
 SHIPPING_ADDRESS_EXPIRED = "shipping_address_expired"
 
+#: FAILS CLOSED, BY DESIGN: a value the buyer gives that is exactly the DAVV's three digits (a bare addressLine2
+#: "715") is, once the confirm card echoes the address, indistinguishable from the DAVV echoed back. The relay's
+#: whole-value rule scrubs it and the setup answer is not confirmed (a2a_rail._scrub_needles): the purchase is
+#: cancelled before anything is submitted. About 1 in 1000 bare 3-digit line 2s. Pinned in
+#: tests/test_agenpas_shipping_address.py; not to be relaxed here.
 ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "addressLine2", "city", "region",
                   "postalCode", "country")
 REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode",
@@ -60,8 +73,33 @@ _ZIP_RE = re.compile(r"^[0-9]{5}(?:-[0-9]{4})?\Z")
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9 ().-]{5,30}\Z")
 
 
-def capture_enabled() -> bool:
+def read_dial_enabled() -> bool:
+    """The internal read's dial alone (the write's router is registered on it)."""
     return (os.getenv(CAPTURE_DIAL_ENV) or "").strip().lower() in _TRUTHY
+
+
+def capture_enabled() -> bool:
+    """Whether a purchase may wait for the buyer's contact: the read dial AND the checkout step AND the token
+    step (the worker's checkout path). THE one predicate for the door, the view and the worker."""
+    if not read_dial_enabled():
+        return False
+    # Imported here: the worker imports this module.
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+
+    return a2a_rail.checkout_step_enabled() and a2a_rail_worker.token_step_enabled()
+
+
+#: The refusals of the A2A door on the market (routes/agent_commerce_purchases).
+SHIPPING_COUNTRY_UNSUPPORTED = "shipping_country_unsupported"
+SHIPPING_MARKET_UNKNOWN = "shipping_market_unknown"
+
+
+def market_for_currency(currency: Any, markets: Mapping[str, str]) -> Optional[str]:
+    """The one market whose currency is `currency` (`markets`: market -> currency), or None when none or several
+    do. Never a default."""
+    code = str(currency or "").strip().upper()
+    found = [market for market, cur in markets.items() if cur == code]
+    return found[0] if len(found) == 1 else None
 
 
 def fields_missing(buyer_email: Any, shipping_address: Any) -> List[str]:

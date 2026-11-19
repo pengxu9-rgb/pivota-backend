@@ -1,4 +1,4 @@
-"""AgenPas asks the buyer for the shipping address the agent did not send (Peng's decision).
+"""AgenPas asks the buyer for the shipping address the agent did not send (the owner's decision).
 
 The door (POST /agent/v2/commerce/purchases, routes/agent_commerce_purchases), the gateway's write
 (POST /agent/internal/commerce/purchases/{id}/shipping-address, routes/agent_internal_commerce_purchases) and,
@@ -502,3 +502,158 @@ async def test_the_whole_path_create_without_an_address_then_submit_then_card_ap
     logged = _app_log(caplog)
     for needle in NEEDLES:
         assert needle not in logged, needle
+
+
+
+# ── review of 192b9e079: one capture predicate; the market; the park race; the second-line guards ──
+
+_DIALS = {
+    "read": internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV,
+    "checkout": a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV,
+    "token": worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV,
+}
+_COMBINATIONS = [(r, c, t) for r in (0, 1) for c in (0, 1) for t in (0, 1)]
+
+
+def _set_dials(monkeypatch, read, checkout, token):
+    for name, on in zip(_DIALS.values(), (read, checkout, token)):
+        if on:
+            monkeypatch.setenv(name, "1")
+        else:
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("read,checkout,token", _COMBINATIONS, ids=[f"read{r}_checkout{c}_token{t}" for r, c, t in _COMBINATIONS])
+async def test_the_door_the_view_and_the_worker_read_one_capture_predicate(monkeypatch, read, checkout, token):
+    # P2-1: a purchase may open without its contact ONLY when the worker will wait for it, and only then is the
+    # buyer asked for it.
+    _set_dials(monkeypatch, read, checkout, token)
+    capture = bool(read and checkout and token)
+    assert shipping_capture.capture_enabled() is capture
+    resp = await _http("POST", BASE, json=_body(email=None))
+    if not capture:
+        assert (resp.status_code, _error(resp)) == (400, "invalid_request")
+        return
+    assert resp.status_code == 202, resp.text
+    pid = resp.json()["purchase_id"]
+    assert (await _http("GET", f"{BASE}/{pid}")).json()["next_action"]["kind"] == "shipping_address"
+    rail = ck.Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED and rail.sent == []
+
+
+async def test_the_reviewers_case_read_dial_on_checkout_off_shows_no_form_and_the_door_needs_the_contact(monkeypatch):
+    _set_dials(monkeypatch, read=1, checkout=0, token=1)
+    resp = await _http("POST", BASE, json=_body(email=None))
+    assert (resp.status_code, _error(resp)) == (400, "invalid_request")  # never a purchase the worker will not wait for
+    # A row left without its contact (opened while capture was on) is not asked for and does not wait.
+    _set_dials(monkeypatch, read=1, checkout=1, token=1)
+    pid = await _create(email=None, idempotency_key="k-left")
+    for dials in ({"read": 1, "checkout": 0, "token": 1}, {"read": 0, "checkout": 1, "token": 1}):
+        _set_dials(monkeypatch, **dials)
+        assert (await _http("GET", f"{BASE}/{pid}")).json().get("next_action") is None, dials
+        assert worker._awaits_contact(await a2a_ledger.get_purchase_internal(pid)) is False, dials
+
+
+@pytest.mark.parametrize("missing", ["email", "address", "both"])
+async def test_with_only_the_read_dial_on_the_door_answers_exactly_as_with_every_dial_off(monkeypatch, missing):
+    # Merging changes nothing while only the read dial is on (the gateway's read may be on before the checkout).
+    body = _body(email=None if missing in ("email", "both") else EMAIL,
+                 address=None if missing in ("address", "both") else dict(ADDRESS))
+    strip = lambda r: (r.status_code, {k: v for k, v in r.json().items() if k != "metadata"})  # noqa: E731
+    _set_dials(monkeypatch, read=1, checkout=0, token=0)
+    read_only = await _http("POST", BASE, json=body)
+    _set_dials(monkeypatch, read=0, checkout=0, token=0)
+    all_off = await _http("POST", BASE, json=body)
+    assert strip(read_only) == strip(all_off) and read_only.status_code == 400
+
+
+@pytest.mark.parametrize("country", ["CA", "GB"])
+async def test_the_a2a_door_refuses_a_non_us_market_by_name(monkeypatch, country):
+    # P3-1: in code, not only by the router's lists: here the router itself picks the A2A rail.
+    monkeypatch.setattr(rail_router, "choose_rail",
+                        lambda **kw: rail_router.RailChoice(rail="a2a", basis="buyer_selected_rail"))
+    currency = reap_routes._MARKET_CURRENCY[country]
+    address = {**ADDRESS, "country": country, "region": "ON" if country == "CA" else "LND", "postalCode": "M5V 2T6"}
+    by_address = await _http("POST", BASE, json=_body(address=address, expected_currency=currency,
+                                                      payment_preference={"rail": "a2a"}))
+    by_currency = await _http("POST", BASE, json=_body(email=None, expected_currency=currency, idempotency_key="k-c",
+                                                       payment_preference={"rail": "a2a"}))
+    for resp in (by_address, by_currency):
+        assert (resp.status_code, _error(resp)) == (400, shipping_capture.SHIPPING_COUNTRY_UNSUPPORTED), resp.text
+
+
+@pytest.mark.parametrize("currency", ["omitted", "XYZ"])
+async def test_with_no_address_and_no_currency_naming_one_market_the_door_refuses_by_name(currency):
+    # P3-1: never a default market.
+    body = _body(email=None, expected_currency=currency)
+    if currency == "omitted":
+        body.pop("expected_currency"), body.pop("expected_unit_price_minor")
+    resp = await _http("POST", BASE, json=body)
+    assert (resp.status_code, _error(resp)) == (400, shipping_capture.SHIPPING_MARKET_UNKNOWN)
+    assert shipping_capture.market_for_currency("USD", reap_routes._MARKET_CURRENCY) == "US"
+    assert shipping_capture.market_for_currency("USD", {"US": "USD", "EC": "USD"}) is None  # two markets: none
+
+
+async def test_a_park_racing_the_buyers_submit_clears_the_wait_and_the_sweep_never_ends_the_purchase():
+    # P3-2: the worker holds a stale row (no contact) while the buyer's submit lands; its park must not re-arm.
+    pid = await _create(email=None)
+    assert await _step(ck.Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED  # the first park sets the deadline
+    await ck._ago("next_poll_at", 1, pid)
+    stale = [r for r in await a2a_ledger.claim_due_purchases(ck.W, limit=50) if r["id"] == pid][0]
+    assert (await _submit(pid)).status_code == 200  # lands while the worker holds the row
+    await worker.step(ck._client(ck.Rail()), stale, ck.W)  # parks from its stale read
+    row = await a2a_ledger.get_purchase_internal(pid)
+    assert (row["state"], row["last_error_code"], row["buyer_action_expires_at"]) == ("opened", None, None)
+    assert row["buyer_email"] == EMAIL and row["shipping_address"] is not None
+    await a2a_ledger.expire_overdue_purchases()
+    assert (await a2a_ledger.get_purchase_internal(pid))["state"] == "opened"
+
+
+async def test_the_park_write_itself_needs_opened_and_no_pending_write():
+    # P3-5 (S1, S12): second-line guards behind `_opened`, pinned on the ledger write.
+    pid = await _create(email=None)
+    await ck._ago("next_poll_at", 1, pid)
+    assert [r for r in await a2a_ledger.claim_due_purchases(ck.W, limit=50) if r["id"] == pid]
+    from datetime import datetime, timezone
+
+    later = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    when = {"expires_at": later, "next_poll_at": later}
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'quoting' WHERE id = :i", {"i": pid})
+    assert await a2a_ledger.park_for_shipping_address_as_holder(pid, ck.W, **when) is None
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'opened', pending_write = 'payment.method-add#submit' "
+                           "WHERE id = :i", {"i": pid})
+    assert await a2a_ledger.park_for_shipping_address_as_holder(pid, ck.W, **when) is None
+    row = await a2a_ledger.get_purchase_internal(pid)
+    assert (row["last_error_code"], row["buyer_action_expires_at"]) == (None, None)
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write = NULL WHERE id = :i", {"i": pid})
+    assert await a2a_ledger.park_for_shipping_address_as_holder(pid, ck.W, **when) is not None
+
+
+async def test_the_gateway_sees_these_exact_409_and_422_bodies():
+    # P3-3, for the gateway: the 422 is flat; the 409 is re-wrapped by ErrorHandlerMiddleware (read detail.error).
+    pid = await _create(email=None)
+    assert (await _submit(pid, _form(addressLine1="1 First St"))).status_code == 200
+    conflict = await _submit(pid, _form(addressLine1="2 Second St"))
+    body = {k: v for k, v in conflict.json().items() if k != "metadata"}
+    assert conflict.status_code == 409
+    assert body == {"status": "error", "detail": {"error": "shipping_address_conflict"},
+                    "error": {"code": "CONFLICT", "message": "shipping_address_conflict",
+                              "details": {"error": "shipping_address_conflict"},
+                              "documentation_url": "https://api.pivota.cc/agent/docs/overview"}}
+    pid2 = await _create(email=None, idempotency_key="k-422")
+    invalid = await _submit(pid2, _form(postalCode="1"))
+    assert (invalid.status_code, invalid.json()) == (
+        422, {"status": "error", "error": "invalid_shipping_address", "field_errors": {"postalCode": "invalid"}})
+
+
+async def test_an_address_line_2_equal_to_the_davv_cancels_before_the_confirm_failing_closed():
+    # P3-6, pinned: a bare 3-digit addressLine2 that is exactly our DAVV is scrubbed as the DAVV echoed back (the
+    # whole-value rule), so the setup answer is not confirmed. About 1 in 1000 bare 3-digit line 2s; it fails
+    # closed (cancelled before anything is submitted). No behaviour change.
+    shipping = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550199", "country": "US",
+                "address1": "77 Needle Lane", "address2": ck.DAVV, "city": "Needleton", "state": "TX",
+                "zip_code": "78799"}
+    answer = ck._task(ck._card("checkout.confirm", {"merchant": "merchant.example", "shipping": shipping},
+                               ("confirm",), kind="confirm"))
+    relay = await ck._relay(ck._Provider(ck._token_result(), answer), setup=ck._setup(ceiling_minor=100000))
+    assert relay.checkout.credential_fields_stripped >= 1

@@ -313,12 +313,18 @@ async def create_purchase(
         merchant_domain = reap_routes._merchant_domain_key(merchant_host)
         product_key, hashed_product, product_url = reap_routes._product_selector(req, merchant_host)
         variant_key, hashed_variant = reap_routes._variant_selector(req)
-        # No address (capture on): the pilot's one market. The A2A rail is US-only; a request the router
-        # hands to Reap is refused there by Reap's own model.
-        market_country = purchasability.normalize_market(
-            req.buyer.shipping_address.country if req.buyer.shipping_address is not None else "US")
-        if market_country is None:
-            raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
+        # The market is the address's country. NEVER A DEFAULT: with no address (capture on) it is the one
+        # market of the purchase's own currency, and with no such market the purchase is refused by name. A
+        # request the router hands to Reap is refused there by Reap's own model, which needs the address.
+        if req.buyer.shipping_address is not None:
+            market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
+            if market_country is None:
+                raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
+        else:
+            market_country = shipping_capture.market_for_currency(req.expected_currency, reap_routes._MARKET_CURRENCY)
+            if market_country is None:
+                raise reap_svc.PurchaseRefused(
+                    shipping_capture.SHIPPING_MARKET_UNKNOWN, "no shipping address and no currency naming one market")
         agent_id = str(context.agent_id)
         owner = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
         if not owner:
@@ -362,6 +368,11 @@ async def create_purchase(
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
             logger.warning("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
             raise reap_svc.PurchaseRefused("not_available_on_this_rail")
+        if market_country not in shipping_capture.PILOT_COUNTRIES:
+            # THE A2A PILOT IS THE US, in code (not only by the router's merchant list): any other market, from
+            # the address or the currency, is refused by name on this rail.
+            raise reap_svc.PurchaseRefused(
+                shipping_capture.SHIPPING_COUNTRY_UNSUPPORTED, "the A2A rail ships to the US only")
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,

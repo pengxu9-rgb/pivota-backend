@@ -493,11 +493,13 @@ async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -
 
 
 def _awaits_contact(row: Mapping[str, Any]) -> bool:
-    """A checkout-path purchase whose email or shipping address is incomplete: nothing may be sent for it
-    (the card binding needs the email, the checkout the address). With the checkout path off, the purchase
-    goes on exactly as before (an email-less row is refused below)."""
-    checkout_path = a2a_rail.checkout_step_enabled() and token_step_enabled()
-    return checkout_path and bool(a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address")))
+    """A purchase whose email or shipping address is incomplete while capture is on: nothing may be sent for it
+    (the card binding needs the email, the checkout the address). Capture is THE predicate the door and the
+    view read too (a2a_shipping_address.capture_enabled: the read dial, the checkout step and the token step),
+    so the worker waits exactly when the door let the purchase open without its contact. With capture off the
+    purchase goes on exactly as before (an email-less row is refused below)."""
+    return a2a_shipping_address.capture_enabled() and bool(
+        a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address")))
 
 
 async def _await_contact(s: _Step) -> str:
