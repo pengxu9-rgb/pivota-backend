@@ -14,14 +14,15 @@ Inputs (Secret Manager file mounts pinned by sha256 envs, or envs the launcher s
   OUTBOUND_ALLOWLIST_POPULATE_RELEASE_COMMIT       must equal /app/.image_commit_sha
   OUTBOUND_ALLOWLIST_POPULATE_WRITE_ENABLED=1      apply/rollback only
 
-Output: lines starting `OLP `. Plan: the per-market counts, the full domain list, the skips, and `OLP plan_doc <b64>`.
-Apply: `OLP receipt ...` and `OLP receipt_doc <b64>`. Rollback: `OLP rollback ...`. A refusal: `OLP refused ...`.
+Output: lines starting `OLP `. Plan: the per-market counts, every entry with its marks, the skips, and the plan document
+as `OLP plan_doc <i>/<n> <sha256> <base64 chunk>` lines (each under Cloud Logging's 256 KB entry limit). Apply:
+`OLP receipt ...` and `OLP receipt_doc ...` lines. Rollback: `OLP rollback ...`. Any refusal, including a database
+error: one `OLP refused mode=<m> reason=<type> detail=<text>` line and exit 2, never a traceback.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 from datetime import datetime, timezone
 from hashlib import sha256
 from hmac import compare_digest
@@ -47,17 +48,9 @@ def out(line: str) -> None:
     sys.stdout.flush()
 
 
-def doc_line(kind: str, value) -> str:
-    return f"{core.LINE_PREFIX}{kind} " + base64.b64encode(core.compact(value).encode()).decode()
-
-
-def parse_doc_line(text: str, kind: str):
-    """Decode the `OLP <kind> <b64>` line of a job log (the operator stores its bytes as the next run's pinned input)."""
-    marker = f"{core.LINE_PREFIX}{kind} "
-    for line in text.splitlines():
-        if line.startswith(marker):
-            return json.loads(base64.b64decode(line[len(marker):].strip(), validate=True))
-    raise core.Refused(f"no {kind} line")
+def parse_doc(text: str, kind: str):
+    """Reassemble the `OLP <kind> i/n sha chunk` lines of a job log into the document the operator pins next."""
+    return core.parse_doc_lines(text, kind)
 
 
 def read_pinned(name: str) -> bytes:
@@ -108,7 +101,8 @@ async def run(mode: str, db, *, release: str) -> int:
         plan = await core.read_plan(db, batch_id=batch_id)
         for line in core.plan_lines(plan):
             out(line)
-        out(doc_line("plan_doc", plan))
+        for line in core.doc_lines("plan_doc", plan):
+            out(line)
         return 0
     if mode == "apply":
         plan_bytes = read_pinned("PLAN")
@@ -116,7 +110,8 @@ async def run(mode: str, db, *, release: str) -> int:
         check_approval("apply", release=release, pinned_key="plan_sha256", pinned_sha=plan.get("plan_sha256"))
         receipt = await core.apply_plan(db, plan)
         out(core.receipt_line(receipt))
-        out(doc_line("receipt_doc", receipt))
+        for line in core.doc_lines("receipt_doc", receipt):
+            out(line)
         return 0
     receipt = json.loads(read_pinned("RECEIPT"))
     check_approval("rollback", release=release, pinned_key="receipt_sha256", pinned_sha=receipt.get("receipt_sha256"))
@@ -143,8 +138,9 @@ async def main(argv) -> int:
             return await run(mode, db, release=release)
         finally:
             await db.disconnect()
-    except core.Refused as error:
-        out(f"{core.LINE_PREFIX}refused mode={mode} error={str(error)[:300]}")
+    except Exception as error:  # every refusal (ours, the reused seed-batch guards', a database error) is one line
+        detail = " ".join(str(error).split())[:300]
+        out(f"{core.LINE_PREFIX}refused mode={mode} reason={type(error).__name__} detail={detail}")
         return 2
 
 
