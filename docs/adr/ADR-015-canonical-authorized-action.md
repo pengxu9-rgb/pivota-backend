@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-18
-**Deciders:** Founder (peng) — authorization/trust; Security / Trust / Commerce owners
+**Deciders:** Founder — authorization/trust; Security / Trust / Commerce owners
 **Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-015 is its **authorization-layer** instance (ADR-014 action item 4): the canonical object that "what did the human authorize" resolves to, and the single gate that enforces it.
 **Builds on:** ADR-012 (which built the AP2 Intent→Cart→Payment **mandate** authority — the AP2-specific precursor this generalizes). Companion: ADR-013 (settlement consumes the authorized amount and decrements the budget in the same transaction); `docs/AP2_ENABLEMENT.md`.
 **Scope:** the authorization layer only — the **Canonical Authorized Action (CAA)** object and the deny-by-default gate that checks "the concrete transaction falls within the CAA." Out of scope: identity (ADR-012), settlement (ADR-013), discovery (ADR-007).

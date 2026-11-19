@@ -1,6 +1,6 @@
 """agent_pdp_view's offer read refuses offers copied off a seed in another currency (real Postgres).
 
-Peng 2026-10-19: a price's currency is the buyer market's, never defaulted, never relabelled. That
+The owner 2026-10-19: a price's currency is the buyer market's, never defaulted, never relabelled. That
 day the view for SKINTIFIC's "Glow Cushion & Peptide Lip Serum Set" (ck_886037a7...) served five
 USD 23.56 offers and a row currency of USD. aggregate_offers takes the MODAL currency, and the
 variant backfill had copied 20 USD 23.56 offers off seed_data.variants, against one AUD 56 mirror
