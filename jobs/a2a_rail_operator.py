@@ -32,7 +32,10 @@ DRY RUN BY DEFAULT. `resolve-held` without `--apply` reads THAT row (by id) and 
 it has been held, and whether the apply would be accepted and why not. With `--lookup` it also sends ONE
 read-only lookup by our idempotency key (worker.operator_lookup_preview) and shows only the answer's state,
 result_status, total, currency and task_id, labelled bound or "UNBOUND: this answer may belong to another
-purchase; not verified as ours"; read then, never stored. `--apply` additionally requires:
+purchase; not verified as ours"; read then, never stored. An answer that reports payment (bound or not) makes
+the preview not eligible (`payment_reported_by_lookup`). `--apply` runs its OWN such lookup when the rail client
+is configured and refuses on an answer that reports payment (with no client, or a failed lookup, it rests on
+--provider-checked); `--lookup` with `--apply` is refused. `--apply` additionally requires:
   * `--operator <handle>` (logged with the decision);
   * `--expect-env <PIVOTA_ENV>`, EXACTLY this process's PIVOTA_ENV;
   * `--provider-checked`: the operator's statement that they checked the provider's side for this purchase.
@@ -78,7 +81,8 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--expect-env")
     resolve.add_argument("--provider-checked", action="store_true")
     resolve.add_argument("--lookup", action="store_true",
-                         help="dry run only: ONE read-only lookup, its safe fields shown (bound or UNBOUND), nothing stored")
+                         help="dry run only (refused with --apply, which runs its own): ONE read-only lookup, its "
+                              "safe fields shown (bound or UNBOUND), nothing stored")
     return parser
 
 
@@ -101,7 +105,26 @@ async def _held(limit: int) -> List[Dict[str, Any]]:
     return [row for row in rows if str(row.get("last_error_code") or "") in codes]
 
 
-async def run(argv: List[str], out=sys.stdout, client: Any = None) -> int:
+#: `run(client=...)` default: the configured rail client (a2a_rail.from_env). A caller passing None means none.
+_FROM_ENV = object()
+
+
+async def _lookup(worker: Any, ledger: Any, purchase_id: str, row: Any, client: Any) -> Dict[str, Any]:
+    """ONE read-only lookup of THIS held row (worker.operator_lookup_preview); never stored. A lookup that
+    raises is reported, never thrown."""
+    if client is _FROM_ENV:
+        from services.payment_orchestration import a2a_rail
+
+        client = a2a_rail.from_env()
+    try:
+        # The full row is read for the lookup's own use (member and task ids); it is never printed.
+        full = await ledger.get_purchase_internal(purchase_id) if row is not None else None
+        return await worker.operator_lookup_preview(client, full)
+    except Exception as exc:  # noqa: BLE001 - a failed read never stops the tool
+        return {"ran": False, "reason": f"lookup failed: {type(exc).__name__}"}
+
+
+async def run(argv: List[str], out=sys.stdout, client: Any = _FROM_ENV) -> int:
     try:
         args = _parser().parse_args(argv)
     except SystemExit:
@@ -109,6 +132,11 @@ async def run(argv: List[str], out=sys.stdout, client: Any = None) -> int:
     from db.database import database
     from services.payment_orchestration import a2a_rail_worker as worker
 
+    if args.command == "resolve-held" and args.apply and args.lookup:
+        # --apply always runs its own lookup; --lookup is the dry run's. Refused, never silently skipped.
+        print(json.dumps({"outcome": "refused", "reason": "--lookup is for the dry run; --apply runs its own lookup"}),
+              file=out)
+        return EXIT_BAD_ARGS
     if args.command == "resolve-held" and args.apply:
         problem = _apply_guard_problem(args)
         if problem:
@@ -142,18 +170,21 @@ async def run(argv: List[str], out=sys.stdout, client: Any = None) -> int:
             if args.lookup:
                 # Read now, shown, never stored (worker.operator_lookup_preview). An answer for a task the row
                 # never recorded is labelled UNBOUND: it may be another purchase's.
-                if client is None:
-                    from services.payment_orchestration import a2a_rail
-
-                    client = a2a_rail.from_env()
-                try:
-                    # The full row is read for the lookup's own use (member and task ids); it is never printed.
-                    full = await ledger.get_purchase_internal(args.purchase_id) if row is not None else None
-                    preview["lookup"] = await worker.operator_lookup_preview(client, full)
-                except Exception as exc:  # noqa: BLE001 - a failed read never stops the preview
-                    preview["lookup"] = {"ran": False, "reason": f"lookup failed: {type(exc).__name__}"}
+                preview["lookup"] = await _lookup(worker, ledger, args.purchase_id, row, client)
+                if preview["lookup"].get("says_done"):
+                    preview["eligible"], preview["reason"] = False, worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP
+                    preview["message"] = ("the lookup reports payment for this purchase (bound or not): escalate; "
+                                          "never resolve it here")
             print(json.dumps(preview, default=str, sort_keys=True), file=out)
-            return EXIT_OK if eligible else EXIT_REFUSED
+            return EXIT_OK if preview["eligible"] else EXIT_REFUSED
+        if eligible:
+            # --apply's OWN read-only lookup: an answer (bound or UNBOUND) that reports payment refuses the apply.
+            # No client here, or a lookup that fails: the apply rests on --provider-checked, as before.
+            lookup = await _lookup(worker, ledger, args.purchase_id, row, client)
+            if lookup.get("says_done"):
+                print(json.dumps({"outcome": "refused", "reason": worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP,
+                                  "lookup": lookup}, default=str, sort_keys=True), file=out)
+                return EXIT_REFUSED
         result = await worker.operator_fail_held_checkout(
             args.purchase_id, expected_code=args.expected_code, operator=args.operator)
         print(json.dumps(result, default=str, sort_keys=True), file=out)

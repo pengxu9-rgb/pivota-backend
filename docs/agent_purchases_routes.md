@@ -225,8 +225,9 @@ creates a checkout task only after our confirm, and a lookup answer echoes nothi
 key, checkout URL or merchant; its `card_last4` names the card, not the purchase), so an answer for a task
 the purchase never recorded (unbound) cannot be verified as ours. It never completes the purchase, never
 records an order id or a total, never adopts the task, never fails it and never makes it "not charged": the
-hold stays, whatever it says. One that says the checkout completed or succeeded (`success: true`, or a
-status / `result_status` / state that says paid, completed or payment-reached) moves the hold to
+hold stays, whatever it says. One that says the checkout succeeded or payment happened (`success: true`, or a
+`result_status` / `status` that says paid, completed or payment-reached; a `state` only when it itself names a
+payment, never `completed` alone, which is the task's lifecycle) moves the hold to
 `checkout_payment_reached_unconfirmed`, which resolve-held refuses. Exact binding (an `idempotency_key`
 echo) comes back only in its own review, once the provider confirms it. A result's status is read from
 `status` or the documented `result_status` (both present and different: unrecognised, held); the fields
@@ -252,7 +253,16 @@ confirm (the same key with another body: our own bug) is held and never looked u
    (`state`, `result_status`, `total`, `currency`, `task_id`; never `card_last4` or the order id), read at
    that moment and NEVER stored (not even as a lookup count). An answer for a task the purchase did not
    record from its own confirm answer is labelled "UNBOUND: this answer may belong to another purchase;
-   not verified as ours": it is a hint for your check in step 2, never proof.
+   not verified as ours": it is a hint for your check in step 2, never proof. An answer that reports payment
+   (bound or not, read as above) makes the preview `eligible: false`, reason `payment_reported_by_lookup`:
+   escalate, never resolve it here. Only a HELD row is looked up.
+
+   `--apply` runs its OWN read-only lookup the same way (when the rail client is configured) and refuses
+   (exit 3, `payment_reported_by_lookup`) on an answer that reports payment: what the preview saw is never
+   stored, so the apply reads again. With no client configured, or a lookup that fails, the apply rests on
+   your `--provider-checked` statement, as before. `--lookup` together with `--apply` is a usage error
+   (exit 2): `--apply` always does its own. That lookup is a provider call too: the go for an `--apply` run
+   covers it only when it says so.
 
    The purchase ends `failed` / `operator_confirmed_not_charged`. The write is a compare-and-swap on the
    code you read and refuses a row a worker holds right now, so a row that moved since is not touched

@@ -1923,12 +1923,13 @@ async def _held_text_only():
     return pid
 
 
-async def _operator(*argv):
+async def _operator(*argv, client=None):
+    """resolve-held / list-held with NO rail client configured (None) unless a fake one is given."""
     import io
     import jobs.a2a_rail_operator as operator
 
     out = io.StringIO()
-    code = await operator.run(list(argv), out=out)
+    code = await operator.run(list(argv), out=out, client=client)
     return code, [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
 
 
@@ -3498,11 +3499,10 @@ UNBOUND_DONE = {
     "success_true_only": _task(_card("checkout.result", {"task_id": "ckout_B", "success": True})),
     "result_status_payment_reached": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "payment-reached"})),
     "result_status_completed": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "completed"})),
-    "state_completed": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "completed"})),
     "state_paid": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "paid"})),
     "status_captured": _task(_card("checkout.result", {"task_id": "ckout_B", "status": "captured"})),
     "status_paid_punctuated": _task(_card("checkout.result", {"task_id": "ckout_B", "status": "Paid."})),
-    "await_state_completed": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "completed"})),
+    "await_state_captured": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "captured"})),
     "over_the_ceiling_success": _documented_result(task="ckout_B", total="$999.00"),
     "other_currency_success": _documented_result(task="ckout_B", currency="EUR"),
 }
@@ -3515,6 +3515,12 @@ UNBOUND_NOT_DONE = {
                                                             "success": False})),
     "await_running": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "running"})),
     "state_failed": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "failed", "success": False})),
+    # `state` is the task's lifecycle: "completed" alone is not done (a finished task that placed nothing).
+    "state_completed_alone": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "completed"})),
+    "await_state_completed_alone": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "completed"})),
+    "documented_completed_but_not_submitted": _documented_result(task="ckout_B", state="completed", success=False,
+                                                                  result_status="form-error", order_id=None,
+                                                                  total=None),
 }
 
 
@@ -3585,8 +3591,14 @@ async def test_a_bound_answer_with_the_documented_field_set_follows_the_result_r
         assert (row["merchant_order_id"], row["final_total_minor"]) == ("1001", TOTAL)
     else:
         assert row["merchant_order_id"] is None and row["final_total_minor"] is None
+    # card_last4, subtotal, shipping_fee, duration_ms: never a stored value (compared whole, or JSON-quoted
+    # inside a JSON column: a random id may contain "4399" by chance).
     stored = await _stored_text()
-    for needle in ("4399", "$45.00", "$4.49", "41000"):  # card_last4, subtotal, shipping_fee, duration_ms
+    values = [str(v) for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")
+              for v in dict(r).values() if v is not None]
+    for needle in ("4399", "41000"):
+        assert needle not in values and f'"{needle}"' not in stored.replace('\\"', '"'), needle
+    for needle in ("$45.00", "$4.49"):
         assert needle not in stored, needle
 
 
@@ -3610,9 +3622,9 @@ async def test_resolve_held_shows_an_unbound_answers_safe_fields_labelled_and_st
     pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
     before = dict(await _held_row_for_preview(pid))
     code_, preview, rail = await _preview_lookup(pid, _documented_result(task="ckout_B"))
-    assert code_ == 3 and (preview["outcome"], preview["reason"]) == ("dry_run", "held_too_recently")
+    assert code_ == 3 and preview["outcome"] == "dry_run"
     assert preview["lookup"] == {
-        "ran": True, "found": True, "bound": False,
+        "ran": True, "found": True, "bound": False, "says_done": True,
         "label": "UNBOUND: this answer may belong to another purchase; not verified as ours",
         "fields": {"state": "completed", "result_status": "payment-reached", "total": "$51.49", "currency": "USD",
                    "task_id": "ckout_B"}}
@@ -3819,3 +3831,85 @@ def test_the_view_names_the_missing_fields_and_never_a_stored_value():
     assert "expires_at" not in view.build_view({**row, "buyer_action_expires_at": None})["shipping_address_required"]
     assert "shipping_address_required" not in view.build_view({**row, "shipping_address": ADDRESS})
     assert "shipping_address_required" not in view.build_view({**row, "state": "quoting"})
+
+
+# ── review of dc95b4357: --apply runs its own lookup; one "done"; --lookup with --apply; held rows only ──
+
+async def _aged_hold(task=None):
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task=task)
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600, pid)
+    return pid
+
+
+_APPLY = ("--apply", "--operator", "ops-1", "--expect-env", "staging", "--provider-checked")
+
+
+def _resolve(pid, *extra):
+    return ("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_confirm_unresolved", *extra)
+
+
+@pytest.mark.parametrize("answer,task", [
+    (_documented_result(task="ckout_B"), None),                                        # unbound payment-reached
+    (_task(_card("checkout.result", {"task_id": "ckout_B", "success": True})), None),  # unbound success
+    (_documented_result(), "ckout_abc123"),                                            # bound payment-reached
+    (_task(_card("checkout.await", {"task_id": "ckout_B", "state": "captured"})), None),
+], ids=["unbound_payment_reached", "unbound_success", "bound_payment_reached", "unbound_await_captured"])
+async def test_apply_runs_its_own_lookup_and_never_resolves_a_reported_payment(answer, task):
+    # P2-1: the preview's answer is not stored, so --apply reads again and refuses on its own.
+    pid = await _aged_hold(task=task)
+    rail = Rail().on("checkout.lookup#submit", answer)
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"], result["reason"]) == (3, "refused", worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP)
+    assert result["lookup"]["says_done"] is True
+    _lookup_only(rail, pid)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", "checkout_confirm_unresolved")
+
+
+async def test_the_preview_says_not_eligible_and_escalates_when_its_lookup_reports_payment():
+    pid = await _aged_hold()
+    code_, [plain] = await _operator(*_resolve(pid))
+    assert (code_, plain["eligible"]) == (0, True)
+    rail = Rail().on("checkout.lookup#submit", _documented_result(task="ckout_B"))
+    code_, [preview] = await _operator(*_resolve(pid, "--lookup"), client=_client(rail))
+    assert (code_, preview["eligible"], preview["reason"]) == (3, False, worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP)
+    assert "escalate" in preview["message"]
+
+
+@pytest.mark.parametrize("answer", [
+    _documented_result(task="ckout_B", state="failed", success=False, result_status="form-error", order_id=None,
+                       total=None),
+    _task(_card("checkout.result", {"task_id": "ckout_B", "state": "completed"})),
+    httpx.Response(404),
+], ids=["not_submitted", "state_completed_alone", "not_found"])
+async def test_apply_resolves_when_its_lookup_reports_no_payment(answer):
+    pid = await _aged_hold()
+    rail = Rail().on("checkout.lookup#submit", answer)
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"]) == (0, "resolved")
+    _lookup_only(rail, pid)
+
+
+@pytest.mark.parametrize("client", ["none", "raising"])
+async def test_without_a_client_or_with_a_failing_lookup_apply_rests_on_provider_checked(client):
+    # The documented semantics: no lookup to read, the apply stands on the operator's --provider-checked statement.
+    pid = await _aged_hold()
+    fake = None if client == "none" else _client(Rail().on("checkout.lookup#submit", httpx.ConnectError("down")))
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=fake)
+    assert (code_, result["outcome"]) == (0, "resolved")
+
+
+async def test_lookup_together_with_apply_is_a_usage_error_and_sends_nothing():
+    pid = await _aged_hold()
+    rail = Rail().on("checkout.lookup#submit", _documented_result(task="ckout_B"))
+    code_, [result] = await _operator(*_resolve(pid, "--lookup", *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"]) == (2, "refused") and "--lookup" in result["reason"]
+    assert rail.sent == [] and (await _row(pid))["state"] == "paying"
+
+
+async def test_the_preview_looks_up_only_a_held_row():
+    pid = await _placing()  # paying, placing: not held
+    rail = Rail().on("checkout.lookup#submit", _documented_result())
+    _, [preview] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_placing",
+                                   "--lookup", client=_client(rail))
+    assert preview["lookup"] == {"ran": False, "reason": "no such held checkout"} and rail.sent == []
