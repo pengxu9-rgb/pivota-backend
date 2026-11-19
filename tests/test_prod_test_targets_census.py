@@ -110,7 +110,7 @@ def test_the_store_key_is_touched_only_by_null_and_length_never_its_content():
     assert expressions == ["           (ms.api_key IS NOT NULL AND length(ms.api_key) > 0) AS store_key_present"]
     for other in (census.OFFERS_SQL, census.STOREFRONT_SQL, census.UNEXPIRED_TEST_ROWS_SQL):
         assert "api_key" not in other
-    assert "store_key_present" in census.KERNEL_SQL and "store_key_names_storefront" in census.KERNEL_SQL
+    assert "store_key_present" in census.KERNEL_SQL and "names_storefront" not in census.KERNEL_SQL
 
 
 def test_output_is_marker_lines_only_and_the_file_has_no_at_sign():
