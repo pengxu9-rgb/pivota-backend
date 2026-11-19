@@ -1,6 +1,6 @@
 """deploy_gateway.sh under CONFIG=preserve keeps a service's existing allUsers invoker binding.
 
-The staging gateway was made allUsers-invokable on 2026-09-29 (Peng) so partner agents can call
+The staging gateway was made allUsers-invokable on 2026-09-29 (the owner) so partner agents can call
 /ucp/mcp with their agent keys. The script defaulted PUBLIC=0 for staging, so the 2026-09-30 04:05Z
 preserve deploy (d02ff489a) ran --no-allow-unauthenticated and silently REVOKED that binding: every
 anonymous call got Cloud Run's 403. Same fix and same tests as deploy_backend.sh (#2452). These run

@@ -414,7 +414,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
 # exceed 3600s.
-# COVERAGE + THROUGHPUT (2026-10-11, Peng: "make sure main route works"). The similar rails are moving
+# COVERAGE + THROUGHPUT (2026-10-11, the owner: "make sure main route works"). The similar rails are moving
 # to relationship-graph-only (PIVOTA-Agent #2409), so the nightly run must GROW coverage, not follow
 # ingest churn: on 2026-10-09 its 250 reviews went to whatever catalog rows changed in 24h (KISS
 # press-ons, Stila, OPI), and 2,550 of ~18,000 products had a served alternative after a one-off
@@ -435,8 +435,8 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     with it (400 is recall's maximum, so 200 is the nightly cap).
 #   RELGRAPH_SYNC_REVIEW_LIMIT=2000 - 400 anchors at ~7.6 candidates each are ~3,000 labels a night; at
 #     1,000 the backfill's labels would wait. ~54 minutes of review at concurrency 6, inside the 90-minute
-#     step budget. (Peng 2026-10-13: graph-only is live with ~91% of PDPs empty; drain + nightly 200/2000.)
-#   RELGRAPH_SYNC_REVIEW_CONCURRENCY=8 (Peng 2026-10-13, review cap kept at 2000) - the first night at
+#     step budget. (the owner 2026-10-13: graph-only is live with ~91% of PDPs empty; drain + nightly 200/2000.)
+#   RELGRAPH_SYNC_REVIEW_CONCURRENCY=8 (the owner 2026-10-13, review cap kept at 2000) - the first night at
 #     2000 reviews took 93 minutes; pivota-pg CPU then was mean 15% / p90 25%, its only bursts over 35%
 #     (8 minutes, max 58%) in the build/recall phase, the review stretch near baseline (the reviews are
 #     LLM calls), so 8 shortens the review without loading the then 2-vCPU primary (4 vCPU since
@@ -445,7 +445,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     ~1,400 newest rows; a targeted run of 45 anchors generated 344 candidates for 32 that had none.
 #     This applies to the recency anchors too.
 #   PREREQUISITE: a relgraph-sync image containing #2418 and its follow-up (the job is pinned by digest).
-# GLOBAL REVIEW BACKLOG (Peng 2026-10-20). The nightly reviewed only the labels its own build produced
+# GLOBAL REVIEW BACKLOG (the owner 2026-10-20). The nightly reviewed only the labels its own build produced
 # (RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD defaults on) and only labels updated since the 24h selection
 # window (RELGRAPH_SYNC_CUTOFF defaults to it), ~1,000 a night, while 26,617 competitive_alternative
 # labels sat `generated` and unreviewed (census 2026-10-20). Prod only:
@@ -453,7 +453,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     global score-ordered generated queue. The cutoff feeds only the review step.
 #   RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative - the similar rail's backlog first
 #     (~3 nights); related_product (43,300 generated) after.
-#   RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true (Peng 2026-10-20, PIVOTA-Agent #2471) - the queue reviews the
+#   RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true (the owner 2026-10-20, PIVOTA-Agent #2471) - the queue reviews the
 #     labels of anchors with no served alternative first, one per anchor per round, then the covered
 #     anchors by score. Only 5,933 of the 26,617 generated alternatives sat on the 2,616 uncovered
 #     anchors; the score-ordered top 3,000 reached 440 of them, this order reaches all 2,616.
@@ -461,7 +461,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     image whose review-limit cap is 10,000 at every layer (PIVOTA-Agent: cron, sync routine, routine
 #     job, review script; before it, each silently capped 10,000 at 5,000). 16 is the gateway's maximum.
 #     Measured at concurrency 8: ~1-1.7 s per review, so 10,000 is ~1.4-2.4 h at 16 plus the ~30-minute
-#     build. CONCURRENCY 12, not 16 (Peng 2026-10-20): the first night at 16 (3,000 reviews, 2026-10-20)
+#     build. CONCURRENCY 12, not 16 (the owner 2026-10-20): the first night at 16 (3,000 reviews, 2026-10-20)
 #     errored 10.3% against 1.5-3.2% at 8, so ~3.0-4.0 h a night at 12. The step budget rises to 300
 #     minutes (the review needs ~165-210) and the task timeout to 21600s (6 h); with
 #     --max-retries 1 a wedged run can cost 12 h. If the model provider throttles at 16, the review error
@@ -1114,7 +1114,7 @@ sched commerce-index-search-index-cron "*/5 * * * *" commerce-index-search-index
 sched commerce-index-checkout-validation-cron "*/5 * * * *" commerce-index-checkout-validation
 sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-refresh
 # Every 10 minutes (was 30 until 2026-09-24: stages take 4-12 min, so a 30-min tick left the one-crawl
-# lane idle ~70% while three coverage waves queued; Peng: "we should not have queue being the
+# lane idle ~70% while three coverage waves queued; the owner: "we should not have queue being the
 # bottleneck"). Each execution also runs stages back to back for up to
 # RETAILER_INGEST_DRAIN_BUDGET_SECONDS (1800s: the last stage starts with >= 30 min left of the 3600s task), so ticks mostly find the
 # lane busy and exit idle. THIS TRIGGER IS THE DRAIN'S ONE ARM/DISARM SWITCH (see the job block): the
@@ -1137,7 +1137,7 @@ sched commerce-index-insight-refresh-cron "*/10 * * * *" commerce-index-insight-
 # RETAILER_INGEST_MAX_LEASES in the --set-env-vars above is the lane count, a literal like the budget
 # and timeout (never a script input: a leftover shell value must not reach the job). Arming more
 # lanes is a reviewed change to that literal, so a re-run keeps what is committed and cannot quietly
-# undo or exceed it. 2026-09-25: armed at 2 (Peng) -- two stages in flight, never two at one host;
+# undo or exceed it. 2026-09-25: armed at 2 (the owner) -- two stages in flight, never two at one host;
 # watch crawl_throttled before raising it (every lane shares the one crawl NAT).
 #
 # ⚠️ RE-IMAGING THE DRAIN ACROSS #2330 (or any change to how applies serialize) IS A DRAINED ROLL.

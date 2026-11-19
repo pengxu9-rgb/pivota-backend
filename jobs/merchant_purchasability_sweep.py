@@ -78,7 +78,7 @@ never checked and, under enforcement, its cards could never carry a cart again.
     unverifiable, which is the answer an absent fact already gives, so a wrong region can
     only cost one abandoned checkout, never open a cart.
 
-  EVERY CONNECTED STORE IS A TEST STORE TODAY (Peng, 2026-09-29): there is no real
+  EVERY CONNECTED STORE IS A TEST STORE TODAY (the owner, 2026-09-29): there is no real
   outside-merchant connection yet, and the lane exists so the first one is covered on day one.
   Measured on prod 2026-09-29, the policy's own rules over the lane's own rows: 6 rows, 4 of them
   listed test merchants and now skipped — merch_efbc46b4619cfbdf (ijaqit-v9),

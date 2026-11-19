@@ -1,6 +1,6 @@
 """deploy_backend.sh under CONFIG=preserve keeps a service's existing allUsers invoker binding.
 
-Staging `web` was made allUsers-invokable on 2026-09-29 (Peng) because the staging gateway calls
+Staging `web` was made allUsers-invokable on 2026-09-29 (the owner) because the staging gateway calls
 /agent/internal/auth/introspect without an ID token. The script defaulted PUBLIC=0 for staging, so
 every preserve deploy ran --no-allow-unauthenticated and silently REVOKED that binding, breaking the
 gateway. These tests run the script's own PUBLIC-resolution block (extracted verbatim) against a

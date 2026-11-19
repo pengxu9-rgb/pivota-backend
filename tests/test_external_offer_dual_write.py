@@ -435,7 +435,7 @@ async def test_variant_offer_projection_follows_its_switch(monkeypatch, value, c
     assert project.await_count == (1 if called else 0)
 
 
-# ── never a default currency or market (Peng 2026-10-19) ────────────────────────────────────────
+# ── never a default currency or market (the owner 2026-10-19) ────────────────────────────────────────
 # Live 10-19: 23 serving nourwish.com products were priced "USD" by mirror offers this writer
 # stamped `price_currency or "USD"` on seeds priced in SGD, and US-partition seeds whose column says
 # USD over a page read in QAR / EUR / INR / ZAR carry USD offers copied off that column.

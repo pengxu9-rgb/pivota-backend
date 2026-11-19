@@ -20,8 +20,8 @@ Current status as of `2026-03-30 UTC`:
 
 - `Phase A` current-environment gate is complete.
   - Evidence:
-    - [commerce-signoff-batch.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
-    - [commerce-signoff-batch.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
+    - [commerce-signoff-batch.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
+    - [commerce-signoff-batch.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
   - Current-environment outcome:
     - `overall_ok = true`
     - `enabled_cases = 1`
@@ -35,8 +35,8 @@ Current status as of `2026-03-30 UTC`:
 
 - `Phase B` supervised real payment completion is complete.
   - Evidence:
-    - [bridge-paid-reference-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
-    - [bridge-paid-reference-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
+    - [bridge-paid-reference-signoff.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
+    - [bridge-paid-reference-signoff.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
   - Outcome:
     - a fresh readiness-owned Stripe Checkout session reached a real paid terminal state
     - readiness verified the paid PSP state before bridging it into the local order
@@ -89,10 +89,10 @@ That is enough to close the current phase, but it does not prove that the same b
   - payment canary PSP/provider distribution
 
 ### Suggested Tooling Work
-- batch wrapper: [run_commerce_channels_signoff_batch.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_commerce_channels_signoff_batch.py)
-- merchant cohort fixture: [commerce_signoff_cohort.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/commerce_signoff_cohort.json)
-- direct single-merchant signoff: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
-- operator query pack: [merchant_commerce_readiness_queries.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
+- batch wrapper: [run_commerce_channels_signoff_batch.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_commerce_channels_signoff_batch.py)
+- merchant cohort fixture: [commerce_signoff_cohort.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/commerce_signoff_cohort.json)
+- direct single-merchant signoff: [smoke_commerce_channels_signoff.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
+- operator query pack: [merchant_commerce_readiness_queries.sql](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
 - keep emitting a rollup JSON/Markdown summary for the cohort
 
 ### Acceptance Criteria
@@ -141,10 +141,10 @@ It should not run as part of routine pivot release close-out.
 - operator window is scheduled
 
 ### Recommended Surfaces
-- [smoke_real_payment_completion_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_real_payment_completion_signoff.py)
-- [smoke_readiness_alpha.sh](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_readiness_alpha.sh)
-- [DEVELOPER_RUNBOOK.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/DEVELOPER_RUNBOOK.md)
-- [REAL_MERCHANT_ALPHA_REPORT.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/REAL_MERCHANT_ALPHA_REPORT.md)
+- [smoke_real_payment_completion_signoff.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_real_payment_completion_signoff.py)
+- [smoke_readiness_alpha.sh](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_readiness_alpha.sh)
+- [DEVELOPER_RUNBOOK.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/DEVELOPER_RUNBOOK.md)
+- [REAL_MERCHANT_ALPHA_REPORT.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/readiness/2026-03-agent-commerce/REAL_MERCHANT_ALPHA_REPORT.md)
 
 Use the structured Python wrapper for routine operator evidence collection:
 - `--mode preflight` for readiness-owned checkout + order-sync only

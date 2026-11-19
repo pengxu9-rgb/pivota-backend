@@ -100,7 +100,7 @@ fi
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
 # UNDER CONFIG=preserve AN UNSET PUBLIC KEEPS WHAT THE SERVICE ALREADY GRANTS (see
 # preserved_public_invoker below): a service that already grants roles/run.invoker to allUsers is
-# redeployed public. Staging `web` became allUsers-invokable on 2026-09-29 (Peng) because the
+# redeployed public. Staging `web` became allUsers-invokable on 2026-09-29 (the owner) because the
 # staging gateway calls /agent/internal/auth/introspect without an ID token; ingress stays
 # `internal`. Before this, every preserve deploy of staging ran --no-allow-unauthenticated and
 # silently REVOKED that binding, breaking the staging gateway. An explicit PUBLIC=0 still wins.

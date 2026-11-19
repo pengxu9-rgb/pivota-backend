@@ -2245,7 +2245,7 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
         raise ValueError(legacy_listing_refusal(findings[0]))
 
 
-#: Multi-market storefronts ADR section 3.4 item 4 (approved by Peng 2026-09-26). A brand may run one
+#: Multi-market storefronts ADR section 3.4 item 4 (approved by the owner 2026-09-26). A brand may run one
 #: brand-official storefront per market (us.frankbody.com and frankbody.com are separate Shopify stores),
 #: and both land on ONE product row: a brand_official product_key is ext:<brand-title>::<sha1>, no host
 #: in it. Exactly one storefront owns that row's canonical copy -- the canonical market's -- and a

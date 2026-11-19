@@ -993,14 +993,14 @@ ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
 
 # ── has_price / has_serving_region_offer under the seed-currency offer rule (FLAG, default OFF) ──
 #
-# Peng 2026-10-19: a price's currency is the buyer market's, never defaulted. An offer copied off a
+# The owner 2026-10-19: a price's currency is the buyer market's, never defaulted. An offer copied off a
 # seed (services/seed_offer_currency: the mirror, the variant backfill, the variant projection) is a
 # price only while an ACTIVE seed is attached to its listing and every active one is read in the
 # offer's currency. The agent_pdp_view offer read, gateway search and offers.resolve already refuse
 # the others. These two signals still count them, so a content_key whose only priced offers are such
 # copies stays serving_eligible with no price anyone will show.
 #
-# OFF BY DEFAULT, and flipping it is Peng's decision: it takes rows out of serving. Prod census
+# OFF BY DEFAULT, and flipping it is the owner's decision: it takes rows out of serving. Prod census
 # spccy5-1019b (2026-10-19, read-only): 49 serving content_keys hold only refused USD offers. With
 # the flag off every statement below is the one main sends, byte for byte.
 #

@@ -56,30 +56,30 @@ No current-merchant discount execution gap remains open inside the audited Shopi
 
 Current evidence artifacts:
 
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.request.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.request.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.request.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.request.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/access_scopes_preflight.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixed_amount_product_scoped.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/segment_customer.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/new_customer.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_prestart.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_active.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_available.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_second_quote.response.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_a.create.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_b.create.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_c.create.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.request.json`
-- `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.request.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_real_target.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.request.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.request.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.request.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_plus_amount10.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/access_scopes_preflight.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixed_amount_product_scoped.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/segment_customer.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/new_customer.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_prestart.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_active.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_available.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/usage_limit_second_quote.response.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_a.create.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_b.create.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixture_batch_c.create.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.request.json`
+- `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
 
 ## Tested scenarios
 
@@ -201,10 +201,10 @@ Validation scope included production quote/cart probes, quote-backed order creat
   - `artifacts/shopify-discount-validation/live-test-order-refund-ledger-repair-20260415T134952Z/refund-ledger-repair.json`
   - `artifacts/shopify-discount-validation/live-test-order-refund-status-after-ledger-repair-20260415T135016Z/summary.json`
 - Usage-limit redemption proof:
-  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
-  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
-  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
-  - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
+  - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/01-quote.json`
+  - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02-order-create.json`
+  - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
+  - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
 
 ## Whether the system is ready for merchant pilots on discounts
 
