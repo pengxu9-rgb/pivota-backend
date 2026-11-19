@@ -1,4 +1,4 @@
--- 290: THE AFFILIATE PROGRAM REGISTRY (developer earnings, manual stage).
+-- 291: THE AFFILIATE PROGRAM REGISTRY (developer earnings, manual stage).
 --
 -- One row per merchant affiliate program Pivota has applied to, or plans to apply to, on a network
 -- (Rakuten, Awin, Impact, ...). Staff manage it in the employee portal through

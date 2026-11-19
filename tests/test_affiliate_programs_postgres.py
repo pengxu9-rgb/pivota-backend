@@ -1,4 +1,4 @@
-"""The affiliate program registry's SQL on Postgres (db/affiliate_programs.py, migration 290).
+"""The affiliate program registry's SQL on Postgres (db/affiliate_programs.py, migration 291).
 
 What only Postgres can show: the module and the migration build the same two tables (columns, CHECKs, the
 foreign key, both indexes); the boot heal is idempotent; the service's statements run on asyncpg (create,
@@ -103,8 +103,8 @@ async def _indexdef(database, name: str):
 
 async def test_the_migration_and_the_module_build_the_same_tables(_db):
     database = _db
-    twin_programs, twin_events = "affiliate_programs_mig290", "affiliate_program_events_mig290"
-    sql = (_REPO / "db/migrations/290_affiliate_programs.sql").read_text("utf-8")
+    twin_programs, twin_events = "affiliate_programs_mig291", "affiliate_program_events_mig291"
+    sql = (_REPO / "db/migrations/291_affiliate_programs.sql").read_text("utf-8")
     sql = re.sub(r"--[^\n]*", "", sql)
     sql = sql.replace("affiliate_program_events", twin_events).replace("affiliate_programs", twin_programs)
     await database.execute(f"DROP TABLE IF EXISTS {twin_events}")

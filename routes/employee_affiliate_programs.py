@@ -1,4 +1,4 @@
-"""Employee portal: the affiliate program registry (services/affiliate_programs.py, migration 290).
+"""Employee portal: the affiliate program registry (services/affiliate_programs.py, migration 291).
 
   DIAL   AFFILIATE_PROGRAM_REGISTRY_ENABLED, default off, read per request. Off: every path below is 404,
          before authentication (a router dependency), so the surface does not exist until it is turned on.

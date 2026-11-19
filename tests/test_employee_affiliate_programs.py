@@ -1,5 +1,5 @@
 """The affiliate program registry (routes/employee_affiliate_programs.py, services/affiliate_programs.py,
-db/affiliate_programs.py, migration 290) on SQLite, through its routes.
+db/affiliate_programs.py, migration 291) on SQLite, through its routes.
 
 What it pins: the dial (off = 404 everywhere, before auth); who may read and who may write; validation that
 names every bad field; the Live rule and its reasons; the auto un-live an edit causes; the append-only
@@ -314,7 +314,7 @@ def test_the_history_table_is_append_only_in_the_repo():
             continue
         if any(part in {".git", "node_modules", ".venv", "venv"} for part in path.parts):
             continue
-        if path.name == "290_affiliate_programs_down.sql" or "tests" in path.relative_to(_REPO).parts[:1]:
+        if path.name == "291_affiliate_programs_down.sql" or "tests" in path.relative_to(_REPO).parts[:1]:
             continue
         if pattern.search(path.read_text("utf-8", errors="ignore")):
             offenders.append(str(path.relative_to(_REPO)))

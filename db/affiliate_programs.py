@@ -1,4 +1,4 @@
-"""The affiliate program registry (migration 290): which merchant programs Pivota has applied to, and
+"""The affiliate program registry (migration 291): which merchant programs Pivota has applied to, and
 whether agent traffic may earn on them.
 
 services/affiliate_programs.py owns the rules (validation, the Live rule, auto un-live, CSV import);
@@ -82,7 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_affiliate_program_events_program
 
 
 async def ensure_affiliate_programs_schema() -> None:
-    """Self-heal parity with migration 290. Idempotent; called at every startup. New, empty tables:
+    """Self-heal parity with migration 291. Idempotent; called at every startup. New, empty tables:
     they lock nothing that exists. Programs first: events reference them."""
     if IS_POSTGRES:
         from db.schema_guard import _ensure_index
