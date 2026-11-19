@@ -63,6 +63,8 @@ SEEDS = [
     ("s12", "US", None, None, None, _sd(domain="brand-f-shop.myshopify.com"), "active"),
     ("s13", "US", None, None, None, _sd(), "active"),  # nothing at all: no_url
     ("s14", "US", "https://co.uk/p", None, None, _sd(), "active"),  # a bare public suffix: never an entry
+    # a snapshot stored as a JSON STRING (the mint parses it with _ensure_json_obj)
+    ("s15", "US", None, None, None, _sd(snapshot=json.dumps({"destination_url": "https://brand-g.test/p"})), "active"),
 ]
 
 
@@ -165,15 +167,16 @@ def test_redirector_marks_for_the_review() -> None:
 def test_the_plan_covers_the_seed_fallbacks_and_cart_hosts_and_names_every_skip(db) -> None:
     plan = asyncio.run(core.read_plan(db, batch_id="olp-test-1", **LOCAL))
     assert [(e["market"], e["domain"], e["rules"], e["seeds"], e["hosts"], e["marks"]) for e in plan["entries"]] == [
-        ("GB", "tenant.myshopify.com", 0, 1, 1, []),
-        ("US", "brand-a.test", 0, 1, 1, []),
-        ("US", "brand-c.test", 0, 1, 1, []),  # seed_data.destination_url
-        ("US", "brand-d.test", 0, 1, 1, []),  # seed_data.snapshot.canonical_url
-        ("US", "brand-e-shop.myshopify.com", 0, 1, 1, []),  # the cart host in `domain`
-        ("US", "brand-e.test", 0, 1, 1, []),
-        ("US", "brand-f-shop.myshopify.com", 0, 1, 1, []),  # the cart host in seed_data.domain
-        ("US", "checkout.brand-b.test", 0, 1, 1, []),
-        ("US", "store-one.test", 2, 0, 2, ["widened"]),
+        ("GB", "tenant.myshopify.com", 0, 1, 1, ["apex"]),  # a curated platform's tenant is its own registrable
+        ("US", "brand-a.test", 0, 1, 1, ["apex"]),
+        ("US", "brand-c.test", 0, 1, 1, ["apex"]),  # seed_data.destination_url
+        ("US", "brand-d.test", 0, 1, 1, ["apex"]),  # seed_data.snapshot.canonical_url
+        ("US", "brand-e-shop.myshopify.com", 0, 1, 1, ["apex"]),  # the cart host in `domain`
+        ("US", "brand-e.test", 0, 1, 1, ["apex"]),
+        ("US", "brand-f-shop.myshopify.com", 0, 1, 1, ["apex"]),  # the cart host in seed_data.domain
+        ("US", "brand-g.test", 0, 1, 1, ["apex"]),  # a snapshot stored as a JSON string
+        ("US", "checkout.brand-b.test", 0, 1, 1, []),  # an exact subdomain: admits only its own subtree
+        ("US", "store-one.test", 2, 0, 2, ["apex", "widened"]),
     ]
     skips = {(s["market"], s["reason"]): s["count"] for s in plan["skips"]}
     assert skips == {
@@ -191,8 +194,8 @@ def test_marks_widened_redirector_and_multi_market_reach_the_reviewed_line() -> 
     rules.append({"market": "US", "destination_url": "https://deals.test/x?url=https://other.test/"})
     plan = core.build_plan(batch_id="olp-marks", rules=rules, seeds=[], present=[])
     lines = core.plan_lines(plan)
-    assert "OLP domain market=US domain=shared.test rules=1 seeds=0 hosts=1 marks=multi_market,path_go,redirector_suspect,widened" in lines
-    assert "OLP domain market=US domain=deals.test rules=1 seeds=0 hosts=1 marks=query_url,redirector_suspect" in lines
+    assert "OLP domain market=US domain=shared.test rules=1 seeds=0 hosts=1 marks=apex,multi_market,path_go,redirector_suspect,widened" in lines
+    assert "OLP domain market=US domain=deals.test rules=1 seeds=0 hosts=1 marks=apex,query_url,redirector_suspect" in lines
     assert "OLP market=US domains=2 from_rules=2 from_seeds=0 widened=1 redirector_suspect=2" in lines
 
 
@@ -207,7 +210,7 @@ def test_the_plan_never_writes(db) -> None:
     plan, statements = asyncio.run(go())
     assert statements and all(s.lstrip().upper().startswith(("SELECT", "SET")) for s in statements), statements
     lines = core.plan_lines(plan)
-    assert lines[0].startswith("OLP plan batch=olp-test-1 markets=2 domains=9 status=disabled plan_sha256=")
+    assert lines[0].startswith("OLP plan batch=olp-test-1 markets=2 domains=10 status=disabled plan_sha256=")
     assert all(line.startswith("OLP ") for line in lines)
     assert not [line for line in lines if "://" in line or "@" in line], "no URL, no address in the report"
 
@@ -217,7 +220,7 @@ def test_production_refuses_a_non_postgres_database(db) -> None:
         asyncio.run(core.read_plan(db, batch_id="olp-test-1"))
     plan = asyncio.run(core.read_plan(db, batch_id="olp-test-1", **LOCAL))
     with pytest.raises(core.Refused, match="Postgres only"):
-        asyncio.run(core.apply_plan(db, plan))
+        asyncio.run(core.apply_plan(db, plan, lists_sha256=None))
     assert asyncio.run(_rows(db)) == [("SG", "sg.store-two.test", "active", "emp_1")]
 
 
@@ -233,7 +236,7 @@ def test_an_applied_batch_is_invisible_to_the_allowlist_reader_and_the_mint_chec
     cache.clear(); inflight.clear()
     try:
         async def go():
-            await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL)
+            await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL, lists_sha256=None)
             staged = await links._fetch_allowed_domains_for_market("US")
             read = await links.get_allowed_domains_for_market(market="US")
             # Control: one ACTIVE row is seen at once (that is what enforcing will do).
@@ -253,18 +256,18 @@ def test_an_applied_batch_is_invisible_to_the_allowlist_reader_and_the_mint_chec
 
 def test_apply_is_insert_only_staged_and_tagged_and_rollback_deletes_only_its_batch(db) -> None:
     async def go():
-        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL)
+        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL, lists_sha256=None)
         after_apply = await _rows(db)
         await db.execute("INSERT INTO outbound_link_allowed_domains (market, domain, status, created_by) VALUES ('JP','other.test','active','emp_2')")
         return receipt, after_apply, await core.rollback_batch(db, receipt, **LOCAL), await _rows(db)
 
     receipt, after_apply, result, after_rollback = asyncio.run(go())
     tag = "allowlist_populate:olp-test-1"
-    assert receipt["inserted"] == 9 and receipt["per_market"] == {"GB": 1, "US": 8}
-    assert core.receipt_line(receipt).startswith("OLP receipt batch=olp-test-1 inserted=9 per_market=GB:1,US:8 receipt_sha256=")
+    assert receipt["inserted"] == 10 and receipt["per_market"] == {"GB": 1, "US": 9}
+    assert core.receipt_line(receipt).startswith("OLP receipt batch=olp-test-1 inserted=10 per_market=GB:1,US:9 receipt_sha256=")
     assert ("SG", "sg.store-two.test", "active", "emp_1") in after_apply
     assert all(r[2:] == ("disabled", tag) for r in after_apply if r[1] != "sg.store-two.test")
-    assert result["deleted"] == 9
+    assert result["deleted"] == 10
     assert after_rollback == [("JP", "other.test", "active", "emp_2"), ("SG", "sg.store-two.test", "active", "emp_1")]
 
 
@@ -274,7 +277,7 @@ def test_apply_is_insert_only_staged_and_tagged_and_rollback_deletes_only_its_ba
 ])
 def test_rollback_refuses_once_a_batch_row_is_no_longer_staged(db, edit) -> None:
     async def go():
-        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL)
+        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL, lists_sha256=None)
         await db.execute(edit)
         before = await _rows(db)
         with pytest.raises(core.Refused, match="no longer staged"):
@@ -288,12 +291,12 @@ def test_rollback_refuses_once_a_batch_row_is_no_longer_staged(db, edit) -> None
 def test_a_rerun_is_idempotent(db) -> None:
     async def go():
         plan = await core.read_plan(db, batch_id="olp-test-1", **LOCAL)
-        await core.apply_plan(db, plan, **LOCAL)
+        await core.apply_plan(db, plan, **LOCAL, lists_sha256=None)
         once = await _rows(db)
         with pytest.raises(core.Refused, match="already present"):
-            await core.apply_plan(db, plan, **LOCAL)
+            await core.apply_plan(db, plan, **LOCAL, lists_sha256=None)
         replan = await core.read_plan(db, batch_id="olp-test-2", **LOCAL)
-        receipt = await core.apply_plan(db, replan, **LOCAL)
+        receipt = await core.apply_plan(db, replan, **LOCAL, lists_sha256=None)
         return once, replan, receipt, await _rows(db)
 
     once, replan, receipt, twice = asyncio.run(go())
@@ -302,13 +305,13 @@ def test_a_rerun_is_idempotent(db) -> None:
 
 def test_a_batch_id_is_applied_once_even_with_new_pairs(db) -> None:
     async def go():
-        await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL)
+        await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL, lists_sha256=None)
         await db.execute("INSERT INTO outbound_link_rules VALUES ('r9','US','https://store-new.test/p','published')")
         again = await core.read_plan(db, batch_id="olp-test-1", **LOCAL)
         assert [e["domain"] for e in again["entries"]] == ["store-new.test"]
         before = await _rows(db)
         with pytest.raises(core.Refused, match="already has rows"):
-            await core.apply_plan(db, again, **LOCAL)
+            await core.apply_plan(db, again, **LOCAL, lists_sha256=None)
         return before, await _rows(db)
 
     before, after = asyncio.run(go())
@@ -320,11 +323,11 @@ def test_apply_refuses_a_tampered_or_drifted_plan_and_writes_nothing(db) -> None
         plan = await core.read_plan(db, batch_id="olp-test-1", **LOCAL)
         tampered = {**plan, "entries": plan["entries"] + [{"market": "US", "domain": "store-nine.test", "rules": 0, "seeds": 0, "hosts": 1, "marks": []}]}
         with pytest.raises(core.Refused, match="its own sha"):
-            await core.apply_plan(db, tampered, **LOCAL)
+            await core.apply_plan(db, tampered, **LOCAL, lists_sha256=None)
         await db.execute("INSERT INTO outbound_link_allowed_domains (market, domain, status, created_by) VALUES ('US','brand-a.test','active','emp_3')")
         before = await _rows(db)
         with pytest.raises(core.Refused, match="already present"):
-            await core.apply_plan(db, plan, **LOCAL)
+            await core.apply_plan(db, plan, **LOCAL, lists_sha256=None)
         return before, await _rows(db)
 
     before, after = asyncio.run(go())
@@ -333,7 +336,7 @@ def test_apply_refuses_a_tampered_or_drifted_plan_and_writes_nothing(db) -> None
 
 def test_rollback_refuses_when_the_batch_no_longer_matches_its_receipt(db) -> None:
     async def go():
-        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL)
+        receipt = await core.apply_plan(db, await core.read_plan(db, batch_id="olp-test-1", **LOCAL), **LOCAL, lists_sha256=None)
         await db.execute("DELETE FROM outbound_link_allowed_domains WHERE domain = 'tenant.myshopify.com'")
         before = await _rows(db)
         with pytest.raises(core.Refused, match="no longer match"):
@@ -429,3 +432,255 @@ def test_apply_requires_an_approval_pinned_to_this_plan_and_release(monkeypatch,
     monkeypatch.setenv(job.ENV + "APPROVAL_SHA256", "0" * 64)
     with pytest.raises(core.Refused, match="SHA-256 pin"):
         job.check_approval("apply", release="r" * 40, pinned_key="plan_sha256", pinned_sha="p" * 64)
+
+
+# --- v2 review P3s: apex marks, wider redirector marks, string snapshots, timing ------------------------
+
+
+@pytest.mark.parametrize("url, apex", [
+    ("https://platform-host.test/store-a", True),  # an uncurated platform's apex: admits every tenant, marked
+    ("https://store-a.platform-host.test/p", False),  # its tenant, exact host: admits only its own subtree
+    ("https://www.store-one.test/p", True),
+    ("https://shop.store-one.test/p", False),
+    ("https://tenant.myshopify.com/p", True),  # a curated platform tenant is its own registrable
+])
+def test_an_apex_entry_is_marked_for_the_review(url, apex) -> None:
+    plan = core.build_plan(batch_id="olp-apex", rules=[{"market": "US", "destination_url": url}], seeds=[], present=[])
+    assert ("apex" in plan["entries"][0]["marks"]) is apex
+    line = [x for x in core.plan_lines(plan) if x.startswith("OLP domain ")][0]
+    assert ("apex" in line.split("marks=", 1)[1].split(",")) is apex
+
+
+@pytest.mark.parametrize("url, mark", [
+    ("https://a.test/x?ued=https%3A%2F%2Fb.test%2F", "query_ued"),
+    ("https://a.test/x?dl=https://b.test/", "query_dl"),
+    ("https://a.test/x?deeplink=https://b.test/", "query_deeplink"),
+    ("https://a.test/login?next=https://b.test/", "query_next"),
+    ("https://a.test/x?continue=//b.test/p", "query_continue"),
+    ("https://a.test/x?return_url=https://b.test/", "query_return_url"),
+    ("https://a.test/x?lp=https://b.test/", "query_lp"),
+    ("https://a.test/x?adurl=https://b.test/", "query_adurl"),
+    ("https://a.test/x?href=https://b.test/", "query_href"),
+    ("https://a.test/search?q=https://b.test/p", "query_q"),
+    ("https://a.test/x?url=b.test/p", "query_url"),  # scheme-less
+    ("https://a.test/x?url=aHR0cHM6Ly9iLnRlc3QvcA", "query_url"),  # base64 of a URL
+    ("https://a.test/x?url=aHR0cHM6Ly9iLnRlc3QvcA==", "query_url"),
+    ("https://a.test/out/https://b.test/p", "path_url"),  # a URL in the path
+    ("https://a.test/go/https%3A%2F%2Fb.test%2Fp", "path_url"),
+    ("https://a.test/redirect.php?id=1", "path_redirect"),
+    ("https://a.test/click.php", "path_click"),
+    ("https://a.test/en/redirect/123", "path_redirect"),  # a head in the second segment
+    ("https://a.test/c/abc123/", "path_c_id"),
+    ("https://a.test/t/xyz789", "path_t_id"),
+    ("https://a.test/p#url=https://b.test/", "fragment_url"),
+    ("https://a.test/p#https://b.test/", "fragment_url"),
+    # the private host lists (a .test fixture here; the real lists are never in the repository)
+    ("https://short.test/3abcde", "shortener_host"),
+    ("https://go.tiny-link.test/somebody", "shortener_host"),
+    ("https://www.aff-net.test/click-1-2", "affiliate_host"),
+    ("https://click.aff-two.test/svt?id=1", "affiliate_host"),
+])
+def test_redirector_marks_table(url, mark, fixture_lists) -> None:
+    assert mark in core.redirector_marks(url, fixture_lists)
+    plan = core.build_plan(batch_id="olp-redir", rules=[{"market": "US", "destination_url": url}], seeds=[], present=[],
+                           lists=fixture_lists)
+    if plan["entries"]:
+        assert "redirector_suspect" in plan["entries"][0]["marks"]
+
+
+# --- the private redirector host lists: loaded at run time, pinned, counts only, bound into the plan and apply ---
+
+LISTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "outbound_redirector_lists.test.json")
+
+
+def _lists_env(path, pin=None) -> dict:
+    from hashlib import sha256
+
+    data = open(path, "rb").read() if os.path.exists(path) else b""
+    return {core.REDIRECTOR_LISTS_PATH_ENV: str(path),
+            core.REDIRECTOR_LISTS_SHA256_ENV: sha256(data).hexdigest() if pin is None else pin}
+
+
+@pytest.fixture
+def fixture_lists() -> dict:
+    return core.load_redirector_lists(_lists_env(LISTS_FIXTURE))
+
+
+def test_the_lists_load_pinned_and_print_counts_only(fixture_lists) -> None:
+    from hashlib import sha256
+
+    assert fixture_lists["sha256"] == sha256(open(LISTS_FIXTURE, "rb").read()).hexdigest()
+    assert fixture_lists["shorteners"] == ("short.test", "tiny-link.test")
+    line = core.lists_line(fixture_lists)
+    assert line == f"OLP lists sha256={fixture_lists['sha256']} shorteners=2 affiliate=2"
+    assert ".test" not in line, "never a host"
+
+
+@pytest.mark.parametrize("case", ["unset", "missing_file", "empty_file"])
+def test_absent_lists_give_no_list_marks_and_no_failure(case, tmp_path) -> None:
+    env = {"unset": {}, "missing_file": _lists_env(tmp_path / "nope.json", pin="0" * 64)}.get(case)
+    if case == "empty_file":
+        (tmp_path / "empty.json").write_bytes(b"")
+        env = _lists_env(tmp_path / "empty.json")
+    lists = core.load_redirector_lists(env)
+    assert lists["sha256"] is None and core.lists_line(lists) == "OLP lists=absent"
+    assert core.redirector_marks("https://short.test/3abcde", lists) == set()
+    assert core.redirector_marks("https://www.aff-net.test/click-1-2", lists) == set()
+    plan = core.build_plan(batch_id="olp-redir", rules=[{"market": "US", "destination_url": "https://short.test/3abcde"}],
+                           seeds=[], present=[], lists=lists)
+    assert plan["redirector_lists_sha256"] is None and "shortener_host" not in plan["entries"][0]["marks"]
+
+
+def test_lists_that_miss_their_pin_refuse(tmp_path) -> None:
+    for pin in ("0" * 64, "", "not-a-sha"):
+        with pytest.raises(core.Refused) as refused:
+            core.load_redirector_lists(_lists_env(LISTS_FIXTURE, pin=pin))
+        assert refused.value.reason == "lists_sha_mismatch"
+
+
+@pytest.mark.parametrize("body", [
+    b"not json", b"[]", b'{"version": 2, "shorteners": [], "affiliate_networks": []}',
+    b'{"version": 1, "shorteners": []}', b'{"version": 1, "shorteners": ["Short.test"], "affiliate_networks": []}',
+    b'{"version": 1, "shorteners": ["short.test", "short.test"], "affiliate_networks": []}',
+    b'{"version": 1, "shorteners": ["https://short.test/"], "affiliate_networks": []}',
+    b'{"version": 1, "version": 1, "shorteners": [], "affiliate_networks": []}',
+])
+def test_lists_that_are_not_the_schema_refuse(body, tmp_path) -> None:
+    path = tmp_path / "lists.json"
+    path.write_bytes(body)
+    with pytest.raises(core.Refused) as refused:
+        core.load_redirector_lists(_lists_env(path))
+    assert refused.value.reason == "lists_invalid"
+
+
+def test_the_plan_names_its_lists_and_apply_refuses_other_lists(db, fixture_lists) -> None:
+    async def go():
+        plan = await core.read_plan(db, batch_id="olp-test-1", lists=fixture_lists, **LOCAL)
+        assert plan["redirector_lists_sha256"] == fixture_lists["sha256"]
+        assert core.verify_plan(plan) is plan
+        for other in (None, "0" * 64):
+            with pytest.raises(core.Refused) as refused:
+                await core.apply_plan(db, plan, lists_sha256=other, **LOCAL)
+            assert refused.value.reason == "lists_sha_mismatch"
+        assert len(await _rows(db)) == 1, "nothing written"
+        unnamed = {k: v for k, v in plan.items() if k not in ("redirector_lists_sha256", "plan_sha256")}
+        unnamed["plan_sha256"] = core.digest(unnamed)
+        with pytest.raises(core.Refused, match="redirector lists"):
+            core.verify_plan(unnamed)
+        receipt = await core.apply_plan(db, plan, lists_sha256=fixture_lists["sha256"], **LOCAL)
+        assert receipt["inserted"] == len(plan["entries"])
+
+    asyncio.run(go())
+
+
+def test_the_apply_approval_binds_the_plans_lists(monkeypatch, tmp_path) -> None:
+    from hashlib import sha256
+
+    from scripts.ops import outbound_allowlist_populate as job
+
+    def approve(lists_sha):
+        approval = {"mode": "apply", "plan_sha256": "p" * 64, "lists_sha256": lists_sha, "release_sha": "r" * 40,
+                    "go_reference": "go ref"}
+        path = tmp_path / "approval.json"
+        path.write_bytes(json.dumps(approval).encode())
+        monkeypatch.setenv(job.ENV + "APPROVAL_PATH", str(path))
+        monkeypatch.setenv(job.ENV + "APPROVAL_SHA256", sha256(path.read_bytes()).hexdigest())
+
+    args = {"release": "r" * 40, "pinned_key": "plan_sha256", "pinned_sha": "p" * 64}
+    approve("l" * 64)
+    assert job.check_approval("apply", **args, extra={"lists_sha256": "l" * 64})
+    for other in (None, "m" * 64):
+        with pytest.raises(core.Refused):
+            job.check_approval("apply", **args, extra={"lists_sha256": other})
+    approve(None)
+    assert job.check_approval("apply", **args, extra={"lists_sha256": None})
+    with pytest.raises(core.Refused):
+        job.check_approval("apply", **args)  # an approval naming lists never passes without the plan's lists
+
+
+def test_the_job_refuses_a_lists_sha_mismatch_as_one_line(db, monkeypatch, capsys) -> None:
+    from scripts.ops import outbound_allowlist_populate as job
+
+    for key, value in _lists_env(LISTS_FIXTURE, pin="0" * 64).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(job, "check_environment", lambda mode: "a" * 40)
+    monkeypatch.setattr(job, "check_gate", lambda now: {})
+    import scripts.ops.reviewed_seed_batch as seed_batch
+
+    async def no_pins(conn):
+        return None
+
+    monkeypatch.setattr(seed_batch, "runtime_pins", lambda: no_pins)
+    import db.database as database_module
+
+    monkeypatch.setattr(database_module, "database", db)
+    monkeypatch.setattr(db, "connect", _noop)
+    monkeypatch.setattr(db, "disconnect", _noop)
+    assert asyncio.run(job.main(["plan"])) == 2
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("OLP refused mode=plan reason=lists_sha_mismatch ")
+
+
+async def _noop(*args, **kwargs):
+    return None
+
+
+@pytest.mark.parametrize("url", [
+    "https://store-one.test/products/rocket-shoe?ref=home",
+    "https://store-one.test/collections/sale?page=2",
+    "https://store-one.test/search?q=red+shoes",  # a search term, not a URL
+    "https://store-one.test/c/",  # a bare /c/ with no id
+    "https://store-one.test/products/clicker",
+])
+def test_ordinary_store_urls_get_no_redirector_mark(url) -> None:
+    assert core.redirector_marks(url) == set()
+
+
+@pytest.mark.parametrize("raw, parsed", [
+    ('{"canonical_url": "https://a.test/p"}', {"canonical_url": "https://a.test/p"}),
+    ('"{\\"canonical_url\\": \\"https://a.test/p\\"}"', {"canonical_url": "https://a.test/p"}),  # string-encoded
+    ({"destination_url": "https://a.test/p"}, {"destination_url": "https://a.test/p"}),
+    ('"not json"', {}), ("null", {}), (None, {}), ("[1, 2]", {}), ("{bad", {}),
+])
+def test_a_snapshot_is_read_as_the_mint_reads_it(raw, parsed) -> None:
+    from routes.agent_api import _ensure_json_obj as mint_ensure_json_obj
+
+    assert core.seed_snapshot(raw) == parsed
+    decoded = raw
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+    assert core.seed_snapshot(raw) == mint_ensure_json_obj(decoded), "the mint's own parser agrees"
+
+
+def test_the_plan_prints_a_timing_line(db) -> None:
+    timing: dict = {}
+    asyncio.run(core.read_plan(db, batch_id="olp-test-1", timing=timing, **LOCAL))
+    published = sum(1 for r in RULES if r[3] == "published")
+    active = sum(1 for r in SEEDS if r[6] == "active")
+    assert (timing["rules"], timing["seeds"], timing["present"]) == (published, active, 1)
+    line = core.timing_line(timing)
+    assert line.startswith("OLP timing ms=") and f"rules={published} seeds={active} present=1" in line
+
+
+def test_the_job_plan_run_prints_the_timing_line_first(db, monkeypatch, capsys) -> None:
+    from scripts.ops import outbound_allowlist_populate as job
+
+    real_read_plan = core.read_plan
+
+    async def local_read_plan(conn, **kwargs):
+        return await real_read_plan(conn, **kwargs, **LOCAL)
+
+    monkeypatch.setattr(job.core, "read_plan", local_read_plan)
+    monkeypatch.setenv(job.ENV + "BATCH_ID", "olp-test-1")
+    for key, value in _lists_env(LISTS_FIXTURE).items():
+        monkeypatch.setenv(key, value)
+    assert asyncio.run(job.run("plan", db, release="a" * 40)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("OLP timing ms=") and " read_ms=" in lines[0] and " build_ms=" in lines[0]
+    assert lines[1].startswith("OLP lists sha256=") and lines[1].endswith(" shorteners=2 affiliate=2")
+    doc = core.parse_doc_lines("\n".join(lines), "plan_doc")
+    assert doc["redirector_lists_sha256"] == lines[1].split("sha256=")[1].split()[0]
+    assert any(line.startswith("OLP plan_doc 1/") for line in lines)
