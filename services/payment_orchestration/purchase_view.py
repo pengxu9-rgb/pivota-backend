@@ -4,13 +4,16 @@
 an agent sees the same shape whether it polls or is told. It is built from the rail route's own
 owner-scoped, redacted view (Reap: routes/agent_commerce_reap._owner_view; the A2A token rail:
 services/payment_orchestration/a2a_purchase_view), never from a raw row,
-so it carries no PII and only a hosted URL the rail route has already vetted.
+so it carries no PII and only a hosted URL the rail route has already vetted. With the AgenPas consent
+gate on (services/payment_orchestration/purchase_consent.py) the rail view may withhold that URL and mark
+the step instead (`detail.buyer_step`); `next_action` then has no url and says `consent_required`.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from services.payment_orchestration.purchase_consent import LOOKUP
 from services.payment_orchestration.rails import BUYER_ACTION_KIND, unified_state
 
 
@@ -35,6 +38,7 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
     # The rail route has already vetted the hosted URL against its allowlist and its deadline and
     # dropped it when it fails; an absent `hosted_url` therefore means "nowhere to send the buyer".
     kind = BUYER_ACTION_KIND.get(state)
+    marker = detail.get("buyer_step")
     if kind and detail.get("hosted_url"):
         body["next_action"] = {
             "type": "open_url",
@@ -42,6 +46,11 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
             "url": detail["hosted_url"],
             "expires_at": detail.get("approval_deadline") or detail.get("hosted_url_expires_at"),
         }
+    elif (kind and isinstance(marker, Mapping) and marker.get("consent_required") is True
+          and marker.get("kind") == kind):
+        # The AgenPas consent gate withheld the page (services/payment_orchestration/purchase_consent.py):
+        # the buyer still has a step to take, on the AgenPas page first. No url, by construction.
+        body["next_action"] = {"kind": kind, "expires_at": marker.get("expires_at"), "consent_required": True}
     if state == "completed" and detail.get("order_reference"):
         body["order_reference"] = detail["order_reference"]
     body["detail"] = dict(detail)
@@ -49,16 +58,19 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
 
 
 async def unified_purchase(
-    parent: Mapping[str, Any], *, agent_id: str, agent_user_ref_hash: str
+    parent: Mapping[str, Any], *, agent_id: str, agent_user_ref_hash: str, consents: Any = LOOKUP
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """(body, None), or (None, "not_found" | "state_unmapped"). Owner-scoped: the rail read
-    conjuncts on the agent AND the buyer."""
+    conjuncts on the agent AND the buyer. `consents`: a page's one-read consent snapshot
+    (services/payment_orchestration/purchase_consent.snapshot); by default the rail view reads its own."""
+    # Passed only when there is one, so a call with the gate off is the call it always was.
+    extra: Dict[str, Any] = {} if consents is LOOKUP else {"consents": consents}
     if parent["rail"] == "a2a":
         from services.payment_orchestration import a2a_purchase_view
 
         detail = await a2a_purchase_view.owner_view(
             purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id,
-            agent_user_ref_hash=agent_user_ref_hash,
+            agent_user_ref_hash=agent_user_ref_hash, **extra,
         )
     elif parent["rail"] == "reap":
         # Imported here: the rail route module imports the web stack, and this module is also used
@@ -67,7 +79,7 @@ async def unified_purchase(
 
         detail = await reap_routes._owner_view(
             purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id,
-            agent_user_ref_hash=agent_user_ref_hash,
+            agent_user_ref_hash=agent_user_ref_hash, **extra,
         )
     else:
         return None, "state_unmapped"

@@ -4,7 +4,9 @@ Staging's database is a RESTORED COPY of production. Every Reap purchase that wa
 production when the copy was taken is live in staging too, with the buyer's email, address and
 Reap approval link, and an armed staging poller would claim it and talk to Reap about a real
 buyer. docs/runbooks/reap_agentic_purchase.md ("Staging pre-flight") requires this BEFORE
-REAP_AGENTIC_ENABLED=1 on staging, and again after EVERY staging restore.
+REAP_AGENTIC_ENABLED=1 on staging, and again after EVERY staging restore. A staging run that opens Reap's
+hosted pages directly needs AGENPAS_CONSENT_GATE off (default), or a consent recorded per step through
+AgenPas first (docs/agent_purchases_routes.md).
 
     census          read-only: non-terminal purchases and pending/active enrollments.
                     exit 0 = CLEAR, 3 = STOP (live rows present).

@@ -118,6 +118,7 @@ from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
+from services.payment_orchestration import purchase_consent
 from services.text_normalization.display_text import clean_product_name
 from services.outbound_links_service import (
     build_shopify_cart_permalink,
@@ -2815,7 +2816,7 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 async def _owner_view(
-    *, purchase_id: str, agent_id: str, agent_user_ref_hash: str
+    *, purchase_id: str, agent_id: str, agent_user_ref_hash: str, consents: Any = purchase_consent.LOOKUP
 ) -> Optional[Dict[str, Any]]:
     # Private columns are needed only to scope the legacy enrollment deadline lookup;
     # public_purchase_view must redact them before any response is built.
@@ -2824,11 +2825,17 @@ async def _owner_view(
     )
     if not row:
         return None
-    return await _owner_public_body(row)
+    return await _owner_public_body(row, consents=consents)
 
 
-async def _owner_public_body(row):
-    """Owner-scoped private row to a redacted response with an original-attempt deadline."""
+async def _owner_public_body(row, *, consents: Any = purchase_consent.LOOKUP):
+    """Owner-scoped private row to a redacted response with an original-attempt deadline.
+
+    THE ONE PLACE EVERY REAP SURFACE TAKES ITS HOSTED URL FROM (GET, list, create, resume, recover, the
+    unified door, the purchase.* events, the AgenPas read), so the AgenPas consent gate is applied here,
+    last: with AGENPAS_CONSENT_GATE on and no consent recorded for the page's step, the body carries no
+    `hosted_url` and a `buyer_step` marker instead (services/payment_orchestration/purchase_consent.py).
+    Off: the body is returned untouched. `consents` is a list page's one-read snapshot."""
     row = dict(row)
     if row.get("state") == "needs_enrollment":
         enrollment = None
@@ -2860,7 +2867,10 @@ async def _owner_public_body(row):
         row.get("state") in {"resolving", "needs_enrollment", "quoting"}
         and continuation.contact_required(row)
     )
-    return body
+    return await purchase_consent.gate(
+        body, rail="reap", rail_purchase_id=str(row.get("id") or ""), rail_state=row.get("state"),
+        agent_id=row.get("agent_id"), consents=consents,
+    )
 
 
 #: The most the post-commit parent write may add to the create's 202 (see `_record_purchase_parent`).
@@ -3769,7 +3779,9 @@ async def list_reap_purchases(
     views = await ledger.list_purchases_for_owner(
         str(context.agent_id), agent_user_ref_hash, limit=min(int(limit), _LIST_MAX), include_private=True
     )
+    # ONE consent read for the page (the gate's; nothing is read while it is off).
+    consents = await purchase_consent.snapshot(str(context.agent_id), [("reap", str(v["id"])) for v in views])
     return {
-        "purchases": [await _owner_public_body(view) for view in views],
+        "purchases": [await _owner_public_body(view, consents=consents) for view in views],
         "limit": min(int(limit), _LIST_MAX),
     }

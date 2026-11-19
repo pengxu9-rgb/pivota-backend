@@ -192,6 +192,64 @@ def test_long_or_undated_run_is_long_running_and_not_retryable(started):
     assert not isinstance(caught.value, gate.ShortRunClosed)
 
 
+def failed_import(job_name, **status):
+    """An execution whose image never imported: Completed=False, no completionTime (seen in prod since August)."""
+    row = execution(job_name, done=False, started=stamp(QUIET - timedelta(days=80)))
+    row["status"].update(conditions=[{"type": "Completed", "status": "False", "reason": "ContainerImageImportFailed"}],
+                         **status)
+    return row
+
+
+@pytest.mark.parametrize("where", ["global", "per_job"])
+def test_a_failed_or_cancelled_execution_without_a_completion_time_is_finished(where):
+    row = failed_import(CRON)
+    if where == "global":
+        assert evaluate(executions=[execution("example-done"), row]).startswith("cpu_peak_5m=")
+    else:
+        assert evaluate(per_job={gate.REQUIRED_JOBS[0]: [row]}).startswith("cpu_peak_5m=")
+
+
+def test_every_task_failed_or_cancelled_and_none_running_is_finished():
+    row = execution(CRON, done=False, started=stamp(QUIET - timedelta(days=3)))
+    row["spec"] = {"taskCount": 2}
+    row["status"].update(failedCount=1, cancelledCount=1)
+    assert evaluate(executions=[execution("example-done"), row]).startswith("cpu_peak_5m=")
+    row["status"]["runningCount"] = 1                       # one task still running: not finished
+    with pytest.raises(gate.GateClosed, match="long-running"):
+        evaluate(executions=[row])
+    row["status"].update(runningCount=0, cancelledCount=0)  # one of two tasks ended: not finished
+    with pytest.raises(gate.GateClosed, match="long-running"):
+        evaluate(executions=[row])
+
+
+@pytest.mark.parametrize("conditions", [
+    [{"type": "Completed", "status": "Unknown"}],
+    [{"type": "Ready", "status": "False"}],                 # not the Completed condition
+    [{"type": "Completed", "status": "false"}],             # not the exact API value
+    "unreadable",
+])
+def test_an_in_progress_or_unreadable_execution_older_than_60_s_still_closes(conditions):
+    row = execution(CRON, done=False, started=stamp(QUIET - timedelta(seconds=61)))
+    row["status"]["conditions"] = conditions
+    with pytest.raises(gate.GateClosed, match="long-running"):
+        evaluate(executions=[row])
+
+
+@pytest.mark.parametrize(("completion_status", "closes"), [
+    ("EXECUTION_FAILED", False), ("EXECUTION_CANCELLED", False), ("EXECUTION_SUCCEEDED", False),
+    ("EXECUTION_RUNNING", True), ("EXECUTION_PENDING", True), (None, True)])
+def test_a_jobs_latest_execution_that_ended_without_a_timestamp_is_finished(completion_status, closes):
+    latest = {"name": CRON + "-x", "creationTimestamp": stamp(QUIET - timedelta(days=80))}
+    if completion_status:
+        latest["completionStatus"] = completion_status
+    jobs = {**required_jobs(), CRON: job(CRON, latest=latest)}
+    if closes:
+        with pytest.raises(gate.GateClosed, match=f"long-running database job execution\\(s\\): {CRON}"):
+            evaluate(jobs=jobs)
+    else:
+        assert evaluate(jobs=jobs).startswith("cpu_peak_5m=")
+
+
 def test_listed_non_db_job_does_not_close(monkeypatch):
     monkeypatch.setattr(gate, "NON_DB_JOBS", {"example-probe": "reviewed: no database access"})
     evaluate(executions=[execution("example-done"), execution("example-probe", done=False, started="")])

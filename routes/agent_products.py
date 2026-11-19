@@ -1257,6 +1257,15 @@ async def get_product_details_by_variant(
             merchant_id=merchant_id,
             product_id=variant_id,
             background_tasks=background_tasks,
+            # Called as a plain function: this route takes no market or payment context, so None, never the
+            # detail route's Query default object (which read as text in the payment context).
+            market=None,
+            psp=None,
+            payment_method_type=None,
+            card_network=None,
+            issuer_name=None,
+            wallet_type=None,
+            installment_provider=None,
             context=context,
         )
         if isinstance(resp, dict) and resp.get("status") == "success":
@@ -1327,6 +1336,15 @@ async def get_product_details_by_variant(
         merchant_id=merchant_id,
         product_id=product_id,
         background_tasks=background_tasks,
+        # Called as a plain function: this route takes no market or payment context, so None, never the
+        # detail route's Query default object (which read as text in the payment context).
+        market=None,
+        psp=None,
+        payment_method_type=None,
+        card_network=None,
+        issuer_name=None,
+        wallet_type=None,
+        installment_provider=None,
         context=context,
     )
 
