@@ -994,6 +994,7 @@ async def search_products(
         _normalize_catalog_surface,
         agent_search_products,
         direct_call_external_seed_only,
+        direct_call_payment_context_unread,
     )
 
     normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
@@ -1315,13 +1316,9 @@ async def search_products(
                 fast_mode=fast_mode,
                 market=market,
                 serving_market=serving_market,
-                # This route takes no payment context: None, never a route's default object (read as text).
-                psp=None,
-                payment_method_type=None,
-                card_network=None,
-                issuer_name=None,
-                wallet_type=None,
-                installment_provider=None,
+                # This route reads no payment context; until AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT is on, the
+                # search answers as it always did for it (every offer with a requirement rejected, `actual` None).
+                payment_context_unread=direct_call_payment_context_unread(),
                 context=context,
             ),
             delegate_timeout_s,

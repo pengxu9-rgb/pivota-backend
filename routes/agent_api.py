@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import random
 import os
 import re
 import time
@@ -122,6 +123,7 @@ from services.merchant_psp_config_service import (
 from services.payment_offer_evidence_service import (
     emit_payment_offer_analytics_event,
     enrich_product_cards_with_payment_offers,
+    UNREAD_PAYMENT_CONTEXT,
     payment_context_from_mapping,
     redact_payment_method_evidence,
     stable_payment_offer_hash,
@@ -5379,8 +5381,8 @@ def _plain_argument(value: Any, default: Any) -> Any:
 #: and the products_cache arm of this search applies no test-merchant exclusion
 #: (services/test_merchant_policy is not read on it) and no currency guard without a price bound. So:
 #:   off (default, and any unknown value): today's scope -- external_seed_only=True, unchanged;
-#:   shadow: today's scope, plus one count-only log line per unscoped call (merchants it would search,
-#:           and how many of them are test merchants);
+#:   shadow: today's scope, plus one count-only log line per SAMPLED unscoped call (merchants it would
+#:           search, how many are test merchants); DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV, default 0 = none;
 #:   on: the caller's own external_seed_only (False unless asked), i.e. the cross-merchant scope.
 DIRECT_CALL_CROSS_MERCHANT_ENV = "AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT"
 
@@ -5388,6 +5390,45 @@ DIRECT_CALL_CROSS_MERCHANT_ENV = "AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT"
 def direct_call_cross_merchant_mode() -> str:
     raw = str(os.getenv(DIRECT_CALL_CROSS_MERCHANT_ENV) or "").strip().lower()
     return raw if raw in {"off", "shadow", "on"} else "off"
+
+
+#: Shadow's sample rate, 0..1 (default 0: shadow adds no query at all). Each sampled unscoped call costs one
+#: merchant_onboarding read and the test-merchant set (cached in-process), off the request path.
+DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV = "AGENT_SEARCH_DIRECT_CALL_SHADOW_SAMPLE_RATE"
+
+
+def _direct_call_shadow_sample_rate() -> float:
+    try:
+        rate = float(str(os.getenv(DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV) or "0").strip())
+    except ValueError:
+        return 0.0
+    return min(1.0, max(0.0, rate)) if rate == rate else 0.0
+
+
+#: The payment context the SDK product search and the /products/resolve fallback hand the search. They never
+#: passed one, so FastAPI's Query objects stood in for every field: every payment offer with a requirement
+#: was rejected as a mismatch (and the object's text was echoed). A sibling of the scope flag, because it is
+#: display-only (DISPLAY_ONLY_POLICY: no quote, PSP amount or discount reads it) and can go on alone:
+#:   off (default, and any unknown value): today's decisions and counts (UNREAD_PAYMENT_CONTEXT, which also
+#:        renders the rejected decisions' `actual` as None instead of that text -- the one unflagged change);
+#:   on: no payment context, as the HTTP product-detail route reads it (offers with a requirement are
+#:       `potential`, with their estimated savings).
+DIRECT_CALL_PAYMENT_CONTEXT_ENV = "AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT"
+
+
+def direct_call_payment_context_unread() -> bool:
+    return str(os.getenv(DIRECT_CALL_PAYMENT_CONTEXT_ENV) or "").strip().lower() != "on"
+
+
+def direct_call_reads_external_seeds() -> bool:
+    """The /products/resolve fallback's seed read. Its Query-object market made the seed read bind no currency,
+    so it ran no seed SQL and found no seed; on (DIRECT_CALL_CROSS_MERCHANT_ENV) it reads the deployment's
+    partition, held to that partition's currency (services.external_seed_search.seed_serving_currency)."""
+    return direct_call_cross_merchant_mode() == "on"
+
+
+async def _no_external_seed_read(**_kwargs: Any) -> List[Dict[str, Any]]:
+    return []
 
 
 async def _log_direct_call_scope_shadow(*, caller: str, context: Any) -> None:
@@ -5437,7 +5478,9 @@ def direct_call_external_seed_only(
         return bool(requested)
     unscoped = not merchant_id and not merchant_ids and search_all_merchants is not True
     if mode == "shadow" and unscoped and not requested:
-        background_tasks.add_task(_log_direct_call_scope_shadow, caller=caller, context=context)
+        rate = _direct_call_shadow_sample_rate()
+        if rate > 0 and random.random() < rate:
+            background_tasks.add_task(_log_direct_call_scope_shadow, caller=caller, context=context)
     return True
 
 
@@ -5472,6 +5515,10 @@ async def agent_search_products(
     issuer_name: Optional[str] = None,
     wallet_type: Optional[str] = None,
     installment_provider: Optional[str] = None,
+    # The two direct-call restorations (see DIRECT_CALL_PAYMENT_CONTEXT_ENV / DIRECT_CALL_CROSS_MERCHANT_ENV):
+    # a caller that never read a payment context, and a caller whose seed read stays off (today's resolve).
+    payment_context_unread: bool = False,
+    read_external_seeds: bool = True,
     context: AgentContext,
 ):
     """
@@ -6087,7 +6134,9 @@ async def agent_search_products(
                     if brand_query_detected:
                         ext_limit = min(360, max(ext_limit, 180))
                     seed_metrics: Dict[str, Any] = {}
-                    external_seed_products = await _load_external_seed_products_with_cache(
+                    external_seed_products = await (
+                    _load_external_seed_products_with_cache if read_external_seeds else _no_external_seed_read
+                )(
                         req=req,
                         query=query,
                         market=market,
@@ -6560,7 +6609,9 @@ async def agent_search_products(
                 if brand_query_detected:
                     external_seed_limit = min(360, max(external_seed_limit, 180))
                 seed_metrics: Dict[str, Any] = {}
-                external_seed_products = await _load_external_seed_products_with_cache(
+                external_seed_products = await (
+                    _load_external_seed_products_with_cache if read_external_seeds else _no_external_seed_read
+                )(
                     req=req,
                     query=query,
                     market=market,
@@ -7109,6 +7160,8 @@ async def agent_search_products(
             if str(value or "").strip()
         }
         payment_context = PivotPaymentContext(**payment_context_payload) if payment_context_payload else None
+        if payment_context_unread:
+            payment_context = UNREAD_PAYMENT_CONTEXT
         paginated_products = await enrich_product_cards_with_payment_offers(
             paginated_products,
             merchant_id=merchant_id,
@@ -8040,16 +8093,11 @@ async def agent_resolve_products(
                         allow_stale_cache=True,
                         external_seed_strategy="legacy",
                         fast_mode=False,
-                        # This lookup names no market and no payment context: None, not a route's default object
-                        # (which read as text: a garbage seed partition, so no seed, and a garbage payment context).
-                        market=None,
-                        serving_market=None,
-                        psp=None,
-                        payment_method_type=None,
-                        card_network=None,
-                        issuer_name=None,
-                        wallet_type=None,
-                        installment_provider=None,
+                        # This lookup names no market and no payment context. When the search took Query objects
+                        # for them, its seed read bound no currency (so no seed SQL ran) and every payment field
+                        # was that object's text: both kept until the direct-call flags are on.
+                        payment_context_unread=direct_call_payment_context_unread(),
+                        read_external_seeds=direct_call_reads_external_seeds(),
                         context=context,
                     ),
                     timeout=search_timeout_s,

@@ -12,7 +12,10 @@ never read; an agent with an allowed_merchants list got the same. The payment-co
 The function now has real Python defaults and every caller passes every argument. Restoring the
 cross-merchant scope is a behaviour change after months of external-seed-only serving, and the
 products_cache arm of this search applies no test-merchant exclusion, so it is behind
-AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT (off | shadow | on, default off = today's scope).
+AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT (off | shadow | on, default off = today's scope), with the
+/products/resolve fallback's seed read. The payment context the SDK search and resolve never read is behind
+its sibling AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT (off = today's decisions, with no parameter text).
+Off, every answer is base's, byte for byte, except that a parameter object's text is never rendered.
 """
 from __future__ import annotations
 
@@ -28,6 +31,8 @@ HEADERS = {"X-API-Key": "test-api-key"}
 CONNECTED = "m_connected_a"
 SEED = "external_seed"
 FLAG = "AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT"
+PAYMENT_FLAG = "AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT"
+SAMPLE = "AGENT_SEARCH_DIRECT_CALL_SHADOW_SAMPLE_RATE"
 
 
 @pytest.fixture
@@ -183,6 +188,7 @@ def test_shadow_serves_todays_scope_and_logs_counts_only(monkeypatch, client) ->
     import routes.agent_api as agent_api
 
     monkeypatch.setenv(FLAG, "shadow")
+    monkeypatch.setenv(SAMPLE, "1")
     seen = _install(monkeypatch)
     monkeypatch.setattr(agent_api, "get_excluded_merchant_ids", AsyncMock(return_value={CONNECTED}))
     lines: List[str] = []
@@ -208,6 +214,7 @@ def test_shadow_logs_nothing_for_a_search_whose_scope_does_not_change(monkeypatc
     import routes.agent_api as agent_api
 
     monkeypatch.setenv(FLAG, "shadow")
+    monkeypatch.setenv(SAMPLE, "1")
     _install(monkeypatch)
     lines: List[str] = []
     monkeypatch.setattr(agent_api.logger, "info", lambda msg, *a, **k: lines.append(str(msg)))
@@ -247,12 +254,11 @@ def test_the_sdk_search_market_and_currency_cells(monkeypatch, client, serving_m
 # --- the other direct callers: every argument is a value, never a Query object ------------------------------
 
 
-def test_the_resolve_search_fallback_passes_values_and_reads_the_us_seeds(monkeypatch, client) -> None:
-    # Before: market / serving_market / psp... were left out, so the seed read bound the TEXT of a Query
-    # object as its partition (no seed) and the payment context carried that text.
+def test_the_resolve_search_fallback_passes_values_and_keeps_todays_answer_with_the_flags_off(monkeypatch, client) -> None:
     import routes.agent_api as agent_api
 
     monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.delenv(PAYMENT_FLAG, raising=False)
     seen = _install(monkeypatch)
     passed: List[Dict[str, Any]] = []
     real = agent_api.agent_search_products
@@ -269,8 +275,53 @@ def test_the_resolve_search_fallback_passes_values_and_reads_the_us_seeds(monkey
 
     for kwargs in passed:
         assert not [k for k, v in kwargs.items() if isinstance(v, (fastapi_params.Param, fastapi_params.Depends))]
-        assert kwargs["market"] is None and kwargs["psp"] is None and kwargs["external_seed_only"] is True
-    assert seen["seed_calls"] and seen["seed_calls"][-1]["market"] is None
+        assert kwargs["external_seed_only"] is True
+        assert kwargs["payment_context_unread"] is True and kwargs["read_external_seeds"] is False
+    assert seen["seed_calls"] == [], "today: the resolve fallback reads no seed"
+
+
+def _seed_sql_recorder(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
+    """The REAL seed loader, over a database that records every external_product_seeds statement."""
+    import routes.agent_api as agent_api
+
+    seed_sql: List[Any] = []
+
+    async def fake_fetch_all(query: Any, values: Any = None) -> List[Dict[str, Any]]:
+        if "external_product_seeds" in str(query):
+            seed_sql.append(dict(values or {}))
+        return []
+
+    async def fake_fetch_one(query: Any, values: Any = None) -> None:
+        if "external_product_seeds" in str(query):
+            seed_sql.append(dict(values or {}))
+        return None
+
+    # services.external_seed_search.fetch_external_seed_rows is handed this same database object.
+    monkeypatch.setattr(agent_api.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(agent_api.database, "fetch_one", fake_fetch_one, raising=False)
+    monkeypatch.setattr(agent_api, "log_agent_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_api, "hydrate_quality_and_enrichment", AsyncMock(return_value=None))
+    return seed_sql
+
+
+@pytest.mark.parametrize("flag, reads", [(None, False), ("off", False), ("shadow", False), ("on", True)])
+def test_the_resolve_fallback_runs_no_seed_sql_until_the_flag_is_on(monkeypatch, client, flag, reads) -> None:
+    if flag is None:
+        monkeypatch.delenv(FLAG, raising=False)
+    else:
+        monkeypatch.setenv(FLAG, flag)
+    seed_sql = _seed_sql_recorder(monkeypatch)
+    response = client.get("/agent/v1/products/resolve", params={"query": "sunscreen", "limit": 10}, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    if not reads:
+        assert seed_sql == [], "today: no seed statement at all"
+    else:
+        assert seed_sql, "on: the seed read runs"
+        # Held to the deployment partition's currency by the seed read itself, never every currency.
+        assert {v.get("serving_currency") for v in seed_sql if "serving_currency" in v} == {"USD"}
+    body = response.json()
+    for candidate in body.get("candidates") or []:
+        assert not ({"price", "currency", "url", "link"} & set(candidate)), "identity only: no price, currency or link"
 
 
 @pytest.mark.asyncio
@@ -311,3 +362,119 @@ def test_a_fastapi_parameter_object_reads_as_the_plain_default() -> None:
     assert agent_api._plain_argument(Depends(lambda: None), "d") == "d"
     for value in (True, False, 0, "", "US", None, ["m"]):
         assert agent_api._plain_argument(value, "default") == value
+
+
+@pytest.mark.parametrize("rate", [None, "0", "", "x", "-1", "nan"])
+def test_shadow_unsampled_adds_no_query(monkeypatch, client, rate) -> None:
+    import routes.agent_api as agent_api
+
+    monkeypatch.setenv(FLAG, "shadow")
+    if rate is None:
+        monkeypatch.delenv(SAMPLE, raising=False)
+    else:
+        monkeypatch.setenv(SAMPLE, rate)
+    _install(monkeypatch)
+    shadow = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_api, "_log_direct_call_scope_shadow", shadow)
+    _served(_sdk_search(client))
+    assert shadow.await_count == 0, "default 0: shadow costs no query"
+
+
+# --- payment-offer evidence on the SDK search ------------------------------------------------------------
+# Three offers per card: none required, a card requirement, and one configured for SG. Before, the SDK search
+# handed the search Query objects for the payment context: the card offer was rejected (and the object's
+# text echoed as `actual`). Off keeps that decision, with `actual` None; on reads no payment context, as the
+# HTTP detail route does.
+
+_PARAM_TEXT = ("annotation=", "required=False", "json_schema_extra", "Query(", "<fastapi", "PydanticUndefined", "FieldInfo")
+
+
+def _install_offers(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.payment_offer_evidence_service as offers
+
+    async def fake_rows(merchant_id: str, *, targets: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for t in targets:
+            base = {"status": "active", "source_product_id": t.product_id, "source_variant_id": t.variant_id,
+                    "label": "Pay benefit", "benefit_kind": "amount_off", "benefit_value": "1.10", "benefit_currency": "USD"}
+            rows += [
+                {**base, "incentive_id": f"io_none_{t.product_id}"},
+                {**base, "incentive_id": f"io_card_{t.product_id}", "payment_method_type": "card"},
+                {**base, "incentive_id": f"io_sg_{t.product_id}", "market": "SG", "benefit_currency": "SGD"},
+            ]
+        return rows
+
+    monkeypatch.setattr(offers, "_fetch_candidate_rows", fake_rows)
+    monkeypatch.setenv("PAYMENT_OFFERS_DISPLAY_ENABLED", "1")
+
+
+def _card(response: Any, pid: str) -> Dict[str, Any]:
+    assert response.status_code == 200, response.text
+    return next(p for p in response.json()["products"] if p.get("product_id") == pid)
+
+
+@pytest.mark.parametrize("flag", [None, "off", "bogus"])
+def test_payment_evidence_off_keeps_todays_decisions_with_actual_none(monkeypatch, client, flag) -> None:
+    if flag is None:
+        monkeypatch.delenv(PAYMENT_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(PAYMENT_FLAG, flag)
+    _install(monkeypatch)
+    _install_offers(monkeypatch)
+    evidence = _card(_sdk_search(client, search_all_merchants="true"), "pc_usd")["payment_offer_evidence"]
+    assert sorted(o["payment_offer_id"] for o in evidence["offers"]) == ["io_none_pc_usd", "io_sg_pc_usd"]
+    assert evidence["decisions"] == [{
+        "type": "payment_offer_rejected", "payment_offer_id": "io_card_pc_usd", "reason": "payment_method_type_mismatch",
+        "required": "card", "actual": None,
+    }]
+
+
+def test_payment_evidence_on_reads_no_payment_context(monkeypatch, client) -> None:
+    monkeypatch.setenv(PAYMENT_FLAG, "on")
+    _install(monkeypatch)
+    _install_offers(monkeypatch)
+    evidence = _card(_sdk_search(client, search_all_merchants="true"), "pc_usd")["payment_offer_evidence"]
+    offers = {o["payment_offer_id"]: o for o in evidence["offers"]}
+    assert sorted(offers) == ["io_card_pc_usd", "io_none_pc_usd", "io_sg_pc_usd"]
+    assert offers["io_card_pc_usd"]["eligibility"]["status"] == "potential"
+    assert offers["io_card_pc_usd"]["estimated_total_after_payment_offer"] == "18.90"
+    assert evidence["decisions"] == []
+
+
+@pytest.mark.parametrize("payment_flag", [None, "on"])
+@pytest.mark.parametrize("scope_flag", [None, "on"])
+@pytest.mark.parametrize("door", ["sdk", "sdk_all", "beauty", "resolve"])
+def test_no_response_carries_a_fastapi_parameter_objects_text(monkeypatch, client, door, scope_flag, payment_flag) -> None:
+    # Unflagged: whatever the flags, no field of these answers is the text of a Query / Param object.
+    for name, value in ((FLAG, scope_flag), (PAYMENT_FLAG, payment_flag)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    _install(monkeypatch)
+    _install_offers(monkeypatch)
+    if door == "sdk":
+        response = _sdk_search(client)
+    elif door == "sdk_all":
+        response = _sdk_search(client, search_all_merchants="true")
+    elif door == "beauty":
+        response = _beauty_search(client, search_all_merchants="true")
+    else:
+        response = client.get("/agent/v1/products/resolve", params={"query": "sunscreen", "limit": 10}, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    assert not [t for t in _PARAM_TEXT if t in response.text], response.text[:400]
+
+
+def test_an_unread_payment_context_rejects_each_requirement_as_the_old_text_did() -> None:
+    import services.payment_offer_evidence_service as offers
+
+    for key in ("psp", "payment_method_type", "card_network", "issuer_name", "wallet_type", "installment_provider"):
+        decisions: List[Dict[str, Any]] = []
+        row = {"incentive_id": "io_1", key: "x_required"}
+        assert offers._payment_context_status(row, offers.UNREAD_PAYMENT_CONTEXT, decisions) is None
+        assert decisions == [{"type": "payment_offer_rejected", "payment_offer_id": "io_1", "reason": f"{key}_mismatch",
+                              "required": "x_required", "actual": None}]
+    decisions = []
+    assert offers._payment_context_status({"incentive_id": "io_2"}, offers.UNREAD_PAYMENT_CONTEXT, decisions) == ("potential", [])
+    assert decisions == []
+    assert offers.payment_context_to_dict(offers.UNREAD_PAYMENT_CONTEXT) == {}
