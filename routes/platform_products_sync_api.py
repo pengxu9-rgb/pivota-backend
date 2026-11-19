@@ -66,4 +66,5 @@ async def sync_platform_products_get(
     limit: int = Query(default=500, ge=1, le=5000),
     _: None = Depends(require_platform_products_admin),
 ) -> Dict[str, Any]:
-    return await sync_platform_products_endpoint(merchant_id=merchant_id, platform=platform, limit=limit)
+    # `_` is the admin dependency this route already resolved; passed on, never left as a Depends object.
+    return await sync_platform_products_endpoint(merchant_id=merchant_id, platform=platform, limit=limit, _=_)

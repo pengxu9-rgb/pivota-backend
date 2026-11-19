@@ -80,4 +80,5 @@ async def sync_shopify_products_get(
     ttl_seconds: int = Query(default=7 * 24 * 60 * 60, ge=300, le=30 * 24 * 60 * 60),
     _: None = Depends(require_shopify_products_admin),
 ) -> Dict[str, Any]:
-    return await sync_shopify_products_endpoint(merchant_id=merchant_id, limit=limit, ttl_seconds=ttl_seconds)  # type: ignore[arg-type]
+    # `_` is the admin dependency this route already resolved; passed on, never left as a Depends object.
+    return await sync_shopify_products_endpoint(merchant_id=merchant_id, limit=limit, ttl_seconds=ttl_seconds, _=_)  # type: ignore[arg-type]

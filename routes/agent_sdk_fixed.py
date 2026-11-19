@@ -994,6 +994,8 @@ async def search_products(
         _normalize_catalog_surface,
         SERVING_MARKET_REFUSAL_REASONS,
         agent_search_products,
+        direct_call_external_seed_only,
+        direct_call_payment_context_unread,
     )
 
     normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
@@ -1306,11 +1308,18 @@ async def search_products(
                 limit=limit,
                 offset=offset,
                 allow_external_seed=allow_external_seed,
+                external_seed_only=direct_call_external_seed_only(
+                    caller="sdk_products_search", background_tasks=background_tasks, context=context,
+                    merchant_id=merchant_id, merchant_ids=merchant_ids, search_all_merchants=search_all_merchants,
+                ),
                 allow_stale_cache=allow_stale_cache,
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
                 market=market,
                 serving_market=serving_market,
+                # This route reads no payment context; until AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT is on, the
+                # search answers as it always did for it (every offer with a requirement rejected, `actual` None).
+                payment_context_unread=direct_call_payment_context_unread(),
                 context=context,
             ),
             delegate_timeout_s,
