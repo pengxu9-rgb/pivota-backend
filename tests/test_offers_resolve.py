@@ -249,7 +249,7 @@ def test_offers_resolve_recovers_attached_seed_after_broad_seed_timeout(
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"product_id": "prod_internal_1"}, "limit": 10, "market": "EU-DE", "tool": "*"},
+            "payload": {"product": {"product_id": "prod_internal_1"}, "limit": 10, "market": "FR", "tool": "*"},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -343,7 +343,7 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"product_id": "prod_internal_prefetch"}, "limit": 10, "market": "EU-DE", "tool": "*"},
+            "payload": {"product": {"product_id": "prod_internal_prefetch"}, "limit": 10, "market": "FR", "tool": "*"},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -4704,15 +4704,28 @@ def test_every_market_cell_answers_the_merchant_scoped_ref_as_the_listing_key_it
     monkeypatch: pytest.MonkeyPatch, client: TestClient, market
 ) -> None:
     """The merchant-scoped ref is answered exactly as the listing's own product_key is, market by
-    market: same offers, same binds (the market and its currency are never defaulted or rewritten)."""
+    market: same offers, same binds (the market and its currency are never defaulted or rewritten).
+    A market this backend does not price (DE, ZZ) is refused by name for both refs alike, before any
+    catalog read."""
+
+    unpriced = market in ("DE", "ZZ")
 
     def answer(**kwargs):
         seen: list = []
         _scoped_setup(monkeypatch, _scoped_fetch_all(
             listings=[(_SCOPED_MERCHANT, _SCOPED_SOURCE_ID, _SCOPED_LISTING_KEY)], seen=seen))
         body = _post_scoped(client, market=market, **kwargs)
+        if unpriced:
+            assert (body["status"], body["error"]["reason"], body["market"]) == ("error", "market_not_priced", market)
+            assert _catalog_binds(seen) == [] and not body.get("offers")
+            return [], None
         (binds,) = _catalog_binds(seen)
         return [(o["source"]["offer_id"], o["price"], o["currency"]) for o in body.get("offers") or []], binds
+
+    if unpriced:
+        answer()
+        answer(merchant_id=None, product_id=_SCOPED_LISTING_KEY)
+        return
 
     scoped, scoped_binds = answer()
     direct, direct_binds = answer(merchant_id=None, product_id=_SCOPED_LISTING_KEY)
@@ -6710,3 +6723,151 @@ def test_the_sweep_population_holds_every_fact_the_warm_stamp_asks(
         return
     assert calls, "the stamp must be asked for this to prove anything"
     assert set(calls) <= swept, sorted(set(calls) - swept)
+
+
+# --- the buyer market: refused by name unless the registry lists it ------------------------------------
+#
+# offers.resolve answered an unregistered market (DE, ZZ) with no currency rule at all, and a lower-case
+# market ('us') matched no `o.market` row, so the catalog arm answered empty. A market is now read as the
+# gateway's get_offers door reads it (trimmed, upper-cased) and refused by name, before any read, when the
+# market registry does not list it. Absent, null or blank still names no market. Made-up hosts throughout.
+
+def _market_offer_row(offer_id, market, currency, host):
+    return {**_CATALOG_OFFER_ROW, "offer_id": offer_id, "merchant_id": f"merch_obs_{offer_id[-1] * 16}",
+            "merchant_name": host, "currency": currency, "market": market,
+            "destination_url": f"https://{host}/products/item"}
+
+
+_MARKET_ROWS = [
+    _market_offer_row("of_mkt_1", "US", "USD", "us-shop.example.test"),
+    _market_offer_row("of_mkt_2", "SG", "SGD", "sg-shop.example.test"),
+    _market_offer_row("of_mkt_3", "GB", "GBP", "gb-shop.example.test"),
+]
+
+
+def _market_resolve(monkeypatch, client, market, *, send_market=True):
+    import routes.agent_shop_gateway as gateway
+
+    reads: list = []
+
+    async def fake_fetch_all(query: str, values=None):
+        values = dict(values or {})
+        reads.append((str(query), values))
+        q = str(query)
+        if "FROM catalog_products" in q and "JOIN catalog_offers" in q:
+            # The statement's own market conjunct, as Postgres applies it.
+            return [r for r in _MARKET_ROWS if values.get("market") is None or r["market"] == values["market"]]
+        return []
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url",
+                        AsyncMock(return_value="https://example.com/r?token=market"))
+    payload = {"product": {"product_id": "sig_" + "e4" * 16}, "limit": 10, "tool": "*",
+               "commerce_surface": "agent_api", **({"market": market} if send_market else {})}
+    res = client.post("/agent/shop/v1/invoke", json={
+        "operation": "offers.resolve", "payload": payload, "metadata": {"source": "creator-agent-ui"}})
+    return res, reads
+
+
+@pytest.mark.parametrize("market", [
+    "USA", "EU-DE", "en-US", "U S", 123, ["US"], {"code": "US"}, True,
+    # Unicode look-alikes: case mapping reads 'ſg' as SG, 'uſ' as US, 'ﬁ' as FI. Two ASCII letters or nothing.
+    "ſg", "uſ", "ﬁ", "ＵＳ", "ｓｇ", "УС", "ıt",
+])
+def test_a_market_that_is_not_a_country_code_is_refused_by_name_before_any_read(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    res, reads = _market_resolve(monkeypatch, client, market)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert reads == [], "nothing is read for a market that cannot be answered"
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "MARKET_INVALID" and body["error"]["reason"] == "market_invalid"
+    assert body["offers"] == [] and body["offers_count"] == 0
+    assert "market" not in body, "an unreadable value is never echoed"
+    if isinstance(market, str):
+        assert market not in res.text
+
+
+@pytest.mark.parametrize("market, code", [("DE", "DE"), ("ZZ", "ZZ"), ("de", "DE"), (" zz ", "ZZ"),
+                                          ("NZ", "NZ"), ("nz", "NZ")])
+def test_a_country_code_the_registry_does_not_list_is_refused_by_name_before_any_read(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market, code
+) -> None:
+    res, reads = _market_resolve(monkeypatch, client, market)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert reads == []
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "MARKET_NOT_PRICED" and body["error"]["reason"] == "market_not_priced"
+    assert body["market"] == code
+    assert body["offers"] == [] and body["offers_count"] == 0
+
+
+@pytest.mark.parametrize("market, code, currency, offer_id", [
+    ("US", "US", "USD", "of_mkt_1"), ("us", "US", "USD", "of_mkt_1"), (" us ", "US", "USD", "of_mkt_1"),
+    ("SG", "SG", "SGD", "of_mkt_2"), ("sg", "SG", "SGD", "of_mkt_2"), ("GB", "GB", "GBP", "of_mkt_3"),
+])
+def test_a_listed_market_is_read_upper_cased_and_served_in_its_own_currency(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market, code, currency, offer_id
+) -> None:
+    res, reads = _market_resolve(monkeypatch, client, market)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    [binds] = [v for q, v in reads if "FROM catalog_products" in q and "JOIN catalog_offers" in q]
+    assert binds["market"] == code and binds["buyer_currency"] == currency
+    assert [o["source"]["offer_id"] for o in body["offers"]] == [offer_id]
+    assert {o["currency"] for o in body["offers"]} == {currency}
+
+
+@pytest.mark.parametrize("market", [None, "", "   ", "absent"])
+def test_a_request_that_names_no_market_is_answered_as_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    res, reads = _market_resolve(monkeypatch, client, None if market == "absent" else market,
+                                 send_market=market != "absent")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] != "error"
+    [binds] = [v for q, v in reads if "FROM catalog_products" in q and "JOIN catalog_offers" in q]
+    assert binds["market"] is None and binds["buyer_currency"] is None, "never defaulted"
+    assert len(body["offers"]) == 3
+
+
+def test_offers_resolve_prices_exactly_the_registry_pricing_regions_and_nz_is_not_one(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The markets this door answers are the registry's pricing regions -- the gateway's own priced map -- not
+    every listed market: NZ is listed with pricing_region false and is refused as the gateway refuses it."""
+    from services import market_registry
+
+    assert market_registry.market_or_none("NZ") is not None and "NZ" not in market_registry.pricing_region_currency()
+    for code in sorted(market_registry.MARKETS):
+        res, reads = _market_resolve(monkeypatch, client, code)
+        body = res.json()
+        if code in market_registry.pricing_region_currency():
+            assert body["status"] != "error", code
+            assert reads, code
+        else:
+            assert (body["status"], body["error"]["reason"], body["market"], reads) == ("error", "market_not_priced", code, []), code
+
+
+
+# The markets the gateway prices (PIVOTA-Agent src/auroraBff/buyerRegion.js BUYER_REGION_CURRENCY), written out: a
+# registry change that unprices one of them must fail here, not quietly turn its buyers into market_not_priced.
+_GATEWAY_PRICED_MARKETS = frozenset({"US", "SG", "GB", "JP", "FR", "HR", "FI", "AU", "SE", "KR", "HK", "CA"})
+
+
+def test_offers_resolve_answers_every_market_the_gateway_prices_and_the_registry_prices_exactly_those(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    from services import market_registry
+
+    assert set(market_registry.pricing_region_currency()) == _GATEWAY_PRICED_MARKETS
+    for code in sorted(_GATEWAY_PRICED_MARKETS):
+        res, reads = _market_resolve(monkeypatch, client, code)
+        body = res.json()
+        assert res.status_code == 200, code
+        assert body["status"] != "error" and "error" not in body, (code, body.get("error"))
+        assert reads, f"{code}: answered, so the catalog was read"

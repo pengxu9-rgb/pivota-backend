@@ -992,6 +992,7 @@ async def search_products(
         _expand_product_ref_aliases,
         _matches_catalog_surface,
         _normalize_catalog_surface,
+        SERVING_MARKET_REFUSAL_REASONS,
         agent_search_products,
         direct_call_external_seed_only,
         direct_call_payment_context_unread,
@@ -1342,7 +1343,11 @@ async def search_products(
 
     if merchant_id and isinstance(result, dict):
         current_products = result.get("products")
-        if isinstance(current_products, list) and not current_products:
+        # A page refused for its serving market is the answer, not a miss: the legacy lane has no market or
+        # currency filter and would serve the refused market a page in another market's currency.
+        delegate_metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        refused_for_market = delegate_metadata.get("reason_code") in SERVING_MARKET_REFUSAL_REASONS
+        if isinstance(current_products, list) and not current_products and not refused_for_market:
             result = await _legacy_scoped_search_fallback()
 
     if isinstance(result, dict):

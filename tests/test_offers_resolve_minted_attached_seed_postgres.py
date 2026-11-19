@@ -363,7 +363,9 @@ def test_an_attached_seed_the_rules_hide_stays_hidden(schema_engine, monkeypatch
     _clear(schema_engine)
     sig, pk, seed_id, merchant = _mint(schema_engine, monkeypatch)
     assert _seed_source(none_served("USD seed, SG buyer", market="SG"))["row_count"] == 0
-    assert _seed_source(none_served("USD seed, unpriced market", market="DE"))["row_count"] == 0
+    # A market the registry does not list is refused by name before any read (offers.resolve market rule).
+    unpriced = none_served("USD seed, unpriced market", market="DE")
+    assert unpriced["error"]["reason"] == "market_not_priced" and "metadata" not in unpriced
     # ... while the same rows do answer the US buyer (the cases above are the filter, not a typo).
     assert len(_seed_offers(_resolve(monkeypatch, sig, flag="1", merchant_id=merchant))) == 1
 
@@ -615,9 +617,9 @@ def test_flag_on_two_currencies_on_one_key_each_go_to_their_own_market(schema_en
         assert offer["source"]["seed_id"] == by_currency[currency], market
         assert (offer["price"], offer["currency"]) == (price, currency), market
         assert offer["execution_spec"]["merchant_domain"] == host, market
-    # A market with no known currency gets neither.
+    # A market with no known currency gets neither: it is refused by name before any read.
     res = _resolve(monkeypatch, sig, flag="1", merchant_id=merchant, market="DE")
-    assert _seed_offers(res) == [] and _seed_source(res)["row_count"] == 0
+    assert _seed_offers(res) == [] and res["error"]["reason"] == "market_not_priced"
 
 
 @pytest.mark.parametrize("stored_order", ["ASC", "DESC"])

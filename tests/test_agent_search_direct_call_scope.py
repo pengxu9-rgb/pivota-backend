@@ -229,14 +229,14 @@ def test_shadow_logs_nothing_for_a_search_whose_scope_does_not_change(monkeypatc
 # MEASURED, not wished: on, the connected rows come back in EVERY currency. This door holds a currency only on
 # the seed read (fetch_external_seed_rows) and, for other rows, only when a price bound is set
 # (_passes_explicit_commerce_filters): a US buyer is served the SGD row, a GB buyer USD and SGD rows. Off stays
-# the default until the products_cache arm holds the buyer's currency too. DE is unpriced and, on this door
-# (main), ignored: it reads as the partition's US.
+# the default until the products_cache arm holds the buyer's currency too. DE is unpriced: refused by name
+# (market_not_priced, #2848) before any read, so it is served nothing either way.
 _CELLS = {
     # serving_market: (served with the flag off == today on main, served with the flag on)
     "US": (["seed_usd"], ["pc_sgd", "pc_usd", "seed_usd"]),
     "SG": (["seed_sgd"], ["pc_sgd", "pc_usd", "seed_sgd"]),
     "GB": (["seed_gbp"], ["pc_sgd", "pc_usd", "seed_gbp"]),
-    "DE": (["seed_usd"], ["pc_sgd", "pc_usd", "seed_usd"]),
+    "DE": ([], []),
     None: (["seed_usd"], ["pc_sgd", "pc_usd", "seed_usd"]),
 }
 
@@ -276,8 +276,8 @@ def test_the_resolve_search_fallback_passes_values_and_keeps_todays_answer_with_
     for kwargs in passed:
         assert not [k for k, v in kwargs.items() if isinstance(v, (fastapi_params.Param, fastapi_params.Depends))]
         assert kwargs["external_seed_only"] is True
-        assert kwargs["payment_context_unread"] is True and kwargs["read_external_seeds"] is False
-    assert seen["seed_calls"] == [], "today: the resolve fallback reads no seed"
+        assert kwargs["payment_context_unread"] is True
+        assert kwargs["market"] is None and kwargs["serving_market"] is None
 
 
 def _seed_sql_recorder(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
@@ -304,8 +304,10 @@ def _seed_sql_recorder(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
     return seed_sql
 
 
-@pytest.mark.parametrize("flag, reads", [(None, False), ("off", False), ("shadow", False), ("on", True)])
-def test_the_resolve_fallback_runs_no_seed_sql_until_the_flag_is_on(monkeypatch, client, flag, reads) -> None:
+# Main (#2848) passes the resolve fallback market=None, so its seed read binds the deployment partition and, by
+# the seed read's own rule, that partition's currency. This merge keeps that, whatever the flags.
+@pytest.mark.parametrize("flag", [None, "off", "shadow", "on"])
+def test_the_resolve_fallback_reads_seeds_held_to_the_partition_currency(monkeypatch, client, flag) -> None:
     if flag is None:
         monkeypatch.delenv(FLAG, raising=False)
     else:
@@ -313,12 +315,8 @@ def test_the_resolve_fallback_runs_no_seed_sql_until_the_flag_is_on(monkeypatch,
     seed_sql = _seed_sql_recorder(monkeypatch)
     response = client.get("/agent/v1/products/resolve", params={"query": "sunscreen", "limit": 10}, headers=HEADERS)
     assert response.status_code == 200, response.text
-    if not reads:
-        assert seed_sql == [], "today: no seed statement at all"
-    else:
-        assert seed_sql, "on: the seed read runs"
-        # Held to the deployment partition's currency by the seed read itself, never every currency.
-        assert {v.get("serving_currency") for v in seed_sql if "serving_currency" in v} == {"USD"}
+    assert seed_sql, "the seed read runs"
+    assert {v.get("serving_currency") for v in seed_sql if "serving_currency" in v} == {"USD"}, "never every currency"
     body = response.json()
     for candidate in body.get("candidates") or []:
         assert not ({"price", "currency", "url", "link"} & set(candidate)), "identity only: no price, currency or link"

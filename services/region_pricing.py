@@ -79,8 +79,13 @@ def normalize_region(region: str) -> str:
     GB — an ISO-3166 code is case-insensitive and a request field routinely
     arrives lower-cased). Everything else is REFUSED by the lookup below; this
     function only spells the canonical form, it does not validate membership.
+
+    Only an ASCII value is upper-cased. Unicode case mapping turns look-alikes into
+    ASCII ('ſg' -> 'SG', the ligature 'ﬁ' -> 'FI'), which then priced as that region;
+    a non-ASCII value is returned trimmed, matches no region and is refused below.
     """
-    return str(region or "").strip().upper()
+    text = str(region or "").strip()
+    return text.upper() if text.isascii() else text
 
 
 def pricing_currency_for_region(region: str) -> str:
