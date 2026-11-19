@@ -135,3 +135,44 @@ async def test_the_claim_lookup_is_a_suffix_compare_not_a_wildcard(catalog):
     assert {r["merchant_id"] for r in rows} == {"merch_tenant_wild"}
     rows = await _read(database, pipeline.CLAIMED_TENANT_SQL, {"verified": STATUS_VERIFIED, "reg": "brand%.example"})
     assert rows == []
+
+
+EDGE_HOSTS = ("WWW.Brand-A.Example.", "brand-a.example..", "brand-a.example...:443", "\tbrand-a.example\n",
+              "\r\nwww.brand-a.example:8080 ", "Brand-A.Example", "www.www.brand-a.example", "brand-a.example:443.",
+              "", "www.")
+
+
+async def test_the_sql_host_fold_is_the_python_one(catalog):
+    """pipeline._host_sql run by Postgres over the edge spellings equals pipeline._norm_host on each."""
+    from services.retailer_ingest import pipeline
+
+    _, admin = catalog
+    sql = f"SELECT {pipeline._host_sql('$1::text')}"
+    for raw in EDGE_HOSTS:
+        assert await admin.fetchval(sql, raw) == pipeline._norm_host(raw), repr(raw)
+    # A non-ASCII capital folds as the database's collation folds it; Python always folds it. Where the server
+    # folds it too the two agree; where it does not, only that letter differs (a pin then holds: fail-closed).
+    raw = "MARKE-Ä.example"
+    folded = await admin.fetchval(sql, raw)
+    if await admin.fetchval("SELECT lower('Ä') = 'ä'"):
+        assert folded == pipeline._norm_host(raw)
+    else:
+        assert folded == "marke-Ä.example"
+
+
+async def test_the_candidate_reads_skip_sellers_of_record_and_stop_at_the_cap(catalog):
+    from services.retailer_ingest import pipeline
+
+    database, admin = catalog
+    await _merchant(admin, "merch_obs_00000000000000aa", HOST)
+    for i in range(pipeline.SELLER_CANDIDATE_CAP + 5):
+        await _merchant(admin, f"agent_seed::seller-{i:04d}", HOST)
+    rows = await _read(database, pipeline.SELLERS_ON_HOST_SQL, {"hosts": HOSTS})
+    assert len(rows) == pipeline.SELLER_CANDIDATE_CAP + 1
+    assert not [r for r in rows if r["merchant_id"].startswith("merch_obs_")]
+    await _offer(admin, "merch_obs_00000000000000aa", "ext:k9::1", source_domain=HOST, brand=None)
+    await _offer(admin, "agent_seed::seller-0000", "ext:k9::1", source_domain=HOST, brand=None)
+    planned = await _read(database, pipeline.OFFER_SELLERS_ON_PLANNED_SQL, {"keys": ["ext:k9::1"]})
+    assert planned == [{"merchant_id": "agent_seed::seller-0000"}]
+    live = await _read(database, pipeline.SELLER_LIVE_AT_HOST_SQL, {"ids": ["agent_seed::seller-0000"], "hosts": HOSTS})
+    assert [(r["merchant_id"], r["brand"]) for r in live] == [("agent_seed::seller-0000", None)]

@@ -35,8 +35,10 @@ def _product(title, ptype, handle, vendor):
 
 
 def _sql_host(value):
-    """What pipeline._host_sql does in SQL: trim, lower-case, drop a trailing `:port` and dot, then a leading `www.`."""
-    return re.sub(r"^www[.]", "", re.sub(r"[.]?(:[0-9]+)?$", "", str(value or "").strip().lower()))
+    """What pipeline._host_sql does in SQL: trim whitespace, lower-case, drop a trailing `:port`, then every trailing
+    dot, then a leading `www.` (the PG test runs the real expression over the same inputs)."""
+    host = re.sub(r":[0-9]+$", "", str(value or "").strip().lower())
+    return re.sub(r"^www[.]", "", re.sub(r"[.]+$", "", host))
 
 
 class _Catalog:
@@ -61,7 +63,9 @@ class _Catalog:
         if query == self.fail:
             raise ConnectionError("down")
         if query == pipeline.SELLERS_ON_HOST_SQL:
-            return [{"merchant_id": m} for m, ref in self.merchants if _sql_host(ref) in values["hosts"]]
+            return sorted(({"merchant_id": m} for m, ref in self.merchants
+                           if _sql_host(ref) in values["hosts"] and not m.startswith("merch_obs_")),
+                          key=lambda r: r["merchant_id"])[:pipeline.SELLER_CANDIDATE_CAP + 1]
         if query == pipeline.PINNED_SELLER_SQL:
             return [{"merchant_id": m} for m, _ in self.merchants if m == values["mid"]]
         if query == pipeline.PINNED_LIVE_HOSTS_SQL:
@@ -69,13 +73,16 @@ class _Catalog:
                                                  if o["merchant_id"] == values["mid"]})]
         if query == pipeline.OFFER_SELLERS_ON_PLANNED_SQL:
             return [{"merchant_id": m} for m in sorted({o["merchant_id"] for o in self.offers
-                                                         if o["product_key"] in values["keys"]})]
+                                                         if o["product_key"] in values["keys"]
+                                                         and not o["merchant_id"].startswith("merch_obs_")})
+                    ][:pipeline.SELLER_CANDIDATE_CAP + 1]
         if query == pipeline.SELLER_LIVE_AT_HOST_SQL:
             groups = {}
             for o in self._live():
                 if o["merchant_id"] in values["ids"] and _sql_host(o["host"]) in values["hosts"]:
                     groups[(o["merchant_id"], o["brand"])] = groups.get((o["merchant_id"], o["brand"]), 0) + 1
-            return [{"merchant_id": m, "brand": b, "offers": n} for (m, b), n in sorted(groups.items())]
+            return [{"merchant_id": m, "brand": b, "offers": n}
+                    for (m, b), n in sorted(groups.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
         if query == pipeline.PRODUCT_SELLERS_SQL:
             return [{"product_key": k, "merchant_id": m} for k, m in self.products.items() if k in values["keys"]]
         if query == pipeline.CLAIMED_TENANT_SQL:
@@ -457,6 +464,9 @@ def test_the_sql_keeps_its_liveness_and_suffix_predicates():
                           "p.suppressed_at IS NULL", "p.suppression_reason IS NULL"):
             assert predicate in sql
     assert "LIKE" not in pipeline.CLAIMED_TENANT_SQL.upper()
+    for sql in (pipeline.SELLERS_ON_HOST_SQL, pipeline.OFFER_SELLERS_ON_PLANNED_SQL):
+        assert "left(merchant_id, 10) <> 'merch_obs_'" in sql  # sellers of record never eat the candidate cap
+        assert f"LIMIT {pipeline.SELLER_CANDIDATE_CAP + 1}" in sql
     assert "right(lower(coalesce(brand_domain, '')), length(:reg) + 1) = '.' || :reg" in pipeline.CLAIMED_TENANT_SQL
 
 
@@ -464,4 +474,79 @@ def test_the_sql_host_spelling_is_the_python_one():
     """_host_sql and _norm_host must agree, or DISTINCT over the SQL host returns one store twice (www and apex)."""
     for raw in ("WWW.Brand-A.Example.:443", " brand-a.example. ", "www.brand-a.example", "brand-a.example:8080"):
         assert _sql_host(raw) == pipeline._norm_host(raw) == OFFICIAL
-    assert "'^www[.]'" in pipeline._host_sql("x") and "btrim(x)" in pipeline._host_sql("x")
+    for raw in ("\tbrand-a.example..\n", "brand-a.example...:443", "\r\nWWW.BRAND-A.EXAMPLE"):
+        assert _sql_host(raw) == pipeline._norm_host(raw) == OFFICIAL
+    assert "'^www[.]'" in pipeline._host_sql("x") and "'[.]+$'" in pipeline._host_sql("x")
+
+
+
+# ---- brand matching, brand-unknown sellers, the pin's brand, the candidate cap ------------------------------
+
+@pytest.mark.parametrize("job_brand,stock_brand", [("Brand A & Co", "Brand A and Co"), ("Brand A and Co", "Brand A & Co")])
+async def test_an_ampersand_and_its_word_are_one_brand(store, job_brand, stock_brand):
+    """brand_spelling.brand_key reads `&` as `and`: "Brand A & Co" and "Brand A and Co" are one brand, so a second
+    seller under the other spelling is a split (a letters-only fold read them as two brands and hid it)."""
+    store.catalog.merchants = [("agent_seed::brand-a-co-old", OFFICIAL)]
+    store.catalog.offer("agent_seed::brand-a-co-old", brand=stock_brand)
+    job_ = official_job(brand=job_brand)
+    await pipeline.run_stage(job_, db=store.db)
+    assert "seller_id_split" in _rules(store), run_flags(store)
+    assert _seller_check(store)["split"] == ["agent_seed::brand-a-co-old"]
+    assert pipeline._brand_carry([stock_brand], pipeline._cohort_brand_keys(job_, {"pdps": []})) == "cohort"
+
+
+async def test_a_pin_recorded_for_another_host_but_live_here_with_the_brand_is_accepted(store):
+    """The pin is judged by its live stock on this host, not by catalog_merchants.source_ref (last-writer-wins)."""
+    store.catalog.merchants = [(OLD, "other.example")]
+    store.catalog.offer(OLD)
+    out = await pipeline.run_stage(official_job(seller_merchant_id=OLD), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert _seller_check(store)["pinned_brand_carry"] == "cohort"
+
+
+@pytest.mark.parametrize("block", ["true", "false"])
+@pytest.mark.parametrize("brand", [None, "", "  "])
+async def test_a_live_seller_whose_rows_name_no_brand_is_never_invisible(store, monkeypatch, block, brand):
+    monkeypatch.setenv(pipeline.SELLER_SPLIT_BLOCK_ENV, block)
+    store.catalog.merchants = [("agent_seed::unlabelled", OFFICIAL)]
+    store.catalog.offer("agent_seed::unlabelled", brand=brand)
+    store.catalog.offer("agent_seed::unlabelled", brand="Brand B", key="ext:old-row::0002")
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    check = _seller_check(store)
+    assert check["brand_unknown"] == ["agent_seed::unlabelled"] and check["status"] == "brand_unknown"
+    assert check["would_flag"] == ["seller_id_split_brand_unknown:agent_seed::unlabelled"]
+    if block == "true":
+        assert out["status"] == "held" and _rules(store) == ["seller_id_split_brand_unknown"], run_flags(store)
+        [flag] = run_flags(store)
+        assert flag.get("acceptable") is not False
+    else:
+        assert out["status"] == "apply_due", run_flags(store)
+
+
+async def test_a_seller_of_another_named_brand_only_is_recorded_not_flagged(store):
+    store.catalog.merchants = [("agent_seed::brand-b", OFFICIAL)]
+    store.catalog.offer("agent_seed::brand-b", brand="Brand B")
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    assert _seller_check(store)["other_brand_sellers"] == {"agent_seed::brand-b": ["Brand B"]}
+
+
+@pytest.mark.parametrize("brand", ["Brand B", None])
+async def test_a_pin_to_a_seller_live_here_with_another_brand_s_stock_is_held(store, brand):
+    store.catalog.merchants = [("agent_seed::brand-b", OFFICIAL)]
+    store.catalog.offer("agent_seed::brand-b", brand=brand)
+    out = await pipeline.run_stage(official_job(seller_merchant_id="agent_seed::brand-b"), db=store.db)
+    assert out["status"] == "held" and _rules(store) == ["seller_merchant_id_other_brand"], run_flags(store)
+    assert _seller_check(store)["pinned_brand_carry"] == ("other" if brand else "unknown")
+
+
+async def test_the_candidates_are_capped_and_the_cap_is_recorded(store, monkeypatch):
+    monkeypatch.setattr(pipeline, "SELLER_CANDIDATE_CAP", 3)
+    store.catalog.merchants = [(f"agent_seed::seller-{i}", OFFICIAL) for i in range(5)]
+    out = await pipeline.run_stage(official_job(), db=store.db)
+    assert out["status"] == "apply_due", run_flags(store)
+    check = _seller_check(store)
+    assert check["truncated"] is True and check["candidates"] == 3
+    store.catalog.merchants = store.catalog.merchants[:3]
+    await pipeline.run_stage(official_job(), db=store.db)
+    assert _seller_check(store)["truncated"] is False

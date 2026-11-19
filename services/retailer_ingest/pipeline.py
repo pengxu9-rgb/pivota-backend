@@ -1146,6 +1146,9 @@ async def _catalog_read(sql: str, values: Dict[str, Any]) -> tuple:
 SELLER_SPLIT_BLOCK_ENV = "RETAILER_INGEST_SELLER_SPLIT_BLOCK_ENABLED"
 #: At most this many ids per list on a run's checks.seller_identity.
 SELLER_IDENTITY_LIST_CAP = 50
+#: At most this many candidate sellers are read per host (each nominating query, and their union); beyond it the
+#: run records checks.seller_identity.truncated -- a host with that many sellers is a census item, not a cohort.
+SELLER_CANDIDATE_CAP = 200
 
 
 def seller_split_block_enabled() -> bool:
@@ -1157,7 +1160,12 @@ def _host_sql(expr: str) -> str:
     trailing dot dropped, and a leading `www.` dropped -- so `www.<host>` and `<host>` are ONE value here, and a
     DISTINCT over it (PINNED_LIVE_HOSTS_SQL) returns each store once. (:hosts still lists both spellings; the
     `www.` one simply never matches.)"""
-    return f"regexp_replace(regexp_replace(lower(btrim({expr})), '[.]?(:[0-9]+)?$', ''), '^www[.]', '')"
+    # The same steps in the same order as _norm_host: strip whitespace (tabs and newlines too), lower-case, drop a
+    # trailing `:port`, then every trailing dot, then a leading `www.`. lower() of a NON-ASCII letter follows the
+    # database's collation (Python's always folds it): such a host may compare unequal, which holds a pin and can
+    # only miss a split -- stored hosts are URL hostnames, ASCII (punycode) in practice.
+    trimmed = f"regexp_replace(lower({expr}), '^[[:space:]]+|[[:space:]]+$', '', 'g')"
+    return f"regexp_replace(regexp_replace(regexp_replace({trimmed}, ':[0-9]+$', ''), '[.]+$', ''), '^www[.]', '')"
 
 
 _OFFER_HOST = _host_sql("coalesce(o.source_domain, o.offer_payload->>'domain', '')")
@@ -1169,13 +1177,19 @@ SELLERS_ON_HOST_SQL = f"""
 SELECT merchant_id
 FROM catalog_merchants
 WHERE {_host_sql("coalesce(source_ref, '')")} = ANY(:hosts)
+  AND left(merchant_id, 10) <> 'merch_obs_'
+ORDER BY merchant_id
+LIMIT {SELLER_CANDIDATE_CAP + 1}
 """
 #: More candidates: every seller with an offer on one of the plan's own products (catalog_offers.product_key is
 #: indexed), whatever minted it -- a seller written without a catalog_merchants row on the host still shows.
-OFFER_SELLERS_ON_PLANNED_SQL = """
+OFFER_SELLERS_ON_PLANNED_SQL = f"""
 SELECT DISTINCT merchant_id
 FROM catalog_offers
 WHERE product_key = ANY(:keys)
+  AND left(merchant_id, 10) <> 'merch_obs_'
+ORDER BY merchant_id
+LIMIT {SELLER_CANDIDATE_CAP + 1}
 """
 #: Which candidates sell LIVE at the host, and which brands they sell there. Live = the offer and its product are
 #: both unsuppressed: a retired retailer chain (scripts/retire_retailer_chain_for_brand_official.py suppresses the
@@ -1246,27 +1260,30 @@ def _store_hosts(domain: Optional[str]) -> tuple:
     return host, (sorted({host, f"www.{host}"}) if host else [])
 
 
-def _brand_fold(value: Any) -> str:
-    return "".join(c for c in str(value or "").casefold() if c.isalnum())
-
-
 def _cohort_brand_keys(job: Dict[str, Any], plan: Dict[str, Any]) -> set:
     """The brands this cohort writes (folded): the job's, every planned product's, and options.brands'."""
     o = job.get("options") or {}
     named = [job.get("brand"), *[p.get("brand") for p in plan.get("pdps") or []],
              *((o.get("brands") or {}).values() if isinstance(o.get("brands"), dict) else [])]
-    return {k for k in (_brand_fold(b) for b in named) if k}
+    from services.brand_spelling import brand_key
+    return {k for k in (brand_key(b) for b in named) if k}
 
 
-def _sells_cohort_brand(brands: List[Any], cohort: set) -> bool:
-    """Does a seller's live stock at the host include this cohort's brand? The same rule resolve_record_brand
-    calls one brand: folded letters and digits, equal or one containing the other (both at least 3 chars).
-    A sibling brand sharing the host, or a vendor the store no longer lists, sells another brand: not ours."""
+def _brand_carry(brands: List[Any], cohort: set) -> str:
+    """What a seller's live stock at the host says about this cohort's brand: "cohort" (it carries it -- the
+    rule resolve_record_brand calls one brand: services.brand_spelling.brand_key, `&` read as `and`, equal or
+    one containing the other, both at least 3 chars), else "unknown" (some of it names no brand, so it cannot
+    be ruled out), else "other" (every row names another brand: a sibling sharing the host, or a vendor the
+    store no longer lists -- not this cohort's)."""
+    from services.brand_spelling import brand_key
+    unknown = False
     for brand in brands:
-        b = _brand_fold(brand)
-        if b and any(b == c or (len(b) >= 3 and len(c) >= 3 and (b in c or c in b)) for c in cohort):
-            return True
-    return False
+        b = brand_key(brand)
+        if not b:
+            unknown = True
+        elif any(b == c or (len(b) >= 3 and len(c) >= 3 and (b in c or c in b)) for c in cohort):
+            return "cohort"
+    return "unknown" if unknown else "other"
 
 
 def _planned_sellers(plan: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -1335,8 +1352,13 @@ async def _seller_identity_checks(job: Dict[str, Any], plan: Dict[str, Any],
             stored, why = await read(PRODUCT_SELLERS_SQL, {"keys": keys})
         if why is None and registrable:
             claimed, why = await read(CLAIMED_TENANT_SQL, {"verified": STATUS_VERIFIED, "reg": registrable})
-        candidates = sorted({str(r.get("merchant_id") or "") for r in (on_host or []) + (on_offers or [])} - {""})
-        candidates = [m for m in candidates if not m.startswith(_OF_RECORD_PREFIX)]
+        nominated = [sorted({str(r.get("merchant_id") or "") for r in rows or []} - {""}) for rows in (on_host, on_offers)]
+        # Each nominating query reads at most SELLER_CANDIDATE_CAP + 1 rows; their union is cut to the cap too.
+        union = sorted(set(nominated[0]) | set(nominated[1]))
+        truncated = any(len(n) > SELLER_CANDIDATE_CAP for n in nominated) or len(union) > SELLER_CANDIDATE_CAP
+        candidates = [m for m in union if not m.startswith(_OF_RECORD_PREFIX)][:SELLER_CANDIDATE_CAP]
+        if pinned and pinned not in candidates:
+            candidates.append(pinned)  # its live stock at the host must carry the cohort's brand (below)
         if why is None and candidates:
             live, why = await read(SELLER_LIVE_AT_HOST_SQL, {"ids": candidates, "hosts": hosts})
     if why:
@@ -1362,40 +1384,59 @@ async def _seller_identity_checks(job: Dict[str, Any], plan: Dict[str, Any],
     brands_of: Dict[str, List[Any]] = {}
     for r in live or []:
         brands_of.setdefault(str(r.get("merchant_id") or ""), []).append(r.get("brand"))
-    existing = {m: sorted({str(b) for b in brands if b}) for m, brands in brands_of.items()
-                if m and _sells_cohort_brand(brands, cohort)}
+    brands_of.pop("", None)
+    carry = {m: _brand_carry(brands, cohort) for m, brands in brands_of.items()}
+    named = {m: sorted({str(b) for b in brands if b}) for m, brands in brands_of.items()}
+    existing = {m: named[m] for m in carry if carry[m] == "cohort"}
     allowed = (set(planned["offers"]) | set(planned["of_record"])
                | {str(r.get("merchant_id") or "") for r in stored or []}
                | {str(r.get("merchant_id") or "") for r in claimed or []}
                | _stale_spelling_sellers(job))
     splits = sorted(m for m in existing if m not in allowed)
-    split_flags = detectors.seller_split_flags(host, splits, existing, planned)
+    # A live seller on the host whose stock names NO brand (NULL / blank) cannot be ruled out: never invisible.
+    unknown = sorted(m for m in carry if carry[m] == "unknown" and m not in allowed)
+    other_brand = sorted(m for m in carry if carry[m] == "other" and m not in allowed)
+    split_flags = (detectors.seller_split_flags(host, splits, existing, planned)
+                   + detectors.seller_brand_unknown_flags(host, unknown, named, planned))
     cap = SELLER_IDENTITY_LIST_CAP
     checks["seller_identity"] = {
-        "status": "split" if splits else "clear", "mode": mode, "host": host, "pinned": pinned,
-        "planned_offer_sellers": planned["offers"][:cap],
+        "status": "split" if splits else ("brand_unknown" if unknown else "clear"), "mode": mode, "host": host,
+        "pinned": pinned, "planned_offer_sellers": planned["offers"][:cap],
         "existing": {m: existing[m][:cap] for m in sorted(existing)[:cap]}, "split": splits[:cap],
+        "brand_unknown": unknown[:cap],
+        # Live on the host but selling only other brands (siblings, vanished vendors): recorded, never flagged.
+        "other_brand_sellers": {m: named[m][:cap] for m in other_brand[:cap]},
         "would_flag": [f["key"] for f in split_flags][:cap],
+        "candidates": len(candidates), "truncated": truncated,
         "planned_products": len(keys),
         "planned_products_existing": len({str(r.get("product_key") or "") for r in stored or []} - {""}),
     }
-    if splits:
+    if split_flags or truncated:
         logger.warning("retailer_ingest seller_identity %s", json.dumps(
-            {"job_id": job.get("id"), "host": host, "mode": mode, "status": "split", "split": splits[:cap],
+            {"job_id": job.get("id"), "host": host, "mode": mode, "status": checks["seller_identity"]["status"],
+             "split": splits[:cap], "brand_unknown": unknown[:cap], "truncated": truncated,
              "planned_offer_sellers": planned["offers"][:cap]}))
     flags = list(split_flags) if block else []
     if pinned:
-        # The pin names THIS store's seller: proven by its live offers on this very host (www./apex only). A seller
-        # with none here -- none at all, only on another host, or only on the apex when the job is a subdomain --
-        # is held for a look.
+        # The pin names THIS store's seller of THIS cohort's brand: proven by its live offers on this very host
+        # (www./apex only) carrying the brand. None here -- none at all, only on another host, only on the apex
+        # when the job is a subdomain -- holds; so does live stock here of another brand only (a sibling's seller)
+        # or of no named brand.
         live_hosts = sorted({_norm_host(r.get("host")) for r in pinned_hosts or []} - {""})
         checks["seller_identity"]["pinned_live_hosts"] = live_hosts[:cap]
+        checks["seller_identity"]["pinned_brand_carry"] = carry.get(pinned)
         if host not in live_hosts:
             flags.append({"key": f"seller_merchant_id_off_host:{pinned}", "rule": "seller_merchant_id_off_host",
                           "severity": detectors.BLOCK, "existing_merchant_id": pinned,
                           "detail": f"options.seller_merchant_id {pinned} has no live offer on {host} (live on "
                                     f"{live_hosts[:5] or 'no host'}): accept this key only if that seller really "
                                     f"is this store's"})
+        elif carry.get(pinned) != "cohort":
+            flags.append({"key": f"seller_merchant_id_other_brand:{pinned}", "rule": "seller_merchant_id_other_brand",
+                          "severity": detectors.BLOCK, "existing_merchant_id": pinned,
+                          "detail": f"options.seller_merchant_id {pinned} sells live on {host}, but none of that stock "
+                                    f"carries this cohort's brand (it carries {named.get(pinned, [])[:5] or 'no named brand'}): "
+                                    f"another brand's seller; accept this key only if it really is this brand's"})
     return flags
 
 

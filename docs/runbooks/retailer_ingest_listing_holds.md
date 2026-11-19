@@ -65,6 +65,11 @@ second seller.
   - A sibling brand on a shared host, or a vendor the store no longer lists. They sell another brand, so they are
     not this cohort's split. A per-host accept would also pre-accept every future split on that host, because
     accepted flags ride along to the next weekly run.
+- **A live seller whose rows name no brand** (and this cohort's on none) can't be ruled out. It is reported as
+  `seller_id_split_brand_unknown:<id>`, which blocks when the switch is on and can be accepted. Sellers that sell
+  only other named brands are recorded in `checks.seller_identity.other_brand_sellers`, never flagged.
+- Brands compare by `services.brand_spelling.brand_key`, which reads `&` as `and`.
+- At most 200 candidates are read per host. `checks.seller_identity.truncated` says when the cap was hit.
 - Retailer jobs are checked too. `source=shopify_markets` captures never reach the checks; the pin is refused there.
 
 **Default: shadow.** It holds only with `RETAILER_INGEST_SELLER_SPLIT_BLOCK_ENABLED=true`. Off, it records
@@ -78,7 +83,8 @@ WARNING line. It adds no flag, so verdicts are unchanged. Census those records b
   disagree. Every offer is written under it, and no offer-seller row is minted.
 - The pin must exist in `catalog_merchants`, otherwise the stage fails with `seller_merchant_id_unknown`.
 - The pin must also sell live on the job's own host (www./apex only, never a sibling subdomain), otherwise the job
-  holds with `seller_merchant_id_off_host`. `source_ref` is last-writer-wins and proves nothing.
+  holds with `seller_merchant_id_off_host`. That live stock must carry the cohort's brand, otherwise the job holds
+  with `seller_merchant_id_other_brand` (for example, a sibling brand's seller). `source_ref` is last-writer-wins and proves nothing.
 - These pin checks run in shadow mode too.
 - The pin is part of the cohort's scope (`db.retailer_ingest.scope_key`). So: cancel the open job, then re-enqueue
   with the pin. Otherwise the old lineage keeps being re-crawled.
