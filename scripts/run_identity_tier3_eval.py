@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """ADR-010 D-2 Phase C — the Tier-3 judge eval gate.
 
-Runs the judge over the gold-label fixture
-(reports/step5/tier3_eval_fixture_2026-07-10.json — 254 groups labeled by
-the step-5 human review) and computes the deployment gate:
+Runs the judge over the gold-label fixture (the 2026-07-10 tier-3 eval
+fixture, 254 groups labeled by the step-5 human review; captured store data,
+so it is kept off main in the private ops bundle and passed with --fixture)
+and computes the deployment gate:
 
   GATE: zero keep_separate-labeled groups judged 'collapse' at or above the
   confidence floor. Mis-merge is worse than fragmentation; until this is
@@ -40,14 +41,13 @@ from services.identity_tier3_judge import (  # noqa: E402
     judge_group,
 )
 
-FIXTURE = "reports/step5/tier3_eval_fixture_2026-07-10.json"
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--limit", type=int, default=0,
                         help="Judge only the first N of each label (smoke run)")
-    parser.add_argument("--fixture", default=FIXTURE)
+    parser.add_argument("--fixture", required=True,
+                        help="the gold-label fixture JSON (private ops bundle; not on main)")
     parser.add_argument("--sleep", type=float, default=0.3,
                         help="Pause between calls (rate-limit kindness)")
     args = parser.parse_args()
