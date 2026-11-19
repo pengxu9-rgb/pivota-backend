@@ -1826,7 +1826,10 @@ def _seed_merchant_display_name(seed_data: Dict[str, Any], domain: Optional[str]
 
 
 def _normalize_market(market: Optional[str]) -> str:
-    m = str(market or "").strip().upper()
+    # Absent (None / blank) reads as US, as before. Only an ASCII value is upper-cased: case mapping reads a
+    # look-alike ('ſg') as a real market ('SG'); a non-ASCII value stays as sent and matches no market.
+    m = str(market or "").strip()
+    m = m.upper() if m.isascii() else m
     return m or "US"
 
 
@@ -1843,7 +1846,7 @@ def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
         return "MARKET_REQUIRED"
     entry = market_registry.market_or_none(code)
     if entry is None:
-        return f"UNKNOWN_MARKET:{code}"
+        return f"UNKNOWN_MARKET:{market_registry.market_echo(code)}"
     if not entry["ingest"]:
         return f"MARKET_NOT_INGESTED:{code}"
     return None

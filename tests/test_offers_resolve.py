@@ -6770,7 +6770,11 @@ def _market_resolve(monkeypatch, client, market, *, send_market=True):
     return res, reads
 
 
-@pytest.mark.parametrize("market", ["USA", "EU-DE", "en-US", "U S", 123, ["US"], {"code": "US"}, True])
+@pytest.mark.parametrize("market", [
+    "USA", "EU-DE", "en-US", "U S", 123, ["US"], {"code": "US"}, True,
+    # Unicode look-alikes: case mapping reads 'ſg' as SG, 'uſ' as US, 'ﬁ' as FI. Two ASCII letters or nothing.
+    "ſg", "uſ", "ﬁ", "ＵＳ", "ｓｇ", "УС", "ıt",
+])
 def test_a_market_that_is_not_a_country_code_is_refused_by_name_before_any_read(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, market
 ) -> None:

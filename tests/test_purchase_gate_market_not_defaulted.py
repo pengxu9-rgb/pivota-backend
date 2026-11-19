@@ -72,6 +72,12 @@ def test_the_one_helper(raw: Any, expected: Any) -> None:
     assert iso2_market(raw) == expected
 
 
+@pytest.mark.parametrize("raw", ["uſ", "ﬁ", "ＵＳ", "ｕｓ", "УС", "ЅG", "ıt", "İT", "ſg"])
+def test_a_unicode_lookalike_is_no_market_code(raw: Any) -> None:
+    """The shape is checked BEFORE upcasing: case mapping turned 'uſ' into 'US' and 'ﬁ' into 'FI'."""
+    assert iso2_market(raw) is None
+
+
 def test_market_unknown_is_the_reason_literal() -> None:
     assert MARKET_UNKNOWN == "market_unknown"
 
