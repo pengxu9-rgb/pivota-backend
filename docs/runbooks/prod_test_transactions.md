@@ -72,6 +72,14 @@ A case's create, read-back and cancel all carry one token, so they share one buy
 
 The owner **enables** the test issuer binding in the developer portal before each go, and **disables** it (`DELETE …/identity-issuers/{id}`) after the run. The binding is registered with `authorized_party` = the token's `azp` and `required_scopes` = its `scope`. Between runs, even a leaked signing key plus the test agent key cannot act as a buyer.
 
+**The disable is not instant.** The gateway's issuer registry refreshes on its own TTL: about **60 s** normally, and up to **15 min** while the backend is unreachable (it serves a stale map). After disabling:
+1. Wait out that window.
+2. Confirm the binding is gone: the portal lists it as disabled, and the internal registry no longer returns it.
+
+Only then count the issuer as off.
+
+**`jti` gives no replay protection.** The gateway keeps no `jti` store; the token carries one for audit only. A token stays valid until its `exp` (5 min), so do not rely on `jti`. The bound is the short `exp` plus the binding toggle.
+
 ### Storefront carts expire ("accept expiry")
 
 A storefront checkout (`esc_…`) cannot be cancelled: the gateway refuses by design, and the seller's cart expires unpaid. Such ids are:
@@ -101,7 +109,7 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 ## What one run does
 
 1. The build copies the scripts from the release image, pinned by digest. It checks that the config is the release copy, and that the digest is the release tag's.
-2. **Gateway check.** The gateway must serve one revision at 100%. Each case's required flags must match the live plain values, and the path-4 cases need the live `PIVOTA_COMMIT_SHA` in `REVIEWED_GATEWAY_SHAS`. A later gateway release is added by a reviewed PR.
+2. **Gateway check.** The gateway must serve one revision at 100%. Each case's required flags must match the live plain values. The path-4 cases need the serving revision's **image digest** in `REVIEWED_GATEWAY_DIGESTS`: it is read from `revisions describe` `status.imageDigest`, not from the `PIVOTA_COMMIT_SHA` env, which a `deploy --image` can leave stale. Today that set holds `080d7297f` → `sha256:67a5940f…` and `7d650dce8` → `sha256:908df3e4…`. A later gateway image is added by a reviewed PR.
 3. **Lock.** `gs://pivota-prod-ops-locks/prod-test-transactions.lock`, create-only.
 4. **Run:**
    1. `oneoff_gate.py` must print `GATE_OPEN`. The job accepts a gate reading up to 300 s old.
@@ -111,17 +119,17 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
       - the issuer key, only for checkout cases.
 
       The gate, the cases and the run id are set.
-   3. The job is executed, and the launcher waits for it by name for **at most 900 s**. The run step has 2100 s, so the disarm always gets to run.
+   3. The job is executed, and the launcher waits for it by name for **at most 900 s**, counted from the run step's own start. 480 s stay reserved for cancel, its terminal poll and the disarm, inside the 2100 s step. If the wait runs out, the launcher **cancels** the execution, then disarms. The run is then not ok.
    4. **Disarm.** The job is redeployed with `--clear-secrets` and no gate or cases.
 5. **Publish.** `log.txt`, `rows.json` and `result.json` are written, create-only, to `gs://pivota-prod-ops-receipts/prod-test-transactions/<build id>/`.
    - The lock is released only when nothing can still run and the job is disarmed.
    - The build fails, naming them, if anything may be **left open**.
-   - **The shadow lookup (path 3) is advisory.** The gateway's line carries no request id or caller, so the check counts lines for the reviewed seller host (by hash) in the run window, plus 3 minutes, and never decides `ok`. A small gateway PR that adds the caller `agent_id` or a request id to the line would make it exact.
+   - **The shadow lookup (path 3) is advisory.** The gateway's line carries no request id or caller, and the job publishes no seller host, not even a hash (an unsalted host hash is reversible). So the check counts **every** shadow line in the run window, plus 3 minutes, and never decides `ok`. A small gateway PR that adds the caller `agent_id` or a request id to the line would make it exact.
 
 **Limits:**
 - 40 calls per run;
 - 3 calls reserved before every create (read back, cancel, read back);
-- a **total** 20 s deadline per call, because the MCP heartbeat would hold a per-read timeout open;
+- a **total** 45 s deadline per call, because the MCP heartbeat would hold a per-read timeout open. A cold storefront create reaches the seller's cart API. If one times out, its case is `unknown:<case>`, so expect a re-run of that case;
 - no retries, no redirects, `trust_env=False`;
 - `gateway.pivota.cc` only. Never `mcp.pivota.cc`, the public-read policy host.
 
@@ -143,7 +151,13 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 
 **Flags required:**
 - **Storefront cases:** `STRICT`, `MCP_STOREFRONT_ESCALATION` (on `/mcp`) or `UCP_TOOL_DOOR` + `UCP_ESCALATION` (on `/ucp/mcp`), `CURRENCY_FOLLOWS_MARKET` and `MERCHANT_PRICING`, all `1`. Also `SHOPIFY_CATALOG_ATTRIBUTION=shadow`, and `UCP_CART_REFERRAL` off.
-- **MCP-K-US:** `STRICT=1`.
+- **MCP-K-US:** `STRICT`, `MCP_STOREFRONT_ESCALATION` and `CURRENCY_FOLLOWS_MARKET`, all `1`, because `/mcp` declares `market` only while the storefront path is on.
+
+**What counts as "nothing created".** Only a 200 tool error whose code is a string other than `UNEXPECTED_ERROR` / `CHECKOUT_OUTCOME_UNKNOWN` / `INTERNAL_ERROR`. Any of these is `unknown:<case>`:
+- a JSON-RPC error such as the heartbeat's `-32603`;
+- a catch-all or unsure code;
+- a non-200;
+- an answer with no code.
 
 ## What the owner sets up (names only; no session reads or creates these)
 
@@ -157,7 +171,7 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 4. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` on those three secrets **only**, and nothing else.
 5. **Launcher (`sa-ops-launcher`):**
    - `roles/iam.serviceAccountUser` on `sa-prod-test-txn`;
-   - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`, created with this filter:
+   - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`. Check that no project-wide `roles/logging.viewer` is left on `sa-ops-launcher`. **Caveat:** the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`. Removing a project-wide viewer from `sa-ops-launcher` breaks that read unless the seed batch moves to a view too. Decide that before trimming. Create the view with this filter:
      ```
      (resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions")
      OR (resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"

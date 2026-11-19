@@ -17,7 +17,7 @@ from scripts.ops import prod_test_transactions_launch as launch
 RELEASE = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 BUILD = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
-GW_SHA = "080d7297f74e019fe5d88a25e78c3315ebdb080a"
+GW_DIGEST = "sha256:908df3e4b47324610fd535f0969c923f03aa63e145875a93c94e385885c5846d"
 CONFIG = Path(__file__).resolve().parents[1] / "infra" / "gcp" / "cloudbuild.prod_test_transactions.yaml"
 GATE = {"verdict": "GATE_OPEN", "observed_at": "2026-01-02T07:00:00+00:00", "summary": "s",
         "source": "scripts/ops/oneoff_gate.py", "cpu_peak_5m": 0.05, "db_job_executions_running": 0}
@@ -60,8 +60,9 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
                                             "_TARGETS_VERSION", "_USER_KEY_VERSION", "_GO_REFERENCE"}
     run_step = int(steps["run"]["timeout"].rstrip("s"))
-    # gate (420) + arm deploy and execute (<= 300) + the wait + the disarm (<= 300) must fit inside the run step.
-    assert 420 + 300 + launch.EXECUTION_DEADLINE_SECONDS + 300 <= run_step
+    assert run_step == launch.RUN_STEP_SECONDS
+    # gate (420) + arm deploy and execute (<= 300) + the wait + cancel/disarm reserve must fit inside the run step.
+    assert 420 + 300 + launch.EXECUTION_DEADLINE_SECONDS + launch.DISARM_RESERVE_SECONDS <= run_step
     assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
 
 
@@ -117,9 +118,9 @@ def test_spec_refusals():
         spec(["NOPE"])
 
 
-def service(flags=None, *, traffic=None, commit=GW_SHA):
+def service(flags=None, *, traffic=None):
     env = [{"name": k, "value": v} for k, v in (flags or {}).items()]
-    env.append({"name": "PIVOTA_COMMIT_SHA", "value": commit})
+    env.append({"name": "PIVOTA_COMMIT_SHA", "value": "7d650dce841828059c060a7593992478ddf4f11d"})   # never trusted
     env.append({"name": "SECRET_THING", "valueFrom": {"secretKeyRef": {"name": "s", "key": "latest"}}})
     return {"metadata": {"generation": 7},
             "spec": {"template": {"spec": {"containers": [{"env": env}]}}},
@@ -128,23 +129,74 @@ def service(flags=None, *, traffic=None, commit=GW_SHA):
                        "observedGeneration": 7, "conditions": [{"type": "Ready", "status": "True"}]}}
 
 
-def test_gateway_reading_names_the_gateway_and_reads_only_plain_values():
-    revision, commit, flags = launch.gateway_reading(service({"AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1"}))
-    assert revision == "gateway-1" and commit == GW_SHA
+def revision_doc(digest=GW_DIGEST, name="gateway-1"):
+    return {"metadata": {"name": name},
+            "status": {"imageDigest": f"us-west1-docker.pkg.dev/pivota-shared/pivota/gateway@{digest}"}}
+
+
+def test_gateway_reading_takes_the_serving_images_digest_not_the_commit_env():
+    revision, digest, flags = launch.gateway_reading(service({"AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1"}),
+                                                     revision_doc())
+    assert revision == "gateway-1" and digest == GW_DIGEST
     assert flags["AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET"] == "1" and "SECRET_THING" not in flags
+    with pytest.raises(launch.LaunchRefused, match="not the serving one"):
+        launch.gateway_reading(service(), revision_doc(name="gateway-0"))
     split = [{"revisionName": "gateway-1", "percent": 50}, {"revisionName": "gateway-0", "percent": 50}]
     with pytest.raises(launch.LaunchRefused, match="the gateway must serve one revision"):
-        launch.gateway_reading(service(traffic=split))
+        launch.gateway_reading(service(traffic=split), revision_doc())
 
 
-def test_the_gateway_step_refuses_path_four_on_an_unreviewed_gateway(monkeypatch, tmp_path):
-    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(service(commit="c" * 40)))
+def test_the_gateway_step_refuses_path_four_on_an_unreviewed_image(monkeypatch, tmp_path):
+    answers = {"services": json.dumps(service()), "revisions": json.dumps(revision_doc("sha256:" + "c" * 64))}
+    monkeypatch.setattr(launch, "run", lambda args, **kw: answers[args[2]])
     args = type("A", (), {"cases": "OR-DE"})()
     with pytest.raises(job.CaseError, match="reviewed against"):
-        launch.cmd_gateway(args)
-    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(service()))
+        launch.cmd_gateway(args)            # even though PIVOTA_COMMIT_SHA names a reviewed commit
+    answers["revisions"] = json.dumps(revision_doc())
     launch.cmd_gateway(args)
-    assert json.loads((tmp_path / "gateway.json").read_text())["commit"] == GW_SHA
+    reading = json.loads((tmp_path / "gateway.json").read_text())
+    assert reading["digest"] == GW_DIGEST and reading["reviewed_commit"].startswith("7d650dce8")
+
+
+def test_the_wait_budget_counts_from_the_step_start():
+    assert launch.wait_budget(0, 0) == launch.EXECUTION_DEADLINE_SECONDS
+    late = launch.RUN_STEP_SECONDS - launch.DISARM_RESERVE_SECONDS - 100
+    assert launch.wait_budget(0, late) == 100                      # a slow gate + deploy shortens the wait
+    assert launch.wait_budget(0, launch.RUN_STEP_SECONDS) == 0
+
+
+def test_a_wait_that_runs_out_cancels_the_execution_then_disarms(monkeypatch, tmp_path):
+    (tmp_path / "lock.held").write_text(BUILD)
+    (tmp_path / "gateway.json").write_text("{}")
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args[:5])
+        if args[:4] == ["gcloud", "run", "jobs", "execute"]:
+            return "prod-test-transactions-abc12\n"
+        return ""
+
+    monkeypatch.setattr(launch, "run", fake_run)
+    monkeypatch.setattr(launch.sbl, "gate_json", lambda out, code, now: GATE)
+    monkeypatch.setattr(launch.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "", "returncode": 0})())
+    monkeypatch.setattr(launch.sbl, "list_executions", lambda job_name: [])
+    waits = []
+
+    def fake_wait(name, *, deadline, **kw):
+        waits.append(deadline)
+        return None if len(waits) == 1 else "EXECUTION_CANCELLED"
+
+    monkeypatch.setattr(launch, "wait_for_execution", fake_wait)
+    args = type("A", (), {"cases": "OR-DE", "release": RELEASE, "digest": DIGEST, "key_version": "4",
+                          "targets_version": "7", "user_key_version": "", "go_reference": "Dark flag session 02:10Z",
+                          "scripts": "/x"})()
+    with pytest.raises(launch.LaunchRefused, match="cancelled"):
+        launch.cmd_run(args, monotonic=lambda: 0.0)
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["cancel_requested"] is True and state["state"] == "EXECUTION_CANCELLED" and state["disarmed"] is True
+    assert ["gcloud", "run", "jobs", "executions", "cancel"] in calls
+    assert waits == [launch.EXECUTION_DEADLINE_SECONDS, launch.CANCEL_POLL_SECONDS]
+    assert calls[-1][:4] == ["gcloud", "run", "jobs", "deploy"]               # the disarm came after the cancel
 
 
 def test_the_wait_gives_up_inside_its_deadline():
@@ -206,20 +258,18 @@ def test_expiring_storefront_carts_are_listed_and_the_shadow_check_is_advisory()
     assert result["ok"] is True and result["expires_on_seller"] == ["esc_#1"] and result["shadow_lookup"]["lines"] == 0
 
 
-def test_shadow_check_counts_only_the_reviewed_seller_host_and_never_decides():
+def test_shadow_check_is_advisory_and_counts_every_line_in_the_window():
     rows = [{**case_row("MCP-SF-US"), "shadow_lookup": True}, {**case_row("UCP-SF-US"), "shadow_lookup": True}]
-    ours = {"mode": "shadow", "sent": False, "reason": "skipped:no_variant", "seller_host_sha256": HOST_SHA}
-    other = {**ours, "seller_host_sha256": "f" * 64}
-    result = launch.shadow_check(rows, [ours, ours, other, other], HOST_SHA)
-    assert result == {"advisory": True, "wanted": 2, "lines": 2, "all_shadow_unsent": True,
-                      "reasons": ["skipped:no_variant"]}
-    assert launch.shadow_check(rows, [ours, {**ours, "sent": True}], HOST_SHA)["all_shadow_unsent"] is False
-    assert launch.shadow_check(rows, [ours, {**ours, "mode": "enforce"}], HOST_SHA)["all_shadow_unsent"] is False
-    assert launch.shadow_check(rows, None, HOST_SHA)["lines"] is None
-    assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], [], HOST_SHA) is None
+    line = {"mode": "shadow", "sent": False, "reason": "skipped:no_variant"}
+    assert launch.shadow_check(rows, [line, line, line]) == {"advisory": True, "wanted": 2, "lines": 3,
+                                                             "all_shadow_unsent": True, "reasons": ["skipped:no_variant"]}
+    assert launch.shadow_check(rows, [line, {**line, "sent": True}])["all_shadow_unsent"] is False
+    assert launch.shadow_check(rows, [line, {**line, "mode": "enforce"}])["all_shadow_unsent"] is False
+    assert launch.shadow_check(rows, None)["lines"] is None
+    assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], []) is None
 
 
-def test_shadow_lines_keep_only_the_host_hash(monkeypatch):
+def test_shadow_lines_keep_no_host(monkeypatch):
     entries = [{"jsonPayload": {"mode": "shadow", "sent": False, "reason": "r", "seller_host": "shop.reviewed.example",
                                 "lines": [{"variant": "gid://x"}]}}]
     seen = {}
@@ -230,7 +280,7 @@ def test_shadow_lines_keep_only_the_host_hash(monkeypatch):
 
     monkeypatch.setattr(launch, "run", fake_run)
     lines = launch.read_shadow_lines("2026-01-02T07:00:00+00:00", "2026-01-02T07:05:00+00:00")
-    assert lines == [{"mode": "shadow", "sent": False, "reason": "r", "seller_host_sha256": HOST_SHA}]
+    assert lines == [{"mode": "shadow", "sent": False, "reason": "r"}]
     assert flag(seen["args"], "--view") == "prod-test-transactions" and flag(seen["args"], "--bucket") == "_Default"
 
 
@@ -271,7 +321,7 @@ def test_publish_keeps_the_lock_while_the_job_may_still_be_armed(monkeypatch, tm
 
 def test_publish_records_the_targets_sha_and_an_advisory_shadow_result(monkeypatch, tmp_path):
     rows = [{**case_row("MCP-SF-US", expires=["esc_#1"])},
-            {"kind": "run", "ok": True, "targets_sha256": "d" * 64, "seller_host_sha256": HOST_SHA}]
+            {"kind": "run", "ok": True, "targets_sha256": "d" * 64}]
     state = {**DONE, "armed": True, "disarmed": True, "execute_attempted": True, "executions_pre_arm": [],
              "started_at": "2026-01-02T07:00:00+00:00", "finished_at": "2026-01-02T07:05:00+00:00"}
     written, args = publish(monkeypatch, tmp_path, rows, state)

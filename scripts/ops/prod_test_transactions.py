@@ -76,17 +76,24 @@ GATEWAY_BASE = "https://gateway.pivota.cc"        # never mcp.pivota.cc (the pub
 ALLOWED_HOSTS = frozenset({"gateway.pivota.cc"})
 MAX_CALLS_PER_RUN = 40
 CHECKOUT_RESERVE_CALLS = 3      # read back + cancel + read back, reserved before every create
-CALL_TIMEOUT_SECONDS = 20.0     # a TOTAL per call: the MCP heartbeat would keep a per-read timeout open
+CALL_TIMEOUT_SECONDS = 45.0     # a TOTAL per call (the MCP heartbeat would keep a per-read timeout open); a cold
+                                # storefront create reaches the seller's cart API, so 20 s was tight
 MAX_BODY_BYTES = 2_000_000
 MAX_SCALAR_CHARS = 120
-# Gateway releases whose answers the read cases were reviewed against: path 4's market refusals need gw#2602
-# (c2ce318d2) and be#2848. A new gateway sha is added here by a reviewed PR before the cases run on it.
-# 7d650dce8 (gw#2603 + gw#2604, live 2026-11-19 03:07Z): readOffersResolveMarket reads the same three carriers by the
-# same rule (first readable two-ASCII code wins; any sent-but-unreadable -> market_invalid; unpriced ->
-# market_not_priced; nothing sent -> no market), so every OR-* expected answer holds; merchantPurchasabilityClient
-# is unchanged between the two.
-REVIEWED_GATEWAY_SHAS = frozenset({"080d7297f74e019fe5d88a25e78c3315ebdb080a",
-                                   "7d650dce841828059c060a7593992478ddf4f11d"})
+# Gateway IMAGES (by the serving revision's digest, not its PIVOTA_COMMIT_SHA env, which a `deploy --image` can leave
+# stale) whose answers the read cases were reviewed against: path 4's market refusals need gw#2602 (c2ce318d2) and
+# be#2848. A new gateway image is added here by a reviewed PR before the cases run on it.
+#   080d7297f (gw#2601 + gw#2602 + gw#2605)
+#   7d650dce8 (gw#2603 + gw#2604, live 2026-11-19 03:07Z): readOffersResolveMarket reads the same three carriers by
+#     the same rule (first readable two-ASCII code wins; sent-but-unreadable -> market_invalid; unpriced ->
+#     market_not_priced; nothing sent -> no market); merchantPurchasabilityClient is unchanged, so every OR-* holds.
+REVIEWED_GATEWAY_DIGESTS = {
+    "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31": "080d7297f74e019fe5d88a25e78c3315ebdb080a",
+    "sha256:908df3e4b47324610fd535f0969c923f03aa63e145875a93c94e385885c5846d": "7d650dce841828059c060a7593992478ddf4f11d",
+}
+# Tool-error codes after which a checkout MAY exist (the gateway failed inside, or does not know): never "nothing
+# created". A JSON-RPC (numeric) error, e.g. the heartbeat's -32603, counts the same.
+UNSURE_ERROR_CODES = frozenset({"UNEXPECTED_ERROR", "CHECKOUT_OUTCOME_UNKNOWN", "INTERNAL_ERROR"})
 
 
 class CaseError(ValueError):
@@ -162,7 +169,7 @@ class Case:
     storefront: bool = False       # a storefront create: the continue_url host must be the reviewed seller host
     shadow_lookup: bool = False    # a US storefront create: the shadow catalog lookup runs (advisory check)
     enabled: bool = True
-    reviewed_gateway: bool = False  # the expected answers hold only on REVIEWED_GATEWAY_SHAS
+    reviewed_gateway: bool = False  # the expected answers hold only on REVIEWED_GATEWAY_DIGESTS
 
 
 OFF = (None, "", "0")  # an on/off flag that must be OFF
@@ -244,8 +251,11 @@ CASES: tuple[Case, ...] = (
            STOREFRONT_FLAGS_MCP, False, False),
           ("MCP-SF-USA", "storefront", "USA", "USA", {"is_error": True, "data.error.code": "INVALID_ARGUMENTS"},
            STOREFRONT_FLAGS_MCP, False, False),
+          # `market` is declared on /mcp only while the storefront path is on: the same flags, without shadow/referral.
           ("MCP-K-US", "kernel", "US", "US", {"is_error": False, "data.status": "ready_for_payment",
-                                             "data.currency": "USD"}, {"AGENT_CHECKOUT_STRICT": "1"}, False, False),
+                                             "data.currency": "USD"},
+           {"AGENT_CHECKOUT_STRICT": "1", "AGENT_CHECKOUT_MCP_STOREFRONT_ESCALATION_ENABLED": "1",
+            "AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET": "1"}, False, False),
       )],
     # Path 1: /ucp/mcp create_checkout, the currency rule (step 1) on the storefront seller.
     *[Case(cid, "/ucp/mcp", "checkout", "create_checkout", _ucp_checkout(country), label, expected,
@@ -306,10 +316,11 @@ def require_flags(cases: list[Case], flags: dict) -> None:
                     f"case {case.case_id} needs {name}={allowed}; gateway has {flags.get(name)!r}")
 
 
-def require_reviewed_gateway(cases: list[Case], gateway_sha: str | None) -> None:
+def require_reviewed_gateway(cases: list[Case], gateway_digest: str | None) -> None:
     for case in cases:
-        require(not case.reviewed_gateway or gateway_sha in REVIEWED_GATEWAY_SHAS,
-                f"case {case.case_id} was reviewed against {sorted(REVIEWED_GATEWAY_SHAS)}; gateway is {gateway_sha!r}")
+        require(not case.reviewed_gateway or gateway_digest in REVIEWED_GATEWAY_DIGESTS,
+                f"case {case.case_id} was reviewed against the gateway images {sorted(REVIEWED_GATEWAY_DIGESTS)}; "
+                f"the serving image is {gateway_digest!r}")
 
 
 # ------------------------------------------------------------------ request guards: schema allowlist + denylist
@@ -559,6 +570,15 @@ CHECKOUT_DOORS = {
 }
 
 
+def nothing_created(status: int, answer: Any) -> bool:
+    """A create refused by name: HTTP 200, a tool error, and a STRING code that is not an unsure one. A heartbeat
+    200 that later failed inside ({"error":{"code":-32603}}) or the catch-all UNEXPECTED_ERROR may follow a minted
+    quote: not this."""
+    code = dig(answer, "data.error.code")
+    return (status == 200 and isinstance(answer, dict) and answer.get("is_error") is True
+            and isinstance(code, str) and bool(code) and code not in UNSURE_ERROR_CODES)
+
+
 def continue_host(answer: Any) -> str | None:
     url = dig(answer, "data.continue_url")
     return urlsplit(url).hostname if isinstance(url, str) else None
@@ -587,10 +607,9 @@ def run_checkout(case: Case, request: dict, transport: Transport, run_id: str, r
     row["got"] = got
     session_id = dig(answer, door["id"])
     if not (status == 200 and isinstance(session_id, str) and session_id):
-        refused = status == 200 and isinstance(answer, dict) and answer.get("is_error") is True
-        if not refused:
-            row["left_open"] = [f"unknown:{case.case_id}"]   # a 5xx, an unreadable 200 or an id we cannot see
-        row["pass"] = refused and matches(case.expected, got)
+        if not nothing_created(status, answer):
+            row["left_open"] = [f"unknown:{case.case_id}"]   # a 5xx, an unreadable 200, an unsure error, no visible id
+        row["pass"] = nothing_created(status, answer) and matches(case.expected, got)
         return
     sid = report_id(session_id)
     row["created"], row["left_open"] = [sid], [sid]
@@ -691,7 +710,6 @@ def run_all(cases: list[Case], transport: Transport, run_id: str, targets: Targe
     summary = {"kind": "run", "ok": bool(rows) and all(r["pass"] for r in rows) and not left_open,
                "cases": len(rows), "passed": sum(1 for r in rows if r["pass"]), "calls": transport.calls,
                "left_open": left_open, "targets_sha256": TARGETS_SHA256,
-               "seller_host_sha256": hashlib.sha256(targets.storefront["host"].encode()).hexdigest(),
                "expires_on_seller": sorted({ref for r in rows for ref in r.get("expires_on_seller") or []})}
     out(summary)
     return summary

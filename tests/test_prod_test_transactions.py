@@ -17,7 +17,7 @@ KEY = "ak_" + "1" * 64
 RUN_ID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 RELEASE = "a" * 40
 NOW = datetime(2026, 1, 2, 7, 0, tzinfo=timezone.utc)
-GW_SHA = "080d7297f74e019fe5d88a25e78c3315ebdb080a"
+GW_DIGEST = "sha256:908df3e4b47324610fd535f0969c923f03aa63e145875a93c94e385885c5846d"   # 7d650dce8
 TARGETS_DOC = {
     "offers_product_id": "prod_test_reviewed_0001",
     "kernel_test_merchant": {"merchant_id": "merch_test_reviewed", "product_id": "prod_k_1", "variant_id": "var_k_1"},
@@ -160,13 +160,15 @@ def test_flags_must_match_and_cart_referral_must_be_off():
             job.require_flags(cases, {**LIVE_FLAGS, name: value})
 
 
-def test_path_four_needs_a_reviewed_gateway_release():
+def test_path_four_needs_a_reviewed_gateway_image_by_digest():
     cases = job.select_cases("OR-DE,MCP-K-US")
-    job.require_reviewed_gateway(cases, GW_SHA)
-    job.require_reviewed_gateway(cases, "7d650dce841828059c060a7593992478ddf4f11d")   # gw#2603 + gw#2604, re-checked
-    for sha in (None, "2b9aa03bac6137f7f689c67f7315e6ed3d4680e5"):
+    job.require_reviewed_gateway(cases, GW_DIGEST)
+    job.require_reviewed_gateway(cases, "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31")
+    assert set(job.REVIEWED_GATEWAY_DIGESTS.values()) == {"080d7297f74e019fe5d88a25e78c3315ebdb080a",
+                                                          "7d650dce841828059c060a7593992478ddf4f11d"}
+    for digest in (None, "sha256:" + "0" * 64, "7d650dce841828059c060a7593992478ddf4f11d"):   # a commit is not a digest
         with pytest.raises(job.CaseError, match="reviewed against"):
-            job.require_reviewed_gateway(cases, sha)
+            job.require_reviewed_gateway(cases, digest)
     job.require_reviewed_gateway(job.select_cases("MCP-K-US"), None)   # checkout cases are not pinned this way
 
 
@@ -441,6 +443,12 @@ def test_the_cancel_note_carries_no_answer_content():
     (502, b"bad gateway"),
     (200, b"event: message\ndata: {...}"),                          # unreadable 200
     (200, mcp_answer({"status": "ready_for_payment"})),             # created, id not where we read it
+    # V3-P2-1: a failure INSIDE the gateway after the heartbeat committed the 200 may follow a minted quote.
+    (200, b'\n\n{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal"}}'),
+    (200, mcp_answer({"error": {"code": "UNEXPECTED_ERROR"}}, True)),
+    (200, mcp_answer({"error": {"code": "CHECKOUT_OUTCOME_UNKNOWN"}}, True)),
+    (200, mcp_answer({"error": {}}, True)),                         # no code at all
+    (500, mcp_answer({"error": {"code": "NO_MERCHANT_OFFER", "detail": {"reason": "market_not_priced"}}}, True)),
 ])
 def test_a_create_whose_outcome_cannot_be_read_is_an_unknown_left_open(create_answer):
     fake = FakeGateway([create_answer])
@@ -448,6 +456,24 @@ def test_a_create_whose_outcome_cannot_be_read_is_an_unknown_left_open(create_an
     summary = job.run_all([case("MCP-K-US")], transport(fake), RUN_ID, TARGETS, out=rows.append, signer=sign)
     assert rows[0]["pass"] is False and rows[0]["left_open"] == ["unknown:MCP-K-US"]
     assert summary["ok"] is False and len(fake.calls) == 1                                   # no retry on create
+
+
+def test_only_a_200_named_refusal_counts_as_nothing_created():
+    assert job.nothing_created(200, {"is_error": True, "data": {"error": {"code": "NO_MERCHANT_OFFER"}}})
+    assert job.nothing_created(200, {"is_error": True, "data": {"error": {"code": "USER_AUTH_REQUIRED"}}})
+    for status, answer in ((500, {"is_error": True, "data": {"error": {"code": "NO_MERCHANT_OFFER"}}}),
+                           (200, {"is_error": True, "data": {"error": {"code": -32603}}}),
+                           (200, {"is_error": True, "data": {"error": {"code": "UNEXPECTED_ERROR"}}}),
+                           (200, {"is_error": False, "data": {}}), (200, {"unparsed": True}), (200, None)):
+        assert not job.nothing_created(status, answer)
+
+
+def test_the_kernel_case_needs_the_flags_that_declare_market_on_mcp():
+    flags = case("MCP-K-US").requires_flags
+    assert flags["AGENT_CHECKOUT_MCP_STOREFRONT_ESCALATION_ENABLED"] == "1"
+    assert flags["AGENT_CHECKOUT_UCP_CURRENCY_FOLLOWS_MARKET"] == "1"
+    with pytest.raises(job.CaseError):
+        job.require_flags([case("MCP-K-US")], {**LIVE_FLAGS, "AGENT_CHECKOUT_MCP_STOREFRONT_ESCALATION_ENABLED": None})
 
 
 def test_a_create_refused_before_sending_is_not_unknown():
@@ -613,8 +639,9 @@ def test_main_runs_the_selected_cases_and_reports_only_shas(capsys, mounts):
     code, rows, out = run_main(capsys, mounts, armed_env(), fake)
     assert code == 0 and len(fake.calls) == 2 and [r["kind"] for r in rows] == ["case", "case", "run"]
     assert rows[-1]["ok"] is True and rows[-1]["targets_sha256"] == TARGETS_SHA
-    assert rows[-1]["seller_host_sha256"] == hashlib.sha256(b"shop.reviewed.example").hexdigest()
-    assert "shop.reviewed.example" not in out and "merch_obs_reviewed" not in out
+    assert "seller_host_sha256" not in rows[-1]                      # an unsalted host hash is reversible: none at all
+    host_sha = hashlib.sha256(b"shop.reviewed.example").hexdigest()
+    assert "shop.reviewed.example" not in out and "merch_obs_reviewed" not in out and host_sha not in out
 
 
 def test_the_key_token_and_pem_never_leave_the_job_even_when_every_call_fails(capsys, mounts):

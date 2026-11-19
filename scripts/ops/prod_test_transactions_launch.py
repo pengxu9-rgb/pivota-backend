@@ -59,9 +59,13 @@ LOG_LOCATION = "global"
 LOG_VIEW = "prod-test-transactions"
 WORK = Path(os.getenv("PROD_TEST_TXN_WORKDIR", "/workspace/prod-test-transactions"))
 TASK_TIMEOUT_SECONDS = 600
-# The run step has 2100 s: gate (<= 420) + arm deploy + this wait + disarm must fit, or Cloud Build kills the step
-# before the disarm and the job keeps its keys mounted.
+# The run step has RUN_STEP_SECONDS (the yaml's `run` timeout). The wait is budgeted FROM THE STEP'S START, leaving
+# DISARM_RESERVE_SECONDS for cancel (60) + its terminal poll (CANCEL_POLL_SECONDS) + the disarm deploy (300), so a slow
+# gate or deploy can never push the disarm past the step's end and leave the keys mounted.
+RUN_STEP_SECONDS = 2100
 EXECUTION_DEADLINE_SECONDS = 900
+CANCEL_POLL_SECONDS = 120
+DISARM_RESERVE_SECONDS = 60 + CANCEL_POLL_SECONDS + 300
 EXECUTION_POLL_SECONDS = 15
 
 LaunchRefused = sbl.LaunchRefused
@@ -109,12 +113,17 @@ def serving_revision(service: dict) -> str:
     return revision
 
 
-def gateway_reading(service: dict) -> tuple[str, str | None, dict]:
-    """The gateway's ONE serving revision, its commit, and the plain values of the flags the cases depend on."""
+def gateway_reading(service: dict, revision_doc: dict) -> tuple[str, str | None, dict]:
+    """The gateway's ONE serving revision, the image digest that revision RUNS (status.imageDigest; not the
+    PIVOTA_COMMIT_SHA env, which a `deploy --image` can leave stale), and the plain values of the cases' flags."""
     revision = serving_revision(service)
+    require(revision_doc.get("metadata", {}).get("name") == revision, "the revision read is not the serving one")
+    digest = str(revision_doc.get("status", {}).get("imageDigest") or "")
+    digest = digest.rsplit("@", 1)[-1] if "@" in digest else None
+    require(digest is None or re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "the serving image digest is unreadable")
     container, = service["spec"]["template"]["spec"]["containers"]
     env = {e["name"]: e.get("value") for e in container.get("env", []) if "value" in e}
-    return revision, env.get("PIVOTA_COMMIT_SHA"), {name: env.get(name) for name in job.GATEWAY_FLAG_NAMES}
+    return revision, digest, {name: env.get(name) for name in job.GATEWAY_FLAG_NAMES}
 
 
 def needs_user_key(cases: list[str]) -> bool:
@@ -156,19 +165,18 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
 
 
-def shadow_check(case_rows: list[dict], lines: list[dict] | None, seller_host_sha256: str | None) -> dict | None:
-    """Path 3, ADVISORY: the gateway's shadow lookup lines for the reviewed seller host in the run's window. The line
-    carries no request id or caller, so another caller's cart at the same store can be counted: this never decides
-    `ok`. None when no US storefront create passed."""
+def shadow_check(case_rows: list[dict], lines: list[dict] | None) -> dict | None:
+    """Path 3, ADVISORY: every gateway shadow lookup line in the run's window. The line carries no request id or
+    caller and the job publishes no seller host (not even a hash: an unsalted host hash is reversible), so other
+    callers' lines are counted too: this never decides `ok`. None when no US storefront create passed."""
     wanted = [r for r in case_rows if r.get("shadow_lookup") and r.get("pass") is True]
     if not wanted:
         return None
-    if lines is None or not seller_host_sha256:
+    if lines is None:
         return {"advisory": True, "wanted": len(wanted), "lines": None, "note": "the shadow lines could not be read"}
-    ours = [line for line in lines if line.get("seller_host_sha256") == seller_host_sha256]
-    return {"advisory": True, "wanted": len(wanted), "lines": len(ours),
-            "all_shadow_unsent": all(line.get("mode") == "shadow" and line.get("sent") is False for line in ours),
-            "reasons": sorted({str(line.get("reason")) for line in ours})}
+    return {"advisory": True, "wanted": len(wanted), "lines": len(lines),
+            "all_shadow_unsent": all(line.get("mode") == "shadow" and line.get("sent") is False for line in lines),
+            "reasons": sorted({str(line.get("reason")) for line in lines})}
 
 
 def summarise(rows: list[dict], *, run_state: dict, bad_lines: list[str], lock: str, cases: list[str],
@@ -206,11 +214,15 @@ def cmd_gateway(args) -> None:
     cases = job.select_cases(args.cases)
     service = json.loads(run(["gcloud", "run", "services", "describe", "gateway", "--project", PROJECT,
                               "--region", REGION, "--format", "json"]))
-    revision, commit, flags = gateway_reading(service)
+    revision_doc = json.loads(run(["gcloud", "run", "revisions", "describe", serving_revision(service), "--project",
+                                   PROJECT, "--region", REGION, "--format", "json"]))
+    revision, digest, flags = gateway_reading(service, revision_doc)
     job.require_flags(cases, flags)
-    job.require_reviewed_gateway(cases, commit)
-    (WORK / "gateway.json").write_text(json.dumps({"revision": revision, "commit": commit, "flags": flags}))
-    print("gateway serving revision:", revision, "commit:", commit, "flags:", json.dumps(flags, sort_keys=True))
+    job.require_reviewed_gateway(cases, digest)
+    commit = job.REVIEWED_GATEWAY_DIGESTS.get(digest)
+    (WORK / "gateway.json").write_text(json.dumps({"revision": revision, "digest": digest, "reviewed_commit": commit,
+                                                   "flags": flags}))
+    print("gateway serving revision:", revision, "digest:", digest, "flags:", json.dumps(flags, sort_keys=True))
 
 
 def lock_url() -> str:
@@ -240,8 +252,15 @@ def release_lock() -> str:
     return f"lock {generation} released"
 
 
-def wait_for_execution(name: str, *, sleep=None, monotonic=None) -> str | None:
-    """Poll BY NAME to a terminal state, at most EXECUTION_DEADLINE_SECONDS (well inside the run step's timeout)."""
+def wait_budget(step_started: float, now: float) -> float:
+    """Seconds the wait may take: at most EXECUTION_DEADLINE_SECONDS, and never past the point where cancel + disarm
+    still fit inside the run step."""
+    return max(0.0, min(EXECUTION_DEADLINE_SECONDS, RUN_STEP_SECONDS - DISARM_RESERVE_SECONDS - (now - step_started)))
+
+
+def wait_for_execution(name: str, *, deadline: float = EXECUTION_DEADLINE_SECONDS, sleep=None,
+                       monotonic=None) -> str | None:
+    """Poll BY NAME to a terminal state for at most `deadline` seconds."""
     sleep, monotonic = sleep or time.sleep, monotonic or time.monotonic
     started = monotonic()
     while True:
@@ -253,9 +272,20 @@ def wait_for_execution(name: str, *, sleep=None, monotonic=None) -> str | None:
                 return state
         except (LaunchRefused, subprocess.TimeoutExpired, ValueError):
             pass
-        if monotonic() - started > EXECUTION_DEADLINE_SECONDS:
+        if monotonic() - started + EXECUTION_POLL_SECONDS > deadline:
             return None
         sleep(EXECUTION_POLL_SECONDS)
+
+
+def cancel_execution(name: str, state: dict, *, wait=None) -> None:
+    """The wait ran out: cancel the execution, so the disarm may follow, and poll briefly for its terminal state."""
+    state["cancel_requested"] = True
+    try:
+        run(["gcloud", "run", "jobs", "executions", "cancel", name, "--project", PROJECT, "--region", REGION,
+             "--quiet"], timeout=60)
+    except Exception as error:  # noqa: BLE001 - recorded; the disarm still runs
+        state["cancel_error"] = f"{type(error).__name__}: {error}"[:200]
+    state["state"] = (wait or wait_for_execution)(name, deadline=CANCEL_POLL_SECONDS)
 
 
 def spec_inputs(args) -> dict:
@@ -267,7 +297,9 @@ def spec_inputs(args) -> dict:
             "user_key_version": parse_version(args.user_key_version, "_USER_KEY_VERSION") if user else None}
 
 
-def cmd_run(args) -> None:
+def cmd_run(args, *, monotonic=None) -> None:
+    monotonic = monotonic or time.monotonic
+    step_started = monotonic()
     state = {"execution": None, "state": None, "error": None, "execute_attempted": False, "armed": False}
     path = WORK / "run.json"
     path.write_text(json.dumps(state))
@@ -307,16 +339,22 @@ def cmd_run(args) -> None:
             require(state["execution"] is not None,
                     "execute failed and exactly one execution since arming could not be found: lock stays held")
         path.write_text(json.dumps(state))
-        state["state"] = wait_for_execution(state["execution"])
+        state["state"] = wait_for_execution(state["execution"], deadline=wait_budget(step_started, monotonic()))
+        if state["state"] is None:
+            cancel_execution(state["execution"], state)
         state["finished_at"] = datetime.now(timezone.utc).isoformat()
         path.write_text(json.dumps(state))
+        require(not state.get("cancel_requested"), "the execution ran past its budget and was cancelled")
         require(state["state"] is not None, "the execution did not reach a terminal state before the deadline")
     except Exception as error:  # noqa: BLE001 - publish reads run.json whatever happened
         state["error"] = f"{type(error).__name__}: {error}"[:500]
         path.write_text(json.dumps(state))
         raise
     finally:
-        if state["armed"] and (not state["execute_attempted"] or state["state"] is not None):
+        # Disarm once nothing new can start: execute never attempted, the execution is terminal, or it was cancelled
+        # (a running execution keeps what it mounted; the disarm stops any NEW one from mounting the keys).
+        if state["armed"] and (not state["execute_attempted"] or state["state"] is not None
+                               or state.get("cancel_requested")):
             try:
                 run(job_spec_args(**common, cases=[], key_version=1, targets_version=1, gate=None, armed=False))
                 state["disarmed"] = True
@@ -353,7 +391,7 @@ def read_log(execution: str, *, sleep=None, monotonic=None) -> tuple[str, str | 
 
 def read_shadow_lines(started_at: str, finished_at: str) -> list[dict] | None:
     """The gateway's shadow lookup lines in the run's window (plus 3 min: they are written after the lookup settles).
-    Only mode / sent / reason and the HASH of the seller host are kept. None when the view cannot be read."""
+    Only mode / sent / reason are kept. None when the view cannot be read."""
     try:
         end = (datetime.fromisoformat(finished_at) + timedelta(minutes=3)).isoformat()
         text = read_view(f'resource.type="cloud_run_revision" AND resource.labels.service_name="gateway" AND '
@@ -362,10 +400,7 @@ def read_shadow_lines(started_at: str, finished_at: str) -> list[dict] | None:
         lines = []
         for entry in json.loads(text or "[]"):
             payload = entry.get("jsonPayload") or {}
-            host = payload.get("seller_host")
-            lines.append({"mode": payload.get("mode"), "sent": payload.get("sent"), "reason": payload.get("reason"),
-                          "seller_host_sha256": hashlib.sha256(host.encode()).hexdigest() if isinstance(host, str)
-                          else None})
+            lines.append({"mode": payload.get("mode"), "sent": payload.get("sent"), "reason": payload.get("reason")})
         return lines
     except (LaunchRefused, subprocess.TimeoutExpired, ValueError, TypeError):
         return None
@@ -409,7 +444,7 @@ def cmd_publish(args) -> None:
     if any(r["shadow_lookup"] and r.get("pass") is True for r in case_rows):
         lines = (read_shadow_lines(state["started_at"], state["finished_at"])
                  if state.get("started_at") and state.get("finished_at") else None)
-        shadow = shadow_check(case_rows, lines, run_line.get("seller_host_sha256"))
+        shadow = shadow_check(case_rows, lines)
     result = summarise(rows, run_state=state, bad_lines=bad, lock=lock, cases=cases, shadow=shadow)
     if (state.get("armed") and state.get("disarmed") is not True) or unsure or (
             held and held.startswith(("HELD: a FOREIGN", "HELD: the execute call failed"))):
