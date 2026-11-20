@@ -628,11 +628,27 @@ async def test_an_import_postgres_aborts_for_a_lock_conflict_is_a_409_with_nothi
     assert [(p["id"], p["notes"]) for p in items] == [(pid, None)]
 
 
-def test_each_409_import_conflict_is_a_new_exception():
-    """A shared instance would grow its __traceback__ on every raise and keep each request's CSV alive."""
-    first, second = employee_affiliate_programs._import_conflict(), employee_affiliate_programs._import_conflict()
+@pytest.mark.parametrize("build", ["_import_conflict", "_not_found", "_duplicate"])
+def test_each_answer_is_a_new_exception(build):
+    """A shared instance would grow its __traceback__ on every raise and keep each request's body alive."""
+    first, second = getattr(employee_affiliate_programs, build)(), getattr(employee_affiliate_programs, build)()
     assert first is not second and first.__traceback__ is None
-    assert not hasattr(employee_affiliate_programs, "_IMPORT_CONFLICT")
+
+
+def test_the_route_module_raises_no_shared_exception_instance():
+    from fastapi import HTTPException
+
+    shared = [name for name, value in vars(employee_affiliate_programs).items() if isinstance(value, HTTPException)]
+    assert shared == []
+
+
+async def test_repeated_404s_and_409s_answer_the_same(client):
+    await _create(client, advertiser_id="TEST-7201", merchant_name="Example Merchant A")
+    for _ in range(3):
+        missing = await client.get(f"{BASE}/afp_missing", headers=_auth())
+        assert (missing.status_code, missing.json()["detail"]) == (404, {"code": "program_not_found"})
+        again = await client.post(BASE, json=_program(advertiser_id="TEST-7201"), headers=_auth())
+        assert again.status_code == 409 and again.json()["detail"]["code"] == "duplicate_program"
 
 
 async def test_an_error_that_is_not_a_lock_conflict_is_not_a_409(client, monkeypatch):

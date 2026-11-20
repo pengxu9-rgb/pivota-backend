@@ -61,9 +61,17 @@ def _invalid(exc: programs.ValidationFailed) -> HTTPException:
     return HTTPException(status_code=422, detail={"code": "invalid_fields", "errors": exc.errors})
 
 
-_NOT_FOUND = HTTPException(status_code=404, detail={"code": "program_not_found"})
-_DUPLICATE = HTTPException(status_code=409, detail={
-    "code": "duplicate_program", "message": "A program with this network and advertiser ID already exists."})
+# Every answer below is a NEW HTTPException per raise. One shared module-level instance would grow its
+# __traceback__ on every raise and keep each failed request's frames (and its body) alive.
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "program_not_found"})
+
+
+def _duplicate() -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "code": "duplicate_program", "message": "A program with this network and advertiser ID already exists."})
 
 
 @router.get("/affiliate-programs")
@@ -92,7 +100,7 @@ async def create_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.DuplicateProgram:
-        raise _DUPLICATE
+        raise _duplicate() from None
 
 
 IMPORT_CONFLICT_MESSAGE = (
@@ -101,8 +109,6 @@ IMPORT_CONFLICT_MESSAGE = (
 
 
 def _import_conflict() -> HTTPException:
-    """A new exception per answer: one shared instance would grow its __traceback__ on every raise and keep
-    each failed request's frames (and its CSV body) alive."""
     return HTTPException(status_code=409, detail={
         "code": "import_conflict", "written": False, "message": IMPORT_CONFLICT_MESSAGE})
 
@@ -151,7 +157,7 @@ async def get_affiliate_program(program_id: str, current_user: dict = Depends(ge
     try:
         return await programs.detail(program_id)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
 
 
 @router.patch("/affiliate-programs/{program_id}")
@@ -166,9 +172,9 @@ async def update_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
     except programs.DuplicateProgram:
-        raise _DUPLICATE
+        raise _duplicate() from None
 
 
 @router.post("/affiliate-programs/{program_id}/mark-live")
@@ -177,7 +183,7 @@ async def mark_affiliate_program_live(program_id: str, current_user: dict = Depe
     try:
         return programs.public(await programs.mark_live(program_id, actor))
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
     except programs.NotLiveReady as exc:
         raise HTTPException(status_code=422, detail={
             "code": "not_live_ready",
@@ -197,4 +203,4 @@ async def unlive_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
