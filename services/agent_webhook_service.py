@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import httpx
 
 from config.settings import resolve_public_api_base_url
-from db.database import database
+from db.database import IS_POSTGRES, database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
 from services import webhook_delivery_gate, webhook_destination_guard
@@ -97,6 +97,10 @@ WEBHOOK_EVENT_CATALOG: List[Dict[str, Any]] = [
 
 DEFAULT_WEBHOOK_EVENTS = [item["event_type"] for item in WEBHOOK_EVENT_CATALOG]
 TEST_EVENT_TYPE = "webhook.test"
+ROTATION_IMMEDIATE = "immediate"
+ROTATION_OVERLAP = "overlap"
+SECRET_ROTATION_OVERLAP = timedelta(hours=24)
+
 RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200, 43200)
 MAX_DELIVERY_ATTEMPTS = 6
 RETRY_POLL_SECONDS = 30
@@ -269,6 +273,20 @@ def _next_retry_at(attempt_count: int) -> Optional[datetime]:
 
 _AGENT_WEBHOOK_DDL_READY = False
 
+# Migration 292: when a signing secret was last shown in full (the first PUT that mints
+# it, or a rotation). NULL = the current secret has never been shown to anyone, so
+# nothing can be verifying against it and a rotation may replace it at once. Nullable,
+# no default: a catalog-only change on Postgres 11+. On Postgres it runs as the last
+# statement below, through guarded_statements (a lock-free catalog check first; the
+# ALTER takes its lock only while the column is missing, under the heal lock_timeout,
+# and a timeout defers it to a later call). SQLite (the hermetic test dialect, a fresh
+# file per run) gets the column from the CREATE TABLE above. Only the first PUT that
+# mints a secret, the rotation and the config read touch the column; the emit, retry
+# and activation paths never name it, so a deferred heal cannot break a delivery.
+_ADD_SECRET_REVEALED_AT_PG = (
+    "ALTER TABLE agent_webhook_configs ADD COLUMN IF NOT EXISTS secret_revealed_at TIMESTAMP"
+)
+
 # Index builds guarded on Postgres (db/schema_guard.guarded_statements). Bare,
 # each took its table's SHARE lock BEFORE finding the index already there, with no
 # lock_timeout, so every boot queued behind any open writer of the deliveries table
@@ -285,6 +303,7 @@ _AGENT_WEBHOOK_DDL_STATEMENTS = guarded_statements((
         signing_secret TEXT,
         pending_signing_secret TEXT,
         pending_secret_activates_at TIMESTAMP,
+        secret_revealed_at TIMESTAMP,
         last_test_at TIMESTAMP,
         last_test_status VARCHAR(32),
         migration_source VARCHAR(128),
@@ -342,7 +361,7 @@ _AGENT_WEBHOOK_DDL_STATEMENTS = guarded_statements((
     CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
     ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
     """,
-))
+) + ((_ADD_SECRET_REVEALED_AT_PG,) if IS_POSTGRES else ()))
 
 
 async def ensure_agent_webhook_tables() -> None:
@@ -547,6 +566,12 @@ async def get_delivery_summary(agent_id: str) -> Dict[str, Any]:
     }
 
 
+def _rotation_activation(current_secret: Optional[str], revealed_at: Any) -> str:
+    """A secret nobody has seen cannot be verifying anything: replace it at once. A shown one
+    keeps the 24 h overlap so a receiver can switch without dropping deliveries."""
+    return ROTATION_OVERLAP if current_secret and revealed_at else ROTATION_IMMEDIATE
+
+
 async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
     summary = await get_delivery_summary(agent_id)
@@ -555,6 +580,7 @@ async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
     current_secret = str(config.get("signing_secret") or "").strip() or None
     pending_secret = str(config.get("pending_signing_secret") or "").strip() or None
     pending_activates_at = _coerce_datetime(config.get("pending_secret_activates_at"))
+    revealed_at = _coerce_datetime(config.get("secret_revealed_at"))
     return {
         "enabled": bool(config.get("enabled") and destination_url),
         "destination_url": destination_url,
@@ -563,6 +589,11 @@ async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
         "signing_secret_last4": _last4(current_secret),
         "pending_signing_secret_last4": _last4(pending_secret),
         "pending_secret_activates_at": pending_activates_at.isoformat() if pending_activates_at else None,
+        # When a signing secret was last shown in full; null = the current one never was.
+        "secret_revealed_at": revealed_at.isoformat() if revealed_at else None,
+        # What POST .../signing-secret/rotate will do now: "immediate" (the current secret was
+        # never shown, so the new one signs at once) or "overlap" (the new one is pending 24 h).
+        "rotation_activation": _rotation_activation(current_secret, revealed_at),
         "last_test_at": (_coerce_datetime(config.get("last_test_at")) or None).isoformat() if _coerce_datetime(config.get("last_test_at")) else None,
         "last_test_status": config.get("last_test_status"),
         "delivery_summary_24h": summary,
@@ -587,7 +618,12 @@ async def update_webhook_config(
         next_url = webhook_destination_guard.check_destination_url(next_url)
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
-    current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
+    # Only a config with no secret yet gets one here, and this PUT then shows it in full, once.
+    # The stamp lands in the same statement as the secret, and only where that statement is the
+    # one that stores it (signing_secret was still NULL), so a concurrent mint keeps its own
+    # secret and this call shows nothing.
+    existing_secret = str(current.get("signing_secret") or "").strip() or None
+    minted_secret = None if existing_secret else _generate_signing_secret()
 
     if current.get("created_at") is None:
         await database.execute(
@@ -598,6 +634,7 @@ async def update_webhook_config(
                 destination_url,
                 subscribed_events,
                 signing_secret,
+                secret_revealed_at,
                 migration_source,
                 created_at,
                 updated_at
@@ -608,6 +645,7 @@ async def update_webhook_config(
                 :destination_url,
                 :subscribed_events,
                 :signing_secret,
+                :secret_revealed_at,
                 :migration_source,
                 :created_at,
                 :updated_at
@@ -616,6 +654,10 @@ async def update_webhook_config(
             SET enabled = EXCLUDED.enabled,
                 destination_url = EXCLUDED.destination_url,
                 subscribed_events = EXCLUDED.subscribed_events,
+                secret_revealed_at = CASE
+                    WHEN agent_webhook_configs.signing_secret IS NULL THEN EXCLUDED.secret_revealed_at
+                    ELSE agent_webhook_configs.secret_revealed_at
+                END,
                 signing_secret = COALESCE(agent_webhook_configs.signing_secret, EXCLUDED.signing_secret),
                 updated_at = EXCLUDED.updated_at
             """,
@@ -624,9 +666,35 @@ async def update_webhook_config(
                 "enabled": next_enabled,
                 "destination_url": next_url,
                 "subscribed_events": json.dumps(next_events),
-                "signing_secret": current_secret,
+                "signing_secret": minted_secret,
+                "secret_revealed_at": now if minted_secret else None,
                 "migration_source": current.get("migration_source"),
                 "created_at": now,
+                "updated_at": now,
+            },
+        )
+    elif minted_secret:
+        await database.execute(
+            """
+            UPDATE agent_webhook_configs
+            SET enabled = :enabled,
+                destination_url = :destination_url,
+                subscribed_events = :subscribed_events,
+                secret_revealed_at = CASE
+                    WHEN signing_secret IS NULL THEN :secret_revealed_at
+                    ELSE secret_revealed_at
+                END,
+                signing_secret = COALESCE(signing_secret, :signing_secret),
+                updated_at = :updated_at
+            WHERE agent_id = :agent_id
+            """,
+            {
+                "agent_id": agent_id,
+                "enabled": next_enabled,
+                "destination_url": next_url,
+                "subscribed_events": json.dumps(next_events),
+                "signing_secret": minted_secret,
+                "secret_revealed_at": now,
                 "updated_at": now,
             },
         )
@@ -637,7 +705,6 @@ async def update_webhook_config(
             SET enabled = :enabled,
                 destination_url = :destination_url,
                 subscribed_events = :subscribed_events,
-                signing_secret = COALESCE(signing_secret, :signing_secret),
                 updated_at = :updated_at
             WHERE agent_id = :agent_id
             """,
@@ -646,13 +713,27 @@ async def update_webhook_config(
                 "enabled": next_enabled,
                 "destination_url": next_url,
                 "subscribed_events": json.dumps(next_events),
-                "signing_secret": current_secret,
                 "updated_at": now,
             },
         )
 
     await _sync_legacy_agent_webhook_url(agent_id, next_url)
-    return await get_webhook_config(agent_id)
+    config = await get_webhook_config(agent_id)
+    if minted_secret and await _stored_signing_secret(agent_id) == minted_secret:
+        # Present ONLY on the response of the PUT that created the secret; no other response,
+        # list, audit row or log line ever carries it.
+        config["signing_secret"] = minted_secret
+    return config
+
+
+async def _stored_signing_secret(agent_id: str) -> Optional[str]:
+    row = _record_to_dict(
+        await database.fetch_one(
+            "SELECT signing_secret FROM agent_webhook_configs WHERE agent_id = :agent_id",
+            {"agent_id": agent_id},
+        )
+    )
+    return str(row.get("signing_secret") or "").strip() or None
 
 
 def list_webhook_events_catalog() -> Dict[str, Any]:
@@ -1050,26 +1131,6 @@ async def emit_agent_webhook_event(
     destination_url = _normalize_destination_url(agent_id, config.get("destination_url")) or ""
     enabled = bool(config.get("enabled") and destination_url)
     subscribed_events = _normalize_events(_coerce_json(config.get("subscribed_events"), []))
-    signing_secret = str(config.get("signing_secret") or "").strip()
-    if not signing_secret:
-        signing_secret = _generate_signing_secret()
-        await database.execute(
-            """
-            INSERT INTO agent_webhook_configs (agent_id, signing_secret, subscribed_events, created_at, updated_at)
-            VALUES (:agent_id, :signing_secret, :subscribed_events, :created_at, :updated_at)
-            ON CONFLICT (agent_id) DO UPDATE
-            SET signing_secret = COALESCE(agent_webhook_configs.signing_secret, EXCLUDED.signing_secret),
-                updated_at = EXCLUDED.updated_at
-            """,
-            {
-                "agent_id": agent_id,
-                "signing_secret": signing_secret,
-                "subscribed_events": json.dumps(subscribed_events),
-                "created_at": _db_now(),
-                "updated_at": _db_now(),
-            },
-        )
-
     if event_type != TEST_EVENT_TYPE and event_type not in subscribed_events:
         return {
             "status": "skipped",
@@ -1083,6 +1144,33 @@ async def emit_agent_webhook_event(
             "reason": "webhook_not_configured",
             "event_type": event_type,
         }
+
+    signing_secret = str(config.get("signing_secret") or "").strip()
+    if not signing_secret:
+        # A config being delivered to always has a secret (the PUT that set its destination, or
+        # the legacy migration, minted one). This mint only covers a row that somehow lacks one:
+        # it never replaces a stored secret (COALESCE), and the delivery is signed with whatever
+        # the row holds afterwards, never with an unstored local value. It runs only for a
+        # delivery that will actually go out, so a skipped event never mints a secret nobody saw.
+        await database.execute(
+            """
+            INSERT INTO agent_webhook_configs (agent_id, signing_secret, subscribed_events, created_at, updated_at)
+            VALUES (:agent_id, :signing_secret, :subscribed_events, :created_at, :updated_at)
+            ON CONFLICT (agent_id) DO UPDATE
+            SET signing_secret = COALESCE(agent_webhook_configs.signing_secret, EXCLUDED.signing_secret),
+                updated_at = EXCLUDED.updated_at
+            """,
+            {
+                "agent_id": agent_id,
+                "signing_secret": _generate_signing_secret(),
+                "subscribed_events": json.dumps(subscribed_events),
+                "created_at": _db_now(),
+                "updated_at": _db_now(),
+            },
+        )
+        signing_secret = await _stored_signing_secret(agent_id) or ""
+        if not signing_secret:
+            raise RuntimeError("webhook signing secret missing after mint")
 
     return await _attempt_delivery(
         agent_id=agent_id,
@@ -1242,12 +1330,24 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
 
 
 async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
-    current = await _get_or_create_raw_config(agent_id)
-    current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
-    new_secret = _generate_signing_secret()
-    activates_at = _utcnow() + timedelta(hours=24)
-    now = _db_now()
+    """Show a new signing secret in full, once, and stamp `secret_revealed_at`.
 
+    The current secret never shown (no `secret_revealed_at`: a legacy-migration or emit-path
+    mint) or absent: the new secret becomes current AT ONCE and any pending one is dropped.
+    Nothing can be verifying against a secret nobody has seen, and an overlap would keep
+    deliveries signed with the unseen one for 24 h.
+
+    The current secret already shown: the new one is pending for 24 h, as before, so a
+    receiver can switch over without dropping deliveries.
+    """
+    current = await _get_or_create_raw_config(agent_id)
+    new_secret = _generate_signing_secret()
+    now_utc = _utcnow()
+    now = _db_datetime(now_utc)
+
+    # Immediate replacement, claimed in one statement: it matches only while the stored
+    # secret is still unrevealed (or absent), so it can never replace a shown secret, and of
+    # two concurrent rotations only the first replaces; the other falls through to the overlap.
     if current.get("created_at") is None:
         await database.execute(
             """
@@ -1257,8 +1357,7 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
                 destination_url,
                 subscribed_events,
                 signing_secret,
-                pending_signing_secret,
-                pending_secret_activates_at,
+                secret_revealed_at,
                 created_at,
                 updated_at
             )
@@ -1268,20 +1367,26 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
                 :destination_url,
                 :subscribed_events,
                 :signing_secret,
-                :pending_signing_secret,
-                :pending_secret_activates_at,
+                :secret_revealed_at,
                 :created_at,
                 :updated_at
             )
+            ON CONFLICT (agent_id) DO UPDATE
+            SET signing_secret = EXCLUDED.signing_secret,
+                pending_signing_secret = NULL,
+                pending_secret_activates_at = NULL,
+                secret_revealed_at = EXCLUDED.secret_revealed_at,
+                updated_at = EXCLUDED.updated_at
+            WHERE agent_webhook_configs.secret_revealed_at IS NULL
+               OR agent_webhook_configs.signing_secret IS NULL
             """,
             {
                 "agent_id": agent_id,
                 "enabled": False,
                 "destination_url": None,
                 "subscribed_events": json.dumps(DEFAULT_WEBHOOK_EVENTS),
-                "signing_secret": current_secret,
-                "pending_signing_secret": new_secret,
-                "pending_secret_activates_at": _db_datetime(activates_at),
+                "signing_secret": new_secret,
+                "secret_revealed_at": now,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -1290,28 +1395,67 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
         await database.execute(
             """
             UPDATE agent_webhook_configs
-            SET signing_secret = COALESCE(signing_secret, :current_signing_secret),
-                pending_signing_secret = :pending_signing_secret,
-                pending_secret_activates_at = :pending_secret_activates_at,
+            SET signing_secret = :signing_secret,
+                pending_signing_secret = NULL,
+                pending_secret_activates_at = NULL,
+                secret_revealed_at = :secret_revealed_at,
                 updated_at = :updated_at
             WHERE agent_id = :agent_id
+              AND (secret_revealed_at IS NULL OR signing_secret IS NULL)
             """,
             {
                 "agent_id": agent_id,
-                "current_signing_secret": current_secret,
-                "pending_signing_secret": new_secret,
-                "pending_secret_activates_at": _db_datetime(activates_at),
+                "signing_secret": new_secret,
+                "secret_revealed_at": now,
                 "updated_at": now,
             },
         )
 
+    stored_secret = await _stored_signing_secret(agent_id)
+    if stored_secret == new_secret:
+        return {
+            "status": "success",
+            "activation": ROTATION_IMMEDIATE,
+            "new_signing_secret": new_secret,
+            "activates_at": now_utc.isoformat(),
+            "overlap_ends_at": now_utc.isoformat(),
+            "secret_revealed_at": now_utc.isoformat(),
+            "signing_secret_last4": _last4(new_secret),
+            "current_signing_secret_last4": _last4(new_secret),
+            "pending_signing_secret_last4": None,
+        }
+    if not stored_secret:
+        raise RuntimeError("webhook signing secret missing after rotation")
+
+    # The current secret has been shown: keep it signing for 24 h beside the new one.
+    activates_at = now_utc + SECRET_ROTATION_OVERLAP
+    await database.execute(
+        """
+        UPDATE agent_webhook_configs
+        SET pending_signing_secret = :pending_signing_secret,
+            pending_secret_activates_at = :pending_secret_activates_at,
+            secret_revealed_at = :secret_revealed_at,
+            updated_at = :updated_at
+        WHERE agent_id = :agent_id
+        """,
+        {
+            "agent_id": agent_id,
+            "pending_signing_secret": new_secret,
+            "pending_secret_activates_at": _db_datetime(activates_at),
+            "secret_revealed_at": now,
+            "updated_at": now,
+        },
+    )
+
     return {
         "status": "success",
+        "activation": ROTATION_OVERLAP,
         "new_signing_secret": new_secret,
         "activates_at": activates_at.isoformat(),
         "overlap_ends_at": activates_at.isoformat(),
-        "signing_secret_last4": _last4(current_secret),
-        "current_signing_secret_last4": _last4(current_secret),
+        "secret_revealed_at": now_utc.isoformat(),
+        "signing_secret_last4": _last4(stored_secret),
+        "current_signing_secret_last4": _last4(stored_secret),
         "pending_signing_secret_last4": _last4(new_secret),
     }
 
