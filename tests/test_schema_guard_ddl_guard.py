@@ -185,3 +185,68 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
         "tierb_cart_link_eligibility",
         "tierb_cart_link_eligibility",
     ]
+
+
+def _transaction_blocks(tree):
+    import ast
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+                isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "transaction" for item in node.items):
+            yield node
+
+
+def test_no_guarded_ddl_runs_inside_a_callers_transaction():
+    """guarded_ddl sets a TRANSACTION-LOCAL lock_timeout as its first statement: run alone, it ends with the
+    statement; run inside a caller's transaction, it would hold 500 ms for the rest of that transaction. So no
+    guarded_ddl call, and no function that runs one (it calls guarded_ddl, or runs a module constant built
+    from it), may sit inside a `transaction()` block anywhere in the non-test code. Enumerated by AST."""
+    import ast
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    modules = []
+    for path in sorted(repo.rglob("*.py")):
+        rel = path.relative_to(repo)
+        if any(p.startswith(".") or p in {"tests", "node_modules", "venv"} for p in rel.parts[:-1]):
+            continue
+        try:
+            modules.append((str(rel), ast.parse(path.read_text(encoding="utf-8"))))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+    def called(node):
+        return {getattr(c.func, "id", getattr(c.func, "attr", None)) for c in ast.walk(node) if isinstance(c, ast.Call)}
+
+    # A builder returns a guarded statement (it calls guarded_ddl): `_recheck`, say.
+    builders = {"guarded_ddl"} | {fn.name for _, tree in modules for fn in ast.walk(tree)
+                                  if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                  and fn.name != "guarded_ddl" and "guarded_ddl" in called(fn)}
+
+    def calls_guarded(node):
+        return bool(called(node) & builders)
+
+    runners, sites = set(), []
+    for path, tree in modules:
+        built = {t.id for n in tree.body if isinstance(n, ast.Assign) and calls_guarded(n.value)
+                 for t in n.targets if isinstance(t, ast.Name)}
+        for fn in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            if fn.name == "guarded_ddl":
+                continue
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            if calls_guarded(fn) or names & built:
+                runners.add(fn.name)
+                sites.append((path, fn.name))
+        for block in _transaction_blocks(tree):
+            assert not calls_guarded(block), f"{path}:{block.lineno}: guarded_ddl inside a transaction"
+    # Positive control: the callers this was written against.
+    assert {"_heal_guarded", "ensure_agent_purchase_consents_schema", "_ensure_invoice_generation_schema"} <= runners, runners
+    inside = []
+    for path, tree in modules:
+        for block in _transaction_blocks(tree):
+            for call in (c for c in ast.walk(block) if isinstance(c, ast.Call)):
+                name = getattr(call.func, "id", getattr(call.func, "attr", None))
+                if name in runners:
+                    inside.append(f"{path}:{call.lineno} {name}")
+    assert inside == [], "a guarded heal runs inside a caller's transaction:\n" + "\n".join(inside)

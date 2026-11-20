@@ -155,8 +155,11 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
     ACCESS SHARE on the table), and that check runs on every boot, so with the
     timeout set only inside the branch a no-op boot could wait without bound
     behind an ACCESS EXCLUSIVE holder or a queued ALTER. Transaction-local: it
-    ends with the statement (every caller runs the block on its own, outside
-    any transaction of its own).
+    ends with the statement. THE BLOCK MUST RUN WITH NO OUTER TRANSACTION:
+    inside a caller's `database.transaction()` the 500 ms would hold for the
+    rest of that transaction. Every caller runs it on its own, and
+    tests/test_schema_guard_ddl_guard.py (no_guarded_ddl_runs_inside_a_callers_transaction)
+    fails on any call, or any function that runs one, inside a transaction block.
 
     `ddl` is kept verbatim and may be several statements: they run in one
     transaction, so a DROP + ADD CONSTRAINT pair is never seen half-done and
