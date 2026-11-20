@@ -291,6 +291,8 @@ from routes.platform_connector_prefix import (
 from routes.admin_cleanup_all_test_data import router as admin_cleanup_all_router
 from routes.admin_debug_shopify_token import router as admin_debug_shopify_token_router
 from routes.employee_agent_mgmt import router as employee_agent_mgmt_router
+from routes.employee_affiliate_programs import RegistryDarkMiddleware
+from routes.employee_affiliate_programs import router as employee_affiliate_programs_router
 from routes.employee_products import router as employee_products_router
 from routes.employee_pdp_governance import router as employee_pdp_governance_router
 from routes.employee_content import router as employee_content_router
@@ -599,6 +601,13 @@ def _runtime_build_payload() -> dict:
         "platform": platform_metadata(),
     }
 
+
+# The affiliate program registry is dark until AFFILIATE_PROGRAM_REGISTRY_ENABLED=true: with it off, every
+# request under /employee/affiliate-programs gets an absent path's 404 before routing, so no 405 (wrong
+# method) or 400 (bad body) shows the surface exists. See routes/employee_affiliate_programs.py.
+# Registered FIRST, so it is the innermost middleware: its 404 leaves through every other middleware
+# (headers, logging, CORS) exactly like the router's 404 for a path that does not exist.
+app.add_middleware(RegistryDarkMiddleware)
 
 @app.middleware("http")
 async def add_service_version_headers(request: Request, call_next):
@@ -1252,6 +1261,8 @@ app.include_router(admin_cleanup_all_router)  # Admin cleanup all test data
 app.include_router(admin_debug_shopify_token_router)  # Admin debug Shopify token
 # Employee agent management (stable /employee/agents/* endpoints used by Employee Portal)
 app.include_router(employee_agent_mgmt_router)
+# Affiliate program registry (developer earnings, manual stage). Dark: AFFILIATE_PROGRAM_REGISTRY_ENABLED.
+app.include_router(employee_affiliate_programs_router)
 app.include_router(employee_settlement_router)
 app.include_router(employee_content_router)
 app.include_router(admin_fix_agents_router)  # Admin fix agents data

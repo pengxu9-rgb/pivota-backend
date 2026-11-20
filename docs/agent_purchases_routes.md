@@ -216,7 +216,12 @@ that sends, at send time: the first hand-over, the retry loop, and a manual retr
 (the agent webhook deliveries list, `routes/agent_webhooks.py`) shows them gated too. While no consent exists for
 the step, the payload goes out without the URL and with `next_action.consent_required`, so a pending
 `purchase.action_required` backlog never carries a card or approval URL past the gate. The event rows are not
-rewritten (a delivery row records what each attempt actually sent). Gate on before the rest: every card / approval page is withheld and the
+rewritten (a delivery row records what each attempt actually sent). **Once an attempt has sent the gated body, that
+delivery stays gated**: its row now holds the body without the URL, and a later retry, even after the consent
+is recorded, re-sends that body (the gate only withholds a URL; it never adds one back). An agent that gets a
+gated `purchase.action_required` reads the purchase (`GET /agent/v2/commerce/purchases/{id}`) after the
+buyer has agreed on the AgenPas page; that live read carries the hosted URL. A retry made after the consent
+from a row that still holds the URL sends it as before. Gate on before the rest: every card / approval page is withheld and the
 AgenPas page says "not available right now". **Precondition for scripts/ops/reap_local_e2e.py and the
 Reap staging preflight**: the gate is off (they open the hosted page directly), or the run records the
 consent step first.

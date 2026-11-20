@@ -1,0 +1,445 @@
+{
+  "_comment": "Generated from pivota-backend utils/availability_vocabulary.normalize_availability. Expected: in_stock | out_of_stock | null (unknown). The gateway must classify every input identically; regenerate here, never hand-edit.",
+  "cases": [
+    {
+      "input": "in_stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "in stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "In Stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "in-stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "InStock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "instock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "IN_STOCK",
+      "expected": "in_stock"
+    },
+    {
+      "input": "available",
+      "expected": "in_stock"
+    },
+    {
+      "input": "Available",
+      "expected": "in_stock"
+    },
+    {
+      "input": "in stock now",
+      "expected": "in_stock"
+    },
+    {
+      "input": "limited availability",
+      "expected": "in_stock"
+    },
+    {
+      "input": "LimitedAvailability",
+      "expected": "in_stock"
+    },
+    {
+      "input": "limited stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "limited_stock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "out_of_stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "out of stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Out of Stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "out-of-stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "OutOfStock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "OUT_OF_STOCK",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "outofstock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "sold out",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "sold_out",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Sold Out",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "SoldOut",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "soldout",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "unavailable",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Unavailable",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "not available",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "notavailable",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "oos",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "OOS",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "reserved",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Reserved",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "discontinued",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Discontinued",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Temporarily out of stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Out Of Stock - notify me",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "no longer available",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "no longer in stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "not in stock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "Sold out of the old model, but in stock now",
+      "expected": null
+    },
+    {
+      "input": "backorder",
+      "expected": null
+    },
+    {
+      "input": "back order",
+      "expected": null
+    },
+    {
+      "input": "backordered",
+      "expected": null
+    },
+    {
+      "input": "on backorder",
+      "expected": null
+    },
+    {
+      "input": "onbackorder",
+      "expected": null
+    },
+    {
+      "input": "BackOrder",
+      "expected": null
+    },
+    {
+      "input": "preorder",
+      "expected": null
+    },
+    {
+      "input": "pre-order",
+      "expected": null
+    },
+    {
+      "input": "PreOrder",
+      "expected": null
+    },
+    {
+      "input": "presale",
+      "expected": null
+    },
+    {
+      "input": "made to order",
+      "expected": null
+    },
+    {
+      "input": "MadeToOrder",
+      "expected": null
+    },
+    {
+      "input": "online only",
+      "expected": null
+    },
+    {
+      "input": "OnlineOnly",
+      "expected": null
+    },
+    {
+      "input": "in store only",
+      "expected": null
+    },
+    {
+      "input": "InStoreOnly",
+      "expected": null
+    },
+    {
+      "input": "unknown",
+      "expected": null
+    },
+    {
+      "input": "Unknown",
+      "expected": null
+    },
+    {
+      "input": "",
+      "expected": null
+    },
+    {
+      "input": "  ",
+      "expected": null
+    },
+    {
+      "input": "n/a",
+      "expected": null
+    },
+    {
+      "input": "active",
+      "expected": null
+    },
+    {
+      "input": "true",
+      "expected": null
+    },
+    {
+      "input": "yes",
+      "expected": null
+    },
+    {
+      "input": "1",
+      "expected": null
+    },
+    {
+      "input": "0",
+      "expected": null
+    },
+    {
+      "input": "choose",
+      "expected": null
+    },
+    {
+      "input": "preserved",
+      "expected": null
+    },
+    {
+      "input": "https://example.com/?x=schema.org/InStock",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/InStock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "http://schema.org/InStock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "https://www.schema.org/InStock",
+      "expected": "in_stock"
+    },
+    {
+      "input": "https://schema.org/OutOfStock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "http://schema.org/OutOfStock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://www.schema.org/OutOfStock",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://schema.org/SoldOut",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "http://schema.org/SoldOut",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://www.schema.org/SoldOut",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://schema.org/Discontinued",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "http://schema.org/Discontinued",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://www.schema.org/Discontinued",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://schema.org/LimitedAvailability",
+      "expected": "in_stock"
+    },
+    {
+      "input": "http://schema.org/LimitedAvailability",
+      "expected": "in_stock"
+    },
+    {
+      "input": "https://www.schema.org/LimitedAvailability",
+      "expected": "in_stock"
+    },
+    {
+      "input": "https://schema.org/PreOrder",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/PreOrder",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/PreOrder",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/BackOrder",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/BackOrder",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/BackOrder",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/InStoreOnly",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/InStoreOnly",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/InStoreOnly",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/OnlineOnly",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/OnlineOnly",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/OnlineOnly",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/Reserved",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "http://schema.org/Reserved",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://www.schema.org/Reserved",
+      "expected": "out_of_stock"
+    },
+    {
+      "input": "https://schema.org/PreSale",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/PreSale",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/PreSale",
+      "expected": null
+    },
+    {
+      "input": "https://schema.org/MadeToOrder",
+      "expected": null
+    },
+    {
+      "input": "http://schema.org/MadeToOrder",
+      "expected": null
+    },
+    {
+      "input": "https://www.schema.org/MadeToOrder",
+      "expected": null
+    },
+    {
+      "input": true,
+      "expected": "in_stock"
+    },
+    {
+      "input": false,
+      "expected": "out_of_stock"
+    },
+    {
+      "input": null,
+      "expected": null
+    }
+  ]
+}
