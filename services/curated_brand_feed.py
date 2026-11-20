@@ -3086,6 +3086,10 @@ def shopify_product_to_record(
     # The product's `body_html_sentences`, when the caller already computed them (records_for_brand
     # does, for its batch pass); derived here otherwise. Same description either way.
     body_sentences: Optional[Sequence[str]] = None,
+    # A brand's own store pinned to the offer seller it already has (retailer_ingest
+    # options.seller_merchant_id): the offer carries it and ingestion.derive_merchant_id uses it
+    # as is. Brand-official only; None (every other caller) leaves the offer exactly as before.
+    seller_merchant_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -3095,6 +3099,9 @@ def shopify_product_to_record(
         return None
     if source_role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
+    if seller_merchant_id and source_role != "brand_official":
+        # A retailer's seller id is its host (ingestion.derive_merchant_id seller_domain): never pinned.
+        raise ValueError("seller_merchant_id is only valid with source_role=brand_official")
     host = _clean_domain(domain)
     title = str(product.get("title") or "").strip()
     handle = str(product.get("handle") or "").strip()
@@ -3351,6 +3358,7 @@ def shopify_product_to_record(
                 "price": price,
                 "in_stock": variant.get("available") if isinstance(variant.get("available"), bool) else None,
                 "validated_at": "shopify_products_json",
+                **({"seller_merchant_id": seller_merchant_id} if seller_merchant_id else {}),
             }
         ],
     }
@@ -4138,6 +4146,8 @@ async def records_for_brand(
     # so a caller that wants extra slack on a specific brand can still ask for it.
     pdp_delay_s: float = 0.0,
     pdp_inci_budget_s: Optional[float] = None,
+    # Brand-official only: the offer seller id the store already has (see shopify_product_to_record).
+    seller_merchant_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch a curated brand's storefront and return Path-C validated records.
 
@@ -4304,7 +4314,7 @@ async def records_for_brand(
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
             source_role=source_role, retailer_name=retailer_name,
-            body_sentences=sentences,
+            body_sentences=sentences, seller_merchant_id=seller_merchant_id,
         )
         if not rec:
             continue

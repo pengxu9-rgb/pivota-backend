@@ -1,0 +1,11 @@
+-- Reverses 292. REVERT THE CODE FIRST. With the column gone and the code still live, these fail:
+--   * the first PUT /agents/{id}/webhooks/config that mints a secret;
+--   * every rotation;
+--   * the pending-secret promotion (services/agent_webhook_service._activate_pending_secret_if_due).
+--     It stamps the column once the process has run its webhook DDL, and every config read, emit,
+--     retry and test send calls it. So a due pending secret would break every delivery for that agent.
+-- Dropping the column forgets which secrets were shown. After a re-apply, every automatic rotation of
+-- a config with nothing pending is immediate (no 24 h overlap) until the next rotation stamps it again.
+-- The boot heal (services/agent_webhook_service.ensure_agent_webhook_tables) re-adds the column at the
+-- next start unless the code is reverted too.
+ALTER TABLE IF EXISTS agent_webhook_configs DROP COLUMN IF EXISTS secret_revealed_at;
