@@ -48,7 +48,6 @@ ENDINGS = frozenset({"refused", "expired"})
 #: The only codes a refused / expired write may carry where a checkout or order can exist. Each is on a
 #: gateway list by name (the gateway's terminal-code parity test).
 POST_DISPATCH_CODES = frozenset({"checkout_expired", "manual_provider_expired", "vic_authorization_expired"})
-WRITERS = frozenset({"transition", "transition_as_holder", "_move"})
 #: The states in which no checkout or order can exist yet (for 'quoting', see the structural tests).
 PRE_DISPATCH = {
     "a2a": frozenset({"opened", "needs_payment_method", "quoting"}),
@@ -115,16 +114,101 @@ def _kw(call: ast.Call, name: str) -> Optional[ast.AST]:
     return next((k.value for k in call.keywords if k.arg == name), None)
 
 
-def _target(call: ast.Call) -> Optional[ast.AST]:
-    if _call_name(call) == "_move" and len(call.args) > 3:
-        return call.args[3]
-    return _kw(call, "to_state")
+#: The ledger writers every other writer is built on: (target keyword, target position, sources keyword,
+#: sources position). Functions that forward their own parameters to one of these, local aliases of them
+#: (`move = ledger.transition_as_holder`) and `functools.partial` over them are writers too (`_writers`).
+BASE_WRITERS = {"transition": ("to_state", None, "from_states", None),
+                "transition_as_holder": ("to_state", None, "from_states", None)}
 
 
-def _sources(call: ast.Call) -> Optional[ast.AST]:
-    if _call_name(call) == "_move" and len(call.args) > 2:
-        return call.args[2]
-    return _kw(call, "from_states")
+def _param(fn: ast.AST, node: Optional[ast.AST]) -> Optional[Tuple[str, Optional[int]]]:
+    """(name, positional index or None) when `node` is one of `fn`'s parameters (or list()/tuple() of one)."""
+    if isinstance(node, ast.Call) and _call_name(node) in ("list", "tuple") and len(node.args) == 1:
+        node = node.args[0]
+    if not isinstance(node, ast.Name):
+        return None
+    positional = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+    if node.id in positional:
+        return node.id, positional.index(node.id)
+    if node.id in {a.arg for a in fn.args.kwonlyargs}:
+        return node.id, None
+    return None
+
+
+def _partial_of(call: ast.Call) -> Optional[str]:
+    """The writer a `functools.partial(writer, ...)` / `partial(writer, ...)` call binds, else None."""
+    if _call_name(call) == "partial" and call.args:
+        inner = call.args[0]
+        return inner.attr if isinstance(inner, ast.Attribute) else (inner.id if isinstance(inner, ast.Name) else None)
+    return None
+
+
+@functools.lru_cache(maxsize=4)
+def _writers_for(repo: Path) -> Dict[str, Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]]:
+    specs: Dict[str, Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]] = dict(BASE_WRITERS)
+    trees = _parsed(repo)
+    while True:
+        before = dict(specs)
+        for _path, tree in trees:
+            for node in ast.walk(tree):
+                # Aliases: `move = ledger.transition_as_holder`, and partials over a writer.
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    alias, value = node.targets[0].id, node.value
+                    name = (value.attr if isinstance(value, ast.Attribute) else
+                            value.id if isinstance(value, ast.Name) else
+                            _partial_of(value) if isinstance(value, ast.Call) else None)
+                    if name in specs and alias not in specs:
+                        t_kw, t_pos, s_kw, s_pos = specs[name]
+                        bound = len(value.args) - 1 if isinstance(value, ast.Call) else 0
+                        specs[alias] = (t_kw, None if t_pos is None else t_pos - bound,
+                                        s_kw, None if s_pos is None else s_pos - bound)
+            for fn in _functions(tree):
+                if fn.name in specs:
+                    continue
+                for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call) and _call_name(n) in specs):
+                    target = _param(fn, _target(call, specs))
+                    if target is None:
+                        continue
+                    sources = _param(fn, _sources(call, specs))
+                    specs[fn.name] = (target[0], target[1], sources[0] if sources else None,
+                                      sources[1] if sources else None)
+                    break
+        if specs == before:
+            return specs
+
+
+def _writers() -> Dict[str, Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]]:
+    return _writers_for(REPO)
+
+
+def _arg(call: ast.Call, keyword: Optional[str], position: Optional[int]) -> Optional[ast.AST]:
+    if keyword is not None:
+        value = _kw(call, keyword)
+        if value is not None:
+            return value
+    args = call.args[1:] if _partial_of(call) else call.args
+    if position is not None and 0 <= position < len(args) and not isinstance(args[position], ast.Starred):
+        return args[position]
+    return None
+
+
+def _spec(call: ast.Call, specs=None):
+    specs = specs if specs is not None else _writers()
+    return specs.get(_partial_of(call) or _call_name(call))
+
+
+def _target(call: ast.Call, specs=None) -> Optional[ast.AST]:
+    spec = _spec(call, specs)
+    return _arg(call, spec[0], spec[1]) if spec else None
+
+
+def _sources(call: ast.Call, specs=None) -> Optional[ast.AST]:
+    spec = _spec(call, specs)
+    return _arg(call, spec[2], spec[3]) if spec else None
+
+
+def _is_writer_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _spec(node) is not None
 
 
 def _literal_states(node: Optional[ast.AST]) -> Optional[Set[str]]:
@@ -192,10 +276,10 @@ def _sites() -> Tuple[List[Dict[str, Any]], Set[Tuple[str, str]]]:
     """Every refused / expired write call: {path, line, fn, rail, sources (set or None), state, code}."""
     sites: List[Dict[str, Any]] = []
     dynamic_seen: Set[Tuple[str, str]] = set()
+    specs = _writers()
     for path, tree in _modules():
         for fn in _functions(tree):
-            params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
-            for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call) and _call_name(n) in WRITERS):
+            for call in (n for n in ast.walk(fn) if _is_writer_call(n)):
                 target = _target(call)
                 if target is None:
                     continue
@@ -204,17 +288,16 @@ def _sites() -> Tuple[List[Dict[str, Any]], Set[Tuple[str, str]]]:
                         continue
                     endings = [(_literal_states(_sources(call)), target.value,
                                 _resolve_code(path, _kw(call, "last_error_code")))]
-                elif isinstance(target, ast.Name) and target.id in params and fn.name in WRITERS:
-                    continue  # the writer itself passing its caller's target on: its callers are the sites
+                elif fn.name in specs and _param(fn, target) is not None:
+                    continue  # a writer passing its caller's target on: its callers are the sites
                 else:
-                    literals = {n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and n.value in ENDINGS}
                     kind = DYNAMIC.get((path, fn.name))
                     if kind is None:
-                        if literals:
-                            raise AssertionError(
-                                f"{path}:{call.lineno} {fn.name}: a write whose target is computed and may be "
-                                f"refused/expired; resolve it from the source in this test")
-                        continue
+                        # Computed, and not a writer forwarding its own parameter (a module table, an alias, a
+                        # helper's return): never skipped silently.
+                        raise AssertionError(
+                            f"{path}:{call.lineno} {fn.name}: a purchase write whose target is computed; "
+                            f"resolve it from the source in this test")
                     dynamic_seen.add((path, fn.name))
                     endings = _vic_endings(fn, call) if kind == "vic" else _manual_endings(tree, call)
                 for sources, state, code in endings:
@@ -225,25 +308,59 @@ def _sites() -> Tuple[List[Dict[str, Any]], Set[Tuple[str, str]]]:
     return sites, dynamic_seen
 
 
-_SET_STATE = re.compile(r"\bSET\s+state\s*=\s*(CASE\b.*?\bEND|'\w+')", re.S | re.I)
+_SET_SPAN = re.compile(r"\bSET\b(.*?)(?=\bWHERE\b|\bRETURNING\b|\bFROM\b|\Z)", re.S | re.I)
+
+
+def _set_items(span: str) -> Iterator[Tuple[str, str]]:
+    """(column, expression) of each top-level assignment in a SET list: commas inside parentheses or a
+    CASE ... END do not split it."""
+    depth, start, i = 0, 0, 0
+    tokens = re.finditer(r"\(|\)|,|\bCASE\b|\bEND\b|'(?:[^']|'')*'", span, re.I)
+    for tok in tokens:
+        word = tok.group(0).upper()
+        if word in ("(", "CASE"):
+            depth += 1
+        elif word in (")", "END"):
+            depth -= 1
+        elif word == "," and depth == 0:
+            yield _assignment(span[start:tok.start()])
+            start = tok.end()
+    yield _assignment(span[start:])
+
+
+def _assignment(item: str) -> Tuple[str, str]:
+    column, _, expr = item.partition("=")
+    return column.strip().split(".")[-1].lower(), expr.strip()
+
+
+def _sql_text(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):  # an f-string: its literal parts, a placeholder per value
+        return "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
+    return None
 
 
 def _sql_sites() -> List[Dict[str, Any]]:
-    """Every SQL constant whose `SET state = ...` can write refused or expired: {path, name, rail, sql}."""
+    """Every SQL string (f-strings included) whose SET list can write `state` = refused or expired, in any
+    position of the list: {path, name, rail, sql, set}."""
     found = []
     for path, tree in _modules():
         named = {id(node.value): node.targets[0].id for node in tree.body
                  if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)}
+        inner = {id(v) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
         for node in ast.walk(tree):
-            text = node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
-            if text is None:
+            text = _sql_text(node) if id(node) not in inner else None
+            if text is None or not re.search(r"'(refused|expired)'", text):
                 continue
-            for match in _SET_STATE.finditer(text):
-                if not re.search(r"'(refused|expired)'", match.group(1)):
-                    continue
-                name = named.get(id(node))
-                assert name, f"{path}:{node.lineno}: a refused/expired SQL write that is not a named module constant"
-                found.append(dict(path=path, name=name, rail=_rail(path), sql=text, set=match.group(1)))
+            for span in _SET_SPAN.finditer(text):
+                for column, expr in _set_items(span.group(1)):
+                    if column != "state" or not re.search(r"'(refused|expired)'", expr):
+                        continue
+                    name = named.get(id(node))
+                    assert name and isinstance(node, ast.Constant), (
+                        f"{path}:{node.lineno}: a refused/expired SQL write that is not a named module constant")
+                    found.append(dict(path=path, name=name, rail=_rail(path), sql=text, set=expr))
     return found
 
 
@@ -262,7 +379,7 @@ def _violations(sites: List[Dict[str, Any]]) -> List[str]:
 
 def test_every_refused_or_expired_write_is_pre_dispatch_or_names_a_listed_code():
     sites, dynamic_seen = _sites()
-    # Positive controls: the enumeration really found the rails' writes (24 when this was written).
+    # Positive controls: the enumeration really found the rails' writes (23 when this was written).
     assert len(sites) >= 20, len(sites)
     assert {s["rail"] for s in sites} == {"a2a", "reap"}
     assert dynamic_seen == set(DYNAMIC), f"a dynamic site moved or vanished: {set(DYNAMIC) - dynamic_seen}"
@@ -279,7 +396,9 @@ def _sql_endings(sql_set: str, sql: str) -> List[Tuple[str, str]]:
         pairs = re.findall(r"WHEN\s+state\s*=\s*'(\w+)'\s+THEN\s+'(\w+)'", sql_set, re.I)
         assert pairs, sql_set
         return [(src, end) for src, end in pairs if end in ENDINGS]
-    end = sql_set.strip("'")
+    literal = re.fullmatch(r"'(\w+)'", sql_set.strip())
+    assert literal, f"a SQL state write that is neither a literal nor a CASE: parse it here: {sql_set!r}"
+    end = literal.group(1)
     states = re.search(r"\bWHERE\s+state\s+IN\s*\(([^)]*)\)", sql, re.I)
     assert states, "a sweep whose source states are not one `WHERE state IN (...)` list: parse it here"
     return [(src.strip().strip("'"), end) for src in states.group(1).split(",")]
@@ -303,6 +422,11 @@ def test_every_sql_ending_is_pre_dispatch_or_proves_no_dispatch_evidence():
     names = {(s["rail"], s["name"]) for s in found}
     assert {("a2a", "_EXPIRE_SQL"), ("a2a", "_EXPIRE_SQL_SQLITE"), ("reap", "_EXPIRE_OVERDUE_SQL"),
             ("reap", "_EXPIRE_OVERDUE_SQL_SQLITE"), ("reap", "_LAPSE_CONTACT_REENTRY_SQL")} <= names, names
+    bad = _sql_violations(found)
+    assert bad == [], "\n".join(bad)
+
+
+def _sql_violations(found: List[Dict[str, Any]]) -> List[str]:
     bad = []
     for site in found:
         code = re.search(r"last_error_code\s*=\s*'(\w+)'", site["sql"])
@@ -318,7 +442,7 @@ def test_every_sql_ending_is_pre_dispatch_or_proves_no_dispatch_evidence():
                 if site["sql"].count(predicate) < copies:
                     bad.append(f"{site['path']} {site['name']}: {src} -> {end} without {predicate!r} "
                                f"({site['sql'].count(predicate)} of {copies} copies)")
-    assert bad == [], "\n".join(bad)
+    return bad
 
 
 # ── why 'quoting' has no dispatch evidence ──────────────────────────────────────────────────
@@ -395,7 +519,7 @@ def test_a2a_has_no_order_or_checkout_before_awaiting_authorization():
     for path, tree in _modules():
         if "a2a" not in Path(path).name:
             continue
-        for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_name(n) in WRITERS):
+        for call in (n for n in ast.walk(tree) if _is_writer_call(n)):
             target = _target(call)
             if isinstance(target, ast.Constant) and target.value in ENDINGS:
                 assert _kw(call, "resolves_write") is None, f"{path}:{call.lineno}"
@@ -409,24 +533,70 @@ def test_the_reap_sweep_proves_no_dispatch_on_every_dialect():
         assert sql.count("AND (state = 'needs_enrollment' OR dispatch_tracking_version = 1)") == 2, name
 
 
-@pytest.mark.parametrize("bad, message", [
-    ('await _move(row, worker_id, ["awaiting_approval"], "expired", last_error_code="stale")', "post_dispatch"),
-    ('await _move(row, worker_id, [row["state"]], "refused", last_error_code=row["code"])', "unknown_states"),
-    ('await ledger.transition_as_holder(pid, w, from_states=["quoting"], to_state=target)', "computed"),
+_SYNTHETIC_HEAD = (
+    "import functools\n"
+    "from db import reap_agentic_ledger as ledger\n"
+    "_ENDING = {'x': 'refused'}\n"
+    "async def _move(row, worker_id, from_states, to_state, **fields):\n"
+    "    return await ledger.transition_as_holder(row, worker_id, from_states=list(from_states), to_state=to_state)\n"
+)
+
+
+@pytest.mark.parametrize("bad, kind", [
+    # A post-dispatch ending with an unlisted code, through a wrapper the test derives from the source.
+    ('await _move(row, worker_id, ["awaiting_approval"], "expired", last_error_code="stale")', "violation"),
+    # From states it cannot read: dispatch-capable, so the code must be listed.
+    ('await _move(row, worker_id, [row["state"]], "refused", last_error_code=row["code"])', "violation"),
+    # A local alias of a writer.
+    ('move = ledger.transition_as_holder\n    await move(pid, w, from_states=["awaiting_approval"], to_state="expired")',
+     "violation"),
+    # A partial over a writer, the ending bound in the partial.
+    ('end = functools.partial(ledger.transition_as_holder, to_state="expired", last_error_code="stale")\n'
+     '    await end(pid, w, from_states=["awaiting_approval"])', "violation"),
+    # A partial over a writer, the ending given at the call.
+    ('end = functools.partial(ledger.transition_as_holder, pid)\n'
+     '    await end(w, from_states=["processing"], to_state="refused")', "violation"),
+    # A target from a module table: computed, never skipped silently.
+    ('await ledger.transition_as_holder(pid, w, from_states=["quoting"], to_state=_ENDING[status])', "computed"),
 ])
-def test_the_check_catches_what_it_is_for(tmp_path, monkeypatch, bad, message):
-    """Positive control on synthetic source: a post-dispatch ending with an unlisted code, one from unknown
-    states, and a computed target in a function that names refused are each caught."""
+def test_the_check_catches_what_it_is_for(tmp_path, monkeypatch, bad, kind):
+    """Positive controls on synthetic source, one per way a write could slip past the enumeration."""
     module = tmp_path / "services"
     module.mkdir()
     (module / "reap_synthetic.py").write_text(
-        "async def _step(row, worker_id, ledger, pid, w, target):\n"
-        "    if target == 'refused':\n"
-        f"        return {bad}\n", encoding="utf-8")
+        _SYNTHETIC_HEAD + "async def _step(row, worker_id, pid, w, status):\n" f"    {bad}\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
-    if message == "computed":
-        with pytest.raises(AssertionError, match=message):
+    if kind == "computed":
+        with pytest.raises(AssertionError, match="computed"):
             _sites()
     else:
         sites, _ = _sites()
         assert sites and _violations(sites), sites
+
+
+@pytest.mark.parametrize("sql", [
+    # `state` is not the first assignment of the SET list.
+    "UPDATE reap_agentic_purchases SET last_error_code = 'x', state = 'expired' WHERE state IN ('awaiting_approval')",
+    # A CASE, after another CASE whose commas must not split the list.
+    "UPDATE reap_agentic_purchases SET a = CASE WHEN b IN (1, 2) THEN 1 ELSE 2 END, state = CASE WHEN "
+    "state = 'awaiting_approval' THEN 'refused' ELSE 'failed' END WHERE state IN ('awaiting_approval')",
+])
+def test_the_sql_check_catches_a_state_write_in_any_position(tmp_path, monkeypatch, sql):
+    module = tmp_path / "db"
+    module.mkdir()
+    (module / "reap_synthetic.py").write_text(f"_X_SQL = {sql!r}\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    found = _sql_sites()
+    assert [(f["name"], f["set"][:4]) for f in found] and any("awaiting_approval" in v for v in _sql_violations(found))
+
+
+def test_an_f_string_that_writes_an_ending_fails(tmp_path, monkeypatch):
+    module = tmp_path / "db"
+    module.mkdir()
+    (module / "reap_synthetic.py").write_text(
+        "async def f(database, col):\n"
+        "    await database.execute(f\"UPDATE reap_agentic_purchases SET {col} = 1, state = 'refused' WHERE id = 1\")\n",
+        encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    with pytest.raises(AssertionError, match="not a named module constant"):
+        _sql_sites()
