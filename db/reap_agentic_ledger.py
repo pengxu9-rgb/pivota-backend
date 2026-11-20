@@ -3020,6 +3020,7 @@ _COUNT_CHECKOUT_NEEDS_HUMAN_SQL = """
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=chr(58))
        OR (state='quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+       OR (state='awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
 """
 _COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
     SELECT count(*) AS n FROM reap_agentic_purchases
@@ -3027,11 +3028,17 @@ _COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=char(58))
        OR (state='quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+       OR (state='awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
 """
 
 
 async def count_checkout_needs_human() -> int:
-    """Only explicitly classified unresolved reads; never general transport/refusal errors."""
+    """Only explicitly classified unresolved reads; never general transport/refusal errors. Three cohorts:
+    a stored checkout classified `checkout_unresolvable:`; a `quoting` row whose create may have reached Reap
+    (a dispatch fence, or no version-1 tracking); and a LEGACY `awaiting_approval` row with no checkout id and
+    no version-1 tracking. The expire sweep refuses that last one (a legacy row's missing id is unknown, never
+    negative proof), and in reconciliation-only mode nothing claims it, so without this count it would wait
+    for ever, unseen. A read: counting changes nothing."""
     if IS_POSTGRES:
         row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL)
     else:
