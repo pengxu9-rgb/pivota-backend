@@ -1,4 +1,4 @@
-"""source = shopify_markets for SG (Peng 2026-10-10: "Build the SG currency support").
+"""source = shopify_markets for SG (the owner 2026-10-10: "Build the SG currency support").
 
 The coverage wave of 2026-10-10 found many (brand, store) pairs for SG buyers at Shopify stores whose base
 currency is not SGD but whose cart quotes SGD to SG (mostly USD- and JPY-base, nearly all of them

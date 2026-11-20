@@ -1,7 +1,7 @@
 # ADR-026: A market is data — one registry, four separate axes, per-market prices and eligibility
 
 **Status:** **Accepted, 2026-10-11.**
-- Peng decided the four open questions (see "Resolved questions").
+- The owner decided the four open questions (see "Resolved questions").
 - The coverage/drain lane, which owns the drain, reviewed every ingestion and drain line against drain `a9b6396d3`; its review is merged.
 - Appendix B holds its price-mix measurement (160 stores, 2026-10-11).
 
@@ -256,7 +256,7 @@ To move market X from `acquisition` to `served`:
 
 After P5, a third served market (GB, JP, AU…) is a registry entry, supply, and the launch checklist.
 
-## Resolved questions (Peng, 2026-10-11: "go with your recommendations")
+## Resolved questions (the owner, 2026-10-11: "go with your recommendations")
 
 1. **Where the registry lives: a checked-in file.** It is reviewed and deployed like code. The gateway reads a generated JSON copy, which CI checks byte-for-byte against the backend's. There is no runtime-toggled DB table: a market change is reviewed like a code change.
 2. **Seed partition: dropped.** A seed's own offers (their currency, and the market they declare) decide which buyer markets see it. The `external_product_seeds.market` read partition goes away in P4.

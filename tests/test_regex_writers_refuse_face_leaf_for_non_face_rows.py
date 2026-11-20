@@ -10,7 +10,7 @@ On 2026-09-23 the 188 rows with an honest leaf were moved (body care / hair care
 the next backfill run, which re-derived the same face leaf. The rule now lives in
 `non_face_leaf`, shared with the curated resolver, and returns NO answer for them.
 
-2026-09-26: nail products got leaves (beauty/makeup/nails/*, Peng). A nail polish now resolves to
+2026-09-26: nail products got leaves (beauty/makeup/nails/*, the owner). A nail polish now resolves to
 `beauty/makeup/nails/nail-polish` -- still never to a face leaf, which is what these tests guard.
 Lash and brow serums still have no leaf and still get no answer.
 

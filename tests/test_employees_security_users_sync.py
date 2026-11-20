@@ -17,14 +17,14 @@ def test_update_employee_syncs_users_table(monkeypatch):
 
     async def fake_fetch_one(query, values=None):
         if "SELECT email FROM employees" in str(query):
-            return {"email": "peng@pivota.cc"}
+            return {"email": "employee@example.com"}
         return None
 
     monkeypatch.setattr(employees_security_module.database, "execute", fake_execute)
     monkeypatch.setattr(employees_security_module.database, "fetch_one", fake_fetch_one)
 
     res = client.put(
-        "/employees/emp_test?name=Peng&role=admin&status=inactive",
+        "/employees/emp_test?name=Owner&role=admin&status=inactive",
         headers={"Authorization": "Bearer test-token"},
     )
 
@@ -48,7 +48,7 @@ def test_delete_employee_deactivates_users_table(monkeypatch):
 
     async def fake_fetch_one(query, values=None):
         if "SELECT email FROM employees" in str(query):
-            return {"email": "peng@pivota.cc"}
+            return {"email": "employee@example.com"}
         return None
 
     monkeypatch.setattr(employees_security_module.database, "execute", fake_execute)

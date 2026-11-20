@@ -50,7 +50,7 @@ The fact answers two different consumers, and NO_CARD_PAYMENT is where they part
     2026-10-09 by the PR controller from a Mac: 643 of 839 negative cart seeds (26 hosts) were
     NO_CARD_PAYMENT, and most of those checkouts take cards through an OFFSITE provider
     (Eximbay, Payfast, "Pay via Cards/Wallets/Bank Transfer") a human completes without
-    noticing — the first cut of the cart gate declined every one of them. Peng's decision.
+    noticing — the first cut of the cart gate declined every one of them. The owner's decision.
 
   Both read the buyer vantage and both fail CLOSED; neither defaults a market. The preflight,
   the sweep and the three write rules above are unchanged by the second reader.
