@@ -439,7 +439,7 @@ async def test_an_import_postgres_aborts_as_a_deadlock_victim_is_a_409_with_noth
     assert response.status_code == 409, response.text
     detail = response.json()["detail"]
     assert (detail["code"], detail["written"]) == ("import_conflict", False)
-    assert "try the import again" in detail["message"].lower()
+    assert detail["message"] == route.IMPORT_CONFLICT_MESSAGE and "dry run again" in detail["message"]
     mine = [p for p in await store.list_programs() if str(p["merchant_name"]).startswith(PREFIX)]
     assert sorted((p["id"], p["notes"]) for p in mine) == sorted([(first["id"], None), (second["id"], None)])
     for pid in (first["id"], second["id"]):

@@ -11,10 +11,12 @@ Every change writes the program row and its append-only event in ONE transaction
 reads its row FOR UPDATE inside that transaction (Postgres), so concurrent edits queue instead of one
 writing the whole row back from a stale read. The CSV import never sets `live_at`, is a dry run unless asked
 otherwise, is idempotent (re-running a file changes nothing) and is all-or-nothing: a real run refuses the
-whole file if any row is invalid, and writes every row in one transaction. It takes its row locks in one fixed
-order (updates by program id, then creates by network and advertiser ID), so two imports of the same programs
-queue instead of deadlocking; if Postgres still aborts one to break a lock cycle, that file rolls back whole
-and ImportConflict says to run it again.
+whole file if any row is invalid, and writes every row in one transaction. Its writes run in one fixed order
+(updates by program id, then creates by network and advertiser ID), so two imports that update the same
+programs take the row locks in one order and queue. That does NOT prevent every cycle: an update that sets an
+advertiser ID claims a unique-index entry in the update phase, so it can still cross a keyed create in another
+import. When Postgres aborts an import to break a cycle, that file rolls back whole and ImportConflict says to
+dry-run it again before re-importing.
 
 Text fields refuse control characters and a leading `=`, `+` or `@` (`-` too on single-line fields), so a
 value can't act as a spreadsheet formula. `notes` may still start with `-`: any future CSV export must
@@ -94,7 +96,9 @@ class ImportRefused(Exception):
 
 class ImportConflict(Exception):
     """A real import Postgres aborted to break a lock cycle with another write (deadlock, 40P01) or a
-    serialization failure (40001). The whole file rolled back and nothing was written; running it again is safe."""
+    serialization failure (40001). The whole file rolled back and nothing was written. A re-run re-plans
+    against the registry as the other write left it, which can match rows differently (e.g. rename a program
+    that write just created), so the answer says to dry-run again first."""
 
     def __init__(self):
         super().__init__("the import collided with another write; nothing was written")
@@ -677,9 +681,14 @@ async def _plan_import(rows: List[Tuple[int, Dict[str, str]]]):
 def _write_order(actions):
     """The real run's writes in ONE fixed order: updates by program_id, then creates by (network,
     advertiser_id). Each _update holds its row lock FOR UPDATE, and each keyed create its unique-index entry,
-    until the import's single transaction commits, so two imports that touch the same programs in different
-    file orders would otherwise each hold one and wait for the other (a deadlock). Stable: ties keep file
-    order. The report (`results`) is not reordered."""
+    until the import's single transaction commits. Without one order, two imports that update the same programs
+    in different file orders each hold one row and wait for the other (a deadlock); with it they queue.
+
+    NOT every cycle: an update that SETS an advertiser_id claims a unique-index entry here, in program_id order,
+    while creates claim theirs later in key order, so two such imports can still cross (Postgres aborts one: a
+    409 import_conflict, nothing written). Locking every update target first and then making every key claim in
+    key order would close that, at the cost of a second pass; not done while the 409 covers it.
+    Stable: ties keep file order. The report (`results`) is not reordered."""
     updates = sorted((a for a in actions if a[1] == "update"), key=lambda a: a[3])
     creates = sorted((a for a in actions if a[1] == "create"),
                      key=lambda a: (a[2]["network"], a[2].get("advertiser_id") or ""))
@@ -691,7 +700,7 @@ async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
     transaction, refuses the whole file (ImportRefused, nothing written) if any row is invalid, and rolls
     everything back if a row conflicts while writing or the database fails part-way. Its writes take their
     locks in _write_order; if Postgres still aborts it as a deadlock victim or for a serialization failure,
-    the file rolled back whole and ImportConflict says to run it again."""
+    the file rolled back whole and ImportConflict says to dry-run it again before re-importing."""
     rows = parse_csv(text)
     if dry_run:
         results, summary, _ = await _plan_import(rows)

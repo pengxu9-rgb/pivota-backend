@@ -622,10 +622,17 @@ async def test_an_import_postgres_aborts_for_a_lock_conflict_is_a_409_with_nothi
     assert response.status_code == 409, response.text
     detail = response.json()["detail"]
     assert (detail["code"], detail["written"]) == ("import_conflict", False)
-    assert "try the import again" in detail["message"].lower()
+    assert detail["message"] == employee_affiliate_programs.IMPORT_CONFLICT_MESSAGE and "dry run again" in detail["message"]
     monkeypatch.setattr(store, "update_program", real_update)
     items = (await client.get(BASE, headers=_auth())).json()["items"]
     assert [(p["id"], p["notes"]) for p in items] == [(pid, None)]
+
+
+def test_each_409_import_conflict_is_a_new_exception():
+    """A shared instance would grow its __traceback__ on every raise and keep each request's CSV alive."""
+    first, second = employee_affiliate_programs._import_conflict(), employee_affiliate_programs._import_conflict()
+    assert first is not second and first.__traceback__ is None
+    assert not hasattr(employee_affiliate_programs, "_IMPORT_CONFLICT")
 
 
 async def test_an_error_that_is_not_a_lock_conflict_is_not_a_409(client, monkeypatch):
