@@ -245,6 +245,26 @@ async def test_the_heal_defers_within_its_lock_timeout_behind_an_access_exclusiv
     assert "'shipping_address'" in await _step_check(database)
 
 
+async def test_the_guard_gives_a_callers_transaction_its_own_lock_timeout_back(_db):
+    # The block sets its 500 ms first (P2-1) and puts the caller's value back last: inside a caller's
+    # transaction nothing leaks, whether the guard found nothing to do or ran its DDL.
+    import db.agent_purchase_consents as consents_db
+    from db.schema_guard import guarded_ddl
+
+    database = _db
+    no_op = guarded_ddl("agent_purchase_consents", consents_db._STEP_CHECK_WIDENED, consents_db._WIDEN_STEP_CHECK_DDL)
+    ran = guarded_ddl("agent_purchase_consents", "true", "PERFORM 1;")
+    async with database.transaction():
+        await database.execute("SET LOCAL lock_timeout = '7s'")
+        for statement in (no_op, ran):
+            await database.execute(statement)
+            assert (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"] == "7s"
+    async with database.transaction():
+        before = (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"]
+        await database.execute(ran)
+        assert (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"] == before != "500ms"
+
+
 async def test_a_double_write_is_one_row_and_the_reselect_names_the_winner(_db):
     issued = datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
     first, created = await _record(issued=issued)

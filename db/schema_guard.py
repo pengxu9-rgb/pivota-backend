@@ -154,12 +154,15 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
     can itself take a relation lock (pg_get_constraintdef on a CHECK takes
     ACCESS SHARE on the table), and that check runs on every boot, so with the
     timeout set only inside the branch a no-op boot could wait without bound
-    behind an ACCESS EXCLUSIVE holder or a queued ALTER. Transaction-local: it
-    ends with the statement. THE BLOCK MUST RUN WITH NO OUTER TRANSACTION:
-    inside a caller's `database.transaction()` the 500 ms would hold for the
-    rest of that transaction. Every caller runs it on its own, and
-    tests/test_schema_guard_ddl_guard.py (no_guarded_ddl_runs_inside_a_callers_transaction)
-    fails on any call, or any function that runs one, inside a transaction block.
+    behind an ACCESS EXCLUSIVE holder or a queued ALTER. Transaction-local, and
+    the caller's own value is put back as the block's LAST statement: run alone
+    the setting ends with the statement, and run inside a caller's
+    `database.transaction()` the caller keeps its own lock_timeout for the rest
+    of that transaction (when the block fails, that transaction is aborted
+    anyway). Still, a guarded heal belongs outside any transaction (its DDL locks
+    last until the caller commits): tests/test_schema_guard_ddl_guard.py
+    (no_guarded_ddl_runs_inside_a_callers_transaction) fails on any call, or any
+    function that runs one, inside a transaction block.
 
     `ddl` is kept verbatim and may be several statements: they run in one
     transaction, so a DROP + ADD CONSTRAINT pair is never seen half-done and
@@ -169,11 +172,13 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
         raise ValueError("guarded_ddl: the statement carries the block's own quote tag")
     return f"""
         DO $guard$
+        DECLARE guard_lock_timeout_was text := current_setting('lock_timeout');
         BEGIN
             PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
             IF to_regclass('{table}') IS NOT NULL AND ({needed}) THEN
                 {ddl.strip()}
             END IF;
+            PERFORM set_config('lock_timeout', guard_lock_timeout_was, true);
         END $guard$;
         """
 
