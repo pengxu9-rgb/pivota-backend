@@ -1,9 +1,8 @@
 """RFC 9421 request signing for Pivota's OUTBOUND UCP calls (Pivota as the platform/agent).
 
-WHY THIS EXISTS. Shopline's agent standard (designed with Meta's Muse, 2026-11-20) treats Pivota
-exactly like Muse: a platform is identified by the `UCP-Agent` profile it names on every request,
-and the request is signed with a key that profile publishes (`signing_keys[]` / `keys[]`, matched
-by `kid`). The backend's checkout client (services/merchant_ucp_checkout.py) sent only
+WHY THIS EXISTS. Under a platform agent standard (2026-11) a platform is identified by the
+`UCP-Agent` profile it names on every request, and the request is signed with a key that profile
+publishes (`signing_keys[]` / `keys[]`, matched by `kid`). The backend's checkout client (services/merchant_ucp_checkout.py) sent only
 `meta["ucp-agent"]` -- no header, no signature, no Content-Digest -- so a merchant enforcing the
 standard refuses it.
 
@@ -20,8 +19,19 @@ THE CONSTRUCTION (ucp.dev/2026-04-08/specification/signatures):
     (verifiers derive it from the JWK's crv);
   - Signature: `sig1=:<base64(raw r||s)>:` -- ECDSA P-256 as fixed-width 64 bytes, NOT DER.
 
+THE COMPONENTS ARE THE WIRE'S. @authority, @path and @query come from `httpx.URL(url)` -- the URL
+httpx actually sends -- never from the raw string: httpx percent-encodes a space or non-ASCII, removes
+dot segments and IDNA-encodes the host, and a verifier rebuilds the base from what it RECEIVED. (The
+gateway's WHATWG `URL` does the same; the shared vectors pin both on those cases.)
+
 KEY MATERIAL comes from env only (UCP_AGENT_SIGNING_PRIVATE_KEY: PEM or a private JWK;
 UCP_AGENT_SIGNING_KEY_ID, else the JWK's kid) and is never logged, returned or put in an error.
+
+THE KEY MUST BE THE PUBLISHED KEY. The gateway hosts the profile; this process cannot see it. So
+`published_key_matches` compares the loaded key's public half and kid to UCP_AGENT_SIGNING_PUBLIC_JWK
+(the same public value the gateway publishes), and the checkout client signs only when they agree:
+a signature under a kid the profile does not publish -- or under that kid with other x/y -- verifies
+against nothing and turns a call that works unsigned into a refusal.
 """
 
 from __future__ import annotations
@@ -33,8 +43,8 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
 
+import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
@@ -42,7 +52,6 @@ logger = logging.getLogger(__name__)
 
 SIGNATURE_TTL_SECONDS = 300
 CONTENT_TYPE = "application/json"
-_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 # (raw env value, kid env value) -> (key, kid). The raw value is the cache key so a rotated secret
 # takes effect on the next call without a restart; it is never logged.
@@ -81,6 +90,16 @@ def load_signing_key(
             key = ec.derive_private_key(_b64url_int(str(jwk["d"])), ec.SECP256R1())
         except Exception:
             raise SigningKeyError("signing JWK private component is unusable") from None
+        # A JWK carries the public half too; `d` alone decides the key, so x/y that disagree would
+        # sign with a key that is not the one this JWK (and whatever was published from it) names.
+        if "x" in jwk or "y" in jwk:
+            nums = key.public_key().public_numbers()
+            try:
+                same = _b64url_int(str(jwk.get("x") or "")) == nums.x and _b64url_int(str(jwk.get("y") or "")) == nums.y
+            except Exception:
+                same = False
+            if not same:
+                raise SigningKeyError("signing JWK x/y do not match its private component")
         jwk_kid = str(jwk.get("kid") or "").strip()
     else:
         try:
@@ -99,18 +118,61 @@ def load_signing_key(
     return key, resolved_kid
 
 
+def public_jwk_of(key: ec.EllipticCurvePrivateKey) -> Dict[str, str]:
+    """The public JWK (kty/crv/x/y) of a loaded private key. Never contains `d`."""
+    nums = key.public_key().public_numbers()
+
+    def enc(n: int) -> str:
+        return base64.urlsafe_b64encode(n.to_bytes(32, "big")).rstrip(b"=").decode("ascii")
+
+    return {"kty": "EC", "crv": "P-256", "x": enc(nums.x), "y": enc(nums.y)}
+
+
+def published_key_matches(
+    key: ec.EllipticCurvePrivateKey, kid: str, published_raw: Optional[str] = None
+) -> bool:
+    """True only when UCP_AGENT_SIGNING_PUBLIC_JWK (an object or an array of them) lists `kid` with
+    this key's x/y. Unset, unreadable or different -> False. Reads only public values."""
+    raw = (published_raw if published_raw is not None else os.getenv("UCP_AGENT_SIGNING_PUBLIC_JWK") or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return False
+    entries = parsed if isinstance(parsed, list) else [parsed]
+    mine = public_jwk_of(key)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if (
+            str(entry.get("kid") or "") == kid
+            and entry.get("kty") == "EC"
+            and entry.get("crv") == "P-256"
+            and entry.get("x") == mine["x"]
+            and entry.get("y") == mine["y"]
+        ):
+            return True
+    return False
+
+
 def content_digest(body: bytes) -> str:
     """RFC 9530 Content-Digest. Always sha-256, over the exact bytes sent."""
     return "sha-256=:" + base64.b64encode(hashlib.sha256(body).digest()).decode("ascii") + ":"
 
 
-def _authority(parts) -> str:
-    # The gateway uses WHATWG `URL.host`: lower-cased hostname, port only when not the scheme's default.
-    host = (parts.hostname or "").lower()
-    port = parts.port
-    if port is not None and port != _DEFAULT_PORTS.get(parts.scheme.lower()):
-        host = f"{host}:{port}"
-    return host
+def wire_components(url: str) -> Tuple[str, str, Optional[str]]:
+    """(@authority, @path, @query or None) exactly as httpx puts them on the wire.
+
+    @authority is httpx's netloc: IDNA (punycode) host, IPv6 bracketed, the port only when it is not
+    the scheme's default, never userinfo -- lower-cased, as WHATWG `URL.host` is. @path/@query are
+    httpx's raw request target split at the first `?`. An empty query (`/mcp?`) is not covered, which
+    matches the gateway signer (WHATWG `search` is "" there)."""
+    u = httpx.URL(url)
+    authority = u.netloc.decode("ascii").lower()
+    target = u.raw_path.decode("ascii")
+    path, sep, query = target.partition("?")
+    return authority, path or "/", ("?" + query) if sep and query else None
 
 
 def build_signature_base(
@@ -125,15 +187,15 @@ def build_signature_base(
     expires: Optional[int],
 ) -> Dict[str, Any]:
     """RFC 9421 signature base + Signature-Input params. Pure; mirrors the gateway's buildUcpSignatureBase."""
-    parts = urlsplit(url)
+    authority, path, query = wire_components(url)
     digest = content_digest(body) if body is not None else None
     fields: List[Tuple[str, str]] = [
         ("@method", str(method or "POST").upper()),
-        ("@authority", _authority(parts)),
-        ("@path", parts.path or "/"),
+        ("@authority", authority),
+        ("@path", path),
     ]
-    if parts.query:
-        fields.append(("@query", "?" + parts.query))
+    if query:
+        fields.append(("@query", query))
     if ucp_agent:
         fields.append(("ucp-agent", ucp_agent))
     if idempotency_key:

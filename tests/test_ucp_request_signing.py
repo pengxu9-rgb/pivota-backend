@@ -34,7 +34,7 @@ with open(_VECTORS_PATH, encoding="utf-8") as fh:
 
 # The SAME sha256 is pinned in PIVOTA-Agent tests/ucp_request_signature_vectors.test.js. A regenerated or
 # edited vector file fails here AND there until both pins move together, so the two copies cannot drift.
-VECTORS_SHA256 = "6b5433aca7f573400ea62f11498aa0aceb6a14a45572c290ef5fdd20499b0dbf"
+VECTORS_SHA256 = "c263a74407f74187f1d7ae3f2a7f6664a54186c5794caafe50c50138f4786b50"
 
 
 def test_the_vector_file_is_byte_for_byte_the_gateway_copy():
@@ -138,6 +138,55 @@ def test_loads_a_private_jwk_and_takes_its_kid():
     assert loaded.private_numbers().private_value == key.private_numbers().private_value
 
 
+def test_a_private_jwk_whose_x_y_are_not_its_d_is_refused():
+    key, _ = sig.load_signing_key(TEST_PRIVATE_PEM, "x")
+    d = key.private_numbers().private_value.to_bytes(32, "big")
+    other = ec.generate_private_key(ec.SECP256R1())
+    jwk = dict(sig.public_jwk_of(other), d=base64.urlsafe_b64encode(d).rstrip(b"=").decode(), kid="k")
+    with pytest.raises(sig.SigningKeyError) as err:
+        sig.load_signing_key(json.dumps(jwk), "")
+    assert "x/y" in str(err.value) and jwk["d"] not in str(err.value)
+
+
+def test_published_key_matches_needs_the_kid_and_this_keys_x_y():
+    key, _ = sig.load_signing_key(TEST_PRIVATE_PEM, "x")
+    pub = VECTORS["public_jwk"]
+    kid = pub["kid"]
+    assert sig.public_jwk_of(key) == {k: pub[k] for k in ("kty", "crv", "x", "y")}
+    assert sig.published_key_matches(key, kid, json.dumps(pub))
+    assert sig.published_key_matches(key, kid, json.dumps([dict(pub, kid="old"), pub]))
+    assert not sig.published_key_matches(key, "other-kid", json.dumps(pub))
+    other = sig.public_jwk_of(ec.generate_private_key(ec.SECP256R1()))
+    assert not sig.published_key_matches(key, kid, json.dumps(dict(other, kid=kid)))
+    assert not sig.published_key_matches(key, kid, "")
+    assert not sig.published_key_matches(key, kid, "{not json")
+
+
+@pytest.mark.parametrize(
+    "url,authority,path,query",
+    [
+        ("https://h.example/ucp/a b/mcp", "h.example", "/ucp/a%20b/mcp", None),
+        ("https://h.example/ucp/caf\u00e9/mcp", "h.example", "/ucp/caf%C3%A9/mcp", None),
+        ("https://h.example/a/../ucp/./mcp", "h.example", "/ucp/mcp", None),
+        ("https://h.example/mcp?q=a b&r=\u00e9", "h.example", "/mcp", "?q=a%20b&r=%C3%A9"),
+        ("https://b\u00fccher.example/mcp", "xn--bcher-kva.example", "/mcp", None),
+        ("https://[2001:DB8::1]:8443/mcp", "[2001:db8::1]:8443", "/mcp", None),
+        ("https://H.Example:443/mcp", "h.example", "/mcp", None),
+        ("https://h.example:80/mcp", "h.example:80", "/mcp", None),
+        ("https://u:p@h.example/mcp#frag", "h.example", "/mcp", None),
+        ("https://h.example/mcp?", "h.example", "/mcp", None),
+        ("https://h.example", "h.example", "/", None),
+    ],
+)
+def test_components_are_the_ones_httpx_puts_on_the_wire(url, authority, path, query):
+    assert sig.wire_components(url) == (authority, path, query)
+    # ...and they ARE the wire: httpx's own request line and Host header.
+    req = httpx.Request("POST", url)
+    target = req.url.raw_path.decode("ascii")
+    assert target.partition("?")[0] == path
+    assert req.headers["host"].lower() == authority
+
+
 def test_no_key_configured_is_none(monkeypatch):
     monkeypatch.delenv("UCP_AGENT_SIGNING_PRIVATE_KEY", raising=False)
     assert sig.load_signing_key() is None
@@ -221,6 +270,7 @@ def _env(monkeypatch):
     monkeypatch.delenv("MERCHANT_UCP_ENDPOINT_DISCOVERY_ENABLED", raising=False)
     monkeypatch.setenv("UCP_AGENT_SIGNING_PRIVATE_KEY", TEST_PRIVATE_PEM)
     monkeypatch.setenv("UCP_AGENT_SIGNING_KEY_ID", VECTORS["public_jwk"]["kid"])
+    monkeypatch.setenv("UCP_AGENT_SIGNING_PUBLIC_JWK", json.dumps(VECTORS["public_jwk"]))
     return monkeypatch
 
 
@@ -309,3 +359,46 @@ async def test_the_callers_arguments_are_not_mutated(_env):
     args = {"meta": muc.build_meta(), "id": "chk_1"}
     await muc._call_tool("shop.example", "get_checkout", args)
     assert "idempotency-key" not in args["meta"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("published", ["unset", "other_kid", "other_key"])
+async def test_flag_on_with_a_key_that_is_not_the_published_key_sends_unsigned(_env, published):
+    _env.setenv("UCP_CHECKOUT_SIGN", "1")
+    pub = VECTORS["public_jwk"]
+    if published == "unset":
+        _env.delenv("UCP_AGENT_SIGNING_PUBLIC_JWK")
+    elif published == "other_kid":
+        _env.setenv("UCP_AGENT_SIGNING_PUBLIC_JWK", json.dumps(dict(pub, kid="pivota-other-kid")))
+    else:
+        other = sig.public_jwk_of(ec.generate_private_key(ec.SECP256R1()))
+        _env.setenv("UCP_AGENT_SIGNING_PUBLIC_JWK", json.dumps(dict(other, kid=pub["kid"])))
+    warnings = []
+    _env.setattr(muc.logger, "warning", lambda fmt, *a: warnings.append(fmt % a))
+    wire = _Wire(_env)
+    await muc.get_checkout("shop.example", "chk_1")
+    (req,) = wire.requests
+    assert "json" in req and "signature" not in req["headers"]
+    assert any("not the published key" in w for w in warnings)
+    assert not any("PRIVATE KEY" in w or "MIGH" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_a_lone_surrogate_is_escaped_and_signed_not_raised(_env):
+    _env.setenv("UCP_CHECKOUT_SIGN", "1")
+    wire = _Wire(_env)
+    await muc.get_checkout("shop.example", "chk_\ud800")
+    (req,) = wire.requests
+    assert req["content"].isascii() and b"chk_\\ud800" in req["content"]
+    assert _verify_request(req)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_a_non_ascii_body_is_sent_as_ascii_escapes_and_verifies(_env):
+    _env.setenv("UCP_CHECKOUT_SIGN", "1")
+    wire = _Wire(_env)
+    await muc.get_checkout("shop.example", "chk_caf\u00e9")
+    (req,) = wire.requests
+    assert req["content"].isascii()
+    assert json.loads(req["content"])["params"]["arguments"]["id"] == "chk_caf\u00e9"
+    assert _verify_request(req)

@@ -155,10 +155,11 @@ _SIGN_FLAG = "UCP_CHECKOUT_SIGN"
 def checkout_signing_enabled() -> bool:
     """Sign every merchant UCP call (RFC 9421), default OFF, read per call.
 
-    Shopline's agent standard identifies a platform by its signed `UCP-Agent` on every request; an
-    unsigned call is refused there. Off, the wire is byte-identical to before: `json=` body, no
-    UCP-Agent header, no idempotency key. On but with no usable key, calls go out unsigned as before
-    and one warning per call names the missing piece (never the key).
+    A platform agent standard (2026-11) identifies a platform by its signed `UCP-Agent` on every
+    request; an unsigned call is refused there. Off, the wire is byte-identical to before: `json=`
+    body, no UCP-Agent header, no idempotency key. On but with no usable key -- or a key that is not
+    the published one (UCP_AGENT_SIGNING_PUBLIC_JWK kid + x/y) -- calls go out unsigned as before and
+    one warning per call names the missing piece (never the key).
     """
     return str(os.getenv(_SIGN_FLAG) or "").strip().lower() in ("1", "true", "on", "yes")
 
@@ -177,6 +178,18 @@ def _signing_key_or_none(tool: str):
             tool,
             _SIGN_FLAG,
         )
+        return None
+    key, kid = loaded
+    if not ucp_request_signing.published_key_matches(key, kid):
+        # Signing under a key the profile does not publish makes every signature unverifiable, and a
+        # verifier that checks what it is shown would refuse a call that goes through unsigned.
+        logger.warning(
+            "merchant-ucp %s sending unsigned: the signing key is not the published key "
+            "(UCP_AGENT_SIGNING_PUBLIC_JWK must list kid %s with this key's x/y)",
+            tool,
+            kid,
+        )
+        return None
     return loaded
 
 
@@ -863,7 +876,10 @@ async def _call_tool(
         "params": {"name": tool, "arguments": arguments},
     }
     body_bytes = (
-        json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        # ensure_ascii=True: the body stays ASCII like the flag-off `json=` wire, and a lone surrogate
+        # in a caller's string is escaped (`\\ud800`) instead of raising UnicodeEncodeError here, outside
+        # the transport's error net. The digest is over these exact bytes either way.
+        json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("ascii")
         if signing is not None
         else None
     )
