@@ -1233,3 +1233,63 @@ def test_metered_quote_is_available_with_zero_credits_but_start_is_blocked(clien
     start = client.post(_URL, json={**body, 'accepted_quote': quote['quote_id']})
     assert start.status_code == 402, start.text
     assert not client.credit_ops and not client.enqueued
+
+
+# --- A supplied quote binds every run, with or without answer capture --------
+@pytest.mark.parametrize('used', [0, 5])
+def test_url_quote_without_questions_charges_exactly_the_quote(client, used):
+    client.state['used'] = used
+    quote = client.post(_URL + '/quote', json=_BODY)
+    assert quote.status_code == 200, quote.text
+    q = quote.json()
+    assert q['status'] == 'quoted' and q['consumer_capture'] is None
+    assert q['credits'] == q['base_credits']
+    assert (q['credits'] > 0) == (used >= 2)
+    assert not client.credit_ops and not client.enqueued  # quoting stays read-only
+    started = client.post(_URL, json={**_BODY, 'accepted_quote': q['quote_id']})
+    assert started.status_code == 200, started.text
+    body = started.json()
+    assert body['status'] == 'running'
+    assert body['credits_charged'] == q['credits']
+    launch = client.enqueued[-1]['request_options_jsonb']['launch']
+    assert launch['estimated_audit_credits'] == q['credits']
+    assert launch['wedge_base_payload']['credits_charged'] == q['credits']
+    consumes = [o for o in client.credit_ops if o['kind'] == 'consume']
+    assert [o['credits'] for o in consumes] == ([q['credits']] if q['credits'] else [])
+
+
+def test_url_quote_without_questions_scope_change_is_409_before_debit(client):
+    client.state['used'] = 5
+    q = client.post(_URL + '/quote', json=_BODY).json()
+    for changes in [{'brand': 'Different'}, {'product_urls': [_BODY['product_urls'][0]]},
+                    {'custom_prompts': ['Another diagnostic question']},
+                    {'refresh': True}]:
+        response = client.post(_URL, json={**_BODY, **changes, 'accepted_quote': q['quote_id']})
+        assert response.status_code == 409, (changes, response.text)
+        assert response.json()['detail']['code'] == 'quote_required'
+    stale = client.post(_URL, json={**_BODY, 'accepted_quote': '0' * 64})
+    assert stale.status_code == 409
+    assert stale.json()['detail']['code'] == 'quote_required'
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_url_quote_without_questions_price_change_is_409_before_debit(client):
+    # Quoted while the last free audit was still available; another run used it
+    # up before Start, so this run would now be metered — a different price.
+    client.state['used'] = 1
+    q = client.post(_URL + '/quote', json=_BODY).json()
+    assert q['credits'] == 0
+    client.state['used'] = 2
+    response = client.post(_URL, json={**_BODY, 'accepted_quote': q['quote_id']})
+    assert response.status_code == 409, response.text
+    assert response.json()['detail']['code'] == 'quote_required'
+    assert not client.credit_ops and not client.enqueued
+
+
+def test_url_run_without_quote_or_questions_keeps_legacy_metering(client):
+    client.state['used'] = 5
+    q = client.post(_URL + '/quote', json=_BODY).json()
+    response = client.post(_URL, json=_BODY)
+    assert response.status_code == 200, response.text
+    assert response.json()['credits_charged'] == q['credits'] > 0
+    assert [o['credits'] for o in client.credit_ops if o['kind'] == 'consume'] == [q['credits']]
