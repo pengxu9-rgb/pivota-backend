@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -43,6 +44,7 @@ from services.agent_card_issuance import (
     validate_merchant_domain,
 )
 from services.outbound_links_service import REFERRAL_CLICK_PARAM
+from services import ucp_request_signing
 from utils.logger import logger
 
 _TIMEOUT_SECONDS = 12.0
@@ -145,6 +147,37 @@ def build_meta() -> Dict[str, Any]:
     # ours (our_fault) rather than the caller's.
     # The hyphen in `ucp-agent` is the merchant's spelling, not ours. Probed 2026-08-31.
     return {"ucp-agent": {"profile": agent_profile_url()}}
+
+
+_SIGN_FLAG = "UCP_CHECKOUT_SIGN"
+
+
+def checkout_signing_enabled() -> bool:
+    """Sign every merchant UCP call (RFC 9421), default OFF, read per call.
+
+    Shopline's agent standard identifies a platform by its signed `UCP-Agent` on every request; an
+    unsigned call is refused there. Off, the wire is byte-identical to before: `json=` body, no
+    UCP-Agent header, no idempotency key. On but with no usable key, calls go out unsigned as before
+    and one warning per call names the missing piece (never the key).
+    """
+    return str(os.getenv(_SIGN_FLAG) or "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _signing_key_or_none(tool: str):
+    if not checkout_signing_enabled():
+        return None
+    try:
+        loaded = ucp_request_signing.load_signing_key()
+    except ucp_request_signing.SigningKeyError as err:
+        logger.warning("merchant-ucp %s sending unsigned: %s", tool, err)
+        return None
+    if loaded is None:
+        logger.warning(
+            "merchant-ucp %s sending unsigned: %s is on but UCP_AGENT_SIGNING_PRIVATE_KEY is unset",
+            tool,
+            _SIGN_FLAG,
+        )
+    return loaded
 
 
 def build_attribution(
@@ -478,6 +511,7 @@ async def _read_bounded(
     url: str,
     *,
     json_body: Optional[Dict[str, Any]] = None,
+    content: Optional[bytes] = None,
     headers: Optional[Dict[str, str]] = None,
     limit: int = _MAX_PROFILE_BYTES,
 ) -> _BoundedBody:
@@ -505,6 +539,10 @@ async def _read_bounded(
     kwargs: Dict[str, Any] = {}
     if json_body is not None:
         kwargs["json"] = json_body
+    # `content` is the signed path: a signature covers a Content-Digest of the EXACT bytes sent, so
+    # those bytes are serialised once by the caller and handed over untouched, never re-encoded here.
+    if content is not None:
+        kwargs["content"] = content
     kwargs["headers"] = dict(headers or {}, **_IDENTITY_ONLY)
     async with client.stream(method, url, **kwargs) as resp:
         encoding = str(resp.headers.get("content-encoding") or "").strip().lower()
@@ -809,12 +847,46 @@ async def _call_tool(
             "merchant_domain does not resolve to a public address", caller_fault=True
         )
 
+    signing = _signing_key_or_none(tool)
+    idempotency_key: Optional[str] = None
+    if signing is not None:
+        # Same rule as the gateway signer: every signed call carries an idempotency key, in the
+        # JSON-RPC meta AND as a covered header. A copy, so the caller's dict is never mutated.
+        idempotency_key = str(uuid.uuid4())
+        meta = dict(arguments.get("meta") or {})
+        meta["idempotency-key"] = idempotency_key
+        arguments = dict(arguments, meta=meta)
     body = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {"name": tool, "arguments": arguments},
     }
+    body_bytes = (
+        json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if signing is not None
+        else None
+    )
+
+    def _post_kwargs(url: str) -> Dict[str, Any]:
+        # Unsigned: exactly the old call. Signed: the exact bytes plus headers signed for THIS url,
+        # so the apex<->www hop and a discovered endpoint each get their own @authority/@path.
+        if signing is None:
+            return {"json_body": body}
+        key, keyid = signing
+        return {
+            "content": body_bytes,
+            "headers": ucp_request_signing.signed_request_headers(
+                method="POST",
+                url=url,
+                body=body_bytes,
+                profile_url=agent_profile_url(),
+                idempotency_key=idempotency_key,
+                key=key,
+                keyid=keyid,
+            ),
+        }
+
     # The host we actually fetched. It diverges from `domain` the moment we hop, and every
     # failure below is reported against THIS, not the host the caller named: an operator who
     # curls the apex and gets an instant 301 should not be told the apex timed out.
@@ -823,9 +895,8 @@ async def _call_tool(
         async with httpx.AsyncClient(
             timeout=_TIMEOUT_SECONDS, follow_redirects=False
         ) as client:
-            resp = await _read_bounded(
-                client, "POST", f"https://{domain}{_MCP_PATH}", json_body=body
-            )
+            first_url = f"https://{domain}{_MCP_PATH}"
+            resp = await _read_bounded(client, "POST", first_url, **_post_kwargs(first_url))
             # Exactly one hop, and only to the apex/www sibling — see _sibling_host. The retry
             # re-runs BOTH guards on the new host: a redirect target is merchant-controlled
             # input, so it is validated like any other caller-supplied host, never trusted
@@ -845,8 +916,9 @@ async def _call_tool(
                         sibling,
                     )
                     fetched = sibling
+                    sibling_url = f"https://{sibling}{_MCP_PATH}"
                     resp = await _read_bounded(
-                        client, "POST", f"https://{sibling}{_MCP_PATH}", json_body=body
+                        client, "POST", sibling_url, **_post_kwargs(sibling_url)
                     )
             # The pinned path is Shopify's. When it says "no door here", ask the merchant's own
             # profile where the door is — the hop the note above called more correct. The
@@ -869,7 +941,9 @@ async def _call_tool(
                         discovered,
                     )
                     fetched = urlsplit(discovered).hostname or fetched
-                    resp = await _read_bounded(client, "POST", discovered, json_body=body)
+                    resp = await _read_bounded(
+                        client, "POST", discovered, **_post_kwargs(discovered)
+                    )
     # `except Exception`, not a tuple of httpx classes. Switching this block to `client.stream`
     # put a whole new exception family on the path: httpx's StreamError/StreamClosed/
     # StreamConsumed/ResponseNotRead are RuntimeError subclasses, NOT HTTPError, so the tuple
