@@ -8,6 +8,8 @@
 #       _NAMED='["named-referral-variants-manifest",<v>,"<sha256>"]'
 #   (apply adds _PLAN and _APPROVAL; rollback adds _RECEIPTS; each '["<secret>",<version>,"<sha256>"]')
 #
+# 0 (root, pinned cloud-sdk) makes /workspace/release and /workspace/seed-batch and hands them to the backend image's
+#   runtime user (uid 10001, infra/gcp/Dockerfile): with --no-source /workspace is root's.
 # 1 copies scripts/, services/ and this config OUT OF THE RELEASE IMAGE (by digest). The next step refuses unless the
 #   submitted config's sha is the release copy's: that catches a stale checkout, not a deliberate mismatch. Every
 #   later step runs the release's own launcher code.
@@ -33,8 +35,18 @@ options:
   dynamicSubstitutions: false
   env:
     - BUILD_ID=$BUILD_ID
-timeout: 4200s
+timeout: 4260s
 steps:
+  - id: workspace
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: bash
+    timeout: 60s
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /workspace/release/infra/gcp /workspace/seed-batch
+        chown -R 10001 /workspace/release /workspace/seed-batch
   - id: release-scripts
     name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
     entrypoint: bash

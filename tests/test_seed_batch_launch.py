@@ -476,11 +476,42 @@ def steps():
 
 def test_step_order_and_failure_policy():
     ids = [s["id"] for s in steps()]
-    assert ids == ["release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "web", "lock", "run",
-                   "publish"]
+    assert ids == ["workspace", "release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "web",
+                   "lock", "run", "publish"]
     assert [s["id"] for s in steps() if s.get("allowFailure")] == ["run"]
     total = sum(int(s["timeout"].rstrip("s")) for s in steps())
     assert all("timeout" in s for s in steps()) and total < int(yaml.safe_load(CONFIG.read_text())["timeout"].rstrip("s"))
+
+
+def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():
+    # Build 99b4e02b (2026-11-20, the test-transaction twin of this config): with --no-source /workspace is root's,
+    # and the backend image runs as `USER app`, so release-scripts could not mkdir. A root step (the pinned cloud-sdk
+    # image, like every other non-backend step) makes the directories first and chowns them to the Dockerfile's uid.
+    import re
+
+    all_steps = steps()
+    by_id = {s["id"]: s for s in all_steps}
+    sdk = by_id["config-is-the-release-config"]["name"]
+    assert sdk.startswith("gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:")
+    first, release = all_steps[0], all_steps[1]
+    assert first["id"] == "workspace" and first["name"] == sdk and first["entrypoint"] == "bash"
+    assert release["id"] == "release-scripts"
+    assert [s["id"] for s in all_steps if "pivota/backend@" in s["name"]] == ["release-scripts"]
+    dockerfile = (CONFIG.parent / "Dockerfile").read_text()
+    uid = re.search(r"useradd [^\n]*--uid (\d+) app\b", dockerfile).group(1)
+    assert re.search(r"^USER app$", dockerfile, re.M)
+    script = first["args"][1]
+    made = re.search(r"^mkdir -p (.+)$", script, re.M).group(1).split()
+    assert made == ["/workspace/release/infra/gcp", "/workspace/seed-batch"]
+    assert re.search(rf"^chown -R {uid} /workspace/release /workspace/seed-batch$", script, re.M)
+    assert not re.search(r"chown[^\n]* /workspace/?(\s|$)", script)  # never /workspace itself
+    # release-scripts may only write under the directories the root step handed over.
+    wanted = re.search(r"^mkdir -p (.+)$", release["args"][1], re.M).group(1).split()
+    assert all(any(w == m or w.startswith(m + "/") or m.startswith(w + "/") for m in made) for w in wanted)
+    targets = re.findall(r"^cp (?:-r )?\S+ (\S+)$", release["args"][1], re.M)
+    assert len(targets) == 3
+    for target in targets:
+        assert target.startswith(("/workspace/release/", "/workspace/seed-batch/")), target
 
 
 def test_builder_images_are_pinned_and_the_digest_check_escapes_its_shell_variables():
