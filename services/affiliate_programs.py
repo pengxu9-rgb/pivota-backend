@@ -62,6 +62,9 @@ _DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)
 MAX_DOMAINS = 20
 MAX_IMPORT_ROWS = 2000
 MAX_IMPORT_BYTES = 1_000_000
+#: The longest CSV cell the import reads. Our own cap, not csv.field_size_limit(): that limit is process-wide
+#: and another module raises it (services/retailer_ingest/affiliate_feed.py), so it can't be relied on here.
+MAX_IMPORT_CELL_CHARS = 8000
 
 
 class ValidationFailed(Exception):
@@ -508,6 +511,8 @@ def parse_csv(text: str) -> List[Tuple[int, Dict[str, str]]]:
             if None in record:
                 raise ValidationFailed({"csv": f"line {line}: more cells than columns"})
             normalized = {str(k).strip().lower(): v for k, v in record.items()}
+            if any(len(v or "") > MAX_IMPORT_CELL_CHARS for v in normalized.values()):
+                raise ValidationFailed({"csv": f"line {line}: a cell is longer than {MAX_IMPORT_CELL_CHARS} characters"})
             if not any((v or "").strip() for v in normalized.values()):
                 continue
             rows.append((line, normalized))

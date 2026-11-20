@@ -513,6 +513,23 @@ async def test_a_malformed_file_is_refused_as_a_whole(client, csv_text, problem)
     assert problem in response.json()["detail"]["errors"]
 
 
+@pytest.mark.parametrize("process_limit", [131072, 16 * 1024 * 1024])
+@pytest.mark.parametrize("cell_chars", [programs.MAX_IMPORT_CELL_CHARS + 1, 140_000])
+async def test_an_oversized_cell_is_refused_whatever_the_process_csv_limit(client, process_limit, cell_chars):
+    """csv.field_size_limit() is process-wide and another module raises it to 16 MB; the outcome must not
+    depend on which tests or imports ran first."""
+    import csv
+
+    before = csv.field_size_limit(process_limit)
+    try:
+        response = await client.post(f"{BASE}/import", headers=_auth(), json={
+            "csv": "network,merchant_name,notes\nother,Example Merchant A," + "x" * cell_chars + "\n"})
+    finally:
+        csv.field_size_limit(before)
+    assert response.status_code == 422, response.text
+    assert "csv" in response.json()["detail"]["errors"]
+
+
 async def test_an_advertiser_row_completes_a_program_recorded_without_one(client):
     pid = (await _create(client, advertiser_id=None, merchant_name="Example Merchant A"))["id"]
     csv_text = "network,advertiser_id,merchant_name\nother,TEST-5001,Example Merchant A\n"
