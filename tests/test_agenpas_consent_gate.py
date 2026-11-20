@@ -874,6 +874,11 @@ def test_the_migration_holds_the_modules_ddl():
     assert "SET LOCAL lock_timeout" in widen
     down = (_REPO / "db/migrations/down/293_agent_purchase_consents_shipping_step_down.sql").read_text("utf-8")
     assert consents_db._STEP_CHECK_289 in down
+    # Always run by hand (the runner never reads down/): ONE transaction of its own, so a failing ADD never
+    # leaves the table without a step CHECK.
+    statements = [line.strip() for line in down.splitlines() if line.strip() and not line.startswith("--")]
+    assert statements[0] == "BEGIN;" and statements[1].startswith("SET LOCAL lock_timeout")
+    assert statements[-1] == "COMMIT;"
 
 
 def test_the_step_check_lists_the_python_steps_and_the_new_step_fits_its_column():
