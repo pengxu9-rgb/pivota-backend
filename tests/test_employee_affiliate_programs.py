@@ -69,7 +69,7 @@ async def client():
 
 
 def _program(**overrides):
-    body = {"network": "rakuten", "advertiser_id": "TEST-1001", "merchant_name": "Example Merchant A",
+    body = {"network": "other", "advertiser_id": "TEST-1001", "merchant_name": "Example Merchant A",
             "merchant_domains": ["https://www.example-a.test/products/x"], "commission_rate_bp": 400,
             "return_window_days": 28}
     body.update(overrides)
@@ -104,6 +104,50 @@ async def test_dial_off_every_path_is_404_before_auth(client, monkeypatch):
         assert as_admin.status_code == 404, (method, path, as_admin.status_code)
 
 
+def _comparable(response):
+    """A 404 minus what differs per request (request id, timestamp)."""
+    try:
+        body = response.json()
+        body.pop("metadata", None)
+    except ValueError:
+        body = response.content
+    return response.status_code, sorted(response.headers.keys()), body
+
+
+_DARK_PATHS = ("", "/", "/import", "/afp_x", "/afp_x/mark-live", "/afp_x/unlive", "/afp_x/nope", "/import/x")
+_DARK_BODIES = (
+    {},
+    {"content": b"{not json", "headers": {"Content-Type": "application/json"}},
+    {"json": {"csv": "network,merchant_name\nother,Example Merchant A\n"}},
+)
+
+
+async def test_dial_off_main_app_answers_like_an_absent_path_for_every_method_body_and_role(monkeypatch):
+    import main
+
+    monkeypatch.setenv(programs.REGISTRY_ENABLED_ENV, "false")
+    absent_base = "/employee/no-such-surface"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://registry.test") as c:
+        for suffix in _DARK_PATHS:
+            for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
+                for kwargs in _DARK_BODIES:
+                    for headers in ({}, _auth()):
+                        merged = {**kwargs, "headers": {**kwargs.get("headers", {}), **headers}}
+                        got = await c.request(method, BASE + suffix, **merged)
+                        absent = await c.request(method, absent_base + suffix, **merged)
+                        assert got.status_code == 404, (method, suffix, got.status_code)
+                        assert _comparable(got) == _comparable(absent), (method, suffix)
+
+
+async def test_dial_on_main_app_serves_the_registry(monkeypatch):
+    import main
+
+    monkeypatch.setenv(programs.REGISTRY_ENABLED_ENV, "true")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://registry.test") as c:
+        assert (await c.get(BASE, headers=_auth())).status_code == 200
+        assert (await c.get(BASE)).status_code in (401, 403)
+
+
 @pytest.mark.parametrize("value", ["", "1", "yes", "TRUE "])
 async def test_only_the_word_true_turns_the_dial_on(client, monkeypatch, value):
     monkeypatch.setenv(programs.REGISTRY_ENABLED_ENV, value)
@@ -130,7 +174,7 @@ async def test_only_admin_roles_write(client):
                                ("PATCH", f"{BASE}/{pid}", {"notes": "x"}),
                                ("POST", f"{BASE}/{pid}/mark-live", {}),
                                ("POST", f"{BASE}/{pid}/unlive", {"reason": "x"}),
-                               ("POST", f"{BASE}/import", {"csv": "network,merchant_name\nrakuten,Example Merchant B\n"})]:
+                               ("POST", f"{BASE}/import", {"csv": "network,merchant_name\nother,Example Merchant B\n"})]:
         response = await client.request(method, path, json=body, headers=_auth("employee"))
         assert response.status_code == 403, (method, path)
     assert (await client.get(BASE, headers=_auth())).json()["counts"]["all"] == 1
@@ -171,11 +215,34 @@ async def test_create_requires_network_and_merchant_name(client):
     assert set(response.json()["detail"]["errors"]) == {"network", "merchant_name"}
 
 
+@pytest.mark.parametrize("field, value", [
+    ("merchant_name", "=HYPERLINK(\"https://example.test\",\"x\")"), ("merchant_name", "+1 Example"),
+    ("merchant_name", "@Example"), ("merchant_name", "-Example"), ("advertiser_id", "=1+1"),
+    ("rate_note", "-50% on sale items"), ("notes", "=cmd"), ("notes", "@x"),
+    ("merchant_name", "Example\x07Merchant"), ("merchant_name", "Example\nMerchant"), ("notes", "a\x00b"),
+])
+async def test_text_fields_refuse_control_characters_and_formula_leads(client, field, value):
+    response = await client.post(BASE, headers=_auth(), json=_program(**{field: value}))
+    assert response.status_code == 422, (field, value, response.text)
+    assert field in response.json()["detail"]["errors"]
+
+
+async def test_notes_may_span_lines_and_start_with_a_dash(client):
+    created = await _create(client, notes="- applied through the network portal\n- waiting on terms")
+    assert created["notes"].startswith("- applied")
+
+
+async def test_list_filters_are_validated(client):
+    for params in ({"status": "bogus"}, {"network": "bogus"}):
+        response = await client.get(BASE, headers=_auth(), params=params)
+        assert response.status_code == 422 and list(params)[0] in response.json()["detail"]["errors"]
+
+
 async def test_the_same_network_and_advertiser_id_is_one_program(client):
     await _create(client)
     response = await client.post(BASE, json=_program(merchant_name="Example Merchant A again"), headers=_auth())
     assert response.status_code == 409
-    other_network = await client.post(BASE, json=_program(network="awin"), headers=_auth())
+    other_network = await client.post(BASE, json=_program(network="cj"), headers=_auth())
     assert other_network.status_code == 201
 
 
@@ -272,7 +339,7 @@ async def test_a_no_op_edit_writes_no_event(client):
 
 
 async def test_the_database_refuses_a_live_row_that_breaks_the_rule():
-    await store.insert_program("afp_check", {**programs._DEFAULTS, "network": "rakuten", "merchant_name": "Example Merchant E"},
+    await store.insert_program("afp_check", {**programs._DEFAULTS, "network": "other", "merchant_name": "Example Merchant E"},
                                actor="t", now=store.utcnow())
     with pytest.raises(Exception):
         await database.execute("UPDATE affiliate_programs SET live_at = CURRENT_TIMESTAMP WHERE id = 'afp_check'")
@@ -283,13 +350,13 @@ async def test_the_database_refuses_a_live_row_that_breaks_the_rule():
 
 async def test_list_filters_and_counts(client):
     a = (await _create(client, advertiser_id="TEST-2001", merchant_name="Example Merchant A"))["id"]
-    await _create(client, network="awin", advertiser_id="TEST-2002", merchant_name="Example Merchant B",
+    await _create(client, network="cj", advertiser_id="TEST-2002", merchant_name="Example Merchant B",
                   merchant_domains=["example-b.test"])
     await client.patch(f"{BASE}/{a}", headers=_auth(), json={"status": "applied"})
     body = (await client.get(BASE, headers=_auth())).json()
     assert body["counts"]["all"] == 2 and body["counts"]["applied"] == 1 and body["counts"]["not_applied"] == 1
     assert [p["id"] for p in (await client.get(BASE, headers=_auth(), params={"status": "applied"})).json()["items"]] == [a]
-    assert len((await client.get(BASE, headers=_auth(), params={"network": "awin"})).json()["items"]) == 1
+    assert len((await client.get(BASE, headers=_auth(), params={"network": "cj"})).json()["items"]) == 1
     assert len((await client.get(BASE, headers=_auth(), params={"q": "example-a.test"})).json()["items"]) == 1
     assert len((await client.get(BASE, headers=_auth(), params={"q": "TEST-2002"})).json()["items"]) == 1
 
@@ -325,10 +392,12 @@ def test_the_history_table_is_append_only_in_the_repo():
 
 _CSV = (
     "network,advertiser_id,merchant_name,merchant_domains,status,commission_rate_percent,return_window_days,applied_at\n"
-    "rakuten,TEST-3001,Example Merchant A,example-a.test;shop.example-a.test,applied,4%,28,2026-09-25\n"
-    "impact,,Example Merchant B,example-b.test,not_applied,,,\n"
+    "other,TEST-3001,Example Merchant A,example-a.test;shop.example-a.test,applied,4%,28,2026-09-25\n"
+    "cj,,Example Merchant B,example-b.test,not_applied,,,\n"
     "myspace,TEST-3003,Example Merchant C,example-c.test,applied,,,\n"
 )
+#: _CSV without its invalid row: a real run of _CSV is refused whole.
+_CSV_VALID = "".join(_CSV.splitlines(keepends=True)[:3])
 
 
 async def test_import_dry_run_writes_nothing(client):
@@ -342,10 +411,10 @@ async def test_import_dry_run_writes_nothing(client):
 
 
 async def test_import_is_idempotent(client):
-    first = (await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV})).json()
-    assert first["summary"] == {"create": 2, "update": 0, "unchanged": 0, "error": 1}
-    second = (await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV})).json()
-    assert second["summary"] == {"create": 0, "update": 0, "unchanged": 2, "error": 1}
+    first = (await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV_VALID})).json()
+    assert first["summary"] == {"create": 2, "update": 0, "unchanged": 0, "error": 0} and first["written"] is True
+    second = (await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV_VALID})).json()
+    assert second["summary"] == {"create": 0, "update": 0, "unchanged": 2, "error": 0}
     items = (await client.get(BASE, headers=_auth())).json()["items"]
     merchant_a = next(p for p in items if p["advertiser_id"] == "TEST-3001")
     assert merchant_a["commission_rate_bp"] == 400 and merchant_a["return_window_days"] == 28
@@ -356,8 +425,8 @@ async def test_import_is_idempotent(client):
 
 
 async def test_import_updates_only_what_changed(client):
-    await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV})
-    changed = "network,advertiser_id,merchant_name,status\nrakuten,TEST-3001,Example Merchant A,approved\n"
+    await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV_VALID})
+    changed = "network,advertiser_id,merchant_name,status\nother,TEST-3001,Example Merchant A,approved\n"
     body = (await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": changed})).json()
     assert body["summary"]["update"] == 1 and body["rows"][0]["changed_fields"] == ["status"]
 
@@ -367,9 +436,9 @@ async def test_import_never_sets_live_but_can_unlive(client):
     await _ready(client, pid)
     await client.post(f"{BASE}/{pid}/mark-live", headers=_auth(), json={})
     rejected = await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={
-        "csv": "network,advertiser_id,merchant_name,live_at\nrakuten,TEST-3001,Example Merchant A,2026-01-01\n"})
+        "csv": "network,advertiser_id,merchant_name,live_at\nother,TEST-3001,Example Merchant A,2026-01-01\n"})
     assert rejected.status_code == 422
-    paused = "network,advertiser_id,merchant_name,status\nrakuten,TEST-3001,Example Merchant A,paused\n"
+    paused = "network,advertiser_id,merchant_name,status\nother,TEST-3001,Example Merchant A,paused\n"
     await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": paused})
     after = (await client.get(f"{BASE}/{pid}", headers=_auth())).json()
     assert after["program"]["is_live"] is False
@@ -378,18 +447,111 @@ async def test_import_never_sets_live_but_can_unlive(client):
 
 async def test_import_refuses_the_same_program_twice_in_one_file(client):
     csv_text = ("network,advertiser_id,merchant_name\n"
-                "rakuten,TEST-4001,Example Merchant A\n"
-                "rakuten,TEST-4001,Example Merchant A renamed\n")
+                "other,TEST-4001,Example Merchant A\n"
+                "other,TEST-4001,Example Merchant A renamed\n")
     body = (await client.post(f"{BASE}/import", headers=_auth(), json={"csv": csv_text})).json()
     assert [r["action"] for r in body["rows"]] == ["create", "error"]
 
 
 async def test_import_rejects_unknown_columns_and_disagreeing_rates(client):
-    unknown = await client.post(f"{BASE}/import", headers=_auth(), json={"csv": "network,merchant_name,payout_account\nrakuten,A,x\n"})
+    unknown = await client.post(f"{BASE}/import", headers=_auth(), json={"csv": "network,merchant_name,payout_account\nother,A,x\n"})
     assert unknown.status_code == 422 and "columns" in unknown.json()["detail"]["errors"]
-    disagree = "network,merchant_name,commission_rate_bp,commission_rate_percent\nrakuten,Example Merchant A,400,5\n"
+    disagree = "network,merchant_name,commission_rate_bp,commission_rate_percent\nother,Example Merchant A,400,5\n"
     body = (await client.post(f"{BASE}/import", headers=_auth(), json={"csv": disagree})).json()
     assert body["rows"][0]["action"] == "error" and "commission_rate_percent" in body["rows"][0]["errors"]
+
+
+async def test_a_real_import_with_any_invalid_row_writes_nothing(client):
+    refused = await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV})
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert detail["code"] == "import_refused" and detail["written"] is False
+    assert detail["summary"] == {"create": 2, "update": 0, "unchanged": 0, "error": 1}
+    assert [r["action"] for r in detail["rows"]] == ["create", "create", "error"]
+    assert (await client.get(BASE, headers=_auth())).json()["counts"]["all"] == 0
+
+
+async def test_a_failure_part_way_rolls_back_the_whole_file(client, monkeypatch):
+    real_create = programs._create
+    calls = {"n": 0}
+
+    async def failing_create(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated database failure on the second row")
+        return await real_create(*args, **kwargs)
+
+    monkeypatch.setattr(programs, "_create", failing_create)
+    with pytest.raises(RuntimeError):
+        await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": _CSV_VALID})
+    assert calls["n"] == 2
+    assert await store.list_programs() == []
+    assert await database.fetch_all("SELECT id FROM affiliate_program_events") == []
+
+
+@pytest.mark.parametrize("percent", ["inf", "-inf", "nan", "1e400", "Infinity%"])
+async def test_a_non_finite_rate_is_a_row_error_not_a_500(client, percent):
+    for columns in ("commission_rate_percent", "commission_rate_bp,commission_rate_percent"):
+        cells = percent if columns == "commission_rate_percent" else "400," + percent
+        response = await client.post(f"{BASE}/import", headers=_auth(), json={
+            "csv": f"network,merchant_name,{columns}\nother,Example Merchant A,{cells}\n"})
+        assert response.status_code == 200, (columns, response.text)
+        row = response.json()["rows"][0]
+        assert row["action"] == "error" and "commission_rate_percent" in row["errors"]
+
+
+@pytest.mark.parametrize("csv_text, problem", [
+    ('network,merchant_name,notes\nother,Example Merchant A,"never closed\n', "csv"),
+    ("network,merchant_name,notes\nother,Example Merchant A," + "x" * 140_000 + "\n", "csv"),
+    ("network,merchant_name,notes\nother,Example Merchant A,a\x00b\n", "csv"),
+    ("network,merchant_name,merchant_name\nother,Example Merchant A,Example Merchant B\n", "repeated_columns"),
+    ("network,merchant_name\nother,Example Merchant A,extra cell\n", "csv"),
+])
+async def test_a_malformed_file_is_refused_as_a_whole(client, csv_text, problem):
+    response = await client.post(f"{BASE}/import", headers=_auth(), json={"csv": csv_text})
+    assert response.status_code == 422, response.text
+    assert problem in response.json()["detail"]["errors"]
+
+
+async def test_an_advertiser_row_completes_a_program_recorded_without_one(client):
+    pid = (await _create(client, advertiser_id=None, merchant_name="Example Merchant A"))["id"]
+    csv_text = "network,advertiser_id,merchant_name\nother,TEST-5001,Example Merchant A\n"
+    dry = (await client.post(f"{BASE}/import", headers=_auth(), json={"csv": csv_text})).json()
+    assert dry["rows"][0]["action"] == "update" and dry["rows"][0]["program_id"] == pid
+    assert dry["rows"][0]["changed_fields"] == ["advertiser_id"]
+    await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": csv_text})
+    items = (await client.get(BASE, headers=_auth())).json()["items"]
+    assert [(p["id"], p["advertiser_id"]) for p in items] == [(pid, "TEST-5001")]
+
+
+@pytest.mark.parametrize("rows", [
+    "other,TEST-5002,Example Merchant B\nother,,Example Merchant B\n",
+    "other,,Example Merchant B\nother,TEST-5002,Example Merchant B\n",
+    "other,,Example Merchant B\nother,,example merchant b\n",
+])
+async def test_one_merchant_keyed_two_ways_in_one_file_is_refused(client, rows):
+    body = (await client.post(f"{BASE}/import", headers=_auth(),
+                              json={"csv": "network,advertiser_id,merchant_name\n" + rows})).json()
+    assert [r["action"] for r in body["rows"]] == ["create", "error"]
+
+
+async def test_two_advertiser_ids_for_one_merchant_name_are_two_programs(client):
+    rows = "other,TEST-5003,Example Merchant C\nother,TEST-5004,Example Merchant C\n"
+    body = (await client.post(f"{BASE}/import", headers=_auth(),
+                              json={"csv": "network,advertiser_id,merchant_name\n" + rows})).json()
+    assert [r["action"] for r in body["rows"]] == ["create", "create"]
+
+
+async def test_an_oversized_import_body_is_refused_before_it_is_parsed(client, monkeypatch):
+    def never(*_a, **_k):
+        raise AssertionError("parsed an oversized body")
+
+    monkeypatch.setattr(programs, "import_csv", never)
+    body = b'{"csv": "' + b"x" * (2 * programs.MAX_IMPORT_BYTES + 8192) + b'"}'
+    response = await client.post(f"{BASE}/import", headers={**_auth(), "Content-Type": "application/json"}, content=body)
+    assert response.status_code == 422 and "csv" in response.json()["detail"]["errors"]
+    malformed = await client.post(f"{BASE}/import", headers={**_auth(), "Content-Type": "application/json"}, content=b"{nope")
+    assert malformed.status_code == 422 and "body" in malformed.json()["detail"]["errors"]
 
 
 # ── wiring ───────────────────────────────────────────────────────────────────────────────────

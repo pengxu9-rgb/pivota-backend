@@ -130,6 +130,10 @@ _TS_COLUMNS = ("applied_at", "decided_at", "live_at", "created_at", "updated_at"
 
 _SELECT_ALL_SQL = "SELECT * FROM affiliate_programs ORDER BY merchant_name, network, id"
 _SELECT_ONE_SQL = "SELECT * FROM affiliate_programs WHERE id = :id"
+#: Every write path reads its row with this on Postgres, inside the write's transaction: two admins editing one
+#: program then queue on the row lock instead of each writing the whole row back from its own stale read
+#: (which let a concurrent notes edit undo a "not allowed" term on a live program). SQLite serializes writers.
+_SELECT_ONE_FOR_UPDATE_SQL = "SELECT * FROM affiliate_programs WHERE id = :id FOR UPDATE"
 _INSERT_SQL = """
     INSERT INTO affiliate_programs (
         id, network, advertiser_id, merchant_name, merchant_domains, status, software_publishers_allowed,
@@ -215,6 +219,13 @@ async def list_programs() -> List[Dict[str, Any]]:
 
 
 async def get_program(program_id: str) -> Optional[Dict[str, Any]]:
+    return normalize_program(await database.fetch_one(_SELECT_ONE_SQL, {"id": program_id}))
+
+
+async def get_program_for_update(program_id: str) -> Optional[Dict[str, Any]]:
+    """The row, locked until the caller's transaction ends (Postgres). Call only inside `database.transaction()`."""
+    if IS_POSTGRES:
+        return normalize_program(await database.fetch_one(_SELECT_ONE_FOR_UPDATE_SQL, {"id": program_id}))
     return normalize_program(await database.fetch_one(_SELECT_ONE_SQL, {"id": program_id}))
 
 

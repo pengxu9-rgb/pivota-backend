@@ -7,8 +7,15 @@ decide whether AI-agent traffic may earn on it. THE LIVE RULE: a program is live
 automatically, by any edit that breaks the rule (an `auto_unlive` event records why). The database CHECK
 ck_affiliate_programs_live is the backstop on both dialects.
 
-Every change writes the program row and its append-only event in ONE transaction. The CSV import never
-sets `live_at`, is a dry run unless asked otherwise, and is idempotent: re-running a file changes nothing.
+Every change writes the program row and its append-only event in ONE transaction, and every write path
+reads its row FOR UPDATE inside that transaction (Postgres), so concurrent edits queue instead of one
+writing the whole row back from a stale read. The CSV import never sets `live_at`, is a dry run unless asked
+otherwise, is idempotent (re-running a file changes nothing) and is all-or-nothing: a real run refuses the
+whole file if any row is invalid, and writes every row in one transaction.
+
+Text fields refuse control characters and a leading `=`, `+` or `@` (`-` too on single-line fields), so a
+value can't act as a spreadsheet formula. `notes` may still start with `-`: any future CSV export must
+prefix such cells with `'`.
 
 Dark: routes/employee_affiliate_programs.py serves nothing unless AFFILIATE_PROGRAM_REGISTRY_ENABLED is
 "true" (any case). Nothing here moves money, issues links or touches clicks.
@@ -18,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import os
 import re
 from datetime import date, datetime, timezone
@@ -70,6 +78,14 @@ class DuplicateProgram(Exception):
     pass
 
 
+class ImportRefused(Exception):
+    """A real import that wrote nothing: some row is invalid, or a row conflicted while writing."""
+
+    def __init__(self, report: Dict[str, Any]):
+        super().__init__("the import was refused; nothing was written")
+        self.report = report
+
+
 class NotLiveReady(Exception):
     def __init__(self, reasons: List[str]):
         super().__init__("program does not meet the live rule")
@@ -99,7 +115,13 @@ def public(program: Mapping[str, Any]) -> Dict[str, Any]:
 # ── validation ─────────────────────────────────────────────────────────────────────────────
 
 
-def _text(value: Any, field: str, errors: Dict[str, str], *, max_len: int, required: bool = False) -> Optional[str]:
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LINE_BREAK_RE = re.compile(r"[\t\r\n]")
+_FORMULA_LEADS = ("=", "+", "@")
+
+
+def _text(value: Any, field: str, errors: Dict[str, str], *, max_len: int, required: bool = False,
+          multiline: bool = False) -> Optional[str]:
     if value is None:
         if required:
             errors[field] = "required"
@@ -114,6 +136,12 @@ def _text(value: Any, field: str, errors: Dict[str, str], *, max_len: int, requi
         return None
     if len(text) > max_len:
         errors[field] = f"at most {max_len} characters"
+        return None
+    if _CONTROL_RE.search(text) or (not multiline and _LINE_BREAK_RE.search(text)):
+        errors[field] = "must not contain control characters" + ("" if multiline else " or line breaks")
+        return None
+    if text[0] in _FORMULA_LEADS or (not multiline and text[0] == "-"):
+        errors[field] = "must not start with " + ("=, +, - or @" if not multiline else "=, + or @")
         return None
     return text
 
@@ -232,7 +260,7 @@ def clean_fields(raw: Mapping[str, Any], *, partial: bool) -> Dict[str, Any]:
         elif field in ("applied_at", "decided_at"):
             out[field] = _when(value, field, errors)
         elif field == "notes":
-            out[field] = _text(value, field, errors, max_len=4000)
+            out[field] = _text(value, field, errors, max_len=4000, multiline=True)
     if not partial:
         for field in ("network", "merchant_name"):
             if field not in raw:
@@ -279,7 +307,7 @@ async def _update(program_id: str, changes: Dict[str, Any], actor: str, *, actio
     now = store.utcnow()
     try:
         async with database.transaction():
-            current = await store.get_program(program_id)
+            current = await store.get_program_for_update(program_id)
             if current is None:
                 raise ProgramNotFound()
             after = {f: current.get(f) for f in store.PROGRAM_FIELDS}
@@ -315,7 +343,7 @@ async def update_program(program_id: str, raw: Mapping[str, Any], actor: str) ->
 async def mark_live(program_id: str, actor: str) -> Dict[str, Any]:
     now = store.utcnow()
     async with database.transaction():
-        current = await store.get_program(program_id)
+        current = await store.get_program_for_update(program_id)
         if current is None:
             raise ProgramNotFound()
         if current.get("live_at") is not None:
@@ -332,12 +360,12 @@ async def mark_live(program_id: str, actor: str) -> Dict[str, Any]:
 
 async def unlive(program_id: str, actor: str, reason: Any) -> Dict[str, Any]:
     errors: Dict[str, str] = {}
-    text = _text(reason, "reason", errors, max_len=500, required=True)
+    text = _text(reason, "reason", errors, max_len=500, required=True, multiline=True)
     if errors:
         raise ValidationFailed(errors)
     now = store.utcnow()
     async with database.transaction():
-        current = await store.get_program(program_id)
+        current = await store.get_program_for_update(program_id)
         if current is None:
             raise ProgramNotFound()
         if current.get("live_at") is None:
@@ -354,6 +382,13 @@ async def unlive(program_id: str, actor: str, reason: Any) -> Dict[str, Any]:
 
 async def list_view(*, status: Optional[str] = None, network: Optional[str] = None, live: Optional[bool] = None,
                     q: Optional[str] = None) -> Dict[str, Any]:
+    errors: Dict[str, str] = {}
+    if status is not None and status not in store.STATUSES:
+        errors["status"] = "must be one of: " + ", ".join(store.STATUSES)
+    if network is not None and network not in store.NETWORKS:
+        errors["network"] = "must be one of: " + ", ".join(store.NETWORKS)
+    if errors:
+        raise ValidationFailed(errors)
     programs = await store.list_programs()
     counts = {"all": len(programs), "live": sum(1 for p in programs if p.get("live_at") is not None)}
     for s in store.STATUSES:
@@ -416,9 +451,8 @@ def _row_to_raw(row: Mapping[str, str]) -> Tuple[Dict[str, Any], Dict[str, str]]
             except ValueError:
                 errors[column] = "must be a whole number"
         elif column == "commission_rate_percent":
-            try:
-                bp = round(float(text.rstrip("%").strip()) * 100)
-            except ValueError:
+            bp = _percent_to_bp(text)
+            if bp is None:
                 errors[column] = "must be a number, e.g. 4 or 4.5%"
                 continue
             if "commission_rate_bp" in raw and raw["commission_rate_bp"] != bp:
@@ -429,13 +463,21 @@ def _row_to_raw(row: Mapping[str, str]) -> Tuple[Dict[str, Any], Dict[str, str]]
     if "commission_rate_percent" in row and "commission_rate_bp" in row:
         bp_text = (row.get("commission_rate_bp") or "").strip()
         pct_text = (row.get("commission_rate_percent") or "").strip()
-        if bp_text and pct_text and "commission_rate_percent" not in errors:
-            try:
-                if int(bp_text) != round(float(pct_text.rstrip("%").strip()) * 100):
-                    errors["commission_rate_percent"] = "disagrees with commission_rate_bp"
-            except ValueError:
-                pass
+        if bp_text and pct_text and "commission_rate_percent" not in errors and "commission_rate_bp" not in errors:
+            if int(bp_text) != _percent_to_bp(pct_text):
+                errors["commission_rate_percent"] = "disagrees with commission_rate_bp"
     return raw, errors
+
+
+def _percent_to_bp(text: str) -> Optional[int]:
+    """"4.5%" -> 450. None for anything that isn't a finite number (inf, nan and 1e400 included)."""
+    try:
+        value = float(text.rstrip("%").strip())
+    except ValueError:
+        return None
+    if not math.isfinite(value) or abs(value) > 1_000_000:
+        return None
+    return round(value * 100)
 
 
 def parse_csv(text: str) -> List[Tuple[int, Dict[str, str]]]:
@@ -443,41 +485,58 @@ def parse_csv(text: str) -> List[Tuple[int, Dict[str, str]]]:
         raise ValidationFailed({"csv": "empty"})
     if len(text.encode("utf-8")) > MAX_IMPORT_BYTES:
         raise ValidationFailed({"csv": f"larger than {MAX_IMPORT_BYTES} bytes"})
-    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
-    headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-    unknown = [h for h in headers if h and h not in CSV_COLUMNS]
-    missing = [h for h in ("network", "merchant_name") if h not in headers]
-    if unknown or missing:
-        problems = {}
-        if unknown:
-            problems["columns"] = "unknown: " + ", ".join(unknown)
-        if missing:
-            problems["required_columns"] = "missing: " + ", ".join(missing)
-        raise ValidationFailed(problems)
-    rows: List[Tuple[int, Dict[str, str]]] = []
-    for index, record in enumerate(reader, start=2):
-        normalized = {str(k).strip().lower(): v for k, v in record.items() if k is not None}
-        if not any((v or "").strip() for v in normalized.values()):
-            continue
-        rows.append((index, normalized))
-        if len(rows) > MAX_IMPORT_ROWS:
-            raise ValidationFailed({"csv": f"more than {MAX_IMPORT_ROWS} rows"})
+    if "\x00" in text:
+        raise ValidationFailed({"csv": "contains a NUL byte"})
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")), strict=True)
+    try:
+        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+        unknown = [h for h in headers if h and h not in CSV_COLUMNS]
+        missing = [h for h in ("network", "merchant_name") if h not in headers]
+        repeated = sorted({h for h in headers if h and headers.count(h) > 1})
+        if unknown or missing or repeated:
+            problems = {}
+            if unknown:
+                problems["columns"] = "unknown: " + ", ".join(unknown)
+            if missing:
+                problems["required_columns"] = "missing: " + ", ".join(missing)
+            if repeated:
+                problems["repeated_columns"] = "listed more than once: " + ", ".join(repeated)
+            raise ValidationFailed(problems)
+        rows: List[Tuple[int, Dict[str, str]]] = []
+        for record in reader:
+            line = reader.line_num
+            if None in record:
+                raise ValidationFailed({"csv": f"line {line}: more cells than columns"})
+            normalized = {str(k).strip().lower(): v for k, v in record.items()}
+            if not any((v or "").strip() for v in normalized.values()):
+                continue
+            rows.append((line, normalized))
+            if len(rows) > MAX_IMPORT_ROWS:
+                raise ValidationFailed({"csv": f"more than {MAX_IMPORT_ROWS} rows"})
+    except csv.Error as exc:
+        raise ValidationFailed({"csv": f"line {reader.line_num}: not valid CSV ({exc})"}) from exc
     return rows
 
 
-async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
-    rows = parse_csv(text)
+async def _plan_import(rows: List[Tuple[int, Dict[str, str]]]):
+    """Match every row against the registry as it is now. Returns (results, summary, actions), where actions
+    are the writes a real run makes: (result, "create" | "update", changes, program_id or None)."""
     programs = await store.list_programs()
     by_advertiser = {(p["network"], p["advertiser_id"]): p for p in programs if p.get("advertiser_id")}
     by_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for p in programs:
         by_name.setdefault((p["network"], str(p["merchant_name"]).lower()), []).append(p)
-    seen: set = set()
+    seen_keys: set = set()
+    seen_names: set = set()          # (network, name) of every row so far
+    seen_unkeyed_names: set = set()  # ... of rows without an advertiser_id
+    seen_ids: set = set()
     results: List[Dict[str, Any]] = []
+    actions: List[Tuple[Dict[str, Any], str, Dict[str, Any], Optional[str]]] = []
     summary = {"create": 0, "update": 0, "unchanged": 0, "error": 0}
+    earlier = {"row": "the same program appears earlier in this file"}
     for line, row in rows:
-        result: Dict[str, Any] = {"line": line, "merchant_name": (row.get("merchant_name") or "").strip(),
-                                  "network": (row.get("network") or "").strip().lower()}
+        result: Dict[str, Any] = {"line": line, "merchant_name": (row.get("merchant_name") or "").strip()[:200],
+                                  "network": (row.get("network") or "").strip().lower()[:32]}
         raw, errors = _row_to_raw(row)
         changes: Dict[str, Any] = {}
         if not errors:
@@ -490,31 +549,38 @@ async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
         match: Optional[Dict[str, Any]] = None
         if not errors:
             network, advertiser = changes["network"], changes.get("advertiser_id")
-            key = (network, advertiser) if advertiser else (network, "name:" + changes["merchant_name"].lower())
-            if key in seen:
-                errors = {"row": "the same program appears earlier in this file"}
-            seen.add(key)
-            if not errors:
-                if advertiser:
-                    match = by_advertiser.get((network, advertiser))
-                else:
-                    candidates = by_name.get((network, changes["merchant_name"].lower()), [])
-                    if len(candidates) > 1:
-                        errors = {"row": "more than one program has this network and merchant name; add advertiser_id"}
-                    match = candidates[0] if len(candidates) == 1 else None
+            name_key = (network, changes["merchant_name"].lower())
+            key = (network, advertiser) if advertiser else (network, "name:" + name_key[1])
+            if key in seen_keys or (not advertiser and name_key in seen_names) or (
+                    advertiser and name_key in seen_unkeyed_names):
+                errors = earlier
+            seen_keys.add(key)
+            seen_names.add(name_key)
+            if not advertiser:
+                seen_unkeyed_names.add(name_key)
+        if not errors:
+            if advertiser:
+                match = by_advertiser.get((network, advertiser))
+                if match is None:
+                    # The same merchant recorded earlier without its advertiser ID: this row completes it.
+                    unkeyed = [p for p in by_name.get(name_key, []) if not p.get("advertiser_id")]
+                    if len(unkeyed) > 1:
+                        errors = {"row": "more than one program has this network and merchant name and no advertiser_id"}
+                    match = unkeyed[0] if len(unkeyed) == 1 else None
+            else:
+                candidates = by_name.get(name_key, [])
+                if len(candidates) > 1:
+                    errors = {"row": "more than one program has this network and merchant name; add advertiser_id"}
+                match = candidates[0] if len(candidates) == 1 else None
+            if not errors and match is not None:
+                if match["id"] in seen_ids:
+                    errors = earlier
+                seen_ids.add(match["id"])
         if errors:
             result.update({"action": "error", "errors": errors})
-            summary["error"] += 1
-            results.append(result)
-            continue
-        if match is None:
+        elif match is None:
             result["action"] = "create"
-            if not dry_run:
-                try:
-                    created = await _create(changes, actor, action="import_create")
-                    result["program_id"] = created["id"]
-                except DuplicateProgram:
-                    result.update({"action": "error", "errors": {"row": "already exists"}})
+            actions.append((result, "create", changes, None))
         else:
             changed = sorted(f for f, v in changes.items() if match.get(f) != v)
             result["program_id"] = match["id"]
@@ -522,11 +588,33 @@ async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
                 result["action"] = "unchanged"
             else:
                 result.update({"action": "update", "changed_fields": changed})
-                if not dry_run:
-                    try:
-                        await _update(match["id"], changes, actor, action="import_update")
-                    except DuplicateProgram:
-                        result.update({"action": "error", "errors": {"row": "conflicts with another program"}})
+                actions.append((result, "update", changes, match["id"]))
         summary[result["action"]] += 1
         results.append(result)
-    return {"dry_run": dry_run, "summary": summary, "rows": results}
+    return results, summary, actions
+
+
+async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
+    """A dry run reports what a real run would do. A real run is all-or-nothing: it plans and writes in ONE
+    transaction, refuses the whole file (ImportRefused, nothing written) if any row is invalid, and rolls
+    everything back if a row conflicts while writing or the database fails part-way."""
+    rows = parse_csv(text)
+    if dry_run:
+        results, summary, _ = await _plan_import(rows)
+        return {"dry_run": True, "written": False, "summary": summary, "rows": results}
+    async with database.transaction():
+        results, summary, actions = await _plan_import(rows)
+        if summary["error"]:
+            raise ImportRefused({"dry_run": False, "written": False, "summary": summary, "rows": results})
+        for result, kind, changes, program_id in actions:
+            try:
+                if kind == "create":
+                    result["program_id"] = (await _create(changes, actor, action="import_create"))["id"]
+                else:
+                    await _update(program_id, changes, actor, action="import_update")
+            except DuplicateProgram:
+                result.update({"action": "error", "errors": {"row": "conflicts with another program"}})
+                summary[kind] -= 1
+                summary["error"] += 1
+                raise ImportRefused({"dry_run": False, "written": False, "summary": summary, "rows": results})
+    return {"dry_run": False, "written": True, "summary": summary, "rows": results}

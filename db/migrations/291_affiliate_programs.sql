@@ -1,7 +1,7 @@
 -- 291: THE AFFILIATE PROGRAM REGISTRY (developer earnings, manual stage).
 --
 -- One row per merchant affiliate program Pivota has applied to, or plans to apply to, on a network
--- (Rakuten, Awin, Impact, ...). Staff manage it in the employee portal through
+-- (the `network` column names which). Staff manage it in the employee portal through
 -- routes/employee_affiliate_programs.py (dark: AFFILIATE_PROGRAM_REGISTRY_ENABLED, default off).
 -- It answers three questions per program: where the application stands, whether AI-agent traffic may
 -- earn on it (software publishers allowed AND revenue sharing with sub-publishers allowed), and
