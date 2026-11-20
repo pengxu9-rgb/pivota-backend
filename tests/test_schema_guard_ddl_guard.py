@@ -29,11 +29,15 @@ def test_the_ddl_runs_verbatim_only_while_needed_and_under_the_lock_timeout():
     """
     statement = _flat(sg.guarded_ddl("t", sg.column_is_not_null("t", "a"), ddl))
 
-    assert statement.startswith("DO $guard$ BEGIN IF to_regclass('t') IS NOT NULL AND (")
+    # The lock_timeout is the block's first statement, BEFORE the catalog check: the check can take a
+    # relation lock of its own (pg_get_constraintdef on a CHECK takes ACCESS SHARE).
+    assert statement.startswith(
+        "DO $guard$ BEGIN PERFORM set_config('lock_timeout', '500ms', true); "
+        "IF to_regclass('t') IS NOT NULL AND (")
+    assert statement.index("set_config('lock_timeout'") < statement.index("to_regclass(")
     assert _flat(ddl) in statement
     assert "AND attname = 'a'" in statement and "AND attnotnull" in statement
-    # The lock_timeout is set before, and only inside, the branch that runs the DDL.
-    assert "THEN PERFORM set_config('lock_timeout', '500ms', true); ALTER TABLE" in statement
+    assert "THEN ALTER TABLE" in statement
 
 
 def test_the_catalog_conditions_name_what_they_check():
@@ -168,7 +172,8 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
     guarded = [
         m.group(1)
         for s in db.statements
-        for m in [re.match(r"DO \$guard\$ BEGIN IF to_regclass\('(\w+)'\)", s)]
+        for m in [re.match(r"DO \$guard\$ BEGIN PERFORM set_config\('lock_timeout', '500ms', true\); "
+                           r"IF to_regclass\('(\w+)'\)", s)]
         if m
     ]
     assert sorted(guarded) == [

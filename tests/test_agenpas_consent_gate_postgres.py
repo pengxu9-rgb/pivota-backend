@@ -15,6 +15,7 @@ THIS MODULE MUST NOT IMPORT `main` (the gate runs every test_*_postgres.py in on
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -199,6 +200,49 @@ async def test_the_heal_is_idempotent(_db):
 
     await consents_db.ensure_agent_purchase_consents_schema()
     await consents_db.ensure_agent_purchase_consents_schema()
+
+
+async def _step_check(database) -> str:
+    return (await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = to_regclass('agent_purchase_consents') "
+        "AND conname = 'ck_agent_purchase_consents_step'"))["def"]
+
+
+@pytest.mark.parametrize("widened", [True, False], ids=["already_widened", "not_widened"])
+async def test_the_heal_defers_within_its_lock_timeout_behind_an_access_exclusive_holder(_db, widened):
+    # The guard's own catalog check (pg_get_constraintdef on a CHECK) takes ACCESS SHARE on the table: with the
+    # lock_timeout set only inside the branch, a no-op heal waited without bound behind an ACCESS EXCLUSIVE
+    # holder (or a queued ALTER). schema_guard.guarded_ddl now sets it as the block's first statement.
+    import asyncpg
+    import time
+
+    import db.agent_purchase_consents as consents_db
+    from db.schema_guard import HEAL_LOCK_TIMEOUT
+
+    database = _db
+    assert HEAL_LOCK_TIMEOUT == "500ms"
+    if not widened:
+        await database.execute("ALTER TABLE agent_purchase_consents DROP CONSTRAINT IF EXISTS ck_agent_purchase_consents_step")
+        await database.execute(f"ALTER TABLE agent_purchase_consents ADD CONSTRAINT ck_agent_purchase_consents_step "
+                               f"CHECK ({consents_db._STEP_CHECK_289})")
+    before = await _step_check(database)
+    assert ("'shipping_address'" in before) is widened
+    holder = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1))
+    try:
+        hold = holder.transaction()
+        await hold.start()
+        await holder.execute("LOCK TABLE agent_purchase_consents IN ACCESS EXCLUSIVE MODE")
+        started = time.monotonic()
+        # Bounded by the test too, so a regression fails here instead of hanging the gate.
+        await asyncio.wait_for(consents_db.ensure_agent_purchase_consents_schema(), timeout=5)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, elapsed  # one 500 ms lock wait, then deferred (logged, not raised)
+        await hold.rollback()
+    finally:
+        await holder.close()
+    assert await _step_check(database) == before  # deferred: nothing changed, the 289 CHECK still in place
+    await consents_db.ensure_agent_purchase_consents_schema()  # the next boot, the holder gone
+    assert "'shipping_address'" in await _step_check(database)
 
 
 async def test_a_double_write_is_one_row_and_the_reselect_names_the_winner(_db):

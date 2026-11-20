@@ -150,6 +150,14 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
     (a SQL boolean over the catalog) is true, under a transaction-local
     lock_timeout.
 
+    The lock_timeout is the block's FIRST statement, before the check: `needed`
+    can itself take a relation lock (pg_get_constraintdef on a CHECK takes
+    ACCESS SHARE on the table), and that check runs on every boot, so with the
+    timeout set only inside the branch a no-op boot could wait without bound
+    behind an ACCESS EXCLUSIVE holder or a queued ALTER. Transaction-local: it
+    ends with the statement (every caller runs the block on its own, outside
+    any transaction of its own).
+
     `ddl` is kept verbatim and may be several statements: they run in one
     transaction, so a DROP + ADD CONSTRAINT pair is never seen half-done and
     takes the table's lock once.
@@ -159,8 +167,8 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
     return f"""
         DO $guard$
         BEGIN
+            PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
             IF to_regclass('{table}') IS NOT NULL AND ({needed}) THEN
-                PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
                 {ddl.strip()}
             END IF;
         END $guard$;
