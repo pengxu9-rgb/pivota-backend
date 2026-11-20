@@ -72,7 +72,8 @@ class FakeGateway:
 
 
 def case(case_id):
-    found, = job.select_cases(case_id)
+    """The listed case, enabled or not (unit tests exercise every listed case's expectation)."""
+    found, = [c for c in job.CASES if c.case_id == case_id]
     return found
 
 
@@ -132,7 +133,7 @@ def test_no_allowed_call_pays_or_completes():
 
 def test_selection_refuses_unknown_repeated_and_disabled_cases(monkeypatch):
     assert [c.case_id for c in job.select_cases("OR-US,OR-DE")] == ["OR-US", "OR-DE"]
-    assert len(job.select_cases("all")) == 19
+    assert len(job.select_cases("all")) == 17
     for raw, message in (("", "no cases"), ("OR-US,OR-US", "repeats"), ("OR-NOPE", "unknown case")):
         with pytest.raises(job.CaseError, match=message):
             job.select_cases(raw)
@@ -164,8 +165,10 @@ def test_path_four_needs_a_reviewed_gateway_image_by_digest():
     cases = job.select_cases("OR-DE,MCP-K-US")
     job.require_reviewed_gateway(cases, GW_DIGEST)
     job.require_reviewed_gateway(cases, "sha256:67a5940f18c10231684cc6e15786318e0f5369215fcf34407ce33f248f2c2f31")
+    job.require_reviewed_gateway(cases, "sha256:c07e945db5707366c5dd7f0d89ca7edbb845ddbcafa01204837a475220b51088")
     assert set(job.REVIEWED_GATEWAY_DIGESTS.values()) == {"080d7297f74e019fe5d88a25e78c3315ebdb080a",
-                                                          "7d650dce841828059c060a7593992478ddf4f11d"}
+                                                          "7d650dce841828059c060a7593992478ddf4f11d",
+                                                          "16477d8341b125a269dce86fabdc0029bcc430a0"}
     for digest in (None, "sha256:" + "0" * 64, "7d650dce841828059c060a7593992478ddf4f11d"):   # a commit is not a digest
         with pytest.raises(job.CaseError, match="reviewed against"):
             job.require_reviewed_gateway(cases, digest)
@@ -722,3 +725,17 @@ def test_the_http_client_ignores_proxy_env_and_netrc_and_never_retries(monkeypat
     job._httpx_post("https://gateway.pivota.cc/mcp", {}, {}, 5.0)
     assert built["trust_env"] is False and built["follow_redirects"] is False
     assert built["transport"]._pool._retries == 0
+
+
+def test_the_sg_served_cases_are_disabled_until_a_reviewed_sgd_source_exists():
+    # Targets census 2026-11-19 15:15Z: the reviewed test product is USD only (0 SGD seed, 0 SGD cache sources).
+    disabled = {c.case_id for c in job.CASES if not c.enabled}
+    assert disabled == {"OR-SG", "OR-USA-beside-SG"}
+    for case_id in disabled:
+        with pytest.raises(job.CaseError, match="review only"):
+            job.select_cases(case_id)
+    assert not disabled & {c.case_id for c in job.select_cases("all")}
+
+
+def test_the_reviewed_targets_sha_is_pinned():
+    assert job.TARGETS_SHA256 == "8a10e364b076c14806a45685d0fbf911727cbe80f054d796c01d8ab0deade60c"

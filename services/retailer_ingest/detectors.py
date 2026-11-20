@@ -438,6 +438,56 @@ def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[s
     return flags
 
 
+def seller_split_flags(host: str, splits: Iterable[str], existing: Dict[str, Any],
+                       planned: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """seller_id_split: one BLOCK flag per seller id the store already has that the plan would NOT write under
+    (pipeline._seller_identity_checks decides which). The flag names both sides: the existing id (and where it
+    was found) and the ids the plan writes. Accepting `seller_id_split:<existing id>` lets the cohort write
+    beside that seller -- only right when the store really changed sellers; a re-spelled brand is answered by
+    options.seller_merchant_id (brand_official) or by the job brand the store's rows already use."""
+    offer_ids, of_record = list(planned.get("offers") or []), list(planned.get("of_record") or [])
+    return [{
+        "key": f"seller_id_split:{mid}",
+        "rule": "seller_id_split",
+        "severity": BLOCK,
+        "handle": None,
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "existing_merchant_id": mid,
+        "planned_merchant_ids": offer_ids + [m for m in of_record if m not in offer_ids],
+        "detail": (f"{host} already has seller {mid} (live there, selling {sorted(set(existing.get(mid) or []))[:5]}); this "
+                   f"cohort writes its offers under {offer_ids[:5]} and its products under {of_record[:5]}: a "
+                   f"second seller for one store. Pin the existing offer seller (options.seller_merchant_id) or "
+                   f"set the job brand to the spelling the store's rows use; accept this key only if the store "
+                   f"really changed sellers"),
+    } for mid in sorted(set(splits or []))]
+
+
+def seller_brand_unknown_flags(host: str, unknown: Iterable[str], named: Dict[str, Any],
+                               planned: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """seller_id_split_brand_unknown: a seller live on the host that the plan would not write under, and whose live
+    stock there names no brand on some rows (and this cohort's brand on none): it cannot be told from a second
+    seller of this brand, so it is never left out silently. BLOCK when the split check holds at all (acceptable:
+    a reviewer who has looked at the seller's rows); recorded in shadow like every split."""
+    offer_ids = list(planned.get("offers") or [])
+    return [{
+        "key": f"seller_id_split_brand_unknown:{mid}",
+        "rule": "seller_id_split_brand_unknown",
+        "severity": BLOCK,
+        "handle": None,
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "existing_merchant_id": mid,
+        "planned_merchant_ids": offer_ids,
+        "detail": (f"{host} has seller {mid} live, on rows with no brand (named brands: "
+                   f"{sorted(set(named.get(mid) or []))[:5]}); this cohort writes its offers under {offer_ids[:5]}. "
+                   f"If those rows are this brand's it is a second seller for one store; accept this key once its "
+                   f"rows are known to be another brand's"),
+    } for mid in sorted(set(unknown or []))]
+
+
 def listing_move_flags(moves: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """listing_moved: a row names a listing on this host that the crawl does not carry, so the plan held
     every record of it (ingestion.ingest_validated_jsonl never moves a row). Always BLOCK and never covered

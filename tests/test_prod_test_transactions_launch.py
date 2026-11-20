@@ -84,7 +84,7 @@ def test_go_reference():
 def test_armed_spec_mounts_the_key_and_targets_by_version_without_the_payment_nat():
     args = spec(["OR-US", "OR-DE"])
     assert args[:5] == ["gcloud", "run", "jobs", "deploy", "prod-test-transactions"]
-    assert flag(args, "--set-secrets") == ("/var/run/pivota-test-agent/key=prod-test-agent-key:4,"
+    assert flag(args, "--set-secrets") == ("/var/run/pivota-test-agent/key=test-shopping-agent-api-key:4,"
                                            "/var/run/pivota-test-targets/targets.json=prod-test-transactions-targets:7")
     assert "--clear-secrets" not in args and ":latest" not in " ".join(args)
     for vpc in ("--network", "--subnet", "--vpc-egress", "--vpc-connector"):

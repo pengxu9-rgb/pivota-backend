@@ -155,7 +155,7 @@ NON_PARTNER_ROUTES: Dict[str, Tuple[str, ...]] = {
     ),
     "staff (employee login) tools: review queues, finance, governance and dashboards. "
     "employee_products.py is the one staff route among the seeds, so this family is named file by file": (
-        "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
+        "employee_affiliate_programs.py", "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
         "employee_kb_monitoring.py", "employee_missing_endpoints.py", "employee_payouts.py",
         "employee_pdp_governance.py", "employee_reviews.py", "employee_routing_dashboard.py",
         "employee_settlement_rules.py", "employee_shopify_orders.py", "employee_store_psp_fixes.py", "employees_security.py",
