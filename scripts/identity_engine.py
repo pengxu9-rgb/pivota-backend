@@ -3,7 +3,7 @@
 per-proposal revert, merge_content_key proposals. DRY RUN UNLESS --execute.
 
 Nothing here runs on its own: no scheduler, startup hook or CI job calls it. Structural data fixes go
-through the coordinator session -- dry run, Peng's go, then the --execute run with the dry run's
+through the coordinator session -- dry run, the owner's go, then the --execute run with the dry run's
 digest -- one prod one-off at a time, under the CPU gate, outside drains and 05:15-06:15Z /
 10:30-11:20Z. Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.
 

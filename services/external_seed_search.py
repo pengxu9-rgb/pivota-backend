@@ -447,7 +447,7 @@ DEFAULT_SEED_SERVING_MARKET = "US"
 def seed_serving_currency(serving_market: Optional[str]) -> Optional[str]:
     """The currency a seed row must be priced in to be SERVED to `serving_market`, or None.
 
-    Peng 2026-09-26: a seed priced in another currency is a wrong result for the buyer, and the
+    The owner 2026-09-26: a seed priced in another currency is a wrong result for the buyer, and the
     fallback lanes must not show it. "currency = market" is region_pricing's rule
     (REGION_PRICING_CURRENCY, the table require_market_currency enforces on writers); this is the
     same table read on the SERVING side, never a second spelling of it.

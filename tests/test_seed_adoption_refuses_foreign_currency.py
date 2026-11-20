@@ -7,7 +7,7 @@ read's variants carry that page's currency. Probed 2026-10-13: a US/USD seed tha
 page stored CAD variant prices. The offer dual-write refused the offer, but the seed kept them,
 and the builders price offers from its variants.
 
-The rule is `services.region_pricing.foreign_seed_currencies` (Peng, 2026-10-14). A read may state
+The rule is `services.region_pricing.foreign_seed_currencies` (the owner, 2026-10-14). A read may state
 only the currency of a served or acquisition market in config/market_registry.json. A seed already
 priced in such a currency keeps it (sticky). There is no comparison against the seed's market
 partition: SG seeds sit in 'US' priced in SGD (ADR-026 drops the partition).

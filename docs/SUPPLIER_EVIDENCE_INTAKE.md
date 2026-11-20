@@ -10,7 +10,7 @@
 > (`claims[] = {claim_text, source_ref, source_type, evidence_grade,
 > substantiation_status}` + `required_disclaimers[]`).
 
-**Status:** Draft for founder review · **Date:** 2026-06-14 · **Deciders:** Founder (peng), Claude
+**Status:** Draft for founder review · **Date:** 2026-06-14 · **Deciders:** Founder, Claude
 
 ---
 

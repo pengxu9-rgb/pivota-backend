@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-18
-**Deciders:** Founder (peng) — protocol strategy; Commerce / Trust / Platform owners
+**Deciders:** Founder — protocol strategy; Commerce / Trust / Platform owners
 **Relationship:** **Meta-ADR.** Sits *above* and generalizes ADR-007 (read surface), ADR-012 (transaction rail boundary + identity rooting), ADR-013 (settlement model). Those three are the per-layer instances of the framework this ADR names; it does not override them.
 **Scope:** the framework for supporting *multiple* agent-commerce protocols (AP2, x402, ACP, MCP, UCP, and successors) **together** — how they compose, where their code lives, and the one rule that keeps the core coherent. **Not** a decision to adopt or drop any specific protocol (those are the per-layer ADRs).
 

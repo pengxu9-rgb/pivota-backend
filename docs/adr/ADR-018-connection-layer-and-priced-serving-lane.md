@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-07-27
-**Deciders:** Founder (peng) — policy; Commerce / Serving owners
+**Deciders:** Founder — policy; Commerce / Serving owners
 **Supersedes (a position, not an ADR):** "the ACP feed is empty by design until a real merchant connects." That position defined *real merchant* as *connected via product sync*. The founder rejects that definition.
 **Relationship:** applies **ADR-001** (Pivota owns the canonical record; merchants supply offers) to the *transactability* axis; consumes **ADR-016** (non-custodial) unchanged — nothing here puts Pivota in the fund flow; extends the settlement-rails vocabulary introduced in `services/platform_capabilities.get_platform_settlement_rails`. Companion to **ADR-007** (citable index) — this ADR is about the *commerce* projection of the same rows.
 **Scope:** how the three connection layers are represented, how they are expressed on ACP / UCP / MCP, and what the ACP product feed selects. **Out of scope:** opening the ACP checkout doors (`AGENT_CHECKOUT_ACP_REST_ENABLED` + `AGENT_CHECKOUT_STRICT`, and the `ACP_SIGNING_SECRET` the adapter build requires) — this ADR is about feed CONTENT.

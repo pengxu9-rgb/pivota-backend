@@ -4,11 +4,11 @@ The rule is services/identity_cross_merchant_match.py (tiers T0a/T0b/T0c + vetoe
 + same-size only). This script exports its inputs and either reports (dry run) or writes the
 proposals with status 'proposed' through the identity engine's writer
 (identity_resolution.upsert_proposals). It never approves and never applies. Approval is #2637's
-module-run approval, after Peng reviewed the audit sample:
+module-run approval, after the owner reviewed the audit sample:
     python -m scripts.identity_engine approve --strategy cross_merchant_same_size --run <proposal_run_id> --by "<who>"
     python -m scripts.identity_engine approve --strategy cross_merchant_same_size --run <proposal_run_id> \
         --by "<who>" --expect-digest ira_... --execute
-and the only apply path is, by the coordinator with Peng's go:
+and the only apply path is, by the coordinator with the owner's go:
     python -m scripts.identity_engine apply --strategy cross_merchant_same_size --max-proposals N
     python -m scripts.identity_engine apply --strategy cross_merchant_same_size --max-proposals N \
         --expect-digest ird_... --execute
@@ -745,7 +745,7 @@ async def run(conn: Any, args: argparse.Namespace, *,
             return 2
         _print(_line("written", strategy=STRATEGY, **result, audit_complete=audit_complete,
                      **approve_commands(result["proposal_run_id"]),
-                     next_step="after Peng reviewed the audit sample: approve_dry_run, then approve_execute"))
+                     next_step="after the owner reviewed the audit sample: approve_dry_run, then approve_execute"))
         return 0
     if args.out.startswith("gs://"):
         _print(_line("warning", gcs_upload="UNTESTED against GCS; the audit sample is also in the log lines"))

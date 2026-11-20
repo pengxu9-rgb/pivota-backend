@@ -164,7 +164,8 @@ approve) and while none is recorded for (rail, rail purchase, step, approval epo
 the rail's hosted URL**: this door's read and list, the Reap rail's own routes (GET, list, create, resume,
 recover), the `purchase.*` webhook payloads, and the internal AgenPas read. The rail's `detail` drops
 `hosted_url`, keeps its deadline (`hosted_url_expires_at`, `approval_deadline`) and adds
-`buyer_step = {"kind", "expires_at", "consent_required": true, "available"}`; `next_action` becomes
+`buyer_step = {"kind", "expires_at", "consent_required": true, "available"}` (`available` on live reads only);
+`next_action` becomes
 `{"kind", "expires_at", "consent_required": true}`. `purchase.action_required` still fires, with that
 body. Once the consent is recorded, every surface answers today's body (URL included). The A2A rail's 3DS
 page (`authenticate`, while `placing`) is never gated. A consent table that cannot be read withholds
@@ -172,9 +173,14 @@ every page (fail closed). List pages read the consents once per page.
 
 `buyer_step.available` follows the same rule as the internal read's `consent.available`: true only when the
 consent POST could succeed now (configuration and offer secret set, the write registered, its dial on and its
-key valid, the consent table readable) and the step is not blocked by Reap's contact re-entry. In
-`purchase.*` payloads it is decided by the process that sends them (the worker, which registers no routes:
-there, "registered" is read from `AGENPAS_CONSENT_WRITE_ENABLED`).
+key valid, the consent table readable) and the step is not blocked by Reap's contact re-entry. **It is only
+meaningful on a live read** (this door's GET and list, the Reap routes, the internal AgenPas read), where the
+serving process computes it for its own routes. Web and the worker run the same app (`main:app`), each with
+its own boot-time dials, so a value computed on the worker could disagree with web's: `purchase.*` webhook
+payloads therefore never carry `buyer_step.available` (it is dropped when an event is recorded and again on
+every hand-over, retry and listing, so an older stored payload goes out without it too). Read the purchase
+for the live value. Set `AGENPAS_CONSENT_WRITE_ENABLED`, `AGENPAS_INTERNAL_CONSENT_KEY` and the rest of the
+configuration identically on web and the worker anyway.
 
 **The offer** binds the agent id, the rail, the rail purchase id, the step, the approval epoch, both versions,
 both URLs and `issued_at` (length-prefixed). **Rotating `AGENPAS_CONSENT_OFFER_SECRET`**: set the old value

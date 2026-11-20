@@ -1,4 +1,4 @@
-"""Multi-market storefronts ADR, Phase 2 (approved by Peng 2026-09-26): acquisition markets and the
+"""Multi-market storefronts ADR, Phase 2 (approved by the owner 2026-09-26): acquisition markets and the
 session-verified Shopify-Markets capture.
 
   "Allow USD offers from non-USD stores that show US buyers USD prices, but only when the store's cart

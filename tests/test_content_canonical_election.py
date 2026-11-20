@@ -204,7 +204,7 @@ class TestPickWinner:
         import subprocess
 
         node = shutil.which("node")
-        lib = "/Users/pengchydan/dev/pa-ui-canonical/scripts/sitemap_lib.mjs"
+        lib = os.path.expanduser("~/dev/pa-ui-canonical/scripts/sitemap_lib.mjs")
         if not node or not os.path.exists(lib):
             pytest.skip("needs node + a pivota-agent-ui worktree; golden covers CI")
 

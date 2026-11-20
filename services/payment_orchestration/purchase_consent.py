@@ -15,8 +15,9 @@ for (rail, rail purchase, step, approval epoch), the rail detail:
   - drops `hosted_url` (the deadline, `hosted_url_expires_at` / `approval_deadline`, stays),
   - adds `buyer_step = {kind, expires_at, consent_required: true}`,
 and purchase_view.unified_body then builds `next_action = {kind, expires_at, consent_required: true}` with no
-url. The hosted URL string appears nowhere in such a body. `buyer_step.available` says whether the consent
-can be given now (`offer_available`, the rule the internal read's block uses). Stored `purchase.*` payloads
+url. The hosted URL string appears nowhere in such a body. On a LIVE read (the door, the Reap routes, the
+internal read) `buyer_step.available` says whether the consent can be given now, computed by the serving
+process (`offer_available`, the rule the internal read's block uses); purchase.* payloads never carry it. Stored `purchase.*` payloads
 are re-gated by whichever process sends or lists them, at that moment (`gate_stored_payload`). `authenticate` (the A2A rail's 3DS page while it
 places the order) is NEVER gated. A consent read that fails is "no consent": fail closed, never open.
 
@@ -150,8 +151,10 @@ def configured_consent_key() -> Optional[str]:
     return key
 
 
-#: Whether THIS process registered the consent write (set by the route module's `mount`). None: this process
-#: never built the web app's routes (the worker), so only the environment can say whether the write is up.
+#: Whether THIS process registered the consent write (set by the route module's `mount`, which runs wherever
+#: `main:app` is built: web AND the worker run the same app, each with its own boot-time dial). None: `mount`
+#: never ran here (a script, a test), so only the environment can say. Only a LIVE read's `available` is
+#: meaningful (the serving process answers for its own routes); purchase.* payloads never carry it.
 _WRITE_MOUNTED: Optional[bool] = None
 
 
@@ -161,8 +164,8 @@ def record_write_mount(mounted: bool) -> None:
 
 
 def write_ready() -> bool:
-    """Whether a consent POST could succeed now: registered (where this process registers routes), its dial on,
-    its key valid. `available` (in the read's block and in every `buyer_step`) is false otherwise."""
+    """Whether a consent POST could succeed now: registered in this process (when `mount` ran here), its dial
+    on, its key valid. `available` (in the read's block and a live read's `buyer_step`) is false otherwise."""
     return _WRITE_MOUNTED is not False and write_enabled() and configured_consent_key() is not None
 
 
@@ -320,11 +323,26 @@ async def gate(
     return gated_detail(detail, step, available=offer_available(config(), blocked=_blocked(detail), consents=consents))
 
 
+def without_live_fields(payload: Any) -> Any:
+    """A purchase.* payload without `detail.buyer_step.available`: that value is a LIVE read's, true for the
+    process that serves it at that moment; frozen into an event (built or sent by whichever process, web or
+    worker, with its own dials) it can be wrong. `payload` itself when there is nothing to drop."""
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    step = detail.get("buyer_step") if isinstance(detail, dict) else None
+    if not isinstance(step, dict) or "available" not in step:
+        return payload
+    return {**payload, "detail": {**detail, "buyer_step": {k: v for k, v in step.items() if k != "available"}}}
+
+
 async def gate_stored_payload(payload: Any, *, agent_id: Any) -> Any:
     """A purchase.* payload written BEFORE the gate went on (or before its consent lapsed) carries the hosted
     URL; the hand-over re-applies the gate so it is not sent. `payload` itself (the same object) unless the
-    gate withholds its page; then a gated copy: no url, `detail.buyer_step`, `next_action.consent_required`.
-    The stored event is not rewritten (its id and row stay as they are)."""
+    gate withholds its page or the payload carries a live-only field; then a copy: no url, `detail.buyer_step`
+    (never with `available`), `next_action.consent_required`. The stored event is not rewritten."""
+    return without_live_fields(await _gate_stored_payload(payload, agent_id=agent_id))
+
+
+async def _gate_stored_payload(payload: Any, *, agent_id: Any) -> Any:
     if not gate_on() or not isinstance(payload, dict):
         return payload
     action, detail = payload.get("next_action"), payload.get("detail")
@@ -338,8 +356,7 @@ async def gate_stored_payload(payload: Any, *, agent_id: Any) -> Any:
     if _satisfied(consents, rail, rail_purchase_id, step):
         return payload
     gated = dict(payload)
-    gated["detail"] = gated_detail(detail, step, available=offer_available(
-        config(), blocked=_blocked(detail), consents=consents))
+    gated["detail"] = gated_detail(detail, step, available=False)  # dropped on the way out: live reads only
     gated["next_action"] = {"kind": step, "expires_at": action.get("expires_at"), "consent_required": True}
     return gated
 

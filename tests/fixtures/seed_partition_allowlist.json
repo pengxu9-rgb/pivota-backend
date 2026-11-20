@@ -287,6 +287,13 @@
       "reason": "Label only, no currency or gate decision: the dry-run planner stamps the partition on the catalogue snapshot's market field; currency comes from the host catalogue."
     },
     {
+      "file": "scripts/ops/prod_test_targets_census.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "Narrowing only, no currency or gate decision: the read-only targets census filters the US partition to shorten the candidate list, and USD is gated separately on price_currency and on every variant's currency. The file stays byte-identical to the version that ran in prod."
+    },
+    {
       "file": "scripts/ops/relgraph_freshness_refresh.py",
       "qualname": "plan",
       "rule": "P",

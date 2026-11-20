@@ -1384,7 +1384,7 @@ async def test_the_readback_reads_each_products_own_row_not_the_shared_index_fla
     assert set(seen["values"]["resolved_scopes"]) == set(_RESOLVED_PDP_SCOPES)
 
 
-# ------------------------------------------------------------------ refile_to_sets (Peng 2026-09-25)
+# ------------------------------------------------------------------ refile_to_sets (the owner 2026-09-25)
 # A bundle of different products on a single-product shelf is RE-FILED to the gift-set shelf, not
 # excluded: shoppers look for gift sets, and the harm was the shelf.
 
