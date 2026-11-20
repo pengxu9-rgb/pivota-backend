@@ -54,8 +54,8 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
             launch.config_matches(raw, sha)
     config = yaml.safe_load(raw)
     steps = {s["id"]: s for s in config["steps"]}
-    assert list(steps) == ["release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "gateway",
-                           "lock", "run", "publish"]
+    assert list(steps) == ["workspace", "release-scripts", "config-is-the-release-config", "digest-is-the-release-tag",
+                           "gateway", "lock", "run", "publish"]
     assert [s for s in config["steps"] if s.get("allowFailure")] == [steps["run"]]
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
                                             "_TARGETS_VERSION", "_USER_KEY_VERSION", "_GO_REFERENCE"}
@@ -66,6 +66,33 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     # The reserve covers the cancel call (60) + its poll with one interval of slack + the disarm deploy (300).
     assert launch.DISARM_RESERVE_SECONDS >= 60 + launch.CANCEL_POLL_SECONDS + launch.EXECUTION_POLL_SECONDS + 300
     assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
+
+
+def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():
+    # Build 99b4e02b (2026-11-20): with --no-source /workspace is root's, and the backend image runs as `USER app`, so
+    # release-scripts could not mkdir. A root step (the pinned cloud-sdk image, like every other non-backend step)
+    # makes the directories first and chowns them to the uid the Dockerfile creates.
+    import re
+
+    config = yaml.safe_load(CONFIG.read_bytes())
+    steps = config["steps"]
+    sdk = steps[1 + 1]["name"]  # config-is-the-release-config: the pinned cloud-sdk image
+    assert sdk.startswith("gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:")
+    first, release = steps[0], steps[1]
+    assert first["id"] == "workspace" and first["name"] == sdk and first["entrypoint"] == "bash"
+    assert [s["id"] for s in steps if "pivota/backend@" in s["name"]] == ["release-scripts"]
+    dockerfile = (CONFIG.parents[0] / "Dockerfile").read_text()
+    uid = re.search(r"useradd [^\n]*--uid (\d+) app\b", dockerfile).group(1)
+    assert re.search(r"^USER app$", dockerfile, re.M)
+    script = first["args"][1]
+    made = re.search(r"^mkdir -p (.+)$", script, re.M).group(1).split()
+    assert re.search(rf"^chown -R {uid} /workspace/release /workspace/prod-test-transactions$", script, re.M)
+    assert made == ["/workspace/release/infra/gcp", "/workspace/prod-test-transactions"]
+    # release-scripts may only write under the directories the root step handed over.
+    wanted = re.search(r"^mkdir -p (.+)$", release["args"][1], re.M).group(1).split()
+    assert all(any(w == m or w.startswith(m + "/") or m.startswith(w + "/") for m in made) for w in wanted)
+    for target in re.findall(r"^cp (?:-r )?\S+ (\S+)$", release["args"][1], re.M):
+        assert target.startswith(("/workspace/release/", "/workspace/prod-test-transactions/")), target
 
 
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
