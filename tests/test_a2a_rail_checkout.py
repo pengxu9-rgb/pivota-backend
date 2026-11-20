@@ -671,6 +671,7 @@ async def _set_address(pid, address):
                            {"a": json.dumps(address, sort_keys=True) if address is not None else None, "i": pid})
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_an_incomplete_contact_mints_no_token_at_all():
     # Incomplete from the start: parked in `opened`, NOTHING sent (AgenPas asks the buyer for the address).
     pid = await _open({k: v for k, v in ADDRESS.items() if k != "postalCode"})
@@ -3682,6 +3683,12 @@ from services.payment_orchestration import purchase_view as unified_view  # noqa
 OWNER = "h" * 64
 
 
+@pytest.fixture
+def consent_gate_on(monkeypatch):
+    """Shipping capture needs the AgenPas consent gate on (a2a_shipping_address.capture_enabled)."""
+    monkeypatch.setenv("AGENPAS_CONSENT_GATE", "1")
+
+
 async def _open_without(*, email=None, address=None):
     row = await ledger.create_purchase(
         agent_id="agent_w", agent_user_ref_hash=OWNER, merchant_domain="merchant.example",
@@ -3690,6 +3697,7 @@ async def _open_without(*, email=None, address=None):
     return row["id"]
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_a_checkout_purchase_without_its_contact_parks_sending_nothing():
     pid = await _open_without()
     rail = Rail()
@@ -3705,6 +3713,7 @@ async def test_a_checkout_purchase_without_its_contact_parks_sending_nothing():
     assert (await _row(pid))["buyer_action_expires_at"] == deadline
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
     assert shipping_capture.fields_missing(None, None) == [
         "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode", "country"]
@@ -3717,6 +3726,7 @@ async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
     assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED and rail.sent == []
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_past_its_deadline_a_waiting_purchase_expires_and_its_contact_is_gone():
     pid = await _open_without(email=EMAIL)
     await _ago("created_at", worker.SHIPPING_ADDRESS_SECONDS + 5, pid)
@@ -3725,6 +3735,7 @@ async def test_past_its_deadline_a_waiting_purchase_expires_and_its_contact_is_g
     assert (row["state"], row["last_error_code"], row["buyer_email"]) == ("expired", worker.SHIPPING_ADDRESS_EXPIRED, None)
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_the_expiry_sweep_names_a_passed_shipping_address_deadline():
     pid = await _open_without()
     assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
@@ -3740,6 +3751,7 @@ async def test_the_expiry_sweep_names_a_passed_shipping_address_deadline():
     assert (await _row(other))["last_error_code"] == "buyer_action_expired"
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_the_submitted_contact_fills_only_an_empty_part_and_makes_the_row_due():
     pid = await _open_without()
     assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
@@ -3759,6 +3771,7 @@ async def test_the_submitted_contact_fills_only_an_empty_part_and_makes_the_row_
     assert (await _row(pid))["shipping_address"] == ADDRESS
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_a_stored_part_is_never_overwritten_and_another_owner_never_writes():
     pid = await _open_without(email=EMAIL)
     assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email="other@example.test",
@@ -3772,6 +3785,7 @@ async def test_a_stored_part_is_never_overwritten_and_another_owner_never_writes
     assert moved is not None and moved["buyer_email"] == EMAIL
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_two_submits_at_once_write_exactly_one_contact():
     pid = await _open_without()
     first, second = {**ADDRESS, "addressLine1": "1 First St"}, {**ADDRESS, "addressLine1": "2 Second St"}
@@ -3783,6 +3797,7 @@ async def test_two_submits_at_once_write_exactly_one_contact():
     assert (await _row(pid))["shipping_address"] == winner["shipping_address"]
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_a_row_that_does_not_wait_takes_no_contact():
     pid = await _open_without()
     await _ago("buyer_action_expires_at", 5, pid)  # the deadline passed (the sweep not yet run)
@@ -3800,6 +3815,7 @@ async def test_a_row_that_does_not_wait_takes_no_contact():
     assert await ledger.submit_shipping_address(moved_on, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_the_park_written_after_the_contact_landed_makes_the_row_due_at_once():
     pid = await _open_without()
     [row] = [r for r in await ledger.claim_due_purchases(W, limit=5) if r["id"] == pid]
@@ -3811,6 +3827,7 @@ async def test_the_park_written_after_the_contact_landed_makes_the_row_due_at_on
     assert [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)] == [pid]
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_with_the_checkout_path_off_an_emailless_purchase_is_refused_as_before(monkeypatch):
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0")
     pid = await _open_without(address=ADDRESS)
@@ -3819,6 +3836,7 @@ async def test_with_the_checkout_path_off_an_emailless_purchase_is_refused_as_be
     assert (await _row(pid))["refusal_reason"] == "buyer_email_required"
 
 
+@pytest.mark.usefixtures("consent_gate_on")
 def test_the_view_names_the_missing_fields_and_never_a_stored_value():
     from datetime import datetime, timedelta, timezone
 

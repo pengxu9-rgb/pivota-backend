@@ -1,4 +1,4 @@
-"""The AgenPas consent record's SQL on Postgres (db/agent_purchase_consents.py, migration 289).
+"""The AgenPas consent record's SQL on Postgres (db/agent_purchase_consents.py, migrations 289 and 293).
 
 What only Postgres can show: the module and the migration build the same table; the insert-or-nothing then
 re-select gives one row and says which call wrote it; the page read binds its ids as one jsonb array; the
@@ -108,14 +108,17 @@ async def _checks(database, table: str):
 async def test_the_migration_and_the_module_build_the_same_table(_db):
     database = _db
     twin = "agent_purchase_consents_mig289"
-    sql = (_REPO / "db/migrations/289_agent_purchase_consents.sql").read_text("utf-8")
+    sql = "".join((_REPO / f"db/migrations/{name}.sql").read_text("utf-8") + ";\n" for name in (
+        "289_agent_purchase_consents", "293_agent_purchase_consents_shipping_step"))
     sql = re.sub(r"--[^\n]*", "", sql).replace("agent_purchase_consents", twin)
     await database.execute(f"DROP TABLE IF EXISTS {twin}")
     try:
-        for statement in [s.strip() for s in sql.split(";") if s.strip()]:
-            await database.execute(statement)
+        async with database.transaction():  # 293's SET LOCAL lock_timeout needs one
+            for statement in [s.strip() for s in sql.split(";") if s.strip()]:
+                await database.execute(statement)
         assert await _columns(database, twin) == await _columns(database, "agent_purchase_consents")
         assert await _checks(database, twin) == await _checks(database, "agent_purchase_consents")
+        assert await _check_defs(database, twin) == await _check_defs(database, "agent_purchase_consents")
         index = await database.fetch_one(
             "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = :i",
             {"i": "uq_agent_purchase_consents_step"})
@@ -123,6 +126,72 @@ async def test_the_migration_and_the_module_build_the_same_table(_db):
         assert "(rail_purchase_id, rail, step, approval_epoch)" in index["indexdef"]
     finally:
         await database.execute(f"DROP TABLE IF EXISTS {twin}")
+
+
+async def test_the_boot_heal_widens_a_289_table_keeping_its_rows_then_takes_the_new_step(_db):
+    # Prod's table was built by the boot heal with the 289 CHECK. ensure_agent_purchase_consents_schema (what
+    # db/schema_guard.ensure_required_schema_light runs at every boot, fast mode included) must widen it in place.
+    import db.agent_purchase_consents as consents_db
+
+    database = _db
+    await database.execute("ALTER TABLE agent_purchase_consents DROP CONSTRAINT IF EXISTS ck_agent_purchase_consents_step")
+    await database.execute(
+        f"ALTER TABLE agent_purchase_consents ADD CONSTRAINT ck_agent_purchase_consents_step CHECK ({consents_db._STEP_CHECK_289})")
+    old = [await _record(step="card_binding", epoch=0, rail_purchase_id="rp_" + "b" * 24),
+           await _record(step="approval", epoch=1, rail_purchase_id="rp_" + "b" * 24)]
+    with pytest.raises(Exception):
+        await _record(rail="a2a", step="shipping_address", epoch=0, rail_purchase_id="ap_" + "b" * 24)
+    await consents_db.ensure_agent_purchase_consents_schema()
+    await consents_db.ensure_agent_purchase_consents_schema()  # idempotent: the second run changes nothing
+    rows = await database.fetch_all("SELECT id, step FROM agent_purchase_consents WHERE agent_id = :a", {"a": AGENT})
+    assert sorted((r["id"], r["step"]) for r in rows) == sorted((o[0]["id"], o[0]["step"]) for o in old)
+    row, created = await _record(rail="a2a", step="shipping_address", epoch=0, rail_purchase_id="ap_" + "b" * 24)
+    assert created is True and row["step"] == "shipping_address"
+    with pytest.raises(Exception):
+        await _record(rail="a2a", step="shipping_addresses", epoch=0, rail_purchase_id="ap_" + "c" * 24)
+    step_check = (await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = to_regclass('agent_purchase_consents') "
+        "AND conname = 'ck_agent_purchase_consents_step'"))["def"]
+    assert "'shipping_address'" in step_check and "'card_binding'" in step_check and "'approval'" in step_check
+
+
+async def test_the_migration_widens_a_289_table_with_rows_and_matches_the_heal(_db):
+    database = _db
+    twin = "agent_purchase_consents_mig293"
+    def render(name: str) -> str:
+        sql = re.sub(r"--[^\n]*", "", (_REPO / f"db/migrations/{name}.sql").read_text("utf-8"))
+        return sql.replace("agent_purchase_consents", twin)
+    await database.execute(f"DROP TABLE IF EXISTS {twin}")
+    try:
+        for statement in [s.strip() for s in render("289_agent_purchase_consents").split(";") if s.strip()]:
+            await database.execute(statement)
+        base = dict(agent_id=AGENT, terms_version="t", privacy_version="p", terms_url="https://legal.example/t",
+                    privacy_url="https://legal.example/p", evidence="link_holder_on_pivota_page",
+                    offer_issued_at=datetime.now(timezone.utc))
+        insert = (f"INSERT INTO {twin} (id, rail, rail_purchase_id, agent_id, step, approval_epoch, terms_version, "
+                  "privacy_version, terms_url, privacy_url, evidence, offer_issued_at) VALUES (:id, :rail, :rp, "
+                  ":agent_id, :step, :epoch, :terms_version, :privacy_version, :terms_url, :privacy_url, :evidence, "
+                  ":offer_issued_at)")
+        await database.execute(insert, dict(base, id="pcn_old_1", rail="reap", rp="rp_old", step="card_binding", epoch=0))
+        await database.execute(insert, dict(base, id="pcn_old_2", rail="reap", rp="rp_old", step="approval", epoch=1))
+        for _ in range(2):  # the migration is idempotent
+            async with database.transaction():
+                for statement in [s.strip() for s in render("293_agent_purchase_consents_shipping_step").split(";")
+                                  if s.strip()]:
+                    await database.execute(statement)
+        assert [r["id"] for r in await database.fetch_all(f"SELECT id FROM {twin} ORDER BY id")] == ["pcn_old_1", "pcn_old_2"]
+        await database.execute(insert, dict(base, id="pcn_new_1", rail="a2a", rp="ap_new", step="shipping_address", epoch=0))
+        assert await _check_defs(database, twin) == await _check_defs(database, "agent_purchase_consents")
+    finally:
+        await database.execute(f"DROP TABLE IF EXISTS {twin}")
+
+
+async def _check_defs(database, table: str):
+    """(constraint name with the table name replaced, its definition), sorted: definitions, not only names."""
+    rows = await database.fetch_all(
+        "SELECT replace(c.conname, :t, 'T') AS name, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
+        "WHERE c.conrelid = to_regclass(:t) ORDER BY 1", {"t": table})
+    return [(r["name"], r["def"]) for r in rows]
 
 
 async def test_the_heal_is_idempotent(_db):

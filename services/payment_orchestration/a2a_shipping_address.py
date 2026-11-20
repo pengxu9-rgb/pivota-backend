@@ -17,7 +17,9 @@ addressLine1, addressLine2 (optional), city, region, postalCode, country. Pilot:
 the 50 states or DC (territories refused), postalCode a ZIP (12345 or 12345-6789).
 
 CAPTURE (`capture_enabled`) is ONE predicate, read by the door, the view and the worker alike: the internal read's
-dial AGENPAS_INTERNAL_READ_ENABLED (whose router carries the write) AND the checkout step AND the token step.
+dial AGENPAS_INTERNAL_READ_ENABLED (whose router carries the write) AND the checkout step AND the token step AND
+the AgenPas consent gate (AGENPAS_CONSENT_GATE: no address is ever asked for without it; the form itself is a
+consent-gated step, services/payment_orchestration/purchase_consent.py).
 Only then does the worker wait for a missing contact, so only then may the door accept a purchase without one
 or the view ask the buyer for it. With any of the three off nothing here changes what the door accepts (with
 the read dial off the write is not registered either).
@@ -80,13 +82,15 @@ def read_dial_enabled() -> bool:
 
 def capture_enabled() -> bool:
     """Whether a purchase may wait for the buyer's contact: the read dial AND the checkout step AND the token
-    step (the worker's checkout path). THE one predicate for the door, the view and the worker."""
+    step (the worker's checkout path) AND the consent gate. THE one predicate for the door, the view and the
+    worker."""
     if not read_dial_enabled():
         return False
     # Imported here: the worker imports this module.
-    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker, purchase_consent
 
-    return a2a_rail.checkout_step_enabled() and a2a_rail_worker.token_step_enabled()
+    return (purchase_consent.gate_on() and a2a_rail.checkout_step_enabled()
+            and a2a_rail_worker.token_step_enabled())
 
 
 #: The refusals of the A2A door on the market (routes/agent_commerce_purchases).

@@ -58,6 +58,11 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
         body["next_action"] = {"kind": "shipping_address", "fields_missing": list(required["fields_missing"])}
         if required.get("expires_at") is not None:
             body["next_action"]["expires_at"] = required["expires_at"]
+    if ("next_action" not in body and isinstance(marker, Mapping) and marker.get("kind") == "shipping_address"
+            and marker.get("consent_required") is True):
+        # The consent gate withheld the shipping-address form: the step is there, the form is not (no
+        # fields_missing until the consent; services/payment_orchestration/purchase_consent.py).
+        body["next_action"] = {"kind": "shipping_address", "consent_required": True, "expires_at": marker.get("expires_at")}
     if state == "completed" and detail.get("order_reference"):
         body["order_reference"] = detail["order_reference"]
     body["detail"] = dict(detail)

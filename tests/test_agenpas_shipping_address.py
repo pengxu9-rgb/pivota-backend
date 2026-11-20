@@ -29,6 +29,7 @@ from db.database import IS_POSTGRES, database  # noqa: E402
 from db.schema_guard import ensure_required_schema_light  # noqa: E402
 from db.buyer_vault import hash_agent_user_ref  # noqa: E402
 import db.a2a_rail_ledger as a2a_ledger  # noqa: E402
+import db.agent_purchase_consents as consents_db  # noqa: E402
 import db.agent_purchase_ledger as purchases  # noqa: E402
 import db.reap_agentic_ledger as reap_ledger  # noqa: E402
 import db.tierb_cart_link_eligibility as tierb_eligibility  # noqa: E402
@@ -40,6 +41,7 @@ from routes.agent_auth import get_agent_context  # noqa: E402
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context  # noqa: E402
 from services.payment_orchestration import a2a_rail, a2a_rail_worker as worker  # noqa: E402
 from services.payment_orchestration import a2a_shipping_address as shipping_capture  # noqa: E402
+from services.payment_orchestration import purchase_consent  # noqa: E402
 from services.payment_orchestration import router as rail_router  # noqa: E402
 import tests.test_a2a_rail_checkout as ck  # noqa: E402 - the fake provider and its cards (a module, not names)
 
@@ -110,6 +112,9 @@ def _env(monkeypatch):
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:US")
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000")
     monkeypatch.setenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV, "1")
+    # Capture needs the AgenPas consent gate too (the form is a consent-gated step): on here; the tests below
+    # record the buyer's shipping-address consent where they show or submit the form (`_create`).
+    monkeypatch.setenv(purchase_consent.GATE_ENV, "1")
     monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, KEY)
     monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
@@ -227,10 +232,24 @@ def _error(resp) -> Optional[str]:
     return detail.get("error")
 
 
-async def _create(**body_over) -> str:
+async def _consent(pid: str, step: str = "shipping_address", epoch: int = 0, agent: str = AGENT) -> None:
+    """Record the buyer's consent for `step`, as POST .../consents does once the buyer accepted (placeholders)."""
+    from datetime import datetime, timezone
+
+    await consents_db.record(rail="a2a", rail_purchase_id=pid, agent_id=agent, step=step, approval_epoch=epoch,
+                             terms_version="terms-test", privacy_version="privacy-test",
+                             terms_url="https://legal.example/terms", privacy_url="https://legal.example/privacy",
+                             offer_issued_at=datetime.now(timezone.utc))
+
+
+async def _create(consented: bool = True, **body_over) -> str:
+    """Open a purchase through the door; by default with its shipping-address consent already recorded."""
     resp = await _http("POST", BASE, json=_body(**body_over))
     assert resp.status_code == 202, resp.text
-    return resp.json()["purchase_id"]
+    pid = resp.json()["purchase_id"]
+    if consented:
+        await _consent(pid)
+    return pid
 
 
 async def _submit(pid, form=None, **kwargs):

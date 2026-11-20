@@ -1276,14 +1276,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
-            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
-            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
-            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            # mig 289 + 293: the buyer's AgenPas terms/privacy consents (293 widens the step CHECK with
+            # 'shipping_address', on a table an earlier boot built, under the heal lock_timeout). Own try:
+            # written only behind AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a
+            # failed read there withholds the page: fail closed); DDL in db/agent_purchase_consents.
             try:
                 from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
                 await ensure_agent_purchase_consents_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchase_consents (mig 289/293) unavailable (%s)", type(exc).__name__)
             # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
             # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
             try:
@@ -4083,14 +4084,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
-            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
-            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
-            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            # mig 289 + 293: the buyer's AgenPas terms/privacy consents (293 widens the step CHECK with
+            # 'shipping_address', on a table an earlier boot built, under the heal lock_timeout). Own try:
+            # written only behind AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a
+            # failed read there withholds the page: fail closed); DDL in db/agent_purchase_consents.
             try:
                 from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
                 await ensure_agent_purchase_consents_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchase_consents (mig 289/293) unavailable (%s)", type(exc).__name__)
             # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
             # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
             try:

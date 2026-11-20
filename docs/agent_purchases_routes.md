@@ -160,7 +160,8 @@ human. The row holds no PII (no IP, no user agent, no email).
 Default off, read per request. Off, every body above is byte for byte what it was (golden-tested).
 
 On, for a step that needs a consent (`card_binding` while the buyer binds a card, `approval` while they
-approve) and while none is recorded for (rail, rail purchase, step, approval epoch), **no surface carries
+approve, and, on the A2A rail, `shipping_address` while the purchase waits for the buyer's address: its form
+is withheld the same way, see the shipping-address write) and while none is recorded for (rail, rail purchase, step, approval epoch), **no surface carries
 the rail's hosted URL**: this door's read and list, the Reap rail's own routes (GET, list, create, resume,
 recover), the `purchase.*` webhook payloads, and the internal AgenPas read. The rail's `detail` drops
 `hosted_url`, keeps its deadline (`hosted_url_expires_at`, `approval_deadline`) and adds
@@ -237,13 +238,24 @@ it. Same router as the read above: the same dial (`AGENPAS_INTERNAL_READ_ENABLED
 key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read and ignored.
 
 - **Capture** is ONE predicate (`a2a_shipping_address.capture_enabled`), read by the door, the view and the
-  worker alike: this dial AND the checkout step AND the token step. Only then does the worker wait for a
+  worker alike: this dial AND the checkout step AND the token step AND the AgenPas consent gate
+  (`AGENPAS_CONSENT_GATE`: no address is ever asked for without it). Only then does the worker wait for a
   missing contact, so only then does `POST /agent/v2/commerce/purchases` on the A2A rail accept a body
   without `buyer.email` and/or `buyer.shipping_address`, and only then does the view ask for it. One that is
   given is read by the Reap rules, plus, for the US, a real state or DC in `region` and a ZIP (12345 or
-  12345-6789) in `postalCode` (`invalid_address`). Capture off (any of the three dials off, e.g. this read
+  12345-6789) in `postalCode` (`invalid_address`). Capture off (any of the four off, e.g. this read
   dial on before the checkout dial): both stay required and every answer is exactly as before. A request the
   router hands to Reap is parsed by Reap's own model, which still requires both.
+- **Consent first.** The form is a consent-gated step (`shipping_address`, A2A only, approval epoch 0; the
+  owner's decision of 11-20). Until the buyer accepted the terms and privacy policy on the AgenPas page, no
+  surface carries the field list: `detail.shipping_address_required` is withheld, `detail.buyer_step` is
+  `{"kind": "shipping_address", "expires_at", "consent_required": true, "available"}` and `next_action` is
+  `{"kind": "shipping_address", "consent_required": true, "expires_at"}` (no `fields_missing`). The internal
+  read's `consent` block is offered for the step, the consent POST accepts `"step": "shipping_address"` (only
+  for an A2A purchase that waits for its contact; otherwise 409 `consent_stale`), and once it is recorded the
+  form appears as above. The write below answers 409 `consent_required` before the consent (nothing written)
+  and 503 when the consent table cannot be read. Stored `purchase.*` payloads that still carry the form are
+  re-gated when they are sent, retried or listed. A terms / privacy version bump does not re-ask.
 - **Market.** The address's country; with no address, the one market of the purchase's own currency
   (`expected_currency`), never a default: none (or several) is 400 `shipping_market_unknown`. The A2A pilot
   is the US, in code: any other market on the A2A rail is 400 `shipping_country_unsupported`.

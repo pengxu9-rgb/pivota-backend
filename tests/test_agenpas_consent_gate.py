@@ -863,9 +863,23 @@ async def test_pii_scrubs_and_expiry_sweeps_leave_the_consents(gate):
 
 
 def test_the_migration_holds_the_modules_ddl():
+    # 289 built the table with the two-step CHECK; 293 widens it (its DROP + ADD is the module's widening).
     migration = " ".join((_REPO / "db/migrations/289_agent_purchase_consents.sql").read_text("utf-8").split())
-    for statement in (consents_db._CREATE_TABLE_PG, consents_db._CREATE_UNIQUE_INDEX):
+    as_289 = consents_db._CREATE_TABLE_PG.replace(consents_db._STEP_CHECK, consents_db._STEP_CHECK_289)
+    assert consents_db._STEP_CHECK in consents_db._CREATE_TABLE_PG and as_289 != consents_db._CREATE_TABLE_PG
+    for statement in (as_289, consents_db._CREATE_UNIQUE_INDEX):
         assert " ".join(statement.split()) in migration
+    widen = " ".join((_REPO / "db/migrations/293_agent_purchase_consents_shipping_step.sql").read_text("utf-8").split())
+    assert " ".join(consents_db._WIDEN_STEP_CHECK_DDL.split()) in widen
+    assert "SET LOCAL lock_timeout" in widen
+    down = (_REPO / "db/migrations/down/293_agent_purchase_consents_shipping_step_down.sql").read_text("utf-8")
+    assert consents_db._STEP_CHECK_289 in down
+
+
+def test_the_step_check_lists_the_python_steps_and_the_new_step_fits_its_column():
+    assert consents_db._STEP_CHECK == "step IN (" + ", ".join(f"'{s}'" for s in consents_db.STEPS) + ")"
+    assert consents_db.STEPS[-1] == purchase_consent.SHIPPING_STEP == "shipping_address"
+    assert len(purchase_consent.SHIPPING_STEP) == 16 and "step VARCHAR(16) NOT NULL" in consents_db._CREATE_TABLE_PG
 
 
 def test_the_checks_are_the_python_vocabularies():
@@ -1478,3 +1492,259 @@ def test_a_payload_without_live_fields_is_returned_as_the_same_object():
     assert purchase_consent.without_live_fields(payload) is payload
     for other in ({}, {"detail": "x"}, None, "x"):
         assert purchase_consent.without_live_fields(other) is other
+
+
+# ── the A2A shipping-address step is consent-gated too (the owner's decision, 11-20) ──────────
+
+ADDRESS_FORM = {"email": EMAIL, "firstName": "Pat", "lastName": "Example", "phone": "+15125550100",
+                "addressLine1": STREET, "addressLine2": "", "city": "Placeholder City", "region": "TX",
+                "postalCode": "78701", "country": "US"}
+
+
+@pytest.fixture
+def capture(gate):
+    """The gate (configured, write on) AND the three capture dials: the A2A rail waits for a missing contact."""
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+
+    gate.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
+    gate.setenv(a2a_rail_worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
+    gate.setenv("PIVOTA_ENV", "staging")
+    return gate
+
+
+async def _waiting(**columns: Any) -> str:
+    """An A2A purchase `opened` without its shipping address: it waits for the buyer's (capture on)."""
+    rail_id = await _a2a("opened", **columns)
+    await database.execute("UPDATE a2a_rail_purchases SET shipping_address = NULL WHERE id = :i", {"i": rail_id})
+    await purchases.ensure_a2a_parent(rail_id, basis="backfill")
+    return rail_id
+
+
+async def _submit_address(rail_id: str, form: Optional[Dict[str, Any]] = None) -> httpx.Response:
+    return await _request("POST", f"{INTERNAL}/{rail_id}/shipping-address", agent=False, json=form or ADDRESS_FORM,
+                          headers={"X-Internal-Key": READ_KEY, "X-Agenpas-Agent-Id": AGENT})
+
+
+async def _contact(rail_id: str) -> tuple:
+    row = await database.fetch_one("SELECT buyer_email, shipping_address, updated_at FROM a2a_rail_purchases "
+                                   "WHERE id = :i", {"i": rail_id})
+    return tuple(row)
+
+
+def test_capture_needs_the_consent_gate(capture):
+    from services.payment_orchestration import a2a_shipping_address
+
+    assert a2a_shipping_address.capture_enabled() is True
+    capture.delenv(purchase_consent.GATE_ENV)
+    assert a2a_shipping_address.capture_enabled() is False  # no address is ever asked for without the gate
+
+
+async def test_with_the_gate_off_the_door_shows_no_form_and_no_step(monkeypatch):
+    # Gate off: capture is off, so nothing asks for an address (and nothing is gated): no next_action at all.
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+
+    monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
+    monkeypatch.setenv(a2a_rail_worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
+    rail_id = await _waiting()
+    body = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert "shipping_address_required" not in body["detail"] and "buyer_step" not in body["detail"]
+    assert "next_action" not in body
+
+
+async def test_gate_on_no_form_then_the_consent_then_the_form_then_the_write(capture):
+    capture.setenv(purchase_consent.MIN_DWELL_ENV, "0")
+    rail_id = await _waiting()
+    door = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert "shipping_address_required" not in door["detail"]
+    assert door["detail"]["buyer_step"] == {"kind": "shipping_address", "expires_at": None,
+                                            "consent_required": True, "available": True}
+    assert door["next_action"] == {"kind": "shipping_address", "consent_required": True, "expires_at": None}
+    assert "fields_missing" not in json.dumps(door)
+    read = (await _internal(rail_id)).json()
+    assert "fields_missing" not in json.dumps({k: v for k, v in read.items() if k != "consent"})
+    consent = read["consent"]
+    assert (consent["step"], consent["satisfied"], consent["available"]) == ("shipping_address", False, True)
+    body = {"step": "shipping_address", "offer_id": consent["offer"]["id"], "issued_at": consent["offer"]["issued_at"],
+            "terms_version": TERMS_V, "privacy_version": PRIVACY_V}
+    posted = await _post(rail_id, body)
+    assert posted.status_code == 201, posted.text
+    assert (posted.json()["consent"]["step"], posted.json()["consent"]["approval_epoch"]) == ("shipping_address", 0)
+    door = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert door["next_action"]["kind"] == "shipping_address" and door["next_action"]["fields_missing"]
+    assert "consent_required" not in door["next_action"] and "buyer_step" not in door["detail"]
+    assert (await _internal(rail_id)).json()["consent"]["satisfied"] is True
+    written = await _submit_address(rail_id)
+    assert written.status_code == 200, written.text
+    row = await _contact(rail_id)
+    assert row[0] == EMAIL and row[1] is not None
+
+
+async def test_the_address_write_before_the_consent_is_409_and_writes_nothing(capture):
+    rail_id = await _waiting()
+    before = await _contact(rail_id)
+    resp = await _submit_address(rail_id)
+    # The route answers {"error": "consent_required"}; ErrorHandlerMiddleware re-wraps a 409 (read detail.error).
+    assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "consent_required"})
+    assert await _contact(rail_id) == before
+    # A consent for another step (or another agent's) does not open the form.
+    await consents_db.record(rail="a2a", rail_purchase_id=rail_id, agent_id=AGENT, step="card_binding",
+                             approval_epoch=0, terms_version=TERMS_V, privacy_version=PRIVACY_V, terms_url=TERMS_URL,
+                             privacy_url=PRIVACY_URL, offer_issued_at=datetime.now(timezone.utc))
+    await consents_db.record(rail="a2a", rail_purchase_id=rail_id, agent_id="agent_other", step="shipping_address",
+                             approval_epoch=0, terms_version=TERMS_V, privacy_version=PRIVACY_V, terms_url=TERMS_URL,
+                             privacy_url=PRIVACY_URL, offer_issued_at=datetime.now(timezone.utc))
+    assert (await _submit_address(rail_id)).status_code == 409
+    assert "shipping_address_required" not in (await _request("GET", f"{DOOR}/{rail_id}")).json()["detail"]
+
+
+async def test_a_consent_read_that_fails_keeps_the_form_and_the_write_closed(capture, monkeypatch):
+    rail_id = await _waiting()
+    await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
+
+    async def _broken(*a, **k):
+        raise RuntimeError("consent table unreadable")
+
+    monkeypatch.setattr(consents_db, "consents_for", _broken)
+    before = await _contact(rail_id)
+    resp = await _submit_address(rail_id)
+    assert resp.status_code == 503 and await _contact(rail_id) == before
+    door = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert "shipping_address_required" not in door["detail"] and door["next_action"]["consent_required"] is True
+
+
+async def test_the_consent_post_takes_the_shipping_step_only_while_an_a2a_purchase_waits(capture):
+    capture.setenv(purchase_consent.MIN_DWELL_ENV, "0")
+    waiting = await _waiting()
+    complete = await _a2a("opened")  # email and address present: nothing to ask
+    reap = await _reap("R_x", "resolving")
+    assert (await _post(waiting, _offer(waiting, "shipping_address"))).status_code == 201
+    for rail_id in (complete, reap):
+        resp = await _post(rail_id, _offer(rail_id, "shipping_address"))
+        assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "consent_stale"}), rail_id
+    # Reap's read offers no shipping step.
+    assert ((await _internal(reap)).json().get("consent") or {}).get("step") != "shipping_address"
+    rows = await _rows()
+    assert [(r["rail_purchase_id"], r["step"], r["approval_epoch"]) for r in rows] == [(waiting, "shipping_address", 0)]
+
+
+async def test_a_version_bump_does_not_ask_again_within_the_step(capture):
+    rail_id = await _waiting()
+    await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
+    capture.setenv(purchase_consent.TERMS_VERSION_ENV, "terms-2026-12")
+    door = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert door["next_action"]["fields_missing"] and (await _submit_address(rail_id)).status_code == 200
+
+
+async def test_a_stored_payload_that_still_carries_the_form_is_withheld_when_resent_or_listed(capture, monkeypatch):
+    from services import agent_webhook_service as svc
+
+    rail_id = await _waiting()
+    # The form as a payload carried it BEFORE the gate went on (built with the consent in place, then the
+    # consent read finds none for it: a pre-gate event).
+    await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
+    body = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert body["next_action"]["fields_missing"] and body["detail"]["shipping_address_required"]
+
+    async def _none(*a, **k):
+        return frozenset()
+
+    monkeypatch.setattr(consents_db, "consents_for", _none)
+    gated = await purchase_consent.gate_stored_payload(body, agent_id=AGENT)
+    assert gated is not body and "fields_missing" not in json.dumps(gated)
+    assert "shipping_address_required" not in gated["detail"]
+    assert gated["next_action"] == {"kind": "shipping_address", "expires_at": None, "consent_required": True}
+    assert gated["detail"]["buyer_step"] == {"kind": "shipping_address", "expires_at": None, "consent_required": True}
+    # The deliveries list and a retry take the same path.
+    envelope = {"id": "evt_ship_1", "type": "purchase.action_required", "created_at": "2026-11-01T00:00:00+00:00",
+                "data": body}
+    await svc.ensure_agent_webhook_tables()
+    await database.execute(
+        "INSERT INTO agent_webhook_deliveries (delivery_id, agent_id, event_id, event_type, status, attempt_count, "
+        "next_retry_at, destination_url, payload, request_headers) VALUES ('whd_ship_1', :a, 'evt_ship_1', "
+        "'purchase.action_required', 'retrying', 1, '2999-01-01 00:00:00', 'https://hooks.example/ship', :p, '{}')",
+        {"a": AGENT, "p": json.dumps(envelope)})
+
+    async def _summary(*a, **k):
+        return {}
+
+    monkeypatch.setattr(svc, "get_delivery_summary", _summary)
+    listed = await svc.list_deliveries(AGENT, limit=50)
+    text = json.dumps(listed["deliveries"], default=str)
+    assert "fields_missing" not in text and "shipping_address_required" not in text
+    from services import webhook_delivery_gate
+
+    async def _config(*a, **k):
+        return {"destination_url": "https://hooks.example/ship", "signing_secret": "whsec_test", "enabled": True,
+                "subscribed_events": ["purchase.action_required"]}
+
+    monkeypatch.setattr(svc, "_get_or_create_raw_config", _config)
+    monkeypatch.setattr(svc, "_delivery_client_options", lambda *a, **k: {})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", _CapturingHttp)
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    _CapturingHttp.bodies = []
+    assert (await svc.retry_delivery(AGENT, "whd_ship_1"))["status"] == "delivered"
+    [sent] = _CapturingHttp.bodies
+    assert "fields_missing" not in sent and json.loads(sent)["data"]["next_action"]["consent_required"] is True
+
+
+async def test_a_live_gated_shipping_body_frozen_into_an_event_drops_available(capture):
+    rail_id = await _waiting()
+    body = (await _request("GET", f"{DOOR}/{rail_id}")).json()
+    assert body["detail"]["buyer_step"]["available"] is True
+    frozen = purchase_consent.without_live_fields(body)
+    assert "available" not in frozen["detail"]["buyer_step"] and frozen["detail"]["buyer_step"]["kind"] == "shipping_address"
+
+
+async def test_with_the_gate_off_a_stored_form_payload_is_the_same_object():
+    payload = {"state": "routing", "rail": "a2a", "rail_purchase_id": "ap_" + "1" * 24,
+               "next_action": {"kind": "shipping_address", "fields_missing": ["email"]},
+               "detail": {"shipping_address_required": {"fields_missing": ["email"]}}}
+    assert await purchase_consent.gate_stored_payload(payload, agent_id=AGENT) is payload
+
+
+def test_the_shipping_step_is_a2a_only_epoch_0_and_never_the_3ds_page():
+    assert purchase_consent.approval_epoch("a2a", "shipping_address") == 0
+    assert purchase_consent.step_for("a2a", "opened", awaits_contact=True) == "shipping_address"
+    assert purchase_consent.step_for("a2a", "opened") is None
+    assert purchase_consent.step_for("reap", "resolving", awaits_contact=True) is None
+    assert purchase_consent.step_for("a2a", "placing", awaits_contact=True) is None  # 3DS stays ungated
+    assert purchase_consent.view_step("reap", "routing", {"shipping_address_required": {"fields_missing": ["x"]}}) is None
+
+
+async def test_a_purchase_whose_contact_was_purged_offers_no_shipping_step(capture):
+    rail_id = await _waiting(contact_purged_at=FIXED)
+    resp = await _post(rail_id, _offer(rail_id, "shipping_address"))
+    assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "consent_stale"})
+    assert await _rows() == []
+
+
+@pytest.mark.parametrize("state", ["no_consent", "consented", "other_step_only", "other_agent_only", "read_fails"])
+async def test_the_read_and_the_address_write_agree_on_the_consent_for_every_row_state(capture, monkeypatch, state):
+    # One rule (purchase_consent.snapshot + satisfied) for both: the read shows the form exactly when the write
+    # takes it, so the buyer is never shown a form the write then refuses (or the reverse).
+    rail_id = await _waiting()
+    now = datetime.now(timezone.utc)
+    common = dict(terms_version=TERMS_V, privacy_version=PRIVACY_V, terms_url=TERMS_URL, privacy_url=PRIVACY_URL,
+                  offer_issued_at=now, rail="a2a", rail_purchase_id=rail_id)
+    if state == "consented":
+        await consents_db.record(agent_id=AGENT, step="shipping_address", approval_epoch=0, **common)
+    elif state == "other_step_only":
+        await consents_db.record(agent_id=AGENT, step="card_binding", approval_epoch=0, **common)
+    elif state == "other_agent_only":
+        await consents_db.record(agent_id="agent_other", step="shipping_address", approval_epoch=0, **common)
+    elif state == "read_fails":
+        async def _broken(*a, **k):
+            raise RuntimeError("consent table unreadable")
+
+        monkeypatch.setattr(consents_db, "consents_for", _broken)
+    shown = []
+    for read in (await _request("GET", f"{DOOR}/{rail_id}"), await _internal(rail_id)):
+        detail = read.json()["detail"]
+        shown.append(isinstance(detail.get("shipping_address_required"), dict))
+    assert shown[0] == shown[1]
+    written = await _submit_address(rail_id)
+    expected = {"consented": 200, "read_fails": 503}.get(state, 409)
+    assert written.status_code == expected, written.text
+    if expected == 409:
+        assert written.json()["detail"] == {"error": "consent_required"}
+    assert shown[0] is (written.status_code == 200)  # the form is shown exactly when the write takes it
