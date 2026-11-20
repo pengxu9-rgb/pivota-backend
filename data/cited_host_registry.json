@@ -12,7 +12,7 @@
       "outreach_hint": "1 sentence: which lever applies (editorial pitch / wholesale onboarding / creator partnership / etc.)"
     },
     "added_for_test_merchant_audits": "2026-05-07 — initial seed covering hosts that appeared in merch_efbc46b4619cfbdf sleepwear audit + the broader fashion/beauty/lifestyle review surface.",
-    "batch_2026_07_14": "Reviewed batch from scripts/sweep_unclassified_cited_hosts.py (reports/registry_proposals_2026-07-14.json) — the recurring cited hosts across 174 succeeded audit runs / 11 merchants that classify_host could not type. Each host was checked individually before typing; the sweep proposes, a human decides."
+    "batch_2026_07_14": "Reviewed batch from scripts/sweep_unclassified_cited_hosts.py (its proposals file is kept off main, in the private ops bundle) — the recurring cited hosts across 174 succeeded audit runs / 11 merchants that classify_host could not type. Each host was checked individually before typing; the sweep proposes, a human decides."
   },
   "hosts": {
     "healthline.com": {

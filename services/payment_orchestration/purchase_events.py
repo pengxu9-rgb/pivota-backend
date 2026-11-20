@@ -133,7 +133,8 @@ async def _detect_one(parent: Dict[str, Any]) -> str:
     await events_db.record_event(
         purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
         rail_state=rail_state, unified_state=state, event_type=event_type,
-        payload=_json_ready(body),
+        # `buyer_step.available` is a live read's only (purchase_consent.without_live_fields).
+        payload=_json_ready(purchase_consent.without_live_fields(body)),
     )
     return "recorded"
 

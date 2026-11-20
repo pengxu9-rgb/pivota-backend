@@ -671,7 +671,7 @@ class Settings(BaseSettings):
         return _deal_flag("DEAL_CODE_CAPTURE_WRITE")
 
     # ---- Affiliate sub-ID on the `/r` click-out (ADR-025 D2; services/affiliate_subid.py) ----
-    # `/r` writes our click id into the affiliate network's sub-ID parameter (Rakuten `u1`, ...) on a
+    # `/r` writes our click id into the affiliate network's sub-ID parameter on a
     # destination whose host is a mapped network, so a network commission report can be joined back
     # to the click. DEFAULT OFF: off, `/r` is byte-identical to before. Read from the env on every
     # access (a property, like the deal-lane flags): tests use monkeypatch.setenv, not setattr.
