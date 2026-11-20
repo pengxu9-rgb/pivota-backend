@@ -130,6 +130,14 @@ def normalize_curated_brand_payload(payload: Dict[str, Any], *,
                                or not math.isfinite(budget) or budget <= 0):
         raise ValueError("pdp_inci_budget_s must be a positive, finite number of seconds")
     normalized["pdp_inci_budget_s"] = budget
+    pinned = payload.get("seller_merchant_id")
+    if pinned is not None:
+        # The offer seller a brand's own store ALREADY has (retailer_ingest options.seller_merchant_id).
+        # Added only when given, so every existing payload -- and its work key -- is byte-identical.
+        from services.catalog_enrichment_agent.ingestion import validate_pinned_merchant_id
+        if role != "brand_official":
+            raise ValueError("seller_merchant_id is only valid with source_role=brand_official")
+        normalized["seller_merchant_id"] = validate_pinned_merchant_id(pinned)
     return normalized
 
 
