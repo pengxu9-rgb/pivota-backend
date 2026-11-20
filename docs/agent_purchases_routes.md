@@ -263,7 +263,10 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   `A2A_SHIPPING_CAPTURE_ENABLED` LAST: on the **worker FIRST, then `web`** (with web on and the worker off,
   the door opens purchases without a contact that the worker ends at once, `shipping_address_not_collected`).
   **Turn it off** with `A2A_SHIPPING_CAPTURE_ENABLED` on **`web` first** (no new purchase opens without its
-  contact), then the worker.
+  contact), then the worker. **Check both boot lines** (WARNING `purchase_consent: service=…`): each carries
+  `A2A_SHIPPING_CAPTURE_ENABLED=on|off`, `consent_givable=yes|no` and `shipping_capture=on|off`, and web and
+  the worker must agree. A worker at `shipping_capture=off` (its consent key or offer secret missing, say)
+  while web is on ends every waiting purchase at its next poll.
 - **What happens to waiting purchases when capture goes off** (any of the dials above, the consent gate's
   rollback included), as the code does it:
   - the worker, at the row's next poll (a parked row is polled every 60 s,

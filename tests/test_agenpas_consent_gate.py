@@ -1396,6 +1396,28 @@ def test_the_boot_log_states_the_gate_and_never_a_value(gate, caplog):
     assert "AGENPAS_CONSENT_GATE=off" in caplog.records[-1].getMessage()
 
 
+def test_the_boot_log_states_capture_so_a_web_worker_mismatch_shows(capture, caplog):
+    import logging
+
+    def line(service: str) -> str:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=purchase_consent.logger.name):
+            purchase_consent.log_boot_state(service)
+        return [r for r in caplog.records if r.name == purchase_consent.logger.name][-1].getMessage()
+
+    web = line("web")
+    assert "A2A_SHIPPING_CAPTURE_ENABLED=on" in web and "consent_givable=yes" in web
+    assert "shipping_capture=on" in web
+    # The worker missing the consent key: capture is off there, and its boot line says so.
+    capture.delenv(purchase_consent.CONSENT_KEY_ENV)
+    worker = line("worker")
+    assert "service=worker" in worker and "consent_givable=no" in worker and "shipping_capture=off" in worker
+    capture.delenv("A2A_SHIPPING_CAPTURE_ENABLED")
+    assert "A2A_SHIPPING_CAPTURE_ENABLED=off" in line("worker")
+    for value in (SECRET, WRITE_KEY, READ_KEY, TERMS_URL, TERMS_V, PRIVACY_URL, PRIVACY_V):
+        assert value not in web and value not in worker
+
+
 def test_main_logs_the_gate_at_boot_on_every_service():
     source = (_REPO / "main.py").read_text("utf-8")
     assert "log_boot_state(_consent_service_name() or \"web\")" in source

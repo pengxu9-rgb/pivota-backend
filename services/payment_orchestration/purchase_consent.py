@@ -258,14 +258,23 @@ def previous_config(cfg: ConsentConfig) -> Optional[ConsentConfig]:
 
 
 def log_boot_state(service: str) -> None:
-    """Once per boot, at WARNING (prod drops module-logger INFO), on web AND worker: whether this process gates.
-    The gate is decided by the process that builds or SENDS a body, so a mismatch between services shows here.
+    """Once per boot, at WARNING (prod drops module-logger INFO), on web AND worker: whether this process gates,
+    and whether it captures a missing shipping contact (a2a_shipping_address.capture_enabled, with its own dial
+    and whether a consent can be given here). The gate is decided by the process that builds or SENDS a body,
+    and capture by the door (web) and the worker alike: a worker that answers capture=off while web answers on
+    ends every waiting purchase at its next poll, so a mismatch between services shows here.
     Names and yes/no only, never a value."""
+    from services.payment_orchestration import a2a_shipping_address
+
     logger.warning(
-        "purchase_consent: service=%s %s=%s %s=%s configured=%s previous_secret=%s",
+        "purchase_consent: service=%s %s=%s %s=%s configured=%s previous_secret=%s %s=%s consent_givable=%s "
+        "shipping_capture=%s",
         service or "unknown", GATE_ENV, "on" if gate_on() else "off", WRITE_ENABLED_ENV,
         "on" if write_enabled() else "off", "yes" if config() is not None else "no",
         "yes" if _env_key(OFFER_SECRET_PREVIOUS_ENV) else "no",
+        a2a_shipping_address.CAPTURE_ENABLED_ENV,
+        "on" if (os.getenv(a2a_shipping_address.CAPTURE_ENABLED_ENV) or "").strip().lower() in _TRUTHY else "off",
+        "yes" if consent_can_be_given() else "no", "on" if a2a_shipping_address.capture_enabled() else "off",
     )
 
 
