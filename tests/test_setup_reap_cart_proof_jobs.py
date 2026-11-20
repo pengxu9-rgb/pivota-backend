@@ -645,7 +645,7 @@ def _only(argv: List[str]) -> List[str]:
 
 @pytest.mark.parametrize("flag", ["--enable", "--disable"])
 def test_the_2026_10_08_case_enable_or_disable_keeps_a_judydoll_only_mirror(tmp_path, flag):
-    """Peng's mirror ran `--only judydoll.com`, enrichment was dark; `--enable` widened it to 42 stores."""
+    """The owner's mirror ran `--only judydoll.com`, enrichment was dark; `--enable` widened it to 42 stores."""
     proc, calls = _run(tmp_path, "prod", TAG, flag, env=SPLIT_JUDYDOLL)
     assert proc.returncode == 0, proc.stderr
     assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]

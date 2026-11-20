@@ -5206,7 +5206,7 @@ async def _handle_offers_resolve(
         title_terms, brand_terms = _external_identity_terms_from_product_payloads(product_payloads)
         if not title_terms:
             return []
-        # A title match is a FALLBACK: it finds a seed the buyer never held, by name. Peng
+        # A title match is a FALLBACK: it finds a seed the buyer never held, by name. The owner
         # 2026-09-26: a fallback in another currency is a wrong result, so it serves only a seed
         # priced in the buyer's market currency -- the same rule, table and conjunct as
         # fetch_external_seed_rows (#2389). No market = US; a market with no known currency gets
@@ -6597,7 +6597,7 @@ async def _handle_offers_resolve(
             }
 
         # The fuzzy ref is a FALLBACK (title / url / seed_data LIKE): it finds seeds the buyer may
-        # never have held. Peng 2026-09-27: a caller that names no market is a US buyer here too
+        # never have held. The owner 2026-09-27: a caller that names no market is a US buyer here too
         # (the UCP get_offers tool sends none), so it gets only seeds priced in the buyer market's
         # currency -- #2389's rule, function and conjunct, as the identity retry above. A market
         # with no known currency gets no fuzzy seed; NULL/blank price_currency never matches.
@@ -10852,7 +10852,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0
                        -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
-                       -- (services/seed_offer_currency, Peng 2026-10-19), the conjunct after the
+                       -- (services/seed_offer_currency, the owner 2026-10-19), the conjunct after the
                        -- next one. Before the window above ranks, so a stale copy never holds a
                        -- seller's slot: SKINTIFIC's set carried 20 USD 23.56 offers the variant
                        -- backfill copied off a seed since re-read in AUD, and this arm would mint
@@ -12383,7 +12383,7 @@ def _cart_is_the_named_offer(
         return True
     if not (len(served) == 1 and served[0] is offer_variant):
         return False
-    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # THE CALLER'S NAME IS A CLAIM HERE (the owner, 2026-10-15). A stored `sku` may match a variant but
     # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
     # data that came WITH the entry. A name the caller sent is an assertion about which variant the
     # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
@@ -12808,7 +12808,7 @@ class _CartPurchasabilityGate:
     and never an `or "US"` default. `tests/test_purchase_gate_market_not_defaulted.py`
     resolves every construction site's argument and pins it.
 
-    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (Peng, 2026-10-09). This gate hands a
+    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (the owner, 2026-10-09). This gate hands a
     prefilled cart to a HUMAN, who pays however the checkout lets them; the Reap rail pays by
     card with nobody present. The two read the same fact through two readers that part on
     NO_CARD_PAYMENT — see "TWO QUESTIONS, TWO READERS" in `db/merchant_purchasability.py`:

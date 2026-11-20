@@ -583,7 +583,7 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
                     continue
                 currency = vcur or offer_currency
                 if not currency:
-                    # Never a USD default (Peng 2026-10-19): a variant price nobody stated a
+                    # Never a USD default (the owner 2026-10-19): a variant price nobody stated a
                     # currency for is not a price.
                     counts["skipped_no_currency"] += 1
                     continue

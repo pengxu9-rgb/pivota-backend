@@ -103,10 +103,10 @@ async def test_every_write_is_a_dry_run_unless_execute(engine):
     await cli.main(["revert-proposal", "irp_x"])
     conn.rows = [{"proposal_id": "irp_x", "strategy": "coordinator_merge", "kind": "merge_content_key",
                   "status": "proposed"}]
-    await cli.main(["approve", "irp_x", "--by", "peng"])
+    await cli.main(["approve", "irp_x", "--by", "owner"])
     assert calls["apply"][0]["dry_run"] is True and calls["revert"][0]["dry_run"] is True
     assert calls["approve"] == []
-    await cli.main(["approve", "irp_x", "--by", "peng", "--execute"])
+    await cli.main(["approve", "irp_x", "--by", "owner", "--execute"])
     assert calls["approve"] == [["irp_x"]]
 
 
@@ -134,7 +134,7 @@ async def test_approving_a_reserved_strategys_proposal_is_refused(engine):
     conn.rows = [{"proposal_id": "irp_s", "strategy": "same_url_dup", "kind": "merge_content_key",
                   "status": "proposed"}]
     with pytest.raises(SystemExit):
-        await cli.main(["approve", "irp_s", "--by", "peng", "--execute"])
+        await cli.main(["approve", "irp_s", "--by", "owner", "--execute"])
     assert calls["approve"] == []
 
 
@@ -175,7 +175,7 @@ async def test_a_module_only_strategy_is_applied_capped_and_digested_never_appro
     conn.rows = [{"proposal_id": "irp_m4", "strategy": "cross_merchant_same_size", "kind": "attach_membership",
                   "status": "proposed"}]
     with pytest.raises(SystemExit):
-        await cli.main(["approve", "irp_m4", "--by", "peng", "--execute"])
+        await cli.main(["approve", "irp_m4", "--by", "owner", "--execute"])
     assert calls["approve"] == []
 
 
@@ -205,7 +205,7 @@ def module_run(engine, monkeypatch):
 @pytest.mark.asyncio
 async def test_an_m4_run_is_approved_only_by_run_and_digest(module_run):
     calls = module_run
-    base = ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng"]
+    base = ["approve", "--strategy", "cross_merchant_same_size", "--by", "owner"]
     await cli.main([*base, "--run", "m4run_1"])
     await cli.main([*base, "--run", "m4run_1", "--expect-digest", "ira_x", "--execute"])
     assert [(c["proposal_run_id"], c["expect_digest"], c["dry_run"]) for c in calls["module_run"]] == [
@@ -214,11 +214,11 @@ async def test_an_m4_run_is_approved_only_by_run_and_digest(module_run):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("argv", [
-    ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng", "--execute"],                # no run
-    ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng", "--run", "r", "--execute"],  # no digest
-    ["approve", "irp_1", "--strategy", "cross_merchant_same_size", "--by", "peng", "--run", "r"],      # by id
-    ["approve", "--strategy", "retailer_listing_brand_prefix", "--by", "peng", "--run", "r"],          # not module-only
-    ["approve", "irp_1", "--by", "peng", "--expect-digest", "ira_x", "--execute"],
+    ["approve", "--strategy", "cross_merchant_same_size", "--by", "owner", "--execute"],                # no run
+    ["approve", "--strategy", "cross_merchant_same_size", "--by", "owner", "--run", "r", "--execute"],  # no digest
+    ["approve", "irp_1", "--strategy", "cross_merchant_same_size", "--by", "owner", "--run", "r"],      # by id
+    ["approve", "--strategy", "retailer_listing_brand_prefix", "--by", "owner", "--run", "r"],          # not module-only
+    ["approve", "irp_1", "--by", "owner", "--expect-digest", "ira_x", "--execute"],
 ])
 async def test_every_other_approval_shape_for_a_module_strategy_is_refused(module_run, argv):
     with pytest.raises(SystemExit):

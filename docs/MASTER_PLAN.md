@@ -4,7 +4,7 @@
 recall investigation closed at 23% pass-rate; tracks every phase since.
 
 - Last updated: 2026-05-08 (UTC) — **O-4 stack shipped (#387 + #388 + #390)**: pdp_lifecycle_stage column + DRAFT→CANDIDATE→VALIDATED→PUBLISHED gates + 3-path INSERT wiring + LabelAgent UPDATE recompute + one-shot backfill script for existing NULL rows. 152 affected tests green across the stack. Pending: prod-verify column/index, run backfill (`scripts/backfill_pdp_lifecycle_stage.py --apply`), then O-5 recall live-stage filter.
-- Owner: peng
+- Owner: Founder
 - Origin: `~/.claude/plans/shimmying-soaring-ember.md` (now superseded — keep this file canonical going forward)
 
 ---
@@ -72,7 +72,7 @@ All PR numbers refer to `pengxu9-rgb/pivota-backend` unless noted.
 | 7b non-beauty deadline | Gateway-level 6000ms hard deadline on non-beauty primary upstream; authoritative strict-empty on hit; `fpm_primary_deadline_*` telemetry | ✅ | PIVOTA-Agent #1314, merged → prod commit `d98a8704` |
 | 7b ingredient_recall_direct | Extend canonical chain to ingredient_recall_direct path | ✅ | PIVOTA-Agent #1315, merged → prod commit `ee5564c4` (auto-deployed 2026-05-07T23:56). Probe v17 post-merge: **skincare_serum 0/2 → 2/2 PASS** ✅, **beauty 100% (37/37)** ✅, overall 37/53 → 38/53. Net +1 (not +2) because electronics dropped 1/5 → 0/5 in the same probe — cache-flake on the existing cache_miss_sync_filled outliers, not caused by this PR. |
 | **— PDP Onboarding Standardization track —** | (started 2026-05-08, see `docs/PDP_ONBOARDING_PLAYBOOK.md`) | | |
-| Onboarding playbook + 5 decisions | Maps 3 onboarding paths, 8 gaps, proposed lifecycle, peng agreed to all 5 recommendations | ✅ | PR #369, merged → prod commit `310ada4a` |
+| Onboarding playbook + 5 decisions | Maps 3 onboarding paths, 8 gaps, proposed lifecycle, the owner agreed to all 5 recommendations | ✅ | PR #369, merged → prod commit `310ada4a` |
 | O-1 — wire merchant tags through Shopify ingest | mig 075 + db/catalog.py mapping + ingest payload + schema_guard at-startup ALTER + tests | ✅ | PR #369. Verified in prod: `catalog_products.tags` JSONB column live on 4690-row catalog. 0 tagged today (waiting on next Shopify sync to populate). 8 tests pass. |
 | O-1 followup — extend tags to all 3 paths | Wix adapter explicit `tags=[]`, mirror script extracts from seed_data jsonb (4 paths), agent ingestion JSONL `tags` field | ✅ | PR #372 → main `18cecd61`. 52 tests pass. All 3 paths now write `tags` consistently. |
 | **O-2 — tag taxonomy v1** | mig 076 + 4 columns (price_tier/use_case_tags/lifestyle_tags/demographic) + `services/pdp_taxonomy.py` helper + 3-path wiring + schema_guard + tests | ✅ | PR #374 → main `caa0a850`. Verified in prod: all 4 columns live on 4690-row catalog. 76 tests pass. Conservative deterministic extraction; Phase O-3 LabelAgent fills the long tail. |
@@ -186,7 +186,7 @@ Per-bucket breakdown (PASS/THIN/EMPTY):
 
 ## ext→sig migration audit (2026-05-07, user-run)
 
-After codex's ext→sig migration ran on prod, peng performed a read-only audit
+After codex's ext→sig migration ran on prod, the owner performed a read-only audit
 to verify quality. **Migration is clean.** Earlier in the same session I
 incorrectly speculated that the migration had deleted ~130 agent-authored
 rows; that claim is retracted — the catalog had been thinly seeded *before*

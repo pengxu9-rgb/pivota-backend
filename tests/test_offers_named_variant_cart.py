@@ -831,7 +831,7 @@ def test_a_shade_whose_only_id_is_its_url_variant_keeps_its_own_cart(monkeypatch
     assert offer["execution_spec"]["variant_id"] == NAMED
 
 
-# ------------------------------------------------------------------ a caller's name may refuse (Peng 10-15)
+# ------------------------------------------------------------------ a caller's name may refuse (the owner 10-15)
 
 
 def test_a_lone_entry_named_by_a_variant_shaped_id_refuses_another_variants_cart(monkeypatch, client):

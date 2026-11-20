@@ -1,6 +1,6 @@
 """A seed's own currency, and which offers copied off a seed are prices at all.
 
-Peng 2026-10-19: a price's currency is the buyer market's currency, and a market or currency is
+The owner 2026-10-19: a price's currency is the buyer market's currency, and a market or currency is
 never defaulted. Live that day, US search_catalog served SKINTIFIC "Glow Cushion & Peptide Lip
 Serum Set" at "USD 23.56". The price came from 20 offers the variant-identity backfill wrote on
 09-10 from seed_data.variants. The seed has since been re-read in AUD (snapshot AUD 57, column

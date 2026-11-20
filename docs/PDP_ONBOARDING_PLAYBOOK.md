@@ -7,7 +7,7 @@ recall architecture work.
 
 - Status: **DRAFT — proposed**
 - Created: 2026-05-08
-- Owner: peng (decisions) + claude/codex (execution)
+- Owner: Founder (decisions) + claude/codex (execution)
 - Origin: 2026-05-08 strategic pivot away from corpus-probe optimization
   toward real merchant + seed onboarding quality.
 

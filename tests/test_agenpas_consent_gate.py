@@ -1302,8 +1302,9 @@ async def test_buyer_step_says_whether_the_consent_can_be_given_now(gate, monkey
     assert all(step["available"] is False for step in (await _steps()).values())
 
 
-async def test_on_a_process_that_registers_no_routes_the_write_dial_says_whether_it_is_up(gate):
-    """The worker builds purchase.* payloads and never runs `mount`: there the environment decides."""
+async def test_where_mount_never_ran_the_write_dial_says_whether_it_is_up(gate):
+    """A process that never ran `mount` (a script, a test; web AND the worker both build main:app and run it):
+    the environment decides."""
     gate.setattr(purchase_consent, "_WRITE_MOUNTED", None)
     assert purchase_consent.write_ready() is True
     gate.delenv(purchase_consent.WRITE_ENABLED_ENV)
@@ -1379,3 +1380,100 @@ def test_main_logs_the_gate_at_boot_on_every_service():
     source = (_REPO / "main.py").read_text("utf-8")
     assert "log_boot_state(_consent_service_name() or \"web\")" in source
     assert purchase_consent.READ_KEY_ENV == internal_routes.INTERNAL_KEY_ENV
+
+
+
+# ── P3-A: `buyer_step.available` is a live read's only; purchase.* payloads never carry it ──────────────
+
+
+def _has_available(value: Any) -> bool:
+    return '"available"' in (value if isinstance(value, str) else json.dumps(value, default=str))
+
+
+@pytest.mark.parametrize("mounted", [True, False, None])
+async def test_an_event_payload_carries_no_available_whatever_the_mount_state(gate, mounted):
+    gate.setattr(purchase_consent, "_WRITE_MOUNTED", mounted)
+    ids = await _fixtures()
+    await purchase_events.detect()
+    rows = {r["rail_purchase_id"]: json.loads(r["payload"]) for r in await database.fetch_all(
+        "SELECT p.rail_purchase_id, e.payload FROM agent_purchase_events e JOIN agent_purchases p ON p.id = e.purchase_id")}
+    for name in GATED:
+        payload = rows[ids[name]]
+        assert payload["detail"]["buyer_step"] == {"kind": GATED[name], "consent_required": True,
+                                                   "expires_at": payload["next_action"]["expires_at"]}
+        assert not _has_available(payload)
+
+
+async def _stored_with_available(ids) -> Dict[str, Any]:
+    """A purchase.* payload as an earlier build stored it: gated, with `buyer_step.available`."""
+    body = (await _request("GET", f"{DOOR}/{ids['R_approve']}")).json()
+    assert body["detail"]["buyer_step"]["available"] is True and "url" not in body["next_action"]
+    return body
+
+
+async def test_a_stored_payload_with_available_is_handed_over_without_it(gate, monkeypatch):
+    from services import agent_webhook_service, webhook_delivery_gate
+
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    sent: List[Dict[str, Any]] = []
+
+    async def _recorder(agent_id, *, event_type, payload, request_id=None, event_id=None):
+        sent.append(payload)
+        return {"status": "delivered", "delivery_id": "whd_x"}
+
+    monkeypatch.setattr(agent_webhook_service, "emit_agent_webhook_event", _recorder)
+    ids = await _fixtures()
+    stored = await _stored_with_available(ids)
+    parent = (await database.fetch_one("SELECT id FROM agent_purchases WHERE rail_purchase_id = :i",
+                                       {"i": ids["R_approve"]}))["id"]
+    import db.agent_purchase_events as events_db
+
+    await events_db.record_event(purchase_id=parent, agent_id=AGENT, rail="reap", rail_state="awaiting_approval",
+                                 unified_state="awaiting_buyer_authorization", event_type="purchase.action_required",
+                                 payload=json.loads(json.dumps(stored, default=str)))
+    await purchase_events.hand_over(worker="w_live")
+    [payload] = sent
+    assert not _has_available(payload) and payload["detail"]["buyer_step"]["consent_required"] is True
+    # ... and with the gate off since, too
+    gate.delenv(purchase_consent.GATE_ENV)
+    assert not _has_available(await purchase_consent.gate_stored_payload(json.loads(json.dumps(stored, default=str)),
+                                                                          agent_id=AGENT))
+
+
+async def test_a_stored_delivery_with_available_is_retried_and_listed_without_it(gate, monkeypatch):
+    from services import agent_webhook_service as svc
+
+    ids = await _fixtures()
+    gate.delenv(purchase_consent.GATE_ENV)
+    uses = await _pre_gate_deliveries(ids, monkeypatch)
+    gate.setenv(purchase_consent.GATE_ENV, "1")
+    stored = await _stored_with_available(ids)
+    envelope = {"id": "evt_consent_1", "type": "purchase.action_required", "created_at": "2026-11-01T00:00:00+00:00",
+                "data": json.loads(json.dumps(stored, default=str))}
+    await database.execute("UPDATE agent_webhook_deliveries SET payload = :p WHERE agent_id = :a",
+                           {"p": json.dumps(envelope), "a": AGENT})
+    await svc.retry_delivery(AGENT, uses["retry"])
+    assert not _has_available(_CapturingHttp.bodies[0])
+    listed = await svc.list_deliveries(AGENT, limit=50)
+    stored_rows = [d for d in listed["deliveries"] if d["delivery_id"] != uses["retry"]]
+    assert stored_rows and all(not _has_available(d["payload"]) for d in listed["deliveries"])
+
+
+async def test_live_reads_still_carry_available(gate):
+    ids = await _fixtures()
+    for name in GATED:
+        door = (await _request("GET", f"{DOOR}/{ids[name]}")).json()
+        internal = (await _internal(ids[name])).json()
+        assert door["detail"]["buyer_step"]["available"] is True
+        assert internal["detail"]["buyer_step"]["available"] is True
+        if name.startswith("R_"):
+            assert (await _request("GET", f"{REAP}/{ids[name]}")).json()["buyer_step"]["available"] is True
+    listed = (await _request("GET", f"{DOOR}?limit=50")).json()["purchases"]
+    assert all(p["detail"]["buyer_step"]["available"] is True for p in listed if "buyer_step" in p["detail"])
+
+
+def test_a_payload_without_live_fields_is_returned_as_the_same_object():
+    payload = {"detail": {"buyer_step": {"kind": "approval", "consent_required": True}}}
+    assert purchase_consent.without_live_fields(payload) is payload
+    for other in ({}, {"detail": "x"}, None, "x"):
+        assert purchase_consent.without_live_fields(other) is other

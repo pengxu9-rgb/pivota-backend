@@ -6,7 +6,7 @@ Pure functions, no I/O and no database; importing it loads no HTTP, database, co
 from here, so the strategy, the census and later the agent verifier agree on one reading of a
 listing title.
 
-THE IDENTITY DEFINITION THIS MODULE IMPLEMENTS (Peng, 2026-10-16)
+THE IDENTITY DEFINITION THIS MODULE IMPLEMENTS (the owner, 2026-10-16)
 -----------------------------------------------------------------
 A product is brand + line + formulation/edition. SIZE and SHADE are variants of it, not
 identity. So `title_core` strips size, pack and shade out of the title and returns them
@@ -277,7 +277,7 @@ class ParsedSize:
 
 
 # Nominal fluid-ounce -> ml, as printed on beauty packs. Anything not listed rounds
-# value x 29.5735. Spec values (Peng): 0.33, 0.5, 1.0/1.01, 1.7/1.69, 2.5, 3.3/3.4, 4.2, 5,
+# value x 29.5735. Spec values (the owner): 0.33, 0.5, 1.0/1.01, 1.7/1.69, 2.5, 3.3/3.4, 4.2, 5,
 # 6.7/6.76, 8.4/8.45, 16.9. Added: the metric round sizes' usual US labels (0.17=5, 0.25=7.5,
 # 0.34=10, 0.68=20, 0.84/0.85=25, 1.35=40, 2.03=60, 2.53=75, 3.04=90, 3.38=100, 4.05=120,
 # 5.07=150, 10.1=300, 13.5=400, 33.8=1000), 1.6=50 (European fragrance labels print 50 ml as

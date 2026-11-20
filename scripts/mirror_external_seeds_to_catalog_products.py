@@ -772,7 +772,7 @@ async def _upsert_canonical_sku_for_mirror_row(
             "sku": row_dict.get("external_product_id"),
             "barcode": None,
             "title": row_dict.get("title"),
-            # The seed's own currency or none: never a USD default (Peng 2026-10-19). A
+            # The seed's own currency or none: never a USD default (the owner 2026-10-19). A
             # currency-less seed writes a currency-less sku, as its offer writes no price.
             # ...normalised and agreed exactly as the offer writer and the readers do (seed_currency_of).
             "currency": seed_currency_of(row_dict),
