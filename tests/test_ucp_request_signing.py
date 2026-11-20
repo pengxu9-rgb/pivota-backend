@@ -14,6 +14,7 @@ Hosts are placeholders.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,15 @@ from services import ucp_request_signing as sig
 _VECTORS_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "ucp_request_signature_vectors.json")
 with open(_VECTORS_PATH, encoding="utf-8") as fh:
     VECTORS = json.load(fh)
+
+# The SAME sha256 is pinned in PIVOTA-Agent tests/ucp_request_signature_vectors.test.js. A regenerated or
+# edited vector file fails here AND there until both pins move together, so the two copies cannot drift.
+VECTORS_SHA256 = "6b5433aca7f573400ea62f11498aa0aceb6a14a45572c290ef5fdd20499b0dbf"
+
+
+def test_the_vector_file_is_byte_for_byte_the_gateway_copy():
+    with open(_VECTORS_PATH, "rb") as fh:
+        assert hashlib.sha256(fh.read()).hexdigest() == VECTORS_SHA256
 
 TEST_PRIVATE_PEM = "\n".join(
     [
