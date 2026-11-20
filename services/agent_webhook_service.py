@@ -281,8 +281,10 @@ _AGENT_WEBHOOK_DDL_READY = False
 # ALTER takes its lock only while the column is missing, under the heal lock_timeout,
 # and a timeout defers it to a later call). SQLite (the hermetic test dialect, a fresh
 # file per run) gets the column from the CREATE TABLE above. Only the first PUT that
-# mints a secret, the rotation and the config read touch the column; the emit, retry
-# and activation paths never name it, so a deferred heal cannot break a delivery.
+# mints a secret, the rotation and the config read touch the column unconditionally; the
+# emit and retry paths never name it, and the pending-secret activation (which they call)
+# names it only once every statement here has run, so a deferred heal cannot break a
+# delivery.
 _ADD_SECRET_REVEALED_AT_PG = (
     "ALTER TABLE agent_webhook_configs ADD COLUMN IF NOT EXISTS secret_revealed_at TIMESTAMP"
 )
@@ -426,14 +428,25 @@ async def _activate_pending_secret_if_due(agent_id: str) -> None:
     pending_secret = str(config["pending_signing_secret"] or "").strip()
     if not pending_secret or not activates_at or activates_at > _utcnow():
         return
+    # A pending secret came from a rotation, which showed it: once current, it counts as shown.
+    # The stamp is written only once this process has run every webhook DDL statement (so the
+    # 292 column exists); a deferred heal promotes the secret as before, without it, and never
+    # breaks the emit / retry paths that call this.
+    stamp = (
+        "secret_revealed_at = COALESCE(secret_revealed_at, :updated_at),"
+        if _AGENT_WEBHOOK_DDL_READY
+        else ""
+    )
     await database.execute(
-        """
+        f"""
         UPDATE agent_webhook_configs
         SET signing_secret = :signing_secret,
             pending_signing_secret = NULL,
             pending_secret_activates_at = NULL,
+            {stamp}
             updated_at = :updated_at
         WHERE agent_id = :agent_id
+          AND pending_signing_secret = :signing_secret
         """,
         {
             "agent_id": agent_id,
@@ -566,10 +579,13 @@ async def get_delivery_summary(agent_id: str) -> Dict[str, Any]:
     }
 
 
-def _rotation_activation(current_secret: Optional[str], revealed_at: Any) -> str:
-    """A secret nobody has seen cannot be verifying anything: replace it at once. A shown one
-    keeps the 24 h overlap so a receiver can switch without dropping deliveries."""
-    return ROTATION_OVERLAP if current_secret and revealed_at else ROTATION_IMMEDIATE
+def _rotation_activation(current_secret: Optional[str], revealed_at: Any, pending_secret: Optional[str]) -> str:
+    """What an automatic rotation does now (mirrors _AUTO_IMMEDIATE_CONDITION). A secret nobody
+    has seen cannot be verifying anything: replace it at once. A shown one, or a pending one
+    (it came from a rotation, so it was shown), keeps the 24 h overlap."""
+    if current_secret and (revealed_at or pending_secret):
+        return ROTATION_OVERLAP
+    return ROTATION_IMMEDIATE
 
 
 async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
@@ -593,7 +609,7 @@ async def get_webhook_config(agent_id: str) -> Dict[str, Any]:
         "secret_revealed_at": revealed_at.isoformat() if revealed_at else None,
         # What POST .../signing-secret/rotate will do now: "immediate" (the current secret was
         # never shown, so the new one signs at once) or "overlap" (the new one is pending 24 h).
-        "rotation_activation": _rotation_activation(current_secret, revealed_at),
+        "rotation_activation": _rotation_activation(current_secret, revealed_at, pending_secret),
         "last_test_at": (_coerce_datetime(config.get("last_test_at")) or None).isoformat() if _coerce_datetime(config.get("last_test_at")) else None,
         "last_test_status": config.get("last_test_status"),
         "delivery_summary_24h": summary,
@@ -718,22 +734,52 @@ async def update_webhook_config(
         )
 
     await _sync_legacy_agent_webhook_url(agent_id, next_url)
-    config = await get_webhook_config(agent_id)
-    if minted_secret and await _stored_signing_secret(agent_id) == minted_secret:
-        # Present ONLY on the response of the PUT that created the secret; no other response,
-        # list, audit row or log line ever carries it.
-        config["signing_secret"] = minted_secret
+    revealed = bool(minted_secret) and await _stored_signing_secret(agent_id) == minted_secret
+    if not revealed:
+        return await get_webhook_config(agent_id)
+    # The row now says this secret was shown, so this response must carry it: a failure while
+    # building the full config view still returns the secret, in a minimal config.
+    try:
+        config = await get_webhook_config(agent_id)
+    except Exception as exc:  # noqa: BLE001 - the secret must not be lost; logged without it
+        logger.warning(
+            "webhook config view failed after minting agent_id=%s error_type=%s",
+            agent_id,
+            type(exc).__name__,
+        )
+        config = {
+            "enabled": next_enabled,
+            "destination_url": next_url,
+            "managed_receiver_url": get_managed_receiver_url(agent_id),
+            "subscribed_events": next_events,
+            "signing_secret_last4": _last4(minted_secret),
+            "pending_signing_secret_last4": None,
+            "pending_secret_activates_at": None,
+            "secret_revealed_at": _coerce_datetime(now).isoformat(),
+            "rotation_activation": ROTATION_OVERLAP,
+            "partial": True,
+        }
+    # Present ONLY on the response of the PUT that created the secret; no other response, list,
+    # audit row or log line ever carries it.
+    config["signing_secret"] = minted_secret
     return config
 
 
-async def _stored_signing_secret(agent_id: str) -> Optional[str]:
+async def _stored_secrets(agent_id: str) -> Dict[str, Optional[str]]:
     row = _record_to_dict(
         await database.fetch_one(
-            "SELECT signing_secret FROM agent_webhook_configs WHERE agent_id = :agent_id",
+            "SELECT signing_secret, pending_signing_secret FROM agent_webhook_configs WHERE agent_id = :agent_id",
             {"agent_id": agent_id},
         )
     )
-    return str(row.get("signing_secret") or "").strip() or None
+    return {
+        "signing_secret": str(row.get("signing_secret") or "").strip() or None,
+        "pending_signing_secret": str(row.get("pending_signing_secret") or "").strip() or None,
+    }
+
+
+async def _stored_signing_secret(agent_id: str) -> Optional[str]:
+    return (await _stored_secrets(agent_id))["signing_secret"]
 
 
 def list_webhook_events_catalog() -> Dict[str, Any]:
@@ -1329,28 +1375,50 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
     )
 
 
-async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
+class RotationSuperseded(RuntimeError):
+    """A concurrent rotation replaced this one's secret before it could be returned; the caller
+    rotates again (the route answers 409). Never carries a secret."""
+
+
+# The automatic immediate replacement: no secret at all, or a current secret nobody has seen
+# with no pending one (a pending secret came from a rotation, so it was shown, and stays the
+# next secret: the rotation then takes the overlap path and replaces it, as it always did).
+_AUTO_IMMEDIATE_CONDITION = (
+    "(signing_secret IS NULL OR (secret_revealed_at IS NULL AND pending_signing_secret IS NULL))"
+)
+
+
+async def rotate_signing_secret(agent_id: str, *, force_immediate: bool = False) -> Dict[str, Any]:
     """Show a new signing secret in full, once, and stamp `secret_revealed_at`.
 
-    The current secret never shown (no `secret_revealed_at`: a legacy-migration or emit-path
-    mint) or absent: the new secret becomes current AT ONCE and any pending one is dropped.
-    Nothing can be verifying against a secret nobody has seen, and an overlap would keep
-    deliveries signed with the unseen one for 24 h.
+    Automatic (`force_immediate=False`):
+      * no secret, or the current one never shown (no `secret_revealed_at`: a legacy-migration
+        or emit-path mint) and nothing pending: the new secret becomes current AT ONCE. Nothing
+        can be verifying against a secret nobody has seen, and an overlap would keep deliveries
+        signed with the unseen one for 24 h;
+      * otherwise the new one is pending for 24 h, as before, so a receiver can switch over
+        without dropping deliveries.
 
-    The current secret already shown: the new one is pending for 24 h, as before, so a
-    receiver can switch over without dropping deliveries.
+    `force_immediate=True` is the owner's explicit choice (`?activation=immediate`): the new
+    secret is current at once whatever came before, ending the old one (and any pending one)
+    now. It is the recovery for a reveal that never reached the developer.
     """
     current = await _get_or_create_raw_config(agent_id)
     new_secret = _generate_signing_secret()
     now_utc = _utcnow()
     now = _db_datetime(now_utc)
 
-    # Immediate replacement, claimed in one statement: it matches only while the stored
-    # secret is still unrevealed (or absent), so it can never replace a shown secret, and of
+    # The immediate replacement is claimed in one statement. Automatic: it matches only while
+    # the stored row still qualifies, so a stale read can never replace a shown secret, and of
     # two concurrent rotations only the first replaces; the other falls through to the overlap.
     if current.get("created_at") is None:
+        conflict_where = "" if force_immediate else (
+            "WHERE agent_webhook_configs.signing_secret IS NULL"
+            " OR (agent_webhook_configs.secret_revealed_at IS NULL"
+            " AND agent_webhook_configs.pending_signing_secret IS NULL)"
+        )
         await database.execute(
-            """
+            f"""
             INSERT INTO agent_webhook_configs (
                 agent_id,
                 enabled,
@@ -1377,8 +1445,7 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
                 pending_secret_activates_at = NULL,
                 secret_revealed_at = EXCLUDED.secret_revealed_at,
                 updated_at = EXCLUDED.updated_at
-            WHERE agent_webhook_configs.secret_revealed_at IS NULL
-               OR agent_webhook_configs.signing_secret IS NULL
+            {conflict_where}
             """,
             {
                 "agent_id": agent_id,
@@ -1392,16 +1459,16 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
             },
         )
     else:
+        where = "" if force_immediate else f" AND {_AUTO_IMMEDIATE_CONDITION}"
         await database.execute(
-            """
+            f"""
             UPDATE agent_webhook_configs
             SET signing_secret = :signing_secret,
                 pending_signing_secret = NULL,
                 pending_secret_activates_at = NULL,
                 secret_revealed_at = :secret_revealed_at,
                 updated_at = :updated_at
-            WHERE agent_id = :agent_id
-              AND (secret_revealed_at IS NULL OR signing_secret IS NULL)
+            WHERE agent_id = :agent_id{where}
             """,
             {
                 "agent_id": agent_id,
@@ -1411,8 +1478,8 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
             },
         )
 
-    stored_secret = await _stored_signing_secret(agent_id)
-    if stored_secret == new_secret:
+    stored = await _stored_secrets(agent_id)
+    if stored["signing_secret"] == new_secret:
         return {
             "status": "success",
             "activation": ROTATION_IMMEDIATE,
@@ -1424,10 +1491,13 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
             "current_signing_secret_last4": _last4(new_secret),
             "pending_signing_secret_last4": None,
         }
-    if not stored_secret:
+    if force_immediate:
+        raise RotationSuperseded("a concurrent rotation replaced this one; rotate again")
+    if not stored["signing_secret"]:
         raise RuntimeError("webhook signing secret missing after rotation")
 
-    # The current secret has been shown: keep it signing for 24 h beside the new one.
+    # The current secret has been shown (or a shown one is pending): keep it signing for 24 h
+    # beside the new one.
     activates_at = now_utc + SECRET_ROTATION_OVERLAP
     await database.execute(
         """
@@ -1446,6 +1516,9 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
             "updated_at": now,
         },
     )
+    stored = await _stored_secrets(agent_id)
+    if stored["pending_signing_secret"] != new_secret:
+        raise RotationSuperseded("a concurrent rotation replaced this one; rotate again")
 
     return {
         "status": "success",
@@ -1454,8 +1527,8 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
         "activates_at": activates_at.isoformat(),
         "overlap_ends_at": activates_at.isoformat(),
         "secret_revealed_at": now_utc.isoformat(),
-        "signing_secret_last4": _last4(stored_secret),
-        "current_signing_secret_last4": _last4(stored_secret),
+        "signing_secret_last4": _last4(stored["signing_secret"]),
+        "current_signing_secret_last4": _last4(stored["signing_secret"]),
         "pending_signing_secret_last4": _last4(new_secret),
     }
 

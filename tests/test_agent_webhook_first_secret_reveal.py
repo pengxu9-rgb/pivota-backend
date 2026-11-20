@@ -221,6 +221,24 @@ async def test_the_first_put_on_an_existing_secretless_row_shows_the_secret(tmp_
         assert stored["secret_revealed_at"] is not None
 
 
+async def test_the_minting_put_returns_the_secret_even_if_the_config_view_fails(
+    tmp_path, monkeypatch, caplog
+):
+    """The row says the secret was shown, so the response must carry it."""
+    async with _service_db(tmp_path, monkeypatch) as db:
+        async def broken_view(agent_id):
+            raise RuntimeError("view failed")
+
+        monkeypatch.setattr(svc, "get_webhook_config", broken_view)
+        put = await _put()
+        stored = await _row(db)
+        assert put["signing_secret"] == stored["signing_secret"]
+        assert put["partial"] is True
+        assert put["signing_secret_last4"] == stored["signing_secret"][-4:]
+        assert put["rotation_activation"] == svc.ROTATION_OVERLAP
+        assert stored["signing_secret"] not in caplog.text
+
+
 # ── (b) rotation: immediate when never shown, 24 h overlap when shown ───────────────────────
 
 
@@ -256,22 +274,115 @@ async def test_rotating_an_unrevealed_secret_is_immediate_and_the_next_delivery_
         _assert_signed_with(_FakeHttp.posts[0], new_secret)
 
 
-async def test_rotating_an_unrevealed_secret_drops_a_pending_one(tmp_path, monkeypatch):
-    """A row rotated before this change: current unseen, pending shown. A new rotation replaces
-    both at once, and nothing keeps signing with the unseen one."""
+async def _insert_pre_change_rotated_row(db, *, activates_in: timedelta) -> None:
+    """A row rotated before this change: current unseen, pending shown, no reveal stamp."""
+    now = svc._db_now()
+    await db.execute(
+        "INSERT INTO agent_webhook_configs (agent_id, enabled, destination_url, subscribed_events,"
+        " signing_secret, pending_signing_secret, pending_secret_activates_at, created_at, updated_at)"
+        " VALUES (:a, TRUE, :u, :e, 'whsec_unseen_current', 'whsec_seen_pending', :p, :t, :t)",
+        {"a": AGENT, "u": DEST, "e": json.dumps([EVENT]), "p": now + activates_in, "t": now},
+    )
+
+
+async def test_a_pending_secret_blocks_the_automatic_immediate_rotation(tmp_path, monkeypatch):
+    """The pending secret was shown by the rotation that made it: an automatic rotation takes
+    the overlap path (as it always did) and GET says so."""
     async with _service_db(tmp_path, monkeypatch) as db:
-        now = svc._db_now()
-        await db.execute(
-            "INSERT INTO agent_webhook_configs (agent_id, enabled, destination_url, subscribed_events,"
-            " signing_secret, pending_signing_secret, pending_secret_activates_at, created_at, updated_at)"
-            " VALUES (:a, TRUE, :u, :e, 'whsec_unseen_current', 'whsec_old_pending', :p, :t, :t)",
-            {"a": AGENT, "u": DEST, "e": json.dumps([EVENT]), "p": now + timedelta(hours=20), "t": now},
-        )
+        await _insert_pre_change_rotated_row(db, activates_in=timedelta(hours=20))
+        assert (await svc.get_webhook_config(AGENT))["rotation_activation"] == svc.ROTATION_OVERLAP
+
         result = await svc.rotate_signing_secret(AGENT)
+        assert result["activation"] == svc.ROTATION_OVERLAP
+        stored = await _row(db)
+        assert stored["signing_secret"] == "whsec_unseen_current"
+        assert stored["pending_signing_secret"] == result["new_signing_secret"]
+
+
+async def test_a_stale_no_row_read_still_respects_a_pending_secret(tmp_path, monkeypatch):
+    """The rotation read "no row" (INSERT path) but the row exists with a shown pending secret:
+    the ON CONFLICT claim must not replace it at once."""
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _insert_pre_change_rotated_row(db, activates_in=timedelta(hours=20))
+
+        async def no_row(agent_id):
+            return {"agent_id": agent_id, "created_at": None, "signing_secret": None}
+
+        monkeypatch.setattr(svc, "_get_or_create_raw_config", no_row)
+        result = await svc.rotate_signing_secret(AGENT)
+        assert result["activation"] == svc.ROTATION_OVERLAP
+        assert (await _row(db))["signing_secret"] == "whsec_unseen_current"
+
+
+async def test_a_promoted_pending_secret_counts_as_shown(tmp_path, monkeypatch):
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _insert_pre_change_rotated_row(db, activates_in=timedelta(hours=-1))
+        config = await svc.get_webhook_config(AGENT)  # promotes the due pending secret
+        stored = await _row(db)
+        assert stored["signing_secret"] == "whsec_seen_pending"
+        assert stored["pending_signing_secret"] is None
+        assert stored["secret_revealed_at"] is not None
+        assert config["rotation_activation"] == svc.ROTATION_OVERLAP
+        assert (await svc.rotate_signing_secret(AGENT))["activation"] == svc.ROTATION_OVERLAP
+
+
+async def test_a_promotion_before_the_heal_completes_does_not_name_the_column(tmp_path, monkeypatch):
+    """With the webhook DDL not (yet) all applied, activation promotes as before, unstamped."""
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _insert_pre_change_rotated_row(db, activates_in=timedelta(hours=-1))
+        seen = []
+        real_execute = db.execute
+
+        async def spy(query, values=None):
+            seen.append(str(query))
+            return await real_execute(query, values)
+
+        monkeypatch.setattr(svc, "_AGENT_WEBHOOK_DDL_READY", False)
+        monkeypatch.setattr(svc, "ensure_agent_webhook_tables", _noop)
+        monkeypatch.setattr(db, "execute", spy)
+        await svc._activate_pending_secret_if_due(AGENT)
+        assert (await _row(db))["signing_secret"] == "whsec_seen_pending"
+        assert not any("secret_revealed_at" in q for q in seen)
+
+
+async def _noop(*a, **k):
+    return None
+
+
+# ── the owner's explicit immediate rotation (recovery) ─────────────────────────────────────
+
+
+async def test_a_forced_immediate_rotation_ends_a_shown_secret_now(tmp_path, monkeypatch):
+    """The recovery for a reveal that never reached the developer (response lost, a staff save,
+    a portal that did not show it): the owner opts into ending the old secret now."""
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _put()
+        await svc.rotate_signing_secret(AGENT)  # a shown secret plus a pending one
+        result = await svc.rotate_signing_secret(AGENT, force_immediate=True)
         assert result["activation"] == svc.ROTATION_IMMEDIATE
+        assert result["pending_signing_secret_last4"] is None
         stored = await _row(db)
         assert stored["signing_secret"] == result["new_signing_secret"]
         assert stored["pending_signing_secret"] is None
+        await svc.emit_agent_webhook_event(AGENT, event_type=EVENT, payload={"n": 1})
+        _assert_signed_with(_FakeHttp.posts[-1], result["new_signing_secret"])
+
+
+async def test_a_superseded_rotation_returns_no_secret(tmp_path, monkeypatch):
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _put()
+
+        async def someone_else(agent_id):
+            return {"signing_secret": "whsec_other_writer", "pending_signing_secret": "whsec_other_pending"}
+
+        monkeypatch.setattr(svc, "_stored_secrets", someone_else)
+        with pytest.raises(svc.RotationSuperseded) as forced:
+            await svc.rotate_signing_secret(AGENT, force_immediate=True)
+        # A superseded forced rotation stops there: it never falls through to write a pending one.
+        assert (await _row(db))["pending_signing_secret"] is None
+        with pytest.raises(svc.RotationSuperseded) as overlap:
+            await svc.rotate_signing_secret(AGENT)
+        assert "whsec_" not in str(forced.value) + str(overlap.value)
 
 
 async def test_rotating_with_no_config_row_is_immediate(tmp_path, monkeypatch):
@@ -413,3 +524,43 @@ async def test_the_secret_is_in_no_other_response_and_no_log_line(tmp_path, monk
             assert value not in blob
             assert value not in caplog.text
         assert all("signing_secret" not in r for r in responses[:2])
+
+
+# ── the route: ?activation=auto|immediate ───────────────────────────────────────────────────
+
+
+async def test_the_rotate_route_takes_activation_and_only_the_owner_may_force_it(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    from routes import agent_webhooks as route
+
+    owner = {"role": "agent", "agent_id": AGENT}
+    staff = {"role": "admin", "membership_type": "employee"}
+    async with _service_db(tmp_path, monkeypatch) as db:
+        await _put()
+
+        auto = await route.post_agent_webhook_rotate_secret(AGENT, current_user=owner)
+        assert auto["activation"] == svc.ROTATION_OVERLAP
+
+        staff_auto = await route.post_agent_webhook_rotate_secret(AGENT, activation="auto", current_user=staff)
+        assert staff_auto["activation"] == svc.ROTATION_OVERLAP
+
+        with pytest.raises(HTTPException) as denied:
+            await route.post_agent_webhook_rotate_secret(AGENT, activation="immediate", current_user=staff)
+        assert denied.value.status_code == 403
+
+        with pytest.raises(HTTPException) as bad:
+            await route.post_agent_webhook_rotate_secret(AGENT, activation="later", current_user=owner)
+        assert bad.value.status_code == 400
+
+        forced = await route.post_agent_webhook_rotate_secret(AGENT, activation="immediate", current_user=owner)
+        assert forced["activation"] == svc.ROTATION_IMMEDIATE
+        assert (await _row(db))["signing_secret"] == forced["new_signing_secret"]
+
+        async def superseded(agent_id, **kwargs):
+            raise svc.RotationSuperseded("rotate again")
+
+        monkeypatch.setattr(route, "rotate_signing_secret", superseded)
+        with pytest.raises(HTTPException) as conflict:
+            await route.post_agent_webhook_rotate_secret(AGENT, activation="immediate", current_user=owner)
+        assert conflict.value.status_code == 409
