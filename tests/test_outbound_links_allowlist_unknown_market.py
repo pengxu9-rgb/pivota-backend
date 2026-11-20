@@ -198,3 +198,95 @@ def test_the_preview_still_refuses_a_lookalike_when_the_allowlist_read_fails(mon
     assert out["preview"]["domain_allowed_reason"] == "allowlist_market_unknown"
     out = _preview(monkeypatch, "US")
     assert out["preview"]["domain_allowed"] is True, "a listed market keeps the fail-open, as before"
+
+
+# --- the REAL raising mint on the one-seed read and the merchant-product /offers lane (P3) -------------------
+# These lanes went through `_make_redirect_url`, which answers 400 DOMAIN_NOT_ALLOWED for a market the allowlist
+# cannot key. The fixture below keeps that real mint (only its clock and signing secret are fixed), so a lane put
+# back on it fails these tests with a 400 instead of passing on a fake.
+
+
+def _placeholder_row(**overrides: Any) -> dict:
+    from tests.test_employee_external_seed_pdp import _seed_row
+
+    host = overrides.pop("host", "store-one.test")
+    row = _seed_row(destination_url=f"https://{host}/p/1", canonical_url=f"https://{host}/p/1", domain=host,
+                    image_url=f"https://{host}/img.jpg", **overrides)
+    row["seed_data"] = {**row["seed_data"], "image_urls": [f"https://{host}/img.jpg"]}
+    return row
+
+
+@pytest.fixture
+def real_mint_client(monkeypatch: pytest.MonkeyPatch, empty_allowlists):
+    from unittest.mock import AsyncMock
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import routes.employee_products as ep
+    service, _asked = empty_allowlists
+
+    async def override_employee():
+        return {"employee_id": "emp_test", "email": "test@example.test"}
+
+    app = FastAPI()
+    app.include_router(ep.router)
+    app.dependency_overrides[ep.get_current_employee] = override_employee
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_get_primary_offer", AsyncMock(return_value=None))
+    monkeypatch.setenv("OUTBOUND_LINKS_SIGNING_SECRET", "test-signing-secret")
+    monkeypatch.setattr(service, "_now_ts", lambda: 1_700_000_000)
+    return TestClient(app), ep
+
+
+def test_one_seed_under_a_market_the_allowlist_cannot_key_gets_no_link_and_the_reason_not_a_400(
+    monkeypatch, real_mint_client
+) -> None:
+    client, ep = real_mint_client
+    row = _placeholder_row(id="eps_star", market="*")
+
+    async def fake_fetch_one(query: Any, values: Any = None):
+        return dict(row) if "FROM external_product_seeds" in str(query) else None
+
+    monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
+    res = client.get("/employee/products/external-seeds/eps_star", headers={"Authorization": "Bearer test-token"})
+    assert res.status_code == 200, res.text
+    action = res.json()["action"]
+    assert action["redirect_url"] is None
+    assert action["redirect_refused_reason"] == "allowlist_market_unknown"
+
+
+def _merchant_offers(monkeypatch, client, ep, rows: List[dict]) -> dict:
+    from unittest.mock import AsyncMock
+
+    product_data = {"title": "Placeholder Item", "variants": [{"id": "v1", "price": "10.00"}]}
+    monkeypatch.setattr(ep, "_fetch_latest_products_cache_row", AsyncMock(return_value={"product_data": product_data}))
+
+    async def fake_fetch_one(query: Any, values: Any = None):
+        return None  # no product group: the merchant product alone
+
+    async def fake_fetch_all(query: Any, values: Any = None):
+        return [dict(r) for r in rows] if "FROM external_product_seeds" in str(query) else []
+
+    monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(ep.database, "fetch_all", fake_fetch_all)
+    res = client.get("/employee/products/merchant_test%7Cshopify%7Cp1/offers", headers={"Authorization": "Bearer test-token"})
+    assert res.status_code == 200, res.text
+    return {i.get("id"): i for i in res.json()["items"]}
+
+
+def test_merchant_product_offers_refuse_only_the_unlisted_market_row_and_leave_the_listed_link_unchanged(
+    monkeypatch, real_mint_client
+) -> None:
+    client, ep = real_mint_client
+    listed = _placeholder_row(id="eps_us", market="US", host="store-one.test")
+    unlisted = _placeholder_row(id="eps_star", market="*", host="store-two.test")
+
+    alone = _merchant_offers(monkeypatch, client, ep, [listed])
+    mixed = _merchant_offers(monkeypatch, client, ep, [listed, unlisted])
+    assert set(mixed) == {"merchant_test|shopify|p1", "eps_us", "eps_star"}, "every offer is still listed"
+    assert mixed["eps_us"]["action"]["redirect_url"].startswith("http://testserver/r?token=")
+    assert mixed["eps_us"] == alone["eps_us"], "the listed row's offer, link included, is unchanged by its neighbour"
+    assert "redirect_refused_reason" not in mixed["eps_us"]["action"]
+    assert mixed["eps_star"]["action"]["redirect_url"] is None
+    assert mixed["eps_star"]["action"]["redirect_refused_reason"] == "allowlist_market_unknown"
