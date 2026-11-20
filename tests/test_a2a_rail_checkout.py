@@ -3685,8 +3685,16 @@ OWNER = "h" * 64
 
 @pytest.fixture
 def consent_gate_on(monkeypatch):
-    """Shipping capture needs the AgenPas consent gate on (a2a_shipping_address.capture_enabled)."""
-    monkeypatch.setenv("AGENPAS_CONSENT_GATE", "1")
+    """Shipping capture needs its own dial, the AgenPas consent gate on and a consent that can be given
+    (a2a_shipping_address.capture_enabled). Test values."""
+    for name, value in {
+        "A2A_SHIPPING_CAPTURE_ENABLED": "1", "AGENPAS_CONSENT_GATE": "1", "AGENPAS_CONSENT_WRITE_ENABLED": "1",
+        "AGENPAS_TERMS_URL": "https://legal.example/terms", "AGENPAS_TERMS_VERSION": "terms-test",
+        "AGENPAS_PRIVACY_URL": "https://legal.example/privacy", "AGENPAS_PRIVACY_VERSION": "privacy-test",
+        "AGENPAS_CONSENT_OFFER_SECRET": "offer_secret_for_capture_tests_0123456789",
+        "AGENPAS_INTERNAL_CONSENT_KEY": "agenpas_consent_key_for_capture_tests_0123",
+    }.items():
+        monkeypatch.setenv(name, value)
 
 
 async def _open_without(*, email=None, address=None):
@@ -3711,6 +3719,59 @@ async def test_a_checkout_purchase_without_its_contact_parks_sending_nothing():
     # A second park never moves the deadline.
     assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
     assert (await _row(pid))["buyer_action_expires_at"] == deadline
+
+
+#: Every dial capture needs (a2a_shipping_address.capture_enabled), as (env, how it is turned off).
+CAPTURE_DIALS_OFF = {
+    "gate": ("AGENPAS_CONSENT_GATE", None),
+    "capture_dial": ("A2A_SHIPPING_CAPTURE_ENABLED", "0"),
+    "checkout_step": (a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0"),
+    "token_step": (worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "0"),
+    "consent_write": ("AGENPAS_CONSENT_WRITE_ENABLED", "0"),
+    "consent_key": ("AGENPAS_INTERNAL_CONSENT_KEY", None),
+    "terms_config": ("AGENPAS_TERMS_URL", None),
+    "read_dial": ("AGENPAS_INTERNAL_READ_ENABLED", "0"),
+}
+
+
+@pytest.mark.parametrize("parked", [True, False], ids=["parked", "not_yet_parked"])
+@pytest.mark.parametrize("dial", sorted(CAPTURE_DIALS_OFF))
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_a_dial_turned_off_while_a_purchase_waits_ends_it_before_any_rail_call(monkeypatch, dial, parked):
+    pid = await _open_without()
+    if parked:
+        assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    name, value = CAPTURE_DIALS_OFF[dial]
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert shipping_capture.capture_enabled() is False
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, pid) == "expired"
+    assert rail.sent == []  # no card read, no binding: the contact can never arrive now
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["payment_method_id"], row["buyer_action_kind"]) == (
+        "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None, None)
+    assert (row["buyer_email"], row["shipping_address"]) == (None, None)  # a terminal write drops the contact
+    assert worker.SHIPPING_ADDRESS_NOT_COLLECTED == shipping_capture.SHIPPING_ADDRESS_NOT_COLLECTED == (
+        "shipping_address_not_collected")  # the shipping write's 409 code
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_with_capture_off_only_an_absent_part_ends_the_purchase(monkeypatch):
+    monkeypatch.setenv("A2A_SHIPPING_CAPTURE_ENABLED", "0")
+    # The door with capture off takes a purchase whole (both parts present): an address without a region,
+    # say, goes on exactly as before, to the card read.
+    whole = await _open_without(email=EMAIL, address={k: v for k, v in ADDRESS.items() if k != "region"})
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, whole) != "expired"
+    assert rail.actions()[0] == "payment.method-view#submit"
+    assert (await _row(whole))["state"] != "expired"
+    # An absent email (only the capture door opens one) ends it.
+    emailless = await _open_without(address=ADDRESS)
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, emailless) == "expired" and rail.sent == []
 
 
 @pytest.mark.usefixtures("consent_gate_on")
@@ -3828,12 +3889,17 @@ async def test_the_park_written_after_the_contact_landed_makes_the_row_due_at_on
 
 
 @pytest.mark.usefixtures("consent_gate_on")
-async def test_with_the_checkout_path_off_an_emailless_purchase_is_refused_as_before(monkeypatch):
+async def test_with_the_checkout_path_off_an_emailless_purchase_ends_before_any_rail_call(monkeypatch):
+    # Only the door with capture on opens an email-less row; with the checkout path off capture is off, the
+    # gateway's write refuses, and the email can never arrive: ended, nothing sent (not even the card read).
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0")
     pid = await _open_without(address=ADDRESS)
     rail = Rail().on("payment.method-view#submit", _methods())
-    assert await _step(rail, pid) == "refused"
-    assert (await _row(pid))["refusal_reason"] == "buyer_email_required"
+    assert await _step(rail, pid) == "expired"
+    assert rail.sent == []
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["refusal_reason"]) == (
+        "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None)
 
 
 @pytest.mark.usefixtures("consent_gate_on")

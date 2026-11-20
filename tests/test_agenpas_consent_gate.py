@@ -123,7 +123,7 @@ def _mounted(request):
 NEW_FLAGS = (
     "AGENPAS_CONSENT_GATE", "AGENPAS_CONSENT_WRITE_ENABLED", "AGENPAS_TERMS_URL", "AGENPAS_TERMS_VERSION",
     "AGENPAS_PRIVACY_URL", "AGENPAS_PRIVACY_VERSION", "AGENPAS_CONSENT_OFFER_SECRET",
-    "AGENPAS_CONSENT_MIN_DWELL_SECONDS", "AGENPAS_INTERNAL_CONSENT_KEY",
+    "AGENPAS_CONSENT_MIN_DWELL_SECONDS", "AGENPAS_INTERNAL_CONSENT_KEY", "A2A_SHIPPING_CAPTURE_ENABLED",
 )
 
 
@@ -1504,6 +1504,7 @@ def test_a_payload_without_live_fields_is_returned_as_the_same_object():
 ADDRESS_FORM = {"email": EMAIL, "firstName": "Pat", "lastName": "Example", "phone": "+15125550100",
                 "addressLine1": STREET, "addressLine2": "", "city": "Placeholder City", "region": "TX",
                 "postalCode": "78701", "country": "US"}
+COMPLETE_ADDRESS = {k: v for k, v in ADDRESS_FORM.items() if k != "email"}
 
 
 @pytest.fixture
@@ -1513,6 +1514,7 @@ def capture(gate):
 
     gate.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
     gate.setenv(a2a_rail_worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
+    gate.setenv("A2A_SHIPPING_CAPTURE_ENABLED", "1")
     gate.setenv("PIVOTA_ENV", "staging")
     return gate
 
@@ -1602,6 +1604,143 @@ async def test_the_address_write_before_the_consent_is_409_and_writes_nothing(ca
     assert "shipping_address_required" not in (await _request("GET", f"{DOOR}/{rail_id}")).json()["detail"]
 
 
+#: Every dial capture needs (a2a_shipping_address.capture_enabled), as (name, how it is turned off).
+CAPTURE_DIALS_OFF = {
+    "gate": (purchase_consent.GATE_ENV, None),
+    "capture_dial": ("A2A_SHIPPING_CAPTURE_ENABLED", "0"),
+    "checkout_step": ("A2A_RAIL_CHECKOUT_STEP_ENABLED", "0"),
+    "token_step": ("A2A_RAIL_TOKEN_STEP_ENABLED", "0"),
+    "consent_write": (purchase_consent.WRITE_ENABLED_ENV, "0"),
+    "consent_key": (purchase_consent.CONSENT_KEY_ENV, None),
+    "terms_config": (purchase_consent.TERMS_URL_ENV, None),
+    "read_dial": (internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV, "0"),
+}
+
+
+def _dial_off(mp, dial: str) -> None:
+    name, value = CAPTURE_DIALS_OFF[dial]
+    if value is None:
+        mp.delenv(name, raising=False)
+    else:
+        mp.setenv(name, value)
+
+
+async def _parked(**columns: Any) -> str:
+    """A purchase the worker parked for its contact (capture on), with the buyer's consent to the step given."""
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
+    rail_id = await _waiting(last_error_code="shipping_address_required", buyer_action_expires_at=deadline, **columns)
+    await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
+    return rail_id
+
+
+def test_each_dial_capture_needs_turns_it_off(capture):
+    from services.payment_orchestration import a2a_shipping_address
+
+    assert sorted(CAPTURE_DIALS_OFF) == sorted(
+        ["gate", "capture_dial", "checkout_step", "token_step", "consent_write", "consent_key", "terms_config",
+         "read_dial"])
+    for dial in CAPTURE_DIALS_OFF:
+        with pytest.MonkeyPatch.context() as mp:
+            assert a2a_shipping_address.capture_enabled() is True
+            _dial_off(mp, dial)
+            assert a2a_shipping_address.capture_enabled() is False, dial
+    # The same answer in every process: whether THIS process mounted the consent write's router (only web
+    # does) is not part of it, so the worker and web agree on every row.
+    capture.setattr(purchase_consent, "_WRITE_MOUNTED", False)
+    assert purchase_consent.write_ready() is False and a2a_shipping_address.capture_enabled() is True
+    # Default off: the capture dial unset is off.
+    capture.delenv("A2A_SHIPPING_CAPTURE_ENABLED")
+    assert a2a_shipping_address.capture_enabled() is False
+
+
+@pytest.mark.parametrize("dial", sorted(CAPTURE_DIALS_OFF))
+async def test_a_dial_turned_off_while_a_purchase_is_parked_refuses_the_write_and_writes_nothing(capture, dial):
+    rail_id = await _parked()
+    assert (await _submit_address(rail_id, {"email": EMAIL})).status_code == 422  # on: the handler reads the form
+    before, consents = await _contact(rail_id), await _rows()
+    _dial_off(capture, dial)
+    resp = await _submit_address(rail_id)
+    if dial == "read_dial":
+        # The write's router is the read's: dark, exactly a path the app does not have (before the handler).
+        assert resp.status_code == 404
+    else:
+        # Re-wrapped by ErrorHandlerMiddleware like every 409 here (the gateway reads detail.error).
+        assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "shipping_address_not_collected"})
+        assert resp.json()["error"]["code"] == "CONFLICT"
+    assert await _contact(rail_id) == before and await _rows() == consents
+
+
+async def test_the_consent_check_runs_even_were_capture_on_with_the_gate_off(capture, monkeypatch):
+    # Unreachable today (capture needs the gate), pinned anyway: the write never skips the consent read when
+    # the gate is off. The snapshot is then LOOKUP, which `satisfied` never counts.
+    from services.payment_orchestration import a2a_shipping_address
+
+    rail_id = await _parked()
+    capture.delenv(purchase_consent.GATE_ENV)
+    monkeypatch.setattr(a2a_shipping_address, "capture_enabled", lambda: True)
+    before = await _contact(rail_id)
+    resp = await _submit_address(rail_id)
+    assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "consent_required"})
+    assert await _contact(rail_id) == before
+
+
+async def test_the_write_refuses_before_the_body_is_read_at_all(capture, monkeypatch):
+    from starlette.requests import Request
+
+    reads: List[int] = []
+    real = Request.json
+
+    async def _counting(self):
+        reads.append(1)
+        return await real(self)
+
+    monkeypatch.setattr(Request, "json", _counting)
+    rail_id = await _waiting()  # no consent yet
+    assert (await _submit_address(rail_id)).status_code == 409 and reads == []
+    with pytest.MonkeyPatch.context() as mp:
+        _dial_off(mp, "capture_dial")
+        await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
+        assert (await _submit_address(rail_id)).status_code == 409 and reads == []
+    assert (await _submit_address(rail_id)).status_code == 200 and reads == [1]
+
+
+#: Row shapes of an `opened` A2A purchase, and whether it waits for its contact (THE rule, for the read and the
+#: consent POST alike: a2a_shipping_address.awaits_contact).
+_PAST = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_FUTURE = datetime.now(timezone.utc) + timedelta(days=30)
+WAIT_SHAPES = {
+    "null_address": (dict(shipping_address=None), True),
+    "incomplete_address": (dict(shipping_address=json.dumps({"addressLine1": STREET, "city": "Placeholder City"})),
+                           True),
+    "complete_address_no_email": (dict(shipping_address=json.dumps(COMPLETE_ADDRESS), buyer_email=None), True),
+    "complete": (dict(shipping_address=json.dumps(COMPLETE_ADDRESS)), False),
+    "purged": (dict(shipping_address=None, contact_purged_at=_PAST), False),
+    "deadline_passed": (dict(shipping_address=None, buyer_action_expires_at=_PAST), False),
+    "deadline_ahead": (dict(shipping_address=None, buyer_action_expires_at=_FUTURE), True),
+    "not_opened": (dict(state="quoting", shipping_address=None), False),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(WAIT_SHAPES))
+async def test_the_read_and_the_consent_post_judge_waiting_by_one_rule(capture, shape):
+    from services.payment_orchestration import a2a_shipping_address
+
+    capture.setenv(purchase_consent.MIN_DWELL_ENV, "0")
+    columns, waits = dict(WAIT_SHAPES[shape][0]), WAIT_SHAPES[shape][1]
+    rail_id = await _a2a(columns.pop("state", "opened"), **columns)
+    await purchases.ensure_a2a_parent(rail_id, basis="backfill")
+    row = await database.fetch_one("SELECT * FROM a2a_rail_purchases WHERE id = :i", {"i": rail_id})
+    assert a2a_shipping_address.awaits_contact(dict(row)) is waits
+    consent = (await _internal(rail_id)).json().get("consent") or {}
+    assert (consent.get("step") == "shipping_address") is waits
+    resp = await _post(rail_id, _offer(rail_id, "shipping_address"))
+    if waits:
+        assert consent["available"] is True and resp.status_code == 201, resp.text
+    else:
+        assert (resp.status_code, resp.json()["detail"]) == (409, {"error": "consent_stale"})
+        assert await _rows() == []
+
+
 async def test_a_consent_read_that_fails_keeps_the_form_and_the_write_closed(capture, monkeypatch):
     rail_id = await _waiting()
     await _consent({"x": rail_id}, "x", step="shipping_address", epoch=0)
@@ -1620,7 +1759,7 @@ async def test_a_consent_read_that_fails_keeps_the_form_and_the_write_closed(cap
 async def test_the_consent_post_takes_the_shipping_step_only_while_an_a2a_purchase_waits(capture):
     capture.setenv(purchase_consent.MIN_DWELL_ENV, "0")
     waiting = await _waiting()
-    complete = await _a2a("opened")  # email and address present: nothing to ask
+    complete = await _a2a("opened", shipping_address=json.dumps(COMPLETE_ADDRESS))  # nothing to ask
     reap = await _reap("R_x", "resolving")
     assert (await _post(waiting, _offer(waiting, "shipping_address"))).status_code == 201
     for rail_id in (complete, reap):

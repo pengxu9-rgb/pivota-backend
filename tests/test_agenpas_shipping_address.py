@@ -11,6 +11,7 @@ catalog read, the Tier B verdict, the click write and the Reap route. No route m
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -73,6 +74,15 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 4650, "currency": "USD", "marke
          "product_name": "Placeholder Serum", "product_key": "pk_1", "variant_title": "30 ml"}
 #: The values long enough to be told apart from other text (not "US" / "TX", which "USD" and others contain).
 NEEDLES = tuple(v for v in (EMAIL, *ADDRESS.values()) if len(v) > 3)
+#: Everything capture needs besides the read dial and the two steps (a2a_shipping_address.capture_enabled): its own
+#: dial, the consent gate, and a consent that can be given (configuration, the write's dial and key). Test values.
+CAPTURE_ENV = {
+    "A2A_SHIPPING_CAPTURE_ENABLED": "1", "AGENPAS_CONSENT_GATE": "1", "AGENPAS_CONSENT_WRITE_ENABLED": "1",
+    "AGENPAS_TERMS_URL": "https://legal.example/terms", "AGENPAS_TERMS_VERSION": "terms-test",
+    "AGENPAS_PRIVACY_URL": "https://legal.example/privacy", "AGENPAS_PRIVACY_VERSION": "privacy-test",
+    "AGENPAS_CONSENT_OFFER_SECRET": "offer_secret_for_capture_tests_0123456789",
+    "AGENPAS_INTERNAL_CONSENT_KEY": "agenpas_consent_key_for_capture_tests_0123",
+}
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
            "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs",
            "a2a_rail_worker_heartbeat")
@@ -112,9 +122,10 @@ def _env(monkeypatch):
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:US")
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000")
     monkeypatch.setenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV, "1")
-    # Capture needs the AgenPas consent gate too (the form is a consent-gated step): on here; the tests below
-    # record the buyer's shipping-address consent where they show or submit the form (`_create`).
-    monkeypatch.setenv(purchase_consent.GATE_ENV, "1")
+    # Capture needs its own dial, the AgenPas consent gate and a consent that can be given (CAPTURE_ENV): on here;
+    # the tests below record the buyer's shipping-address consent where they show or submit the form (`_create`).
+    for name, value in CAPTURE_ENV.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv(internal_routes.INTERNAL_KEY_ENV, KEY)
     monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
@@ -362,8 +373,12 @@ async def test_the_email_may_be_left_out_when_the_row_has_it_and_is_required_whe
 
 async def test_two_submits_at_once_one_wins_and_the_other_is_a_conflict():
     pid = await _create(email=None)
-    a, b = await asyncio.gather(_submit(pid, _form(addressLine1="1 First St")),
-                                _submit(pid, _form(addressLine1="2 Second St")))
+    # As a server runs two requests: each in its own task with a FRESH context, so each gets its own database
+    # connection (`databases` keeps the connection in a ContextVar; a plain gather would hand both tasks this
+    # test's connection, and their transactions would interleave on it, which no server request ever does).
+    a, b = await asyncio.gather(
+        asyncio.create_task(_submit(pid, _form(addressLine1="1 First St")), context=contextvars.Context()),
+        asyncio.create_task(_submit(pid, _form(addressLine1="2 Second St")), context=contextvars.Context()))
     assert sorted([a.status_code, b.status_code]) == [200, 409]
 
 

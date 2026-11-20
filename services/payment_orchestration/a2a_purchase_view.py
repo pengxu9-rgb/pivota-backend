@@ -119,14 +119,14 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
     ):
         view["hosted_url"] = row["buyer_action_url"]
         view["hosted_url_expires_at"] = row.get("buyer_action_expires_at")
-    if state == "opened" and a2a_shipping_address.capture_enabled():
-        # Asked for only while the worker waits for it (the same predicate as the door and the worker).
-        missing = a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))
-        if missing and not row.get("contact_purged_at"):
-            required: Dict[str, Any] = {"fields_missing": missing}
-            if expires is not None and row.get("buyer_action_kind") is None:
-                required["expires_at"] = row.get("buyer_action_expires_at")
-            view["shipping_address_required"] = required
+    if a2a_shipping_address.awaits_contact(row, now):
+        # Asked for only while the purchase waits for it: THE shared rule (a2a_shipping_address.awaits_contact),
+        # which the consent POST applies too, so the read never offers a step the POST then refuses.
+        required: Dict[str, Any] = {
+            "fields_missing": a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))}
+        if expires is not None and row.get("buyer_action_kind") is None:
+            required["expires_at"] = row.get("buyer_action_expires_at")
+        view["shipping_address_required"] = required
     if state == "completed" and row.get("merchant_order_id"):
         view["order_reference"] = row["merchant_order_id"]
         if merchant_order_url_is_allowed(row.get("merchant_order_status_url"), str(row.get("merchant_domain") or "")):

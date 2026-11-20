@@ -34,10 +34,12 @@ the same key and the same (agent id, purchase id) scoping; `X-Agenpas-Agent-User
   WRITE  a compare-and-swap (db/a2a_rail_ledger.submit_shipping_address): only while the row waits
          (`opened`, a part empty, the deadline not passed) and only into the empty part; the row is then due
          at once, so the worker's next tick goes on.
-  CONSENT with AGENPAS_CONSENT_GATE on (which capture needs), the form is a consent-gated step: without a consent
-         row for (a2a, rail purchase, shipping_address, epoch 0) the answer is 409 {"error": "consent_required"}
-         and nothing is written; a failed consent read is a 503 (fail closed). Checked after the key, the scoping
-         and the not-found, before any field of the body is read.
+  CAPTURE and CONSENT, checked after the key, the scoping and the not-found, BEFORE the body is parsed and
+         before any write: capture off now (a2a_shipping_address.capture_enabled: a dial turned off while the
+         purchase waited) is 409 {"error": "shipping_address_not_collected"}; with no consent row for (a2a, rail
+         purchase, shipping_address, epoch 0) it is 409 {"error": "consent_required"}; a failed consent read is a
+         503 (fail closed). Nothing is written on any of them. (ErrorHandlerMiddleware re-wraps a 409: the
+         gateway reads `detail.error`.)
   ANSWER 200 the unified view (as the read) | 422 {"status": "error", "error": "invalid_shipping_address",
          "field_errors": {field: code}} with codes required / invalid / too_long / unsupported, never a value | 409
          {"error": "shipping_address_conflict"} when the row no longer waits and what it holds differs (the
@@ -256,10 +258,6 @@ async def submit_shipping_address_for_gateway(
     if not purchases.is_enabled() or not public._PURCHASE_ID_RE.fullmatch(purchase_id):
         return _not_found()
     try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001 - the parser's message can quote the body
-        body = None
-    try:
         parent = await _parent_for_agent(purchase_id, agent_id)
         owner = str((parent or {}).get("agent_user_ref_hash") or "")
         if parent is None or not owner:
@@ -273,16 +271,25 @@ async def submit_shipping_address_for_gateway(
         return _unavailable()
     if row is None:
         return _not_found()
-    if purchase_consent.gate_on():
-        # The form is a consent-gated step (services/payment_orchestration/purchase_consent.py): no address is
-        # written before the buyer accepted on the AgenPas page. A failed consent read fails CLOSED.
-        # THE SAME read and rule as the views' gate (purchase_consent.snapshot + satisfied): the read shows the
-        # form exactly when this write takes it. Not nested: this request holds no transaction to protect.
-        consents = await purchase_consent.snapshot(agent_id, [("a2a", rail_id)], nested=False)
-        if consents is purchase_consent.FAILED:
-            return _unavailable()  # the read failed: fail closed, 503, nothing written
-        if not purchase_consent.satisfied(consents, "a2a", rail_id, purchase_consent.SHIPPING_STEP):
-            return JSONResponse(status_code=409, content={"error": "consent_required"})
+    # BOTH CHECKS BEFORE THE BODY IS READ AT ALL (not even parsed), and before any write:
+    # 1. Capture must be on now (THE predicate the door, the view and the worker read): a dial turned off
+    #    while a purchase waited (the consent gate, the capture dial, a checkout step) ends the collection.
+    if not shipping_capture.capture_enabled():
+        return JSONResponse(status_code=409, content={"error": shipping_capture.SHIPPING_ADDRESS_NOT_COLLECTED})
+    # 2. The form is a consent-gated step (services/payment_orchestration/purchase_consent.py): no address is
+    #    written before the buyer accepted on the AgenPas page. THE SAME read and rule as the views' gate
+    #    (purchase_consent.snapshot + satisfied), always run: a failed read is FAILED (503, fail closed), and with
+    #    the gate off the snapshot is LOOKUP, which `satisfied` never counts (unreachable here: capture needs the
+    #    gate, but it fails closed if it ever were).
+    consents = await purchase_consent.snapshot(agent_id, [("a2a", rail_id)])
+    if consents is purchase_consent.FAILED:
+        return _unavailable()  # the read failed: fail closed, 503, nothing written
+    if not purchase_consent.satisfied(consents, "a2a", rail_id, purchase_consent.SHIPPING_STEP):
+        return JSONResponse(status_code=409, content={"error": "consent_required"})
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - the parser's message can quote the body
+        body = None
     email, address, field_errors = shipping_capture.read_submission(
         body, email_required=not row.get("buyer_email"), address_required=not row.get("shipping_address"))
     if field_errors:
@@ -439,8 +446,7 @@ async def record_purchase_consent(
     step = body["step"]
     # Not final and in this step, in one check: a final (or unmapped) state asks for no step at all. The A2A
     # shipping-address step: while the row is `opened` and still waits for the buyer's contact (capture on).
-    awaits_contact = (rail == "a2a" and bool(row.get("contact_missing")) and not row.get("contact_purged_at")
-                      and shipping_capture.capture_enabled())
+    awaits_contact = rail == "a2a" and shipping_capture.awaits_contact(row)  # THE rule the read applies too
     if purchase_consent.step_for(rail, row.get("state"), awaits_contact=bool(awaits_contact)) != step:
         return _refusal(409, "consent_stale")
     # Reap asks the agent for the buyer's contact again first (the read shows no offer then): the same rule

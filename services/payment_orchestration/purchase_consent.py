@@ -176,6 +176,13 @@ def record_write_mount(mounted: bool) -> None:
     _WRITE_MOUNTED = bool(mounted)
 
 
+def consent_can_be_given() -> bool:
+    """Whether a consent COULD be recorded, by configuration alone: the terms / privacy configuration and offer
+    secret set, the write's dial on, its key valid. The same answer in every process (web and the worker share
+    the environment), unlike `write_ready`, which also asks whether THIS process mounted the write's router."""
+    return config() is not None and write_enabled() and configured_consent_key() is not None
+
+
 def write_ready() -> bool:
     """Whether a consent POST could succeed now: registered in this process (when `mount` ran here), its dial
     on, its key valid. `available` (in the read's block and a live read's `buyer_step`) is false otherwise."""
@@ -292,25 +299,20 @@ def view_step(rail: str, unified: str, detail: Any) -> Optional[str]:
 # ── reading the consents ─────────────────────────────────────────────────────────────────────
 
 
-async def snapshot(agent_id: str, refs: Iterable[Tuple[str, str]], *, nested: bool = True) -> Any:
+async def snapshot(agent_id: str, refs: Iterable[Tuple[str, str]]) -> Any:
     """The consents for a page of purchases, in ONE read: a Snapshot, FAILED when the read failed, or
     LOOKUP when the gate is off (nothing will ask). THE one read every reader and writer of a consent decision
-    uses (the views' gate, the internal read's block, the shipping-address write), judged by `satisfied`.
-    `nested=False` for a caller that holds no transaction of its own to protect (a nested one would then only
-    collide with a concurrent request on a shared connection)."""
+    uses (the views' gate, the internal read's block, the shipping-address write), judged by `satisfied`."""
     if not gate_on():
         return LOOKUP
     import db.agent_purchase_consents as consents_db
     from db.database import database
 
     try:
-        ids = [rail_id for _rail, rail_id in refs]
-        if not nested:
-            return await consents_db.consents_for(agent_id, ids)
         # In its own (nested) transaction: inside a caller's transaction that is a SAVEPOINT, so a failed read
         # (the table missing, say) rolls back to it and does not abort the caller's work on Postgres.
         async with database.transaction():
-            return await consents_db.consents_for(agent_id, ids)
+            return await consents_db.consents_for(agent_id, [rail_id for _rail, rail_id in refs])
     except Exception as exc:  # noqa: BLE001 - fail closed: no consent read, no hosted page
         logger.warning("purchase_consent: consent read failed error_type=%s", type(exc).__name__)
         return FAILED

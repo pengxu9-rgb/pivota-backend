@@ -220,19 +220,20 @@ _SELECT_REAP_FOR_AGENT_SQL = """
       FROM reap_agentic_purchases
      WHERE id = :id AND agent_id = :agent_id
 """
-#: `contact_missing` says only WHETHER the buyer's email or address is still missing (the shipping-address
-#: step), never what is stored.
+#: The contact columns and the deadline are read ONLY for the shared waiting-for-contact rule
+#: (a2a_shipping_address.awaits_contact, the same one the read applies); the write never returns or logs them.
 _SELECT_A2A_FOR_AGENT_SQL = """
-    SELECT id, state, member_id AS rail_buyer_ref, contact_purged_at,
-           (buyer_email IS NULL OR shipping_address IS NULL) AS contact_missing
+    SELECT id, state, member_id AS rail_buyer_ref, contact_purged_at, buyer_email, shipping_address,
+           buyer_action_kind, buyer_action_expires_at
       FROM a2a_rail_purchases
      WHERE id = :id AND agent_id = :agent_id
 """
 
 
 async def rail_purchase_for_agent(rail: str, rail_purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
-    """{id, state, rail_buyer_ref, contact_purged_at[, last_error_code (Reap) | contact_missing (A2A)]} of this agent's
-    rail purchase, or None ("not this agent's" and "does not exist" are the same None)."""
+    """{id, state, rail_buyer_ref, contact_purged_at[, last_error_code (Reap) | buyer_email, shipping_address,
+    buyer_action_kind, buyer_action_expires_at (A2A: for the waiting-for-contact rule only; never returned, never
+    logged)]} of this agent's rail purchase, or None ("not this agent's" and "does not exist" are the same None)."""
     params = {"id": rail_purchase_id, "agent_id": agent_id}
     if rail == "reap":
         row = await database.fetch_one(_SELECT_REAP_FOR_AGENT_SQL, params)
