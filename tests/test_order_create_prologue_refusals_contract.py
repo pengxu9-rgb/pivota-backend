@@ -1171,6 +1171,9 @@ def test_c1_a_listed_refusal_in_the_held_branch_is_caught(path: str, function: s
 _APP_MIDDLEWARE = {
     "UsageLoggerMiddleware", "RateLimitMiddleware", "StructuredLoggingMiddleware", "SyntheticCallMiddleware",
     "ErrorHandlerMiddleware", "SecurityHeadersMiddleware", "AP2SecurityMiddleware", "TieredCORSMiddleware",
+    # Reviewed (affiliate registry, 2026-11-20): answers 404 for /employee/affiliate-programs* while its dial
+    # is off and passes every other request through untouched; it reads no body and writes nothing.
+    "RegistryDarkMiddleware",
 }
 _APP_HTTP_MIDDLEWARE_FUNCTIONS = {"add_service_version_headers", "cors_preflight_passthrough"}
 
