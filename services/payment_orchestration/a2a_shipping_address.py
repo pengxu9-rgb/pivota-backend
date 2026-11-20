@@ -127,6 +127,24 @@ def _address(value: Any) -> Any:
     return value
 
 
+def incomplete_address(value: Any) -> Optional[Dict[str, Any]]:
+    """The stored address when it is there but lacks a required field, else None. Such an address counts as
+    ABSENT (THE waiting rule, `fields_missing`): the gateway's write may replace it, and the worker's park
+    does not take it for a complete contact (db/a2a_rail_ledger: both compare on exactly this value)."""
+    address = _address(value)
+    if not isinstance(address, Mapping) or not address:
+        return None
+    if any(not str(address.get(f) or "").strip() for f in REQUIRED_ADDRESS_FIELDS):
+        return dict(address)
+    return None
+
+
+def address_missing(value: Any) -> bool:
+    """No stored address, or one that lacks a required field: the write asks for the whole address."""
+    address = _address(value)
+    return not (isinstance(address, Mapping) and address) or incomplete_address(address) is not None
+
+
 def contact_missing(row: Mapping[str, Any]) -> bool:
     """The row still lacks a part of its contact (`fields_missing`, per field) and it was never purged."""
     return not row.get("contact_purged_at") and bool(

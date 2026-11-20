@@ -3775,6 +3775,23 @@ async def test_with_capture_off_only_an_absent_part_ends_the_purchase(monkeypatc
 
 
 @pytest.mark.usefixtures("consent_gate_on")
+async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
+    # The park's "the contact landed meanwhile" check counts an address that is still exactly the incomplete
+    # one the worker read as absent (THE waiting rule): the row parks with its deadline, it is not made due at
+    # once, and a second park keeps the same deadline.
+    partial = {k: v for k, v in ADDRESS.items() if k != "region"}
+    pid = await _open_without(email=EMAIL, address=partial)
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("opened", worker.SHIPPING_ADDRESS_REQUIRED)
+    deadline = row["buyer_action_expires_at"]
+    assert deadline is not None
+    assert pid not in [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)]  # not due at once
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert (await _row(pid))["buyer_action_expires_at"] == deadline
+
+
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
     assert shipping_capture.fields_missing(None, None) == [
         "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode", "country"]

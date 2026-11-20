@@ -362,6 +362,63 @@ async def test_the_submitted_contact_is_stored_and_the_answer_is_the_unified_vie
     assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"] == ADDRESS
 
 
+PARTIAL = {"addressLine1": "1 Partial Way", "city": "Placeholder City"}
+
+
+async def _store_partial(pid: str, partial: Dict[str, Any] = PARTIAL) -> None:
+    # An address that lacks required fields, encoded as the door stores one (sorted keys).
+    await database.execute("UPDATE a2a_rail_purchases SET shipping_address = :a WHERE id = :i",
+                           {"a": json.dumps(partial, sort_keys=True), "i": pid})
+
+
+async def test_an_incomplete_stored_address_counts_as_absent_and_the_whole_address_replaces_it():
+    # THE waiting rule (a2a_shipping_address.awaits_contact) calls it missing, so the write does too: the form
+    # asks for the whole address, and the buyer's replaces the incomplete one (no more 409 for a step the read
+    # offered and the consent POST took).
+    pid = await _create()
+    await _store_partial(pid)
+    form = {k: v for k, v in _form().items() if k != "email"}
+    short = await _submit(pid, {k: form[k] for k in PARTIAL})
+    assert short.status_code == 422
+    assert set(short.json()["field_errors"]) == set(shipping_capture.REQUIRED_ADDRESS_FIELDS) - set(PARTIAL)
+    # Nothing sent for the address: required whole, never "already there" (an empty form is not a 200).
+    empty = await _submit(pid, {})
+    assert empty.status_code == 422
+    assert set(empty.json()["field_errors"]) == set(shipping_capture.REQUIRED_ADDRESS_FIELDS)
+    resp = await _submit(pid, form)
+    assert resp.status_code == 200, resp.text
+    row = await a2a_ledger.get_purchase_internal(pid)
+    assert (row["buyer_email"], row["shipping_address"], row["last_error_code"]) == (EMAIL, ADDRESS, None)
+    # Now complete: a different address is a conflict again, and the stored one stays.
+    other = await _submit(pid, {**form, "addressLine1": "2 Other St"})
+    assert (other.status_code, _error(other)) == (409, "shipping_address_conflict")
+    assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"] == ADDRESS
+
+
+async def test_the_ledger_replaces_only_exactly_the_incomplete_address_it_was_given():
+    pid = await _create()
+    await _store_partial(pid)
+    owner = (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"]
+    # Another incomplete value than the one stored (the row moved on since it was read): nothing written.
+    stale = {**PARTIAL, "city": "Elsewhere"}
+    assert await a2a_ledger.submit_shipping_address(
+        pid, AGENT, owner, buyer_email=None, shipping_address=ADDRESS, replaces_address=stale) is None
+    # An incomplete address replaced by nothing: the email alone does not end the wait.
+    assert await a2a_ledger.submit_shipping_address(
+        pid, AGENT, owner, buyer_email=EMAIL, shipping_address=None, replaces_address=PARTIAL) is None
+    # Without the fence the stored (non-null) address is never overwritten, as before.
+    assert await a2a_ledger.submit_shipping_address(
+        pid, AGENT, owner, buyer_email=None, shipping_address=ADDRESS) is None
+    assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"] == PARTIAL
+    written = await a2a_ledger.submit_shipping_address(
+        pid, AGENT, owner, buyer_email=None, shipping_address=ADDRESS, replaces_address=PARTIAL)
+    assert written is not None and written["shipping_address"] == ADDRESS
+    # The route passes only what a2a_shipping_address.incomplete_address returns: never a complete address.
+    assert shipping_capture.incomplete_address(ADDRESS) is None
+    assert shipping_capture.incomplete_address(json.dumps(PARTIAL)) == PARTIAL
+    assert shipping_capture.incomplete_address(None) is None and shipping_capture.incomplete_address({}) is None
+
+
 async def test_the_email_may_be_left_out_when_the_row_has_it_and_is_required_when_it_does_not():
     with_email = await _create()
     form = {k: v for k, v in _form().items() if k != "email"}

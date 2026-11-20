@@ -308,7 +308,10 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
   in `fields_missing`); a part that is sent is read whole. US only. Region is one of the 50 states or DC.
 - **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
-  deadline not passed, the contact never purged) and fills only an empty part. The purchase is then due
+  deadline not passed, the contact never purged) and fills only an empty part. "Empty" is the waiting
+  rule's: a stored address that lacks a required field counts as absent, so the form asks for the whole
+  address and the write replaces exactly that stored value (it compares on it, so an address a concurrent
+  write completed is never overwritten). A complete stored address is never replaced. The purchase is then due
   at once. A submit that lands while the worker holds the row is never undone: the worker's park then finds
   the contact complete and clears the code and the deadline, so the expiry sweep cannot end it.
 - **Answers.**

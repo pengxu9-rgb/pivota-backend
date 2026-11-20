@@ -524,7 +524,8 @@ async def _await_contact(s: _Step) -> str:
             s.id, s.worker, from_states=["opened"], to_state="expired", last_error_code=SHIPPING_ADDRESS_EXPIRED)
         return await _settled(s, moved, "expired")
     parked = await ledger.park_for_shipping_address_as_holder(
-        s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS))
+        s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS),
+        incomplete_address=a2a_shipping_address.incomplete_address(s.row.get("shipping_address")))
     return SHIPPING_ADDRESS_REQUIRED if parked is not None else "lost"
 
 

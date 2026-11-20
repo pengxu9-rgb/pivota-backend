@@ -290,8 +290,12 @@ async def submit_shipping_address_for_gateway(
         body = await request.json()
     except Exception:  # noqa: BLE001 - the parser's message can quote the body
         body = None
+    # THE waiting rule's "missing" (a2a_shipping_address.awaits_contact): an address that lacks a required field
+    # is asked for whole, and the ledger replaces exactly that stored value (a compare-and-swap on it).
+    replaces = shipping_capture.incomplete_address(row.get("shipping_address"))
     email, address, field_errors = shipping_capture.read_submission(
-        body, email_required=not row.get("buyer_email"), address_required=not row.get("shipping_address"))
+        body, email_required=not row.get("buyer_email"),
+        address_required=shipping_capture.address_missing(row.get("shipping_address")))
     if field_errors:
         # The app's "already normalised" error shape (`status` + `error`), which ErrorHandlerMiddleware passes
         # through with its status: a 422 stays a 422 (a FastAPI-default 422 would be re-nested as a 400).
@@ -299,7 +303,7 @@ async def submit_shipping_address_for_gateway(
             "status": "error", "error": "invalid_shipping_address", "field_errors": field_errors})
     try:
         written = await a2a_ledger.submit_shipping_address(
-            rail_id, agent_id, owner, buyer_email=email, shipping_address=address)
+            rail_id, agent_id, owner, buyer_email=email, shipping_address=address, replaces_address=replaces)
         if written is None:
             current = await a2a_ledger.get_purchase_for_owner(rail_id, agent_id, owner)
             if current is None:
