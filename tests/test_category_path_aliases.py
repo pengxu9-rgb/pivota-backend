@@ -308,7 +308,7 @@ def test_the_vendored_distinct_list_is_not_EMPTY_or_TRUNCATED():
         assert path in INTENTIONALLY_DISTINCT, path
 
 
-# --- the nail leaves (Peng 2026-09-26) -----------------------------------------------------------
+# --- the nail leaves (the owner 2026-09-26) -----------------------------------------------------------
 
 NAIL_LEAVES = frozenset({
     "beauty/makeup/nails/nail-polish",

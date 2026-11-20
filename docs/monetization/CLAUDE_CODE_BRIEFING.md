@@ -77,7 +77,7 @@ Cowork (Jack's other session) is for architecture/product decisions. Don't pull 
 #    The blueprint is the source of truth.
 
 # 2. Dispatch Wave 1 (T1 + T2 in parallel).
-cd /Users/pengchydan/dev/pivota-backend-receipt-suppress-fix
+cd ~/dev/pivota-backend-receipt-suppress-fix
 mkdir -p docs/monetization/codex_dispatch/outputs
 
 # T1 — Stripe audit (read-only, no deps)

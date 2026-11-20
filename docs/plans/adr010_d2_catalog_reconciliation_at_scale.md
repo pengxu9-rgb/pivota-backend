@@ -6,7 +6,7 @@ plan is the execution path for **ADR-010's committed-but-unbuilt Option D
 increment** (action items 3–6), sequenced against what step-5 already built
 and learned. Companions: `docs/adr/ADR-010-canonical-product-identity.md`,
 `docs/plans/adr011_step5_catalog_identity_reconciliation.md` (the completed
-discovery phase), `reports/step5/lane4_review_2026-07-10.*` (the gold-label
+discovery phase), the 2026-07-10 lane-4 review (kept off main in the private ops bundle; the gold-label
 seed).
 
 ## 0. Where step-5 left the catalog, and why scale is now the right call

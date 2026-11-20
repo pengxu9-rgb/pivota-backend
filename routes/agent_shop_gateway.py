@@ -66,6 +66,12 @@ from services.offer_buyability import (
     availability_is_known_unavailable,
     expected_currency_for_market,
 )
+from services.unknown_stock import (
+    SQL_OUT_OF_STOCK_SPELLINGS,
+    UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG as _UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG,
+    stated_in_stock as _shared_stated_in_stock,
+    unknown_stock_stays_unknown as _shared_unknown_stock_stays_unknown,
+)
 from services import market_telemetry
 from db.database import database
 from models.catalog import PivotPaymentContext, PivotQueryRequest, PivotResultItem
@@ -5200,7 +5206,7 @@ async def _handle_offers_resolve(
         title_terms, brand_terms = _external_identity_terms_from_product_payloads(product_payloads)
         if not title_terms:
             return []
-        # A title match is a FALLBACK: it finds a seed the buyer never held, by name. Peng
+        # A title match is a FALLBACK: it finds a seed the buyer never held, by name. The owner
         # 2026-09-26: a fallback in another currency is a wrong result, so it serves only a seed
         # priced in the buyer's market currency -- the same rule, table and conjunct as
         # fetch_external_seed_rows (#2389). No market = US; a market with no known currency gets
@@ -6591,7 +6597,7 @@ async def _handle_offers_resolve(
             }
 
         # The fuzzy ref is a FALLBACK (title / url / seed_data LIKE): it finds seeds the buyer may
-        # never have held. Peng 2026-09-27: a caller that names no market is a US buyer here too
+        # never have held. The owner 2026-09-27: a caller that names no market is a US buyer here too
         # (the UCP get_offers tool sends none), so it gets only seeds priced in the buyer market's
         # currency -- #2389's rule, function and conjunct, as the identity retry above. A market
         # with no known currency gets no fuzzy seed; NULL/blank price_currency never matches.
@@ -7376,7 +7382,7 @@ async def _handle_offers_resolve(
                     {"aliases": ident_aliases, "limit": max(limit, 1),
                      "market": market_hint,
                      "buyer_currency": _declared_buyer_currency(market_hint),
-                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+                     "unavailable": _catalog_unavailable_spellings(),
                      **_price_params},
                 ),
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
@@ -10605,7 +10611,7 @@ def _catalog_offer_entry(r: Dict[str, Any], *, group_mode: bool, redirect_url: O
         "availability": availability,
         # In a resolved group, the seed lane's wider vocabulary too ("sold out", the
         # schema.org OutOfStock URL...), so a sold-out retailer is never best price.
-        "in_stock": not (
+        "in_stock": _stated_in_stock(availability) if _unknown_stock_stays_unknown() else not (
             _availability_says_out_of_stock(availability) if group_mode
             else availability_is_known_unavailable(availability)
         ),
@@ -10723,7 +10729,13 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     Plus the seed-currency conjunct, read per call: "" with the reader kill switch
     (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off. The conjunct is then dropped and rows and
     plan match the pre-rule statement, but the text (and so its Query Insights digest) differs: the
-    guard's SQL comments stay in it."""
+    guard's SQL comments stay in it.
+
+    The ORDER BY's in-SQL comment ("see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds") holds with
+    OFFERS_UNKNOWN_STOCK_STAYS_UNKNOWN_ENABLED off. With it on, `:unavailable` is the wider list from
+    `_catalog_unavailable_spellings` so the order matches the flag-on `in_stock`; free prose the normalizer
+    flags False cannot be listed and still sorts as sellable (ordering only). The comment is left as is
+    on purpose: editing it would change the statement text (and its Query Insights digest) flag off."""
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )
@@ -10840,7 +10852,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0
                        -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
-                       -- (services/seed_offer_currency, Peng 2026-10-19), the conjunct after the
+                       -- (services/seed_offer_currency, the owner 2026-10-19), the conjunct after the
                        -- next one. Before the window above ranks, so a stale copy never holds a
                        -- seller's slot: SKINTIFIC's set carried 20 USD 23.56 offers the variant
                        -- backfill copied off a seed since re-read in AUD, and this arm would mint
@@ -11057,6 +11069,31 @@ def _seed_offer_matched(src: Dict[str, Any], entries: set, variants: Optional[Li
         elif stored is not None and stored_entry_answers_to(stored, entry):
             return True
     return False
+
+
+UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG = _UNKNOWN_STOCK_STAYS_UNKNOWN_FLAG
+
+
+def _unknown_stock_stays_unknown() -> bool:
+    """Default OFF; case-insensitive "true" after trimming, "1"/"yes"/"on" stay off. On: an offer or seed whose
+    availability is missing or not understood says in_stock None (unknown), never True, and carries no invented
+    inventory count. Off: today's behaviour. Shared with beauty_external_ranking: services.unknown_stock."""
+    return _shared_unknown_stock_stays_unknown()
+
+
+def _stated_in_stock(availability: Any) -> Optional[bool]:
+    """True only on an affirmative in-stock statement, False on ANY out-of-stock statement (the catalog arm's
+    vocabulary or the seed lane's: "sold out" is sold out in every lane), None when it is missing or says neither."""
+    return _shared_stated_in_stock(availability)
+
+
+def _catalog_unavailable_spellings() -> List[str]:
+    """The `:unavailable` bind of the catalog arm's ORDER BY. Off: OFFER_UNAVAILABLE_AVAILABILITIES (the base
+    list, unchanged). On: the wider list the normalizer calls out of stock (services.unknown_stock), so a
+    "sold out" / schema.org SoldOut / "discontinued" row sorts the way its in_stock flag reads."""
+    if _unknown_stock_stays_unknown():
+        return list(SQL_OUT_OF_STOCK_SPELLINGS)
+    return sorted(OFFER_UNAVAILABLE_AVAILABILITIES)
 
 
 def _availability_says_out_of_stock(value: Any) -> bool:
@@ -11638,7 +11675,7 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
             {"aliases": snap["aliases"], "limit": max(snap["limit"], 1),
              "market": snap["market"],
              "buyer_currency": _declared_buyer_currency(snap["market"]),
-             "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+             "unavailable": _catalog_unavailable_spellings(),
              **price_params},
         )
     record.update(_group_shadow_compute(snap, group, list(rows or [])))
@@ -12346,7 +12383,7 @@ def _cart_is_the_named_offer(
         return True
     if not (len(served) == 1 and served[0] is offer_variant):
         return False
-    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # THE CALLER'S NAME IS A CLAIM HERE (the owner, 2026-10-15). A stored `sku` may match a variant but
     # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
     # data that came WITH the entry. A name the caller sent is an assertion about which variant the
     # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
@@ -12771,7 +12808,7 @@ class _CartPurchasabilityGate:
     and never an `or "US"` default. `tests/test_purchase_gate_market_not_defaulted.py`
     resolves every construction site's argument and pins it.
 
-    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (Peng, 2026-10-09). This gate hands a
+    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (the owner, 2026-10-09). This gate hands a
     prefilled cart to a HUMAN, who pays however the checkout lets them; the Reap rail pays by
     card with nobody present. The two read the same fact through two readers that part on
     NO_CARD_PAYMENT — see "TWO QUESTIONS, TWO READERS" in `db/merchant_purchasability.py`:
@@ -13525,9 +13562,11 @@ def _external_seed_to_shop_product(
     ingredient_ids = _normalize_external_seed_structured_ingredient_ids(row, seed_data)
     product_type = _normalize_external_seed_product_type(row, seed_data)
 
-    in_stock = True
+    in_stock: Optional[bool] = True
     if isinstance(availability, str):
         in_stock = availability.lower() not in {"out_of_stock", "outofstock", "sold_out"}
+    if _unknown_stock_stays_unknown():
+        in_stock = _stated_in_stock(availability)
 
     # Structured brand so agents can cite "<brand>'s <product>" without parsing the
     # title. External seeds carry brand/vendor in seed_data; fall back to the
@@ -13566,7 +13605,8 @@ def _external_seed_to_shop_product(
         "currency": price_currency,
         "image_url": image_url,
         "product_type": product_type or None,
-        "inventory_quantity": 999 if in_stock else 0,
+        # No invented count for an unknown: an in-stock-only filter that trusts a quantity must not count it.
+        "inventory_quantity": (999 if in_stock else 0) if in_stock is not None else None,
         "platform": "external",
         "availability": availability,
         "in_stock": in_stock,
@@ -13883,6 +13923,19 @@ def _normalize_prefetched_external_seed_candidates(
     return normalized
 
 
+def _prefetched_candidate_availability(candidate: Dict[str, Any]) -> Optional[str]:
+    """The availability a prefetched candidate's seed row is rebuilt with. Off: a missing one is read off
+    `in_stock` and anything not False becomes "in_stock". On: only a stated True/False is translated; a missing
+    or unknown one stays None (unknown)."""
+    if candidate.get("availability"):
+        return candidate.get("availability")
+    if _unknown_stock_stays_unknown():
+        # Identity, not equality: 0/1 are not a stated True/False (a dict lookup would map them).
+        stated = candidate.get("in_stock")
+        return "in_stock" if stated is True else "out_of_stock" if stated is False else None
+    return "in_stock" if candidate.get("in_stock") is not False else "out_of_stock"
+
+
 async def _build_prefetched_external_seed_wrappers(
     request_metadata: Optional[Dict[str, Any]],
     *,
@@ -14053,7 +14106,7 @@ async def _build_prefetched_external_seed_wrappers(
             "image_url": candidate.get("image_url"),
             "price_amount": candidate.get("price"),
             "price_currency": candidate.get("currency"),
-            "availability": candidate.get("availability") or ("in_stock" if candidate.get("in_stock") is not False else "out_of_stock"),
+            "availability": _prefetched_candidate_availability(candidate),
             "attached_product_key": candidate.get("attached_product_key"),
             "attached_variant_id": candidate.get("attached_variant_id"),
         }

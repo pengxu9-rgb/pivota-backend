@@ -3,7 +3,7 @@
 # READ-ONLY: the program issues SELECTs only.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MAIN=/Users/pengchydan/dev/pivota-backend-quality-gate
+MAIN=$HOME/dev/pivota-backend-quality-gate
 SRC="${1:-$HERE/stila_probe.py}"
 B64="$(python3 -c "import base64,sys;sys.stdout.write(base64.b64encode(open(sys.argv[1],'rb').read()).decode())" "$SRC")"
 PROG="exec(__import__('base64').b64decode('$B64'))"

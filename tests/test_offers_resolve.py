@@ -501,7 +501,7 @@ def _identity_seed_row(seed_id: str, currency, domain: str) -> dict:
     }
 
 
-# Peng 2026-09-26: a fallback in the wrong currency is a wrong result. The identity retry finds a
+# The owner 2026-09-26: a fallback in the wrong currency is a wrong result. The identity retry finds a
 # seed BY TITLE -- one the buyer never held -- so it is a fallback, and it serves only a seed
 # priced in the buyer market's currency (the #2389 rule). The fake evaluates the currency
 # conjunct the way Postgres would, so dropping it from the SQL serves the SGD / JPY / NULL rows.
@@ -580,7 +580,7 @@ def test_offers_resolve_identity_retry_serves_only_the_buyer_market_currency(
         assert served_seeds == [f"ext_eps_{served_currency.lower()}"]
 
 
-# Peng 2026-09-27: "treat market-less offers.resolve callers as US too". The fuzzy ref (title / url /
+# The owner 2026-09-27: "treat market-less offers.resolve callers as US too". The fuzzy ref (title / url /
 # seed_data LIKE on the product id) is a fallback that can surface a seed the buyer never held, so it
 # gets #2389's rule: no market = US = USD, SG = SGD, NULL/blank never, an unknown market gets no
 # fuzzy seed and the query is not run. The fake evaluates the conjunct the way Postgres would.
@@ -5716,7 +5716,7 @@ async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact(pur
     enforcement — the HUMAN cart's field, not the Reap rail's `tier`. Real fact table, real
     `record_check` writes, the ops handler called directly.
 
-    THE TWO FIELDS PART ON NO_CARD_PAYMENT (Peng, 2026-10-09): a checkout read with no on-site
+    THE TWO FIELDS PART ON NO_CARD_PAYMENT (the owner, 2026-10-09): a checkout read with no on-site
     card line refuses the headless card rail and KEEPS the human cart. Pinned here as the one
     case where `tier` and `human_handoff_tier` disagree, in that direction and no other."""
     import db.merchant_purchasability as mp

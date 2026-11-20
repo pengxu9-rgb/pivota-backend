@@ -1,7 +1,7 @@
 # Pivota Merchant Growth System — Holistic Build Plan
 
 **Date:** 2026-06-14 · **Status:** Draft for joint review (pre-implementation) ·
-**Deciders:** Founder (peng), Claude
+**Deciders:** Founder, Claude
 
 Synthesizes the last 24h of decisions into **one system**. Companion docs:
 ADR-001 (canonical record vs supplier), ADR-002 (decision-intelligence),

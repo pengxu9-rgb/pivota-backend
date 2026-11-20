@@ -17,6 +17,7 @@ from models.standard_product import (
     _normalized_visible_term_matches,
 )
 from services.external_seed_search import ensure_json_obj, stable_external_product_id
+from services.unknown_stock import stated_in_stock as stated_in_stock_of, unknown_stock_stays_unknown
 
 
 BEAUTY_EXTERNAL_RANKING_AUDIT_VERSION = "beauty_external_ranking_v1"
@@ -521,6 +522,18 @@ def build_external_seed_filter_product(
         or seed_data.get("availability")
         or "unknown"
     ).strip().lower()
+    # Flag OFFERS_UNKNOWN_STOCK_STAYS_UNKNOWN_ENABLED (default off): the stock verdict is the served
+    # product's (services.unknown_stock.stated_in_stock on the raw value, the same precedence), so an
+    # unknown or "sold out" seed is never in stock here while the served product says null / false.
+    # Off: the three-literal denylist and 999 below, unchanged.
+    stated_in_stock: Optional[bool] = None
+    unknown_stock_on = unknown_stock_stays_unknown()
+    if unknown_stock_on:
+        stated_in_stock = stated_in_stock_of(
+            external_product.get("availability")
+            or row.get("availability")
+            or seed_data.get("availability")
+        )
     ingredient_ids = normalize_external_seed_structured_ingredient_ids(row, seed_data)
     product_type = normalize_external_seed_product_type(row, seed_data)
     variants: List[StandardProductVariant] = []
@@ -576,11 +589,21 @@ def build_external_seed_filter_product(
         ingredient_ids=ingredient_ids,
         price=price,
         currency=currency,
-        inventory_quantity=0 if availability in {"out_of_stock", "outofstock", "sold_out"} else 999,
+        # Flag on: a count only for a stated in stock (999, as off) or out of stock (0); unknown has none
+        # (None; StandardProduct reads it as 0 and, with in_stock None and no orderable, in_stock False —
+        # this is the FILTER product only, so an in-stock-only check drops it; the served product says null).
+        inventory_quantity=(
+            ({True: 999, False: 0}[stated_in_stock] if stated_in_stock is not None else None)
+            if unknown_stock_on
+            else (0 if availability in {"out_of_stock", "outofstock", "sold_out"} else 999)
+        ),
         image_url=external_product.get("image_url") or row.get("image_url") or seed_data.get("image_url"),
         variants=variants,
         status=ProductStatus.ACTIVE,
-        in_stock=availability not in {"out_of_stock", "outofstock", "sold_out"},
+        in_stock=(
+            stated_in_stock if unknown_stock_on
+            else availability not in {"out_of_stock", "outofstock", "sold_out"}
+        ),
         platform_metadata={
             "external_seed_id": row.get("id"),
             "canonical_url": row.get("canonical_url") or seed_data.get("canonical_url"),

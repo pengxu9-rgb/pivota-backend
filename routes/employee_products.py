@@ -1277,7 +1277,7 @@ def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
     - `description` is the page's real copy (JSON-LD or its long-description block), with its
       `description_source`. og/meta description text (SEO copy), or text whose source a snapshot
       from before the split never recorded, is never `description`: it is `fill_only_description`,
-      which may fill a seed that has NO description and nothing else (Peng 2026-10-15), and
+      which may fill a seed that has NO description and nothing else (the owner 2026-10-15), and
       `description_refused_source` names why ("meta" | "unknown").
     - `meta_description` is the page's own meta text, so a seed already storing that exact SEO
       line can be upgraded to real copy.
@@ -5523,7 +5523,7 @@ async def create_external_seed(
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
-    # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
+    # Where `description` came from, and SEO copy that may only fill an empty one (the owner 2026-10-15).
     description_origin = (
         SEED_DESCRIPTION_SOURCE_EMPLOYEE if (body.description or "").strip() else (content["description_source"] if snap_description else None)
     )
@@ -7889,7 +7889,7 @@ async def _refresh_external_seed_by_id(
                 seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
             elif page_read_is_the_product and content["fill_only_description"]:
                 # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
-                # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+                # copy from a later read replaces it (the owner 2026-10-15). It never reaches
                 # `snapshot.description`, which the gateway serves ahead of the seed's own.
                 seed_data["description"] = content["fill_only_description"]
                 seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
