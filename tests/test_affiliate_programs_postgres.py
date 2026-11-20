@@ -4,7 +4,9 @@ What only Postgres can show: the module and the migration build the same two tab
 foreign key, both indexes); the boot heal is idempotent; the service's statements run on asyncpg (create,
 update, mark-live, auto un-live, history order, import idempotency); the live CHECK and the partial unique
 index hold; two admins writing one program on two connections queue on the row lock, so neither write is
-lost and the history matches the row; and a real import that fails part-way leaves nothing behind.
+lost and the history matches the row; a real import that fails part-way leaves nothing behind; two real imports
+of the same programs in opposite file orders both land (they lock in one order, so they queue, not deadlock);
+and an import Postgres aborts as a deadlock victim is a 409 with nothing written.
 
 The routes, the dial and the roles are tested on SQLite (tests/test_employee_affiliate_programs.py).
 
@@ -349,3 +351,96 @@ async def test_a_real_import_with_an_invalid_row_writes_nothing_on_postgres(_db)
         await programs.import_csv(csv_text, dry_run=False, actor="pg@example.com")
     assert refused.value.report["summary"]["error"] == 1
     assert [p for p in await store.list_programs() if str(p["merchant_name"]).startswith(PREFIX)] == []
+
+
+# ── two real imports, two connections ────────────────────────────────────────────────────────
+
+
+async def test_two_real_imports_of_the_same_programs_in_opposite_orders_both_land(_db, monkeypatch):
+    """The first import is held at its first locked write; the second then plans and reaches for its first row.
+    Written in file order, the second would lock M first and wait on the first import for K, which then waits
+    on it: Postgres kills one (40P01). Written in program-id order, both reach for the same row first, so the
+    second simply queues behind the first."""
+    from services import affiliate_programs as programs
+
+    k = (await programs.create_program({"network": "other", "advertiser_id": "PGTEST-10",
+                                        "merchant_name": PREFIX + " K"}, "setup@example.com"))["id"]
+    m = (await programs.create_program({"network": "other", "advertiser_id": "PGTEST-11",
+                                        "merchant_name": PREFIX + " M"}, "setup@example.com"))["id"]
+    header = "network,advertiser_id,merchant_name,notes\n"
+
+    def row_k(note):
+        return f"other,PGTEST-10,{PREFIX} K,{note}\n"
+
+    def row_m(note):
+        return f"other,PGTEST-11,{PREFIX} M,{note}\n"
+
+    first_csv = header + row_k("from the first import") + row_m("from the first import")
+    second_csv = header + row_m("from the second import") + row_k("from the second import")
+    reached, release = _hold_writes_by(monkeypatch, "first@example.com")
+    task_first = _own_connection(programs.import_csv(first_csv, dry_run=False, actor="first@example.com"))
+    await asyncio.wait_for(reached.wait(), 10)
+    task_second = _own_connection(programs.import_csv(second_csv, dry_run=False, actor="second@example.com"))
+    try:
+        await asyncio.sleep(0.5)
+        second_finished_early = task_second.done()
+    finally:
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(task_first, task_second, return_exceptions=True), 30)
+    assert not second_finished_early, "the second import wrote a row the first held: no row lock"
+    assert not [r for r in results if isinstance(r, BaseException)], results
+    assert [r["summary"]["update"] for r in results] == [2, 2]
+    # The reports stay in file order.
+    assert [row["program_id"] for row in results[0]["rows"]] == [k, m]
+    assert [row["program_id"] for row in results[1]["rows"]] == [m, k]
+    for pid in (k, m):
+        detail = await programs.detail(pid)
+        assert detail["program"]["notes"] == "from the second import"
+        assert [(e["action"], e["actor"]) for e in detail["events"][:2]] == [
+            ("import_update", "second@example.com"), ("import_update", "first@example.com")]
+
+
+async def test_an_import_postgres_aborts_as_a_deadlock_victim_is_a_409_with_nothing_written(_db, monkeypatch):
+    import asyncpg.exceptions
+    import httpx
+    from fastapi import FastAPI
+
+    import db.affiliate_programs as store
+    from routes import employee_affiliate_programs as route
+    from services import affiliate_programs as programs
+    from utils.auth import get_current_user
+
+    monkeypatch.setenv(programs.REGISTRY_ENABLED_ENV, "true")
+    first = await programs.create_program({"network": "other", "advertiser_id": "PGTEST-12",
+                                           "merchant_name": PREFIX + " N"}, "setup@example.com")
+    second = await programs.create_program({"network": "other", "advertiser_id": "PGTEST-13",
+                                            "merchant_name": PREFIX + " O"}, "setup@example.com")
+    real_update = store.update_program
+    calls = {"n": 0}
+
+    async def aborted_on_the_second_row(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the first row's write has landed in the transaction by now
+            raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+        await real_update(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_program", aborted_on_the_second_row)
+    app = FastAPI()
+    app.include_router(route.router)
+    app.dependency_overrides[get_current_user] = lambda: {"role": "admin", "email": "pg@example.com"}
+    csv_text = ("network,advertiser_id,merchant_name,notes\n"
+                f"other,PGTEST-12,{PREFIX} N,touched\n"
+                f"other,PGTEST-13,{PREFIX} O,touched\n"
+                f"other,PGTEST-14,{PREFIX} P,\n")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://registry.test") as client:
+        response = await client.post("/employee/affiliate-programs/import", params={"dry_run": "false"},
+                                     json={"csv": csv_text})
+    assert calls["n"] == 2
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["written"]) == ("import_conflict", False)
+    assert "try the import again" in detail["message"].lower()
+    mine = [p for p in await store.list_programs() if str(p["merchant_name"]).startswith(PREFIX)]
+    assert sorted((p["id"], p["notes"]) for p in mine) == sorted([(first["id"], None), (second["id"], None)])
+    for pid in (first["id"], second["id"]):
+        assert [e["action"] for e in (await programs.detail(pid))["events"]] == ["create"]

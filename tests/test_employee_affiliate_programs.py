@@ -530,6 +530,116 @@ async def test_an_oversized_cell_is_refused_whatever_the_process_csv_limit(clien
     assert "csv" in response.json()["detail"]["errors"]
 
 
+@pytest.mark.parametrize("csv_text, where", [
+    # A bad cell on line 2 (csv's own line_num said "line 1": it does not count a line that fails to parse).
+    ('network,merchant_name,notes\nother,Example Merchant A,"ok"x\n', "line 2: "),
+    ('network,merchant_name\nother,Example Merchant A\nother,Example Merchant B,extra cell\n', "line 3: "),
+    # A record that spans lines names its first line, and its last when the fault is past the first.
+    ('network,merchant_name,notes\nother,Example Merchant A,"two\nlines",extra cell\n', "lines 2-3: "),
+    ('network,merchant_name,notes\nother,Example Merchant A,"opened\nnever closed\n', "lines 2-3: "),
+    ('network,merchant_name,notes\nother,Example Merchant A,"x\ny"\nother,Example Merchant B,"ok"x\n', "line 4: "),
+    # Our own cell cap (MAX_IMPORT_CELL_CHARS) names its line too.
+    ("network,merchant_name,notes\nother,Example Merchant A,\nother,Example Merchant B,"
+     + "x" * (programs.MAX_IMPORT_CELL_CHARS + 1) + "\n", "line 3: "),
+])
+async def test_a_malformed_file_names_the_physical_line_at_fault(client, csv_text, where):
+    response = await client.post(f"{BASE}/import", headers=_auth(), json={"csv": csv_text})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["errors"]["csv"].startswith(where), response.json()
+
+
+async def test_every_row_reports_the_line_it_starts_on(client):
+    csv_text = ("network,merchant_name,notes\n"                      # line 1
+                'other,Example Merchant A,"first line\nsecond line"\n'  # lines 2-3
+                "\n"                                                  # line 4, blank
+                "myspace,Example Merchant B,\n"                       # line 5, invalid network
+                'other,Example Merchant C,"a\nb\nc"\n'                 # lines 6-8
+                "other,,\n")                                         # line 9, no merchant_name
+    body = (await client.post(f"{BASE}/import", headers=_auth(), json={"csv": csv_text})).json()
+    assert [(r["line"], r["action"]) for r in body["rows"]] == [
+        (2, "create"), (5, "error"), (6, "create"), (9, "error")]
+
+
+async def test_a_real_import_writes_updates_in_program_id_order_then_creates(client, monkeypatch):
+    ids = []
+    for n in range(1, 5):
+        ids.append((await _create(client, advertiser_id=f"TEST-600{n}", merchant_name=f"Example Merchant {n}"))["id"])
+    by_id = dict(zip(ids, range(1, 5)))
+    shuffled = sorted(ids, reverse=True)
+    shuffled[0], shuffled[2] = shuffled[2], shuffled[0]  # neither file order nor its reverse is sorted
+    lines = ["network,advertiser_id,merchant_name,notes", "other,TEST-6099,Example Merchant New Z,created",
+             "cj,TEST-6098,Example Merchant New Y,created"]
+    lines += [f"other,TEST-600{by_id[pid]},Example Merchant {by_id[pid]},touched" for pid in shuffled]
+    lines += ["cj,,Example Merchant New X,created"]
+    writes = []
+    real_update, real_create = programs._update, programs._create
+
+    async def spy_update(program_id, changes, actor, *, action):
+        writes.append(("update", program_id))
+        return await real_update(program_id, changes, actor, action=action)
+
+    async def spy_create(fields, actor, *, action):
+        writes.append(("create", (fields["network"], fields.get("advertiser_id"))))
+        return await real_create(fields, actor, action=action)
+
+    monkeypatch.setattr(programs, "_update", spy_update)
+    monkeypatch.setattr(programs, "_create", spy_create)
+    response = await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"},
+                                 json={"csv": "\n".join(lines) + "\n"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert writes == [("update", pid) for pid in sorted(ids)] + [
+        ("create", ("cj", None)), ("create", ("cj", "TEST-6098")), ("create", ("other", "TEST-6099"))]
+    # The report stays in file order, every create carries its new id, every update its program.
+    assert [(r["line"], r["action"]) for r in body["rows"]] == [
+        (2, "create"), (3, "create"), (4, "update"), (5, "update"), (6, "update"), (7, "update"), (8, "create")]
+    assert [r["program_id"] for r in body["rows"][2:6]] == shuffled
+    assert all(r["program_id"].startswith("afp_") for r in body["rows"])
+    assert body["summary"] == {"create": 3, "update": 4, "unchanged": 0, "error": 0}
+
+
+class _FakeDriverError(Exception):
+    """Stands in for asyncpg's DeadlockDetectedError / SerializationError, which carry `sqlstate`."""
+
+    def __init__(self, sqlstate: str):
+        super().__init__(f"simulated {sqlstate}")
+        self.sqlstate = sqlstate
+
+
+@pytest.mark.parametrize("sqlstate", ["40P01", "40001"])
+async def test_an_import_postgres_aborts_for_a_lock_conflict_is_a_409_with_nothing_written(client, monkeypatch, sqlstate):
+    pid = (await _create(client, advertiser_id="TEST-7001", merchant_name="Example Merchant A"))["id"]
+    real_update = store.update_program
+
+    async def aborted(*args, **kwargs):
+        raise _FakeDriverError(sqlstate)
+
+    monkeypatch.setattr(store, "update_program", aborted)
+    csv_text = ("network,advertiser_id,merchant_name,notes\n"
+                "other,TEST-7001,Example Merchant A,touched\n"
+                "other,TEST-7002,Example Merchant B,\n")
+    response = await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={"csv": csv_text})
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["written"]) == ("import_conflict", False)
+    assert "try the import again" in detail["message"].lower()
+    monkeypatch.setattr(store, "update_program", real_update)
+    items = (await client.get(BASE, headers=_auth())).json()["items"]
+    assert [(p["id"], p["notes"]) for p in items] == [(pid, None)]
+
+
+async def test_an_error_that_is_not_a_lock_conflict_is_not_a_409(client, monkeypatch):
+    await _create(client, advertiser_id="TEST-7101", merchant_name="Example Merchant A")
+
+    async def broken(*args, **kwargs):
+        raise _FakeDriverError("57014")  # query_canceled: not one a retry is known to fix
+
+    monkeypatch.setattr(store, "update_program", broken)
+    with pytest.raises(_FakeDriverError):
+        await client.post(f"{BASE}/import", headers=_auth(), params={"dry_run": "false"}, json={
+            "csv": "network,advertiser_id,merchant_name,notes\nother,TEST-7101,Example Merchant A,touched\n"})
+
+
 async def test_an_advertiser_row_completes_a_program_recorded_without_one(client):
     pid = (await _create(client, advertiser_id=None, merchant_name="Example Merchant A"))["id"]
     csv_text = "network,advertiser_id,merchant_name\nother,TEST-5001,Example Merchant A\n"
