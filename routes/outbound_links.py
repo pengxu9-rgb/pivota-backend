@@ -321,7 +321,7 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
 
     # Affiliate sub-ID (ADR-025 D2; services/affiliate_subid.py; flag-gated, DEFAULT OFF — off, this
     # block never runs and the redirect and click ctx are byte-identical). On a mapped network host,
-    # our click id goes into the network's sub-ID parameter (Rakuten `u1`, ...), replacing any value
+    # our click id goes into the network's sub-ID parameter, replacing any value
     # there, so a commission report joins back to this click. Applied HERE, after the HMAC check and
     # to the Location only: `payload["dest"]` (the signed destination, which the click row records and
     # the published URLs are checked against) is not changed. Never on a warm continue_url (a brand

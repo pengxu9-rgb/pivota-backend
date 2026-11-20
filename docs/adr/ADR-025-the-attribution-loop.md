@@ -60,7 +60,7 @@ A per-seller **evidence route** decides the carrier:
 
 | Evidence source (link 4) | Carrier (link 3) | Reads back |
 |---|---|---|
-| Affiliate network (any: Rakuten, Impact, Awin, CJ, …) | the network's tracking link, with our click id in its **sub-id** parameter | the network's transaction/commission report, keyed by sub-id |
+| Affiliate network (any network) | the network's tracking link, with our click id in its **sub-id** parameter | the network's transaction/commission report, keyed by sub-id |
 | Connected store (Shopify/Woo/Wix) | `attributes[pivota_click_id]` cart attribute, or the `pvt_click_id` param | webhook / poller `note_attributes` (exists) |
 | Direct agreement, merchant statement | `pvt_click_id` param / cart attribute / UCP stamp | monthly order report through the self-report API (exists) |
 | UCP agentic checkout | UCP `attribution` member (`click_id_value`) | the merchant's order snapshot, via connection or statement |
@@ -68,8 +68,8 @@ A per-seller **evidence route** decides the carrier:
 
 A seller with **no evidence route** is still served, but it is recorded as `unattributable`.
 Nobody should mistake traffic to it for revenue. The coverage census
-(`scripts/affiliate_coverage_census.py`) is the tool that measures how much of the catalog
-falls there. Rakuten is its first adapter, not its premise. When D2's network link wrapping lands, the warm-handoff affiliate denylist (`outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES`) must cover every wrapper host it emits. Today it misses CJ's (anrdoezrs.net, jdoqocy.com, ...) and Impact vanity domains.
+(an operator script) is the tool that measures how much of the catalog
+falls there. Its first network adapter is one network's publisher API, not its premise; the census itself now lives in the private ops bundle, not on main. When D2's network link wrapping lands, the warm-handoff affiliate denylist (`outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES`) must cover every wrapper host it emits. Today it misses some networks' click and vanity domains (the host lists are private; see the private affiliate-networks manifest).
 
 ### D3. Evidence adapters share one contract
 
