@@ -956,9 +956,8 @@ async def log_agent_request(
     
     # 获取请求信息
     request = context.request
-    
-    # 记录使用日志
-    request_id = await log_agent_usage(
+
+    call = dict(
         agent_id=context.agent_id,
         endpoint=str(request.url.path),
         method=request.method,
@@ -969,8 +968,19 @@ async def log_agent_request(
         order_amount=order_amount,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
-        error_message=error_message
+        error_message=error_message,
     )
+
+    # ONE ROW PER REQUEST: under /agent/v1 UsageLoggerMiddleware writes the request's row, so this
+    # call adds its fields to that row instead of inserting a second one (middleware/usage_logger.py).
+    from middleware.usage_logger import usage_log_slot
+
+    slot = usage_log_slot(request)
+    if slot is not None:
+        request_id = slot.record_handler_call(call, writer=log_agent_usage)
+    else:
+        # 记录使用日志
+        request_id = await log_agent_usage(**call)
     
     context.request_id = request_id
     

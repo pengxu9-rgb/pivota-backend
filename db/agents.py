@@ -709,10 +709,16 @@ async def log_agent_usage(
     order_amount: Optional[float] = None,
     ip_address: Optional[str] = None,
     user_agent: Optional[str] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    request_id: Optional[str] = None,
+    timestamp: Optional[datetime] = None,
 ) -> str:
-    """记录 Agent API 使用"""
-    request_id = f"req_{secrets.token_hex(16)}"
+    """记录 Agent API 使用
+
+    `request_id` / `timestamp` are passed only by middleware/usage_logger.py, when this call's row is
+    the request's one row there; otherwise a fresh request_id and the column default apply.
+    """
+    request_id = request_id or f"req_{secrets.token_hex(16)}"
     if is_synthetic_call():
         # Our own eval traffic writes no usage row (services/synthetic_call.py). Only the gateway's
         # service key can carry it, and that key's quota is not enforced.
@@ -730,7 +736,8 @@ async def log_agent_usage(
         response_time_ms=response_time_ms,
         error_message=error_message,
         order_id=order_id,
-        order_amount=order_amount
+        order_amount=order_amount,
+        **({"timestamp": timestamp} if timestamp is not None else {}),
     )
     
     try:
