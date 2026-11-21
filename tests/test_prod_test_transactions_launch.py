@@ -54,8 +54,8 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
             launch.config_matches(raw, sha)
     config = yaml.safe_load(raw)
     steps = {s["id"]: s for s in config["steps"]}
-    assert list(steps) == ["release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "gateway",
-                           "lock", "run", "publish"]
+    assert list(steps) == ["workspace", "release-scripts", "config-is-the-release-config", "digest-is-the-release-tag",
+                           "gateway", "lock", "run", "publish"]
     assert [s for s in config["steps"] if s.get("allowFailure")] == [steps["run"]]
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
                                             "_TARGETS_VERSION", "_USER_KEY_VERSION", "_GO_REFERENCE"}
@@ -66,6 +66,58 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     # The reserve covers the cancel call (60) + its poll with one interval of slack + the disarm deploy (300).
     assert launch.DISARM_RESERVE_SECONDS >= 60 + launch.CANCEL_POLL_SECONDS + launch.EXECUTION_POLL_SECONDS + 300
     assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
+
+
+def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():
+    # Build 99b4e02b (2026-11-20): with --no-source /workspace is root's, and the backend image runs as `USER app`, so
+    # release-scripts could not mkdir. A root step (the pinned cloud-sdk image, like every other non-backend step)
+    # makes the directories first and chowns them to the uid the Dockerfile creates.
+    import re
+
+    config = yaml.safe_load(CONFIG.read_bytes())
+    steps = config["steps"]
+    sdk = steps[1 + 1]["name"]  # config-is-the-release-config: the pinned cloud-sdk image
+    assert sdk.startswith("gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:")
+    first, release = steps[0], steps[1]
+    assert first["id"] == "workspace" and first["name"] == sdk and first["entrypoint"] == "bash"
+    assert [s["id"] for s in steps if "pivota/backend@" in s["name"]] == ["release-scripts"]
+    dockerfile = (CONFIG.parents[0] / "Dockerfile").read_text()
+    uid = re.search(r"useradd [^\n]*--uid (\d+) app\b", dockerfile).group(1)
+    assert re.search(r"^USER app$", dockerfile, re.M)
+    script = first["args"][1]
+    made = re.search(r"^mkdir -p (.+)$", script, re.M).group(1).split()
+    assert re.search(rf"^chown -R {uid} /workspace/release /workspace/prod-test-transactions$", script, re.M)
+    assert made == ["/workspace/release/infra/gcp", "/workspace/prod-test-transactions"]
+    # release-scripts may only write under the directories the root step handed over.
+    wanted = re.search(r"^mkdir -p (.+)$", release["args"][1], re.M).group(1).split()
+    assert all(any(w == m or w.startswith(m + "/") or m.startswith(w + "/") for m in made) for w in wanted)
+    for target in re.findall(r"^cp (?:-r )?\S+ (\S+)$", release["args"][1], re.M):
+        assert target.startswith(("/workspace/release/", "/workspace/prod-test-transactions/")), target
+
+
+def test_every_cloud_sdk_step_starts_an_executable_the_pinned_image_is_recorded_to_have():
+    # Build c2e19f14 (2026-11-20) failed at step 2: the pinned cloud-sdk image (594.0.0, slim) has no python3 on PATH,
+    # and these tests never run an image. tests/fixtures/cloud_sdk_image.json records what that image's own build
+    # proves present / absent; a new pin must re-record it, and every step must start something recorded present.
+    import re
+
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "cloud_sdk_image.json").read_text())
+    steps = yaml.safe_load(CONFIG.read_bytes())["steps"]
+    sdk_steps = [s for s in steps if s["name"].startswith("gcr.io/google.com/cloudsdktool/cloud-sdk")]
+    assert len(sdk_steps) == len(steps) - 1          # all but release-scripts (the backend image)
+    for step in sdk_steps:
+        assert step["name"] == recorded["image"], step["id"]
+        assert step["entrypoint"] in recorded["present"], step["id"]
+        assert step["entrypoint"] not in recorded["absent_on_path"], step["id"]
+        if step["entrypoint"] == "bash":             # a bash step must not reach for a Python the image lacks either
+            for word in recorded["absent_on_path"]:
+                assert not re.search(rf"(?<![\w/.-]){word}(?![\w.-])", step["args"][-1]), (step["id"], word)
+    python_steps = [s["id"] for s in sdk_steps if s["entrypoint"].endswith("/python3")]
+    assert python_steps == ["config-is-the-release-config", "gateway", "lock", "run", "publish"]
+    # The gate is started with the step's own interpreter, never a bare name the image may not have.
+    source = Path(launch.__file__).read_text()
+    assert "sys.executable, str(Path(args.scripts) / \"ops\" / \"oneoff_gate.py\")" in source
+    assert not re.search(r"""["']python3?["']\s*,\s*str\(""", source)
 
 
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
