@@ -54,8 +54,8 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
             launch.config_matches(raw, sha)
     config = yaml.safe_load(raw)
     steps = {s["id"]: s for s in config["steps"]}
-    assert list(steps) == ["release-scripts", "config-is-the-release-config", "digest-is-the-release-tag", "gateway",
-                           "lock", "run", "publish"]
+    assert list(steps) == ["workspace", "release-scripts", "config-is-the-release-config", "digest-is-the-release-tag",
+                           "gateway", "lock", "run", "publish"]
     assert [s for s in config["steps"] if s.get("allowFailure")] == [steps["run"]]
     assert set(config["substitutions"]) == {"_RELEASE", "_DIGEST", "_CONFIG_SHA256", "_CASES", "_KEY_VERSION",
                                             "_TARGETS_VERSION", "_USER_KEY_VERSION", "_GO_REFERENCE"}
@@ -66,6 +66,58 @@ def test_config_must_be_the_release_copy_and_its_run_step_outlasts_every_wait():
     # The reserve covers the cancel call (60) + its poll with one interval of slack + the disarm deploy (300).
     assert launch.DISARM_RESERVE_SECONDS >= 60 + launch.CANCEL_POLL_SECONDS + launch.EXECUTION_POLL_SECONDS + 300
     assert sum(int(s.get("timeout", "0s").rstrip("s")) for s in config["steps"]) <= int(config["timeout"].rstrip("s"))
+
+
+def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():
+    # Build 99b4e02b (2026-11-20): with --no-source /workspace is root's, and the backend image runs as `USER app`, so
+    # release-scripts could not mkdir. A root step (the pinned cloud-sdk image, like every other non-backend step)
+    # makes the directories first and chowns them to the uid the Dockerfile creates.
+    import re
+
+    config = yaml.safe_load(CONFIG.read_bytes())
+    steps = config["steps"]
+    sdk = steps[1 + 1]["name"]  # config-is-the-release-config: the pinned cloud-sdk image
+    assert sdk.startswith("gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:")
+    first, release = steps[0], steps[1]
+    assert first["id"] == "workspace" and first["name"] == sdk and first["entrypoint"] == "bash"
+    assert [s["id"] for s in steps if "pivota/backend@" in s["name"]] == ["release-scripts"]
+    dockerfile = (CONFIG.parents[0] / "Dockerfile").read_text()
+    uid = re.search(r"useradd [^\n]*--uid (\d+) app\b", dockerfile).group(1)
+    assert re.search(r"^USER app$", dockerfile, re.M)
+    script = first["args"][1]
+    made = re.search(r"^mkdir -p (.+)$", script, re.M).group(1).split()
+    assert re.search(rf"^chown -R {uid} /workspace/release /workspace/prod-test-transactions$", script, re.M)
+    assert made == ["/workspace/release/infra/gcp", "/workspace/prod-test-transactions"]
+    # release-scripts may only write under the directories the root step handed over.
+    wanted = re.search(r"^mkdir -p (.+)$", release["args"][1], re.M).group(1).split()
+    assert all(any(w == m or w.startswith(m + "/") or m.startswith(w + "/") for m in made) for w in wanted)
+    for target in re.findall(r"^cp (?:-r )?\S+ (\S+)$", release["args"][1], re.M):
+        assert target.startswith(("/workspace/release/", "/workspace/prod-test-transactions/")), target
+
+
+def test_every_cloud_sdk_step_starts_an_executable_the_pinned_image_is_recorded_to_have():
+    # Build c2e19f14 (2026-11-20) failed at step 2: the pinned cloud-sdk image (594.0.0, slim) has no python3 on PATH,
+    # and these tests never run an image. tests/fixtures/cloud_sdk_image.json records what that image's own build
+    # proves present / absent; a new pin must re-record it, and every step must start something recorded present.
+    import re
+
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "cloud_sdk_image.json").read_text())
+    steps = yaml.safe_load(CONFIG.read_bytes())["steps"]
+    sdk_steps = [s for s in steps if s["name"].startswith("gcr.io/google.com/cloudsdktool/cloud-sdk")]
+    assert len(sdk_steps) == len(steps) - 1          # all but release-scripts (the backend image)
+    for step in sdk_steps:
+        assert step["name"] == recorded["image"], step["id"]
+        assert step["entrypoint"] in recorded["present"], step["id"]
+        assert step["entrypoint"] not in recorded["absent_on_path"], step["id"]
+        if step["entrypoint"] == "bash":             # a bash step must not reach for a Python the image lacks either
+            for word in recorded["absent_on_path"]:
+                assert not re.search(rf"(?<![\w/.-]){word}(?![\w.-])", step["args"][-1]), (step["id"], word)
+    python_steps = [s["id"] for s in sdk_steps if s["entrypoint"].endswith("/python3")]
+    assert python_steps == ["config-is-the-release-config", "gateway", "lock", "run", "publish"]
+    # The gate is started with the step's own interpreter, never a bare name the image may not have.
+    source = Path(launch.__file__).read_text()
+    assert "sys.executable, str(Path(args.scripts) / \"ops\" / \"oneoff_gate.py\")" in source
+    assert not re.search(r"""["']python3?["']\s*,\s*str\(""", source)
 
 
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
@@ -357,6 +409,13 @@ def test_shadow_check_is_advisory_and_counts_every_line_in_the_window():
     assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], []) is None
 
 
+def test_no_shadow_line_read_is_unknown_never_a_vacuous_all_unsent():
+    # A view that misses the gateway lines reads as empty, not as an error: all() over [] must not say "all unsent".
+    rows = [{**case_row("MCP-SF-US"), "shadow_lookup": True}]
+    assert launch.shadow_check(rows, []) == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                             "note": "no shadow line was read in the window"}
+
+
 def test_shadow_lines_keep_no_host(monkeypatch):
     entries = [{"jsonPayload": {"mode": "shadow", "sent": False, "reason": "r", "seller_host": "shop.reviewed.example",
                                 "lines": [{"variant": "gid://x"}]}}]
@@ -369,7 +428,22 @@ def test_shadow_lines_keep_no_host(monkeypatch):
     monkeypatch.setattr(launch, "run", fake_run)
     lines = launch.read_shadow_lines("2026-01-02T07:00:00+00:00", "2026-01-02T07:05:00+00:00")
     assert lines == [{"mode": "shadow", "sent": False, "reason": "r"}]
-    assert flag(seen["args"], "--view") == "prod-test-transactions" and flag(seen["args"], "--bucket") == "_Default"
+    assert flag(seen["args"], "--view") == "prod-test-transactions-gateway-shadow"
+    assert flag(seen["args"], "--bucket") == "_Default" and flag(seen["args"], "--location") == "global"
+    assert 'jsonPayload.event="ucp_shopify_catalog_attribution"' in seen["args"][3]
+
+
+def test_the_job_lines_are_read_through_the_job_view_and_only_reviewed_views_are_read(monkeypatch):
+    seen = []
+    monkeypatch.setattr(launch, "run", lambda args, **kw: seen.append(args) or 'PROD_TEST_TXN_RESULT {"kind": "run"}')
+    monkeypatch.setattr(launch.job, "parse_result_lines", lambda text: ([{"kind": "run"}], []))
+    launch.read_log("prod-test-transactions-abc12")
+    assert flag(seen[-1], "--view") == "prod-test-transactions"
+    assert 'labels."run.googleapis.com/execution_name"="prod-test-transactions-abc12"' in seen[-1][3]
+    assert launch.LOG_VIEW != launch.SHADOW_LOG_VIEW
+    for view in ("", "_AllLogs", "prod-test-transactions-x", None):
+        with pytest.raises(launch.LaunchRefused, match="not a reviewed log view"):
+            launch.read_view("x", fmt="json", limit=1, view=view)
 
 
 def publish(monkeypatch, tmp_path, rows, state):
@@ -416,5 +490,6 @@ def test_publish_records_the_targets_sha_and_an_advisory_shadow_result(monkeypat
     launch.cmd_publish(args)
     result = json.loads(written["result.json"])
     assert result["ok"] is True and result["targets_sha256"] == "d" * 64
-    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": True,
-                                       "reasons": []}
+    # No line read is unknown, and the advisory check never moves `ok`.
+    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                       "note": "no shadow line was read in the window"}
