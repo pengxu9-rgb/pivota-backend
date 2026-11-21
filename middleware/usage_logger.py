@@ -1,16 +1,33 @@
 """
-Middleware to log all Agent API usage to agent_usage_logs table
+Middleware to log all Agent API usage to agent_usage_logs table.
+
+ONE ROW PER REQUEST. Under /agent/v1 this middleware writes the request's row, and a handler's
+`log_agent_request` (routes/agent_auth.py) no longer writes a second one: it hands its richer fields
+(merchant_id, order_id, order_amount, ip_address, user_agent, error_message) to the request's
+`UsageLogSlot`, which puts them on the same row. Before this, every /agent/v1 request whose handler
+also logged wrote TWO rows (measured 2026-11-12: GET /agent/v1/products/search 864 rows for 432
+requests), and every reader that counts rows -- the per-agent rate limit and daily quota in
+db/agents.py among them -- counted those requests twice.
+
+A handler call made before the middleware writes (an awaited `log_agent_request`, e.g. on an error
+path) is merged into the INSERT. One made after (a BackgroundTasks or create_task call, which runs
+after the response has started) fills the handler columns of the row already written, by an UPDATE
+keyed on the request's request_id, ordered after the INSERT. If the middleware writes nothing for the
+request (no agent on request.state), the handler's own row is written, once. Outside /agent/v1 there
+is no slot and `log_agent_request` writes its own row as before.
 """
 import asyncio
 import json
 import logging
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from db.agents import agent_usage_logs
 from db.database import database
 from observability.reliability_metrics import record_traffic_taxonomy
 from services.synthetic_call import is_synthetic_call
@@ -40,51 +57,156 @@ def _restore_request_body(request: Request, raw_body: bytes) -> None:
     request._receive = _receive
 
 
+# Columns only a handler knows. The middleware's row carries them when the handler logged.
+_HANDLER_COLUMNS = ("merchant_id", "order_id", "order_amount", "ip_address", "user_agent", "error_message")
+_ROW_COLUMNS = (
+    "agent_id",
+    "caller_id",
+    "source_channel",
+    "source_family",
+    "query_source",
+    "protocol_name",
+    "commerce_surface",
+    "llm_provider",
+    "llm_model",
+    "endpoint",
+    "method",
+    "status_code",
+    "response_time_ms",
+    "timestamp",
+    "request_id",
+) + _HANDLER_COLUMNS
+_SLOT_STATE_KEY = "agent_usage_log_slot"
+# The late UPDATE is bounded by agent and time as well as request_id, so it rides the
+# (agent_id, timestamp) index whatever the state of the request_id unique index.
+_LATE_FILL_SLACK = timedelta(minutes=1)
+
+
 async def _insert_usage_log(payload):
+    row = dict(payload)
+    if "response_time_ms" not in row and "response_time" in row:
+        row["response_time_ms"] = row.get("response_time")
+    values = {column: row.get(column) for column in _ROW_COLUMNS}
     try:
-        await database.execute(
-            """
-            INSERT INTO agent_usage_logs
-            (
-                agent_id,
-                caller_id,
-                source_channel,
-                source_family,
-                query_source,
-                protocol_name,
-                commerce_surface,
-                llm_provider,
-                llm_model,
-                endpoint,
-                method,
-                status_code,
-                response_time_ms,
-                timestamp,
-                request_id
-            )
-            VALUES (
-                :agent_id,
-                :caller_id,
-                :source_channel,
-                :source_family,
-                :query_source,
-                :protocol_name,
-                :commerce_surface,
-                :llm_provider,
-                :llm_model,
-                :endpoint,
-                :method,
-                :status_code,
-                :response_time,
-                :timestamp,
-                :request_id
-            )
-            """,
-            payload,
-        )
+        await database.execute(agent_usage_logs.insert().values(**values))
     except Exception as e:
         # Keep logging best-effort and non-blocking for the request path.
         logger.warning("Failed to log usage: %s", e)
+
+
+async def _fill_handler_fields(
+    previous: Optional["asyncio.Task[Any]"],
+    *,
+    agent_id: str,
+    request_id: str,
+    since: datetime,
+    call: Dict[str, Any],
+) -> None:
+    """Put a late handler call's fields on the request's row, after that row's INSERT."""
+    if previous is not None:
+        try:
+            await previous
+        except Exception:  # noqa: BLE001 -- the INSERT logs its own failure
+            pass
+    values = {column: call.get(column) for column in _HANDLER_COLUMNS if call.get(column) is not None}
+    if not values:
+        return
+    try:
+        await database.execute(
+            agent_usage_logs.update()
+            .where(agent_usage_logs.c.request_id == request_id)
+            .where(agent_usage_logs.c.agent_id == agent_id)
+            .where(agent_usage_logs.c.timestamp >= since)
+            .values(**values)
+        )
+    except Exception as e:
+        logger.warning("Failed to add handler fields to usage log: %s", e)
+
+
+async def _write_handler_row(
+    writer: Callable[..., Awaitable[Any]], call: Dict[str, Any], *, request_id: str
+) -> None:
+    try:
+        await writer(**call, request_id=request_id)
+    except Exception as e:
+        logger.warning("Failed to log usage: %s", e)
+
+
+def _merge_handler_call(previous: Optional[Dict[str, Any]], call: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(previous or {})
+    for key, value in call.items():
+        if value is not None or key not in merged:
+            merged[key] = value
+    return merged
+
+
+class UsageLogSlot:
+    """The one usage row of one /agent/v1 request; see the module docstring."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.started_at = datetime.now()
+        self.decided = False
+        self.handler_call: Optional[Dict[str, Any]] = None
+        self.handler_writer: Optional[Callable[..., Awaitable[Any]]] = None
+        self.row_agent_id: Optional[str] = None
+        self.write_task: Optional["asyncio.Task[Any]"] = None
+
+    def record_handler_call(
+        self, call: Dict[str, Any], *, writer: Callable[..., Awaitable[Any]]
+    ) -> str:
+        """A handler's `log_agent_request`. Returns the request_id of the request's one row."""
+        if not self.decided:
+            self.handler_call = _merge_handler_call(self.handler_call, call)
+            self.handler_writer = writer
+        elif self.write_task is None:
+            # The middleware wrote nothing for this request: this call's row is the row.
+            self._start_handler_row(call, writer)
+        else:
+            self.write_task = asyncio.create_task(
+                _fill_handler_fields(
+                    self.write_task,
+                    agent_id=str(self.row_agent_id or call.get("agent_id") or ""),
+                    request_id=self.request_id,
+                    since=self.started_at - _LATE_FILL_SLACK,
+                    call=call,
+                )
+            )
+        return self.request_id
+
+    def decide(self, payload: Optional[Dict[str, Any]]) -> None:
+        """The middleware's turn: write its row (with any handler fields already recorded), or none."""
+        if self.decided:
+            return
+        self.decided = True
+        if payload is not None:
+            handler_call = self.handler_call or {}
+            row = dict(payload)
+            row.update({column: handler_call.get(column) for column in _HANDLER_COLUMNS})
+            self.row_agent_id = str(row.get("agent_id") or "")
+            self.write_task = asyncio.create_task(_insert_usage_log(row))
+            if int(row.get("status_code") or 0) >= 400:
+                asyncio.create_task(_emit_request_failure_event(row))
+        elif self.handler_call is not None and self.handler_writer is not None:
+            self._start_handler_row(self.handler_call, self.handler_writer)
+
+    def _start_handler_row(self, call: Dict[str, Any], writer: Callable[..., Awaitable[Any]]) -> None:
+        self.row_agent_id = str(call.get("agent_id") or "")
+        self.write_task = asyncio.create_task(
+            _write_handler_row(writer, dict(call, timestamp=datetime.now()), request_id=self.request_id)
+        )
+
+
+def usage_log_slot(request: Any) -> Optional[UsageLogSlot]:
+    """The request's slot when UsageLoggerMiddleware owns its usage row, else None."""
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return None
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return None
+    slot = state.get(_SLOT_STATE_KEY)
+    return slot if isinstance(slot, UsageLogSlot) else None
 
 
 async def _emit_request_failure_event(payload):
@@ -118,6 +240,17 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/agent/v1") or is_synthetic_call():
             return await call_next(request)
 
+        # The request_id of this request's one row, shared with the handler's log_agent_request.
+        slot = UsageLogSlot(request.headers.get("x-request-id") or f"req_{secrets.token_hex(16)}")
+        setattr(request.state, _SLOT_STATE_KEY, slot)
+        try:
+            return await self._process(request, call_next, slot)
+        except BaseException:
+            # No middleware row (as before); a handler call already recorded still gets its row.
+            slot.decide(None)
+            raise
+
+    async def _process(self, request: Request, call_next, slot: UsageLogSlot):
         # Record start time
         start_time = time.time()
         request_json = None
@@ -142,15 +275,11 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
             agent_id = getattr(state, "agent_id", None)
 
         if not agent_id:
+            slot.decide(None)
             return response
 
         # Calculate response time
         response_time_ms = int((time.time() - start_time) * 1000)
-
-        # Generate a unique request_id if not provided
-        request_id = request.headers.get("x-request-id")
-        if not request_id:
-            request_id = f"req_{secrets.token_hex(16)}"
 
         payload = {
             "agent_id": str(agent_id),
@@ -159,9 +288,8 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
             "status_code": response.status_code,
             "response_time": response_time_ms,
             "timestamp": datetime.now(),
-            "request_id": request_id,
+            "request_id": slot.request_id,
         }
-
         state_taxonomy = getattr(state, "traffic_taxonomy", None) if state is not None else None
         body_metadata = request_json.get("metadata") if isinstance(request_json, dict) else None
         if not isinstance(body_metadata, dict):
@@ -219,7 +347,5 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
         )
 
         # Fire-and-forget to avoid extending request latency.
-        asyncio.create_task(_insert_usage_log(payload))
-        if response.status_code >= 400:
-            asyncio.create_task(_emit_request_failure_event(payload))
+        slot.decide(payload)
         return response
