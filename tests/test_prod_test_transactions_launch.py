@@ -409,6 +409,13 @@ def test_shadow_check_is_advisory_and_counts_every_line_in_the_window():
     assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], []) is None
 
 
+def test_no_shadow_line_read_is_unknown_never_a_vacuous_all_unsent():
+    # A view that misses the gateway lines reads as empty, not as an error: all() over [] must not say "all unsent".
+    rows = [{**case_row("MCP-SF-US"), "shadow_lookup": True}]
+    assert launch.shadow_check(rows, []) == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                             "note": "no shadow line was read in the window"}
+
+
 def test_shadow_lines_keep_no_host(monkeypatch):
     entries = [{"jsonPayload": {"mode": "shadow", "sent": False, "reason": "r", "seller_host": "shop.reviewed.example",
                                 "lines": [{"variant": "gid://x"}]}}]
@@ -421,7 +428,22 @@ def test_shadow_lines_keep_no_host(monkeypatch):
     monkeypatch.setattr(launch, "run", fake_run)
     lines = launch.read_shadow_lines("2026-01-02T07:00:00+00:00", "2026-01-02T07:05:00+00:00")
     assert lines == [{"mode": "shadow", "sent": False, "reason": "r"}]
-    assert flag(seen["args"], "--view") == "prod-test-transactions" and flag(seen["args"], "--bucket") == "_Default"
+    assert flag(seen["args"], "--view") == "prod-test-transactions-gateway-shadow"
+    assert flag(seen["args"], "--bucket") == "_Default" and flag(seen["args"], "--location") == "global"
+    assert 'jsonPayload.event="ucp_shopify_catalog_attribution"' in seen["args"][3]
+
+
+def test_the_job_lines_are_read_through_the_job_view_and_only_reviewed_views_are_read(monkeypatch):
+    seen = []
+    monkeypatch.setattr(launch, "run", lambda args, **kw: seen.append(args) or 'PROD_TEST_TXN_RESULT {"kind": "run"}')
+    monkeypatch.setattr(launch.job, "parse_result_lines", lambda text: ([{"kind": "run"}], []))
+    launch.read_log("prod-test-transactions-abc12")
+    assert flag(seen[-1], "--view") == "prod-test-transactions"
+    assert 'labels."run.googleapis.com/execution_name"="prod-test-transactions-abc12"' in seen[-1][3]
+    assert launch.LOG_VIEW != launch.SHADOW_LOG_VIEW
+    for view in ("", "_AllLogs", "prod-test-transactions-x", None):
+        with pytest.raises(launch.LaunchRefused, match="not a reviewed log view"):
+            launch.read_view("x", fmt="json", limit=1, view=view)
 
 
 def publish(monkeypatch, tmp_path, rows, state):
@@ -468,5 +490,6 @@ def test_publish_records_the_targets_sha_and_an_advisory_shadow_result(monkeypat
     launch.cmd_publish(args)
     result = json.loads(written["result.json"])
     assert result["ok"] is True and result["targets_sha256"] == "d" * 64
-    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": True,
-                                       "reasons": []}
+    # No line read is unknown, and the advisory check never moves `ok`.
+    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                       "note": "no shadow line was read in the window"}

@@ -174,12 +174,16 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 4. **Service account:** `sa-prod-test-txn@pivota-prod.iam.gserviceaccount.com`, with `roles/secretmanager.secretAccessor` **only** on `test-shopping-agent-api-key` and `prod-test-transactions-targets`. Add `prod-test-agent-user-key` when the checkout cases come. It gets nothing else.
 5. **Launcher (`sa-ops-launcher`):**
    - `roles/iam.serviceAccountUser` on `sa-prod-test-txn`;
-   - `roles/logging.viewAccessor` on the log view `projects/pivota-prod/locations/global/buckets/_Default/views/prod-test-transactions`, **added alongside** the project-wide `roles/logging.viewer` it already has. Keep that viewer: the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`, so removing it would break the seed batch. Trimming it waits until the seed batch reads through a view too (the controller's call, 2026-11-19). Create the view with this filter:
-     ```
-     (resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions")
-     OR (resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
-         AND jsonPayload.event="ucp_shopify_catalog_attribution")
-     ```
+   - `roles/logging.viewAccessor` on **two** log views on `_Default` (location `global`), **added alongside** the project-wide `roles/logging.viewer` it already has. Keep that viewer: the seed-batch launcher reads its job logs with a plain project-level `gcloud logging read`, so removing it would break the seed batch. Trimming it waits until the seed batch reads through a view too (the controller's call, 2026-11-19).
+   - A view filter allows nesting depth 1, so one OR-of-ANDs view is refused (found 2026-11-20). Each source gets its own flat view:
+
+     | View | Filter | Read by |
+     |---|---|---|
+     | `prod-test-transactions` (created 2026-11-20) | `resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions"` | the job's own lines (every run) |
+     | `prod-test-transactions-gateway-shadow` | `resource.type="cloud_run_revision" AND resource.labels.service_name="gateway" AND jsonPayload.event="ucp_shopify_catalog_attribution"` | the shadow lookup lines (storefront runs only) |
+
+   - The shadow view is needed **before the first run with a US storefront create** (MCP-SF-US, UCP-SF-US, `all`); OR-* and the refusal cases never read it. If the view API refuses the `jsonPayload` term, drop it: the launcher's query still filters on the event. The view then shows all gateway lines, which the launcher can already read through its project viewer.
+   - Without that view, the shadow read finds no lines. The check then reports `lines: 0, all_shadow_unsent: null` (unknown), never `true`.
 
 ## First-run order (each run is its own go; enable the issuer binding before, disable it after)
 
