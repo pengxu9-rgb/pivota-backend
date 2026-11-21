@@ -109,6 +109,7 @@ Each also gets one re-read. SG, DE, no market (on `/mcp`) and USA are refused be
 ## What one run does
 
 1. The build copies the scripts from the release image, pinned by digest. It checks that the config is the release copy, and that the digest is the release tag's.
+   - Every other step runs in the pinned cloud-sdk image (594.0.0, slim). That image has **no `python3` on PATH**, so the Python steps name gcloud's bundled interpreter by absolute path, `/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3` (build c2e19f14, 2026-11-20, failed on a bare `python3`). `tests/fixtures/cloud_sdk_image.json` records what the image's own build proves present; a new pin must re-record it.
 2. **Gateway check.** The gateway must serve one revision at 100%. Each case's required flags must match the live plain values. The path-4 cases need the serving revision's **image digest** in `REVIEWED_GATEWAY_DIGESTS`: it is read from `revisions describe` `status.imageDigest`, not from the `PIVOTA_COMMIT_SHA` env, which a `deploy --image` can leave stale. Today that set holds `080d7297f` → `sha256:67a5940f…` and `7d650dce8` → `sha256:908df3e4…`. A later gateway image is added by a reviewed PR.
 3. **Lock.** `gs://pivota-prod-ops-locks/prod-test-transactions.lock`, create-only.
 4. **Run:**
