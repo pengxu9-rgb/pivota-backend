@@ -11,7 +11,12 @@ Every change writes the program row and its append-only event in ONE transaction
 reads its row FOR UPDATE inside that transaction (Postgres), so concurrent edits queue instead of one
 writing the whole row back from a stale read. The CSV import never sets `live_at`, is a dry run unless asked
 otherwise, is idempotent (re-running a file changes nothing) and is all-or-nothing: a real run refuses the
-whole file if any row is invalid, and writes every row in one transaction.
+whole file if any row is invalid, and writes every row in one transaction. Its writes run in one fixed order
+(updates by program id, then creates by network and advertiser ID), so two imports that update the same
+programs take the row locks in one order and queue. That does NOT prevent every cycle: an update that sets an
+advertiser ID claims a unique-index entry in the update phase, so it can still cross a keyed create in another
+import. When Postgres aborts an import to break a cycle, that file rolls back whole and ImportConflict says to
+dry-run it again before re-importing.
 
 Text fields refuse control characters and a leading `=`, `+` or `@` (`-` too on single-line fields), so a
 value can't act as a spreadsheet formula. `notes` may still start with `-`: any future CSV export must
@@ -87,6 +92,16 @@ class ImportRefused(Exception):
     def __init__(self, report: Dict[str, Any]):
         super().__init__("the import was refused; nothing was written")
         self.report = report
+
+
+class ImportConflict(Exception):
+    """A real import Postgres aborted to break a lock cycle with another write (deadlock, 40P01) or a
+    serialization failure (40001). The whole file rolled back and nothing was written. A re-run re-plans
+    against the registry as the other write left it, which can match rows differently (e.g. rename a program
+    that write just created), so the answer says to dry-run again first."""
+
+    def __init__(self):
+        super().__init__("the import collided with another write; nothing was written")
 
 
 class NotLiveReady(Exception):
@@ -281,6 +296,34 @@ def _stamp_dates(before: Optional[Mapping[str, Any]], after: Dict[str, Any], exp
             after["applied_at"] = now
         if after["status"] in ("approved", "rejected") and after.get("decided_at") is None and "decided_at" not in explicit:
             after["decided_at"] = now
+
+
+#: deadlock_detected, serialization_failure: Postgres aborted the transaction; the same work may succeed if retried.
+_LOCK_CONFLICT_SQLSTATES = frozenset({"40P01", "40001"})
+_LOCK_CONFLICT_TYPES = frozenset({"DeadlockDetectedError", "SerializationError"})
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    """Did Postgres abort this transaction as a deadlock victim or for a serialization failure?
+
+    Matched as db.reap_agentic_ledger._is_unique_violation matches its own error: `databases` 0.7.0 wraps
+    neither driver, so by SQLSTATE first (asyncpg sets `sqlstate`), then by asyncpg's type name, walking
+    __cause__, __context__ and SQLAlchemy's `.orig`. SQLite has neither error: it serializes writers."""
+    seen = set()
+    candidates = [exc]
+    while candidates:
+        current = candidates.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) in _LOCK_CONFLICT_SQLSTATES:
+            return True
+        if type(current).__name__ in _LOCK_CONFLICT_TYPES:
+            return True
+        for nested in (current.__cause__, current.__context__, getattr(current, "orig", None)):
+            if isinstance(nested, BaseException):
+                candidates.append(nested)
+    return False
 
 
 def _same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -483,16 +526,46 @@ def _percent_to_bp(text: str) -> Optional[int]:
     return round(value * 100)
 
 
+class _CountedLines:
+    """The text's physical lines (split on "\\n", as io.StringIO splits them), counted as csv reads them.
+
+    csv's own line_num is the LAST line of the record it just returned, and it does not count a line that
+    fails to parse: a bad cell on line 2 was reported as line 1, and a row error in a quoted multi-line record
+    named the record's last line instead of its first. Counting the lines csv pulls gives both ends exactly."""
+
+    def __init__(self, text: str):
+        self._lines = iter(io.StringIO(text))
+        self.read = 0
+
+    def __iter__(self) -> "_CountedLines":
+        return self
+
+    def __next__(self) -> str:
+        line = next(self._lines)
+        self.read += 1
+        return line
+
+
+def _where(first: int, last: int) -> str:
+    return f"line {first}" if last <= first else f"lines {first}-{last}"
+
+
 def parse_csv(text: str) -> List[Tuple[int, Dict[str, str]]]:
+    """(line, row) for every non-blank record, where line is the physical line the record STARTS on. A
+    malformed file is refused whole, naming the line (or lines, for a multi-line record) at fault."""
     if not isinstance(text, str) or not text.strip():
         raise ValidationFailed({"csv": "empty"})
     if len(text.encode("utf-8")) > MAX_IMPORT_BYTES:
         raise ValidationFailed({"csv": f"larger than {MAX_IMPORT_BYTES} bytes"})
     if "\x00" in text:
         raise ValidationFailed({"csv": "contains a NUL byte"})
-    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")), strict=True)
+    lines = _CountedLines(text.lstrip("\ufeff"))
+    # csv.reader, not DictReader, so each record's first line is known; the dict is built below exactly as
+    # DictReader builds it (a short row's missing cells are None, an extra cell is refused).
+    reader = csv.reader(lines, strict=True)
+    first = 1
     try:
-        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+        headers = [h.strip().lower() for h in next(reader, [])]
         unknown = [h for h in headers if h and h not in CSV_COLUMNS]
         missing = [h for h in ("network", "merchant_name") if h not in headers]
         repeated = sorted({h for h in headers if h and headers.count(h) > 1})
@@ -506,20 +579,26 @@ def parse_csv(text: str) -> List[Tuple[int, Dict[str, str]]]:
                 problems["repeated_columns"] = "listed more than once: " + ", ".join(repeated)
             raise ValidationFailed(problems)
         rows: List[Tuple[int, Dict[str, str]]] = []
-        for record in reader:
-            line = reader.line_num
-            if None in record:
-                raise ValidationFailed({"csv": f"line {line}: more cells than columns"})
-            normalized = {str(k).strip().lower(): v for k, v in record.items()}
+        while True:
+            first = lines.read + 1
+            record = next(reader, None)
+            if record is None:
+                break
+            if not record:  # a blank line
+                continue
+            if len(record) > len(headers):
+                raise ValidationFailed({"csv": f"{_where(first, lines.read)}: more cells than columns"})
+            normalized = {h: (record[i] if i < len(record) else None) for i, h in enumerate(headers)}
             if any(len(v or "") > MAX_IMPORT_CELL_CHARS for v in normalized.values()):
-                raise ValidationFailed({"csv": f"line {line}: a cell is longer than {MAX_IMPORT_CELL_CHARS} characters"})
+                raise ValidationFailed({"csv": f"{_where(first, lines.read)}: a cell is longer than "
+                                               f"{MAX_IMPORT_CELL_CHARS} characters"})
             if not any((v or "").strip() for v in normalized.values()):
                 continue
-            rows.append((line, normalized))
+            rows.append((first, normalized))
             if len(rows) > MAX_IMPORT_ROWS:
                 raise ValidationFailed({"csv": f"more than {MAX_IMPORT_ROWS} rows"})
     except csv.Error as exc:
-        raise ValidationFailed({"csv": f"line {reader.line_num}: not valid CSV ({exc})"}) from exc
+        raise ValidationFailed({"csv": f"{_where(first, lines.read)}: not valid CSV ({exc})"}) from exc
     return rows
 
 
@@ -599,27 +678,53 @@ async def _plan_import(rows: List[Tuple[int, Dict[str, str]]]):
     return results, summary, actions
 
 
+def _write_order(actions):
+    """The real run's writes in ONE fixed order: updates by program_id, then creates by (network,
+    advertiser_id). Each _update holds its row lock FOR UPDATE, and each keyed create its unique-index entry,
+    until the import's single transaction commits. Without one order, two imports that update the same programs
+    in different file orders each hold one row and wait for the other (a deadlock); with it they queue.
+
+    NOT every cycle: an update that SETS an advertiser_id claims a unique-index entry here, in program_id order,
+    while creates claim theirs later in key order, so two such imports can still cross (Postgres aborts one: a
+    409 import_conflict, nothing written). Locking every update target first and then making every key claim in
+    key order would close that, at the cost of a second pass; not done while the 409 covers it.
+    Stable: ties keep file order. The report (`results`) is not reordered."""
+    updates = sorted((a for a in actions if a[1] == "update"), key=lambda a: a[3])
+    creates = sorted((a for a in actions if a[1] == "create"),
+                     key=lambda a: (a[2]["network"], a[2].get("advertiser_id") or ""))
+    return updates + creates
+
+
 async def import_csv(text: str, *, dry_run: bool, actor: str) -> Dict[str, Any]:
     """A dry run reports what a real run would do. A real run is all-or-nothing: it plans and writes in ONE
     transaction, refuses the whole file (ImportRefused, nothing written) if any row is invalid, and rolls
-    everything back if a row conflicts while writing or the database fails part-way."""
+    everything back if a row conflicts while writing or the database fails part-way. Its writes take their
+    locks in _write_order; if Postgres still aborts it as a deadlock victim or for a serialization failure,
+    the file rolled back whole and ImportConflict says to dry-run it again before re-importing."""
     rows = parse_csv(text)
     if dry_run:
         results, summary, _ = await _plan_import(rows)
         return {"dry_run": True, "written": False, "summary": summary, "rows": results}
-    async with database.transaction():
-        results, summary, actions = await _plan_import(rows)
-        if summary["error"]:
-            raise ImportRefused({"dry_run": False, "written": False, "summary": summary, "rows": results})
-        for result, kind, changes, program_id in actions:
-            try:
-                if kind == "create":
-                    result["program_id"] = (await _create(changes, actor, action="import_create"))["id"]
-                else:
-                    await _update(program_id, changes, actor, action="import_update")
-            except DuplicateProgram:
-                result.update({"action": "error", "errors": {"row": "conflicts with another program"}})
-                summary[kind] -= 1
-                summary["error"] += 1
+    try:
+        async with database.transaction():
+            results, summary, actions = await _plan_import(rows)
+            if summary["error"]:
                 raise ImportRefused({"dry_run": False, "written": False, "summary": summary, "rows": results})
+            for result, kind, changes, program_id in _write_order(actions):
+                try:
+                    if kind == "create":
+                        result["program_id"] = (await _create(changes, actor, action="import_create"))["id"]
+                    else:
+                        await _update(program_id, changes, actor, action="import_update")
+                except DuplicateProgram:
+                    result.update({"action": "error", "errors": {"row": "conflicts with another program"}})
+                    summary[kind] -= 1
+                    summary["error"] += 1
+                    raise ImportRefused({"dry_run": False, "written": False, "summary": summary, "rows": results})
+    except ImportRefused:
+        raise
+    except Exception as exc:
+        if _is_lock_conflict(exc):
+            raise ImportConflict() from exc
+        raise
     return {"dry_run": False, "written": True, "summary": summary, "rows": results}
