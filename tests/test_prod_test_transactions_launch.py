@@ -95,6 +95,31 @@ def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_
         assert target.startswith(("/workspace/release/", "/workspace/prod-test-transactions/")), target
 
 
+def test_every_cloud_sdk_step_starts_an_executable_the_pinned_image_is_recorded_to_have():
+    # Build c2e19f14 (2026-11-20) failed at step 2: the pinned cloud-sdk image (594.0.0, slim) has no python3 on PATH,
+    # and these tests never run an image. tests/fixtures/cloud_sdk_image.json records what that image's own build
+    # proves present / absent; a new pin must re-record it, and every step must start something recorded present.
+    import re
+
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "cloud_sdk_image.json").read_text())
+    steps = yaml.safe_load(CONFIG.read_bytes())["steps"]
+    sdk_steps = [s for s in steps if s["name"].startswith("gcr.io/google.com/cloudsdktool/cloud-sdk")]
+    assert len(sdk_steps) == len(steps) - 1          # all but release-scripts (the backend image)
+    for step in sdk_steps:
+        assert step["name"] == recorded["image"], step["id"]
+        assert step["entrypoint"] in recorded["present"], step["id"]
+        assert step["entrypoint"] not in recorded["absent_on_path"], step["id"]
+        if step["entrypoint"] == "bash":             # a bash step must not reach for a Python the image lacks either
+            for word in recorded["absent_on_path"]:
+                assert not re.search(rf"(?<![\w/.-]){word}(?![\w.-])", step["args"][-1]), (step["id"], word)
+    python_steps = [s["id"] for s in sdk_steps if s["entrypoint"].endswith("/python3")]
+    assert python_steps == ["config-is-the-release-config", "gateway", "lock", "run", "publish"]
+    # The gate is started with the step's own interpreter, never a bare name the image may not have.
+    source = Path(launch.__file__).read_text()
+    assert "sys.executable, str(Path(args.scripts) / \"ops\" / \"oneoff_gate.py\")" in source
+    assert not re.search(r"""["']python3?["']\s*,\s*str\(""", source)
+
+
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
 def test_versions_must_be_numbered(raw):
     with pytest.raises(launch.LaunchRefused):
