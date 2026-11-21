@@ -12,7 +12,8 @@ db/agents.py among them -- counted those requests twice.
 A handler call made before the middleware writes (an awaited `log_agent_request`, e.g. on an error
 path) is merged into the INSERT. One made after (a BackgroundTasks or create_task call, which runs
 after the response has started) fills the handler columns of the row already written, by an UPDATE
-keyed on the request's request_id, ordered after the INSERT. If the middleware writes nothing for the
+keyed on the request's request_id, ordered after the INSERT. That request_id is minted by this
+middleware for every request; a caller's X-Request-Id is never the row's id. If the middleware writes nothing for the
 request (no agent on request.state), the handler's own row is written, once. Outside /agent/v1 there
 is no slot and `log_agent_request` writes its own row as before.
 """
@@ -77,8 +78,9 @@ _ROW_COLUMNS = (
     "request_id",
 ) + _HANDLER_COLUMNS
 _SLOT_STATE_KEY = "agent_usage_log_slot"
-# The late UPDATE is bounded by agent and time as well as request_id, so it rides the
-# (agent_id, timestamp) index whatever the state of the request_id unique index.
+# The late UPDATE is bounded by agent and a time window (both ends) as well as by the request's
+# server-minted request_id, so it rides the (agent_id, timestamp) index whatever the state of the
+# request_id unique index, and can only ever match the request's own row.
 _LATE_FILL_SLACK = timedelta(minutes=1)
 
 
@@ -117,6 +119,7 @@ async def _fill_handler_fields(
             .where(agent_usage_logs.c.request_id == request_id)
             .where(agent_usage_logs.c.agent_id == agent_id)
             .where(agent_usage_logs.c.timestamp >= since)
+            .where(agent_usage_logs.c.timestamp <= datetime.now() + _LATE_FILL_SLACK)
             .values(**values)
         )
     except Exception as e:
@@ -241,7 +244,12 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # The request_id of this request's one row, shared with the handler's log_agent_request.
-        slot = UsageLogSlot(request.headers.get("x-request-id") or f"req_{secrets.token_hex(16)}")
+        # Always minted here, never the caller's X-Request-Id (that stays in the structured request
+        # log): the column is VARCHAR(100), so a longer header failed the INSERT and left the request
+        # with no row, i.e. uncounted by the rate limit and daily quota; and a header repeated
+        # across requests (a retrying client) made them share one row, which the late UPDATE of one
+        # request would then overwrite with another's fields.
+        slot = UsageLogSlot(f"req_{secrets.token_hex(16)}")
         setattr(request.state, _SLOT_STATE_KEY, slot)
         try:
             return await self._process(request, call_next, slot)

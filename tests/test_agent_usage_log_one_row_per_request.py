@@ -16,10 +16,14 @@ handler's late UPDATE and the request_id unique constraint all run as SQL.
   re-raises, before the middleware writes. One row, status 404, the handler's error_message.
 - GET /agent/v1/analytics/summary: the handler does not log. One row (the middleware's).
 - A handler that logs on a path outside /agent/v1, where the middleware writes nothing: one row.
+- The row's request_id is minted by the middleware, never the caller's X-Request-Id: a repeated
+  header still gives one row per request, each with its own handler fields. (The over-long header
+  case needs Postgres, which enforces VARCHAR(100): tests/test_agent_usage_log_one_row_per_request_postgres.py.)
 """
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -39,6 +43,8 @@ from middleware.usage_logger import UsageLoggerMiddleware
 AGENT_ID = "agent_test"  # the agent the test-key bypass in get_agent_context authenticates
 HEADERS = {"X-API-Key": "test-agent-key"}
 MERCHANT = "merch_usage_rows_01"
+OTHER_MERCHANT = "merch_usage_rows_02"
+MINTED_REQUEST_ID = re.compile(r"^req_[0-9a-f]{32}$")
 
 
 @pytest.fixture()
@@ -133,7 +139,10 @@ def _order(order_id: str) -> Dict[str, Any]:
 
 @pytest.fixture()
 def app(monkeypatch, usage_table) -> FastAPI:
-    known = {"ord_usage_found": _order("ord_usage_found")}
+    known = {
+        "ord_usage_found": _order("ord_usage_found"),
+        "ord_usage_other": {**_order("ord_usage_other"), "merchant_id": OTHER_MERCHANT},
+    }
 
     async def get_order(order_id):
         return known.get(order_id)
@@ -245,3 +254,32 @@ async def test_a_handler_call_on_a_request_the_middleware_does_not_log_writes_th
     rows = _rows(usage_table)
     assert len(rows) == 1, rows
     assert (rows[0]["endpoint"], rows[0]["merchant_id"]) == ("/agent/v1/usage-probe-unattributed", MERCHANT)
+
+
+async def test_a_repeated_caller_request_id_still_gives_each_request_its_own_row(app, usage_table):
+    """A retrying client that reuses one X-Request-Id: each request keeps its own row and its own
+    handler fields (the caller's id used to be the row's id, so the unique request_id collapsed the
+    requests into one row and the second's late UPDATE overwrote the first's merchant/order)."""
+    shared = {"X-Request-Id": "client-retry-0001"}
+    for order_id in ("ord_usage_found", "ord_usage_other", "ord_usage_found"):
+        response = await _get(app, f"/agent/v1/orders/{order_id}", headers=shared)
+        assert response.status_code == 200
+
+    rows = _rows(usage_table)
+    assert [(r["order_id"], r["merchant_id"]) for r in rows] == [
+        ("ord_usage_found", MERCHANT),
+        ("ord_usage_other", OTHER_MERCHANT),
+        ("ord_usage_found", MERCHANT),
+    ]
+    assert len({r["request_id"] for r in rows}) == 3
+    assert all(MINTED_REQUEST_ID.match(r["request_id"]) for r in rows), rows
+
+
+async def test_the_rows_request_id_is_minted_not_the_callers_header(app, usage_table):
+    long_header = "x" * 101  # longer than agent_usage_logs.request_id (VARCHAR(100))
+    for path in ("/agent/v1/orders/ord_usage_found", "/agent/v1/orders/ord_usage_missing", "/agent/v1/analytics/summary"):
+        await _get(app, path, headers={"X-Request-Id": long_header})
+
+    rows = _rows(usage_table)
+    assert len(rows) == 3, rows
+    assert all(MINTED_REQUEST_ID.match(r["request_id"]) for r in rows), rows
