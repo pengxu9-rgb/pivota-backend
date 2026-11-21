@@ -2558,7 +2558,13 @@ async def run_merchant_url_audit(
                 "credits": metered_credits, "base_credits": base_credits,
                 "consumer_capture": consumer_quote, "providers": providers_for_launch,
                 "product_count": len(synthetic_products), "unresolved_urls": unresolved}
-    if consumer_plan and body.accepted_quote != quote_id:
+    # A supplied quote is binding on EVERY run, not only answer-capture ones:
+    # quote_id hashes the scope AND total_credits, so a match means this run
+    # debits exactly the quoted price, and any drift (scope, free allowance
+    # used up, pinned basis repriced) is a 409 before anything is debited.
+    # Answer capture always needs one; a run with no questions and no quote
+    # keeps the legacy unquoted path.
+    if (consumer_plan or body.accepted_quote) and body.accepted_quote != quote_id:
         raise HTTPException(status_code=409, detail={"code": "quote_required",
                             "message": "Review a fresh quote before starting this audit."})
     if consumer_plan and metered_credits > int(balance.get("credits") or 0):
