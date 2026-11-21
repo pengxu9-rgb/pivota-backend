@@ -61,9 +61,17 @@ def _invalid(exc: programs.ValidationFailed) -> HTTPException:
     return HTTPException(status_code=422, detail={"code": "invalid_fields", "errors": exc.errors})
 
 
-_NOT_FOUND = HTTPException(status_code=404, detail={"code": "program_not_found"})
-_DUPLICATE = HTTPException(status_code=409, detail={
-    "code": "duplicate_program", "message": "A program with this network and advertiser ID already exists."})
+# Every answer below is a NEW HTTPException per raise. One shared module-level instance would grow its
+# __traceback__ on every raise and keep each failed request's frames (and its body) alive.
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "program_not_found"})
+
+
+def _duplicate() -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "code": "duplicate_program", "message": "A program with this network and advertiser ID already exists."})
 
 
 @router.get("/affiliate-programs")
@@ -92,8 +100,17 @@ async def create_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.DuplicateProgram:
-        raise _DUPLICATE
+        raise _duplicate() from None
 
+
+IMPORT_CONFLICT_MESSAGE = (
+    "Another change to the same programs was saved at the same moment, so nothing from this file was written. "
+    "Run a dry run again and check the plan before importing: the registry may have changed.")
+
+
+def _import_conflict() -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "code": "import_conflict", "written": False, "message": IMPORT_CONFLICT_MESSAGE})
 
 #: The JSON envelope around the CSV text: quotes, escapes and the key. A body over this is refused unparsed.
 _MAX_IMPORT_BODY_BYTES = 2 * programs.MAX_IMPORT_BYTES + 4096
@@ -106,7 +123,9 @@ async def import_affiliate_programs(
     current_user: dict = Depends(get_current_user),
 ):
     """Body: {"csv": "<file text>"}. A dry run unless `dry_run=false`. Never sets a program live.
-    A real run is all-or-nothing: any invalid row refuses the whole file (422, nothing written)."""
+    A real run is all-or-nothing: any invalid row refuses the whole file (422, nothing written), and a run
+    Postgres aborted to break a lock cycle with another write is a 409 import_conflict (nothing written; dry-run
+    it again before re-importing)."""
     actor = _require(current_user, ADMIN_ROLES)
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > _MAX_IMPORT_BODY_BYTES:
@@ -128,6 +147,8 @@ async def import_affiliate_programs(
         raise _invalid(exc)
     except programs.ImportRefused as exc:
         raise HTTPException(status_code=422, detail={"code": "import_refused", **exc.report})
+    except programs.ImportConflict:
+        raise _import_conflict() from None
 
 
 @router.get("/affiliate-programs/{program_id}")
@@ -136,7 +157,7 @@ async def get_affiliate_program(program_id: str, current_user: dict = Depends(ge
     try:
         return await programs.detail(program_id)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
 
 
 @router.patch("/affiliate-programs/{program_id}")
@@ -151,9 +172,9 @@ async def update_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
     except programs.DuplicateProgram:
-        raise _DUPLICATE
+        raise _duplicate() from None
 
 
 @router.post("/affiliate-programs/{program_id}/mark-live")
@@ -162,7 +183,7 @@ async def mark_affiliate_program_live(program_id: str, current_user: dict = Depe
     try:
         return programs.public(await programs.mark_live(program_id, actor))
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
     except programs.NotLiveReady as exc:
         raise HTTPException(status_code=422, detail={
             "code": "not_live_ready",
@@ -182,4 +203,4 @@ async def unlive_affiliate_program(
     except programs.ValidationFailed as exc:
         raise _invalid(exc)
     except programs.ProgramNotFound:
-        raise _NOT_FOUND
+        raise _not_found() from None
