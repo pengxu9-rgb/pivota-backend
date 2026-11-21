@@ -2418,3 +2418,24 @@ async def test_the_isError_plain_text_is_flattened_not_only_capped(monkeypatch):
     detail = str(excinfo.value)
     assert "\n" not in detail, "a newline inside the cap must still be flattened"
     assert "Invalid arguments CRITICAL - card issued" in detail
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "a b", "a!b", "a$b", "a&b", "a'b", "a(b", "a)b", "a*b", "a+b", "a,b", "a=b", "a:b", "a@b",
+        "a|b", "a\\b", 'a"b', "a<b", "a>b", "a^b", "a`b", "a{b", "a}b", "a[b", "a]b",
+        "a%b", "a%4", "a%zzb",
+    ],
+)
+def test_validated_endpoint_admits_only_unreserved_slash_and_percent_xx(monkeypatch, segment):
+    """Anything outside unreserved + `/` + well-formed `%XX` is refused, sub-delims included:
+    a target may still give `;` `+` `@` `:` `=` meaning when it routes."""
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    assert muc._validated_endpoint(f"https://www.wixapis.com/ecom/{segment}/mcp") is None, segment
+
+
+def test_validated_endpoint_still_admits_unreserved_and_benign_percent_xx(monkeypatch):
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    for path in ("/api/ucp/mcp", "/ecom/ucp/53b84487-eb3f-4f9d-a68b-583b9677dc65/mcp", "/a_b~c.d/mcp", "/a%41b/mcp"):
+        assert muc._validated_endpoint(f"https://www.wixapis.com{path}") == f"https://www.wixapis.com{path}", path

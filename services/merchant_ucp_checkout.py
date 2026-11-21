@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -626,6 +627,13 @@ def _sibling_host(
     return host
 
 
+# An endpoint path is built ONLY from RFC 3986 unreserved characters, `/` and well-formed `%XX`. Sub-delims
+# (`!$&'()*+,;=`), `:` and `@` are legal in a path segment, and a target may still give them meaning when it
+# routes (matrix parameters, `@`-scoped segments, `+` decoded as a space), so they are refused with the rest.
+# Both real platform paths (`/api/ucp/mcp`, `/ecom/ucp/<uuid>/mcp`) fit.
+_ENDPOINT_PATH_RE = re.compile(r"(?:[A-Za-z0-9\-._~/]|%[0-9A-Fa-f]{2})+")
+
+
 def _validated_endpoint(url: str) -> Optional[str]:
     """Admit a merchant-DECLARED MCP endpoint, or None.
 
@@ -695,6 +703,8 @@ def _validated_endpoint(url: str) -> Optional[str]:
     if len(path) > 512 or not path.isascii() or not path.isprintable():
         return None
     if not path.endswith("/mcp"):
+        return None
+    if not _ENDPOINT_PATH_RE.fullmatch(path):
         return None
     # A suffix is not a path bound. httpx forwards the path verbatim, so the TARGET decides what
     # `/admin/jobs/%2e%2e/mcp` or `/admin/jobs;/mcp` resolves to — a server that collapses dot
