@@ -12,6 +12,7 @@ from services.agent_webhook_service import (
     list_webhook_events_catalog,
     receive_managed_inbox_delivery,
     retry_delivery,
+    RotationSuperseded,
     rotate_signing_secret,
     send_test_webhook,
     update_webhook_config,
@@ -181,15 +182,37 @@ async def post_agent_webhook_retry(
         raise HTTPException(status_code=500, detail=f"Failed to retry webhook delivery: {exc}")
 
 
+_ROTATE_ACTIVATIONS = ("auto", "immediate")
+
+
 @router.post("/{agent_id}/webhooks/signing-secret/rotate")
 async def post_agent_webhook_rotate_secret(
     agent_id: str,
+    activation: str = Query(
+        default="auto",
+        description=(
+            "auto: immediate when the current secret was never shown, else a 24 h overlap. "
+            "immediate: the new secret signs now and the old (and any pending) one ends now."
+        ),
+    ),
     current_user: dict = Depends(get_current_user),
 ):
     await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
+    # Called as a plain function (not through FastAPI), an omitted param is the Query object.
+    mode = activation if isinstance(activation, str) else "auto"
+    if mode not in _ROTATE_ACTIVATIONS:
+        raise HTTPException(status_code=400, detail="activation must be 'auto' or 'immediate'")
+    if mode == "immediate":
+        # Ends a possibly live secret now: the owning agent's own choice only, never staff's.
+        await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     try:
-        result = await rotate_signing_secret(agent_id)
+        result = await rotate_signing_secret(agent_id, force_immediate=mode == "immediate")
         return result
+    except RotationSuperseded:
+        raise HTTPException(
+            status_code=409,
+            detail="A concurrent rotation replaced this one. Rotate again.",
+        )
     except HTTPException:
         raise
     except Exception as exc:

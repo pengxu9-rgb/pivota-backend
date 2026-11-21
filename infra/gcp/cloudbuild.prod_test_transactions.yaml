@@ -9,6 +9,12 @@
 #       _GO_REFERENCE='<where the owner gave the go, and when>'
 #   (add _USER_KEY_VERSION=<n> when a selected case is a checkout case: it mounts the test issuer key; else leave it out)
 #
+# 0 (root, pinned cloud-sdk) makes /workspace/release and /workspace/prod-test-transactions and hands them to the
+# backend image's runtime user (uid 10001, infra/gcp/Dockerfile): with --no-source /workspace is root's.
+# The pinned cloud-sdk image (594.0.0, slim) has NO python3 on PATH: its own build asserts `! command -v python3` and
+# that gcloud's Python is /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3, so every Python step names
+# that path (build c2e19f14, 2026-11-20, failed at step 2 on a bare `python3`). The launcher runs oneoff_gate.py with
+# sys.executable, so the gate gets the same interpreter. tests/fixtures/cloud_sdk_image.json records the image.
 # 1 copies scripts/ and this config OUT OF THE RELEASE IMAGE (by digest); 2 the config is the release copy; 3 the digest
 # is the release tag's; 4 the gateway serves one revision and its flags match what the selected cases expect; 5 the
 # lock. Steps 1-5 fail closed with nothing taken or run. 6 run: gate -> armed deploy (secrets by version) -> execute
@@ -28,8 +34,18 @@ options:
   dynamicSubstitutions: false
   env:
     - BUILD_ID=$BUILD_ID
-timeout: 3300s
+timeout: 3360s
 steps:
+  - id: workspace
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
+    entrypoint: bash
+    timeout: 60s
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /workspace/release/infra/gcp /workspace/prod-test-transactions
+        chown -R 10001 /workspace/release /workspace/prod-test-transactions
   - id: release-scripts
     name: us-west1-docker.pkg.dev/pivota-shared/pivota/backend@${_DIGEST}
     entrypoint: bash
@@ -45,7 +61,7 @@ steps:
         cp /app/infra/gcp/cloudbuild.prod_test_transactions.yaml /workspace/release/infra/gcp/cloudbuild.prod_test_transactions.yaml
   - id: config-is-the-release-config
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
-    entrypoint: python3
+    entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
     timeout: 60s
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, config, --config-sha256, "${_CONFIG_SHA256}"]
   - id: digest-is-the-release-tag
@@ -62,17 +78,17 @@ steps:
         test "$$tag_digest" = "$$DIGEST"
   - id: gateway
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
-    entrypoint: python3
+    entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
     timeout: 120s
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, gateway, --cases, "${_CASES}"]
   - id: lock
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
-    entrypoint: python3
+    entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
     timeout: 120s
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, lock, --cases, "${_CASES}"]
   - id: run
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
-    entrypoint: python3
+    entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
     timeout: 2100s
     allowFailure: true
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, run, --release, "${_RELEASE}",
@@ -80,7 +96,7 @@ steps:
            --targets-version, "${_TARGETS_VERSION}", --user-key-version, "${_USER_KEY_VERSION}", --go-reference, "${_GO_REFERENCE}"]
   - id: publish
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
-    entrypoint: python3
+    entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
     timeout: 600s
     args: [/workspace/release/scripts/ops/prod_test_transactions_launch.py, publish, --release, "${_RELEASE}",
            --cases, "${_CASES}", --go-reference, "${_GO_REFERENCE}"]
