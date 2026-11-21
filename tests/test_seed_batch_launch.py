@@ -514,6 +514,48 @@ def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_
         assert target.startswith(("/workspace/release/", "/workspace/seed-batch/")), target
 
 
+def test_every_cloud_sdk_step_starts_an_executable_the_pinned_image_is_recorded_to_have():
+    # The test-transaction twin (build c2e19f14, 2026-11-20) failed at its first Python step: the pinned cloud-sdk image
+    # (594.0.0, slim) has no python3 on PATH, and these tests never run an image. tests/fixtures/cloud_sdk_image.json
+    # records what that image's own build proves present / absent; a new pin must re-record it.
+    import re
+
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "cloud_sdk_image.json").read_text())
+    all_steps = steps()
+    sdk_steps = [s for s in all_steps if s["name"].startswith("gcr.io/google.com/cloudsdktool/cloud-sdk")]
+    assert len(sdk_steps) == len(all_steps) - 1          # all but release-scripts (the backend image)
+    for step in sdk_steps:
+        assert step["name"] == recorded["image"], step["id"]
+        assert step["entrypoint"] in recorded["present"], step["id"]
+        assert step["entrypoint"] not in recorded["absent_on_path"], step["id"]
+        if step["entrypoint"] == "bash":                 # a bash step must not reach for a Python the image lacks either
+            for word in recorded["absent_on_path"]:
+                assert not re.search(rf"(?<![\w/.-]){word}(?![\w.-])", step["args"][-1]), (step["id"], word)
+    python_steps = [s["id"] for s in sdk_steps if s["entrypoint"].endswith("/python3")]
+    assert python_steps == ["config-is-the-release-config", "web", "lock", "run", "publish"]
+    # The gate is started with the step's own interpreter, never a bare name the image may not have.
+    source = Path(launch.__file__).read_text()
+    assert "sys.executable, str(Path(args.scripts) / \"ops\" / \"oneoff_gate.py\")" in source
+    assert not re.search(r"""["']python3?["']\s*,\s*str\(""", source)
+
+
+def test_the_scripts_the_bundled_interpreter_runs_import_only_the_standard_library():
+    # gcloud's bundled Python has no site-packages: a third-party import in the launcher or the gate it starts would
+    # fail at import, before any check runs.
+    import ast
+    import sys
+
+    for path in (Path(launch.__file__), Path(launch.__file__).with_name("oneoff_gate.py")):
+        top = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                top |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                assert node.level == 0, (path.name, node.module)  # no package-relative imports either
+                top.add(node.module.split(".")[0])
+        assert top and top <= set(sys.stdlib_module_names), (path.name, sorted(top - set(sys.stdlib_module_names)))
+
+
 def test_builder_images_are_pinned_and_the_digest_check_escapes_its_shell_variables():
     for step in steps():
         assert "@sha256:" in step["name"] or step["name"].endswith("@${_DIGEST}"), step["id"]
