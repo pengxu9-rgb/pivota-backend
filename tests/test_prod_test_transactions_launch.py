@@ -95,6 +95,31 @@ def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_
         assert target.startswith(("/workspace/release/", "/workspace/prod-test-transactions/")), target
 
 
+def test_every_cloud_sdk_step_starts_an_executable_the_pinned_image_is_recorded_to_have():
+    # Build c2e19f14 (2026-11-20) failed at step 2: the pinned cloud-sdk image (594.0.0, slim) has no python3 on PATH,
+    # and these tests never run an image. tests/fixtures/cloud_sdk_image.json records what that image's own build
+    # proves present / absent; a new pin must re-record it, and every step must start something recorded present.
+    import re
+
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "cloud_sdk_image.json").read_text())
+    steps = yaml.safe_load(CONFIG.read_bytes())["steps"]
+    sdk_steps = [s for s in steps if s["name"].startswith("gcr.io/google.com/cloudsdktool/cloud-sdk")]
+    assert len(sdk_steps) == len(steps) - 1          # all but release-scripts (the backend image)
+    for step in sdk_steps:
+        assert step["name"] == recorded["image"], step["id"]
+        assert step["entrypoint"] in recorded["present"], step["id"]
+        assert step["entrypoint"] not in recorded["absent_on_path"], step["id"]
+        if step["entrypoint"] == "bash":             # a bash step must not reach for a Python the image lacks either
+            for word in recorded["absent_on_path"]:
+                assert not re.search(rf"(?<![\w/.-]){word}(?![\w.-])", step["args"][-1]), (step["id"], word)
+    python_steps = [s["id"] for s in sdk_steps if s["entrypoint"].endswith("/python3")]
+    assert python_steps == ["config-is-the-release-config", "gateway", "lock", "run", "publish"]
+    # The gate is started with the step's own interpreter, never a bare name the image may not have.
+    source = Path(launch.__file__).read_text()
+    assert "sys.executable, str(Path(args.scripts) / \"ops\" / \"oneoff_gate.py\")" in source
+    assert not re.search(r"""["']python3?["']\s*,\s*str\(""", source)
+
+
 @pytest.mark.parametrize("raw", ["", "latest", "0", "-1", "1.5", "01", "1234567"])
 def test_versions_must_be_numbered(raw):
     with pytest.raises(launch.LaunchRefused):
@@ -384,6 +409,13 @@ def test_shadow_check_is_advisory_and_counts_every_line_in_the_window():
     assert launch.shadow_check([{**case_row("MCP-SF-US", passes=False), "shadow_lookup": True}], []) is None
 
 
+def test_no_shadow_line_read_is_unknown_never_a_vacuous_all_unsent():
+    # A view that misses the gateway lines reads as empty, not as an error: all() over [] must not say "all unsent".
+    rows = [{**case_row("MCP-SF-US"), "shadow_lookup": True}]
+    assert launch.shadow_check(rows, []) == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                             "note": "no shadow line was read in the window"}
+
+
 def test_shadow_lines_keep_no_host(monkeypatch):
     entries = [{"jsonPayload": {"mode": "shadow", "sent": False, "reason": "r", "seller_host": "shop.reviewed.example",
                                 "lines": [{"variant": "gid://x"}]}}]
@@ -396,7 +428,22 @@ def test_shadow_lines_keep_no_host(monkeypatch):
     monkeypatch.setattr(launch, "run", fake_run)
     lines = launch.read_shadow_lines("2026-01-02T07:00:00+00:00", "2026-01-02T07:05:00+00:00")
     assert lines == [{"mode": "shadow", "sent": False, "reason": "r"}]
-    assert flag(seen["args"], "--view") == "prod-test-transactions" and flag(seen["args"], "--bucket") == "_Default"
+    assert flag(seen["args"], "--view") == "prod-test-transactions-gateway-shadow"
+    assert flag(seen["args"], "--bucket") == "_Default" and flag(seen["args"], "--location") == "global"
+    assert 'jsonPayload.event="ucp_shopify_catalog_attribution"' in seen["args"][3]
+
+
+def test_the_job_lines_are_read_through_the_job_view_and_only_reviewed_views_are_read(monkeypatch):
+    seen = []
+    monkeypatch.setattr(launch, "run", lambda args, **kw: seen.append(args) or 'PROD_TEST_TXN_RESULT {"kind": "run"}')
+    monkeypatch.setattr(launch.job, "parse_result_lines", lambda text: ([{"kind": "run"}], []))
+    launch.read_log("prod-test-transactions-abc12")
+    assert flag(seen[-1], "--view") == "prod-test-transactions"
+    assert 'labels."run.googleapis.com/execution_name"="prod-test-transactions-abc12"' in seen[-1][3]
+    assert launch.LOG_VIEW != launch.SHADOW_LOG_VIEW
+    for view in ("", "_AllLogs", "prod-test-transactions-x", None):
+        with pytest.raises(launch.LaunchRefused, match="not a reviewed log view"):
+            launch.read_view("x", fmt="json", limit=1, view=view)
 
 
 def publish(monkeypatch, tmp_path, rows, state):
@@ -443,5 +490,6 @@ def test_publish_records_the_targets_sha_and_an_advisory_shadow_result(monkeypat
     launch.cmd_publish(args)
     result = json.loads(written["result.json"])
     assert result["ok"] is True and result["targets_sha256"] == "d" * 64
-    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": True,
-                                       "reasons": []}
+    # No line read is unknown, and the advisory check never moves `ok`.
+    assert result["shadow_lookup"] == {"advisory": True, "wanted": 1, "lines": 0, "all_shadow_unsent": None,
+                                       "note": "no shadow line was read in the window"}

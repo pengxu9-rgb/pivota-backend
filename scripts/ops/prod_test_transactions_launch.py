@@ -17,7 +17,8 @@ Subcommands, in build order:
             still run and the job is disarmed. Fails the build when anything was LEFT OPEN.
 
 The launcher never reads a secret: it passes Secret Manager names and numbered versions to `--set-secrets`. It reads
-logs only through the reviewed log view LOG_VIEW (the job's own lines and the gateway's shadow lookup lines).
+logs only through two reviewed log views: LOG_VIEW (the job's own lines) and SHADOW_LOG_VIEW (the gateway's shadow
+lookup lines).
 """
 
 from __future__ import annotations
@@ -50,13 +51,15 @@ SHADOW_EVENT = "ucp_shopify_catalog_attribution"
 LOCK_OBJECT = "prod-test-transactions.lock"
 RECEIPTS_PREFIX = "prod-test-transactions"
 CONFIG_PATH = "infra/gcp/cloudbuild.prod_test_transactions.yaml"
-# The log view the launcher reads through (roles/logging.viewAccessor on this view only). Its filter (runbook):
-#   (resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions")
-#   OR (resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
-#       AND jsonPayload.event="ucp_shopify_catalog_attribution")
+# The log views the launcher reads through (roles/logging.viewAccessor on these views only). A view filter allows
+# nesting depth 1, so one OR-of-ANDs view was refused (2026-11-20); each source has its own flat view (runbook):
+#   LOG_VIEW:        resource.type="cloud_run_job" AND resource.labels.job_name="prod-test-transactions"
+#   SHADOW_LOG_VIEW: resource.type="cloud_run_revision" AND resource.labels.service_name="gateway"
+#                    AND jsonPayload.event="ucp_shopify_catalog_attribution"
 LOG_BUCKET = "_Default"
 LOG_LOCATION = "global"
 LOG_VIEW = "prod-test-transactions"
+SHADOW_LOG_VIEW = "prod-test-transactions-gateway-shadow"
 WORK = Path(os.getenv("PROD_TEST_TXN_WORKDIR", "/workspace/prod-test-transactions"))
 TASK_TIMEOUT_SECONDS = 600
 # The run step has RUN_STEP_SECONDS (the yaml's `run` timeout). The wait is budgeted FROM THE STEP'S START, leaving
@@ -170,12 +173,16 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
 def shadow_check(case_rows: list[dict], lines: list[dict] | None) -> dict | None:
     """Path 3, ADVISORY: every gateway shadow lookup line in the run's window. The line carries no request id or
     caller and the job publishes no seller host (not even a hash: an unsalted host hash is reversible), so other
-    callers' lines are counted too: this never decides `ok`. None when no US storefront create passed."""
+    callers' lines are counted too: this never decides `ok`. None when no US storefront create passed. No line read
+    is UNKNOWN (all_shadow_unsent None), never a vacuous True: a view that misses the lines reads as empty."""
     wanted = [r for r in case_rows if r.get("shadow_lookup") and r.get("pass") is True]
     if not wanted:
         return None
     if lines is None:
         return {"advisory": True, "wanted": len(wanted), "lines": None, "note": "the shadow lines could not be read"}
+    if not lines:
+        return {"advisory": True, "wanted": len(wanted), "lines": 0, "all_shadow_unsent": None,
+                "note": "no shadow line was read in the window"}
     return {"advisory": True, "wanted": len(wanted), "lines": len(lines),
             "all_shadow_unsent": all(line.get("mode") == "shadow" and line.get("sent") is False for line in lines),
             "reasons": sorted({str(line.get("reason")) for line in lines})}
@@ -366,9 +373,11 @@ def cmd_run(args, *, monotonic=None) -> None:
             path.write_text(json.dumps(state))
 
 
-def read_view(filter_text: str, *, fmt: str, limit: int) -> str:
+def read_view(filter_text: str, *, fmt: str, limit: int, view: str = LOG_VIEW) -> str:
+    if view not in (LOG_VIEW, SHADOW_LOG_VIEW):
+        raise LaunchRefused(f"not a reviewed log view: {view!r}")
     return run(["gcloud", "logging", "read", filter_text, "--project", PROJECT, "--bucket", LOG_BUCKET,
-                "--location", LOG_LOCATION, "--view", LOG_VIEW, "--order", "asc", "--limit", str(limit),
+                "--location", LOG_LOCATION, "--view", view, "--order", "asc", "--limit", str(limit),
                 "--format", fmt], timeout=120)
 
 
@@ -393,12 +402,13 @@ def read_log(execution: str, *, sleep=None, monotonic=None) -> tuple[str, str | 
 
 def read_shadow_lines(started_at: str, finished_at: str) -> list[dict] | None:
     """The gateway's shadow lookup lines in the run's window (plus 3 min: they are written after the lookup settles).
-    Only mode / sent / reason are kept. None when the view cannot be read."""
+    Only mode / sent / reason are kept. Read through SHADOW_LOG_VIEW (LOG_VIEW holds the job's lines only).
+    None when the view cannot be read."""
     try:
         end = (datetime.fromisoformat(finished_at) + timedelta(minutes=3)).isoformat()
         text = read_view(f'resource.type="cloud_run_revision" AND resource.labels.service_name="gateway" AND '
                          f'jsonPayload.event="{SHADOW_EVENT}" AND timestamp>="{started_at}" AND timestamp<="{end}"',
-                         fmt="json", limit=200)
+                         fmt="json", limit=200, view=SHADOW_LOG_VIEW)
         lines = []
         for entry in json.loads(text or "[]"):
             payload = entry.get("jsonPayload") or {}
