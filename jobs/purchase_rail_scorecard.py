@@ -33,7 +33,8 @@ One group per (rail, merchant_domain, market, buyer), over the purchases CREATED
                   the same predicate). On the token rail, any of: a checkout the worker holds
                   (a2a_rail_worker.held_checkout_codes, state `paying`); an order step it holds
                   (its order-step hold codes); a write a crashed step left pending (`worker_error`
-                  with `pending_write` set), which the worker never clears by itself
+                  with `pending_write` set) or one it parked as unreconcilable
+                  (`pending_write_unreconcilable`): the worker never clears either by itself
   in_flight       not terminal and not held: still moving, so not judged yet
   finished        completed + failed + refused + expired + held
   success_rate    completed / finished, 4 decimals; null when nothing finished. A HELD purchase counts
@@ -99,6 +100,9 @@ TERMINAL_STATES = ("completed", "failed", "refused", "expired")
 #: The only shape of code this job prints. A rail's `last_error_code` can carry a detail after a
 #: colon; a detail that is not such a token is never echoed.
 _CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+#: The code the token rail's worker parks a row with when it holds a write it cannot reconcile
+#: (a2a_rail_worker._reconcile). A test reads it back out of the worker's source.
+_UNRECONCILABLE_WRITE = "pending_write_unreconcilable"
 _MARKET_RE = re.compile(r"^[A-Z]{2}$")
 
 # ── the reads ────────────────────────────────────────────────────────────────────────────────
@@ -232,9 +236,13 @@ def _a2a_held(row: Mapping[str, Any], checkout_hold_codes: Iterable[str], order_
       * a checkout the worker holds: `paying`, and the code is a checkout hold code (the operator's list);
       * an order step it holds: the code is an order-step hold code (the worker parks it unread);
       * a write a crashed step left pending: `worker_error` with `pending_write` set. The worker's house
-        rule is that a human decides it; nothing clears it."""
+        rule is that a human decides it; nothing clears it;
+      * a pending write the worker parked as one it cannot reconcile (`pending_write_unreconcilable`):
+        it is never resent and stays pending until a person acts."""
     last = _last_segment(row)
     if row.get("state") == "paying" and last in checkout_hold_codes:
+        return True
+    if last == _UNRECONCILABLE_WRITE:
         return True
     return last in order_hold_codes or (last == "worker_error" and bool(row.get("write_pending")))
 

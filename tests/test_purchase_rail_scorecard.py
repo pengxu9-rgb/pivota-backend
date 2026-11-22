@@ -11,6 +11,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -26,6 +27,8 @@ import routes.agent_commerce_reap as reap_routes  # noqa: E402
 from services.payment_orchestration import a2a_rail_worker as worker  # noqa: E402
 
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm")
+
+_REPO = Path(__file__).resolve().parents[1]
 
 AGENT = "agent_scorecard"
 TEST_AGENT = "agent_scorecard_rig"
@@ -160,12 +163,19 @@ def test_what_waits_for_a_person_on_the_token_rail_is_held_and_named_by_its_hold
         _row("paying", last_error_code="token:worker_error", write_pending=1),     # a crashed step's write
         _row("paying", last_error_code="token:worker_error"),                      # crashed, nothing pending
         _row("paying", last_error_code="quote_pending", write_pending=1),          # a write in progress
+        _row("needs_payment_method", last_error_code="pending_write_unreconcilable", write_pending=1),  # parked
         _row("failed", last_error_code=HOLD),                                      # ended: not held
     ])
     [group] = report["groups"]
-    assert (group["held"], group["in_flight"], group["failed"], group["finished"]) == (4, 2, 1, 5)
+    assert (group["held"], group["in_flight"], group["failed"], group["finished"]) == (5, 2, 1, 6)
     assert group["ended_by"] == {
-        f"failed:{HOLD}": 1, f"held:{HOLD}": 1, f"held:{ORDER_HOLD}": 2, "held:worker_error": 1}
+        f"failed:{HOLD}": 1, f"held:{HOLD}": 1, f"held:{ORDER_HOLD}": 2, "held:worker_error": 1,
+        "held:pending_write_unreconcilable": 1}
+
+
+def test_the_unreconcilable_code_is_the_one_the_worker_parks_with():
+    source = (_REPO / "services" / "payment_orchestration" / "a2a_rail_worker.py").read_text()
+    assert f's.release(POLL_PARKED, "{scorecard._UNRECONCILABLE_WRITE}")' in source
 
 
 def test_a_hold_code_on_a_token_rail_row_that_is_not_paying_is_not_a_hold():
