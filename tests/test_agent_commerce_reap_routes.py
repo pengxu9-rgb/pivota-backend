@@ -1460,27 +1460,11 @@ async def test_anything_else_on_the_request_state_is_ignored_and_never_fails_the
     assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
 
 
-@pytest.mark.parametrize("loser_was_routed", [True, False])
-async def test_a_request_that_lost_its_key_writes_no_parent_for_the_winners_purchase(
-    client, monkeypatch, loser_was_routed
-):
-    """Two requests, one key, one body. The first opened the purchase; the second misses the replay read,
-    opens its own row, loses the key claim and answers with the first one's purchase. How the SECOND came
-    to this rail says nothing about the FIRST: it must write no parent row for it."""
-    import db.agent_purchase_ledger as agent_purchase_ledger
+async def _lose_the_key_race(client, monkeypatch, same_body, *, loser_was_routed: bool):
+    """Send `same_body` again as a request whose replay read misses once (the race): it opens its own row,
+    loses the key claim and answers with the earlier request's purchase. Returns its response."""
     from services.payment_orchestration import router as rail_router
 
-    await _seed_all()
-    same_body = _body()  # one key, one body, sent twice
-    # The winner: opened while the ledger is off, so its parent is not written yet.
-    monkeypatch.delenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, raising=False)
-    first = await client.post(f"{BASE}/purchases", json=same_body)
-    assert first.status_code == 202, first.text
-    winner = first.json()["purchase_id"]
-    assert await _agent_purchase_parents(winner) == []
-    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
-
-    # The loser: its replay read misses once (the race), so it goes on to the key claim and loses it.
     real_replay, misses = routes_reap._replayed_purchase_id, []
 
     async def _miss_once(**kwargs):
@@ -1496,14 +1480,76 @@ async def test_a_request_that_lost_its_key_writes_no_parent_for_the_winners_purc
             currency="USD", worker_alive=True)
         client._app = _with_request_state(
             client._app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
-    second = await client.post(f"{BASE}/purchases", json=same_body)
-    assert second.status_code == 202, second.text
-    assert second.json()["purchase_id"] == winner and misses == [1]
+    response = await client.post(f"{BASE}/purchases", json=same_body)
+    assert response.status_code == 202 and misses == [1], response.text
+    return response
+
+
+@pytest.mark.parametrize("loser_was_routed", [True, False])
+async def test_a_request_that_lost_its_key_gives_the_winner_a_neutral_parent_when_it_has_none(
+    client, monkeypatch, loser_was_routed
+):
+    """The winner's own parent write FAILED. The loser is then its only second chance (nothing scheduled
+    heals a parent, and no parent means no events), so it writes one: `backfill`, never its own decision."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    same_body = _body()  # one key, one body, sent twice
+    real_ensure, calls = agent_purchase_ledger.ensure_reap_parent, []
+
+    async def _fail_first(rail_purchase_id, **kwargs):
+        calls.append((rail_purchase_id, dict(kwargs)))
+        if len(calls) == 1:
+            raise RuntimeError("agent_purchases unavailable")
+        return await real_ensure(rail_purchase_id, **kwargs)
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _fail_first)
+    first = await client.post(f"{BASE}/purchases", json=same_body)
+    assert first.status_code == 202, first.text
+    winner = first.json()["purchase_id"]
+    assert await _agent_purchase_parents(winner) == []
+
+    second = await _lose_the_key_race(client, monkeypatch, same_body, loser_was_routed=loser_was_routed)
+    assert second.json()["purchase_id"] == winner
     [loser] = await database.fetch_all(
         "SELECT id, state, refusal_reason FROM reap_agentic_purchases WHERE id <> :w", {"w": winner})
     assert (loser["state"], loser["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
-    # By purchase id, not "the table is empty": other files' parents can be in this table.
-    assert await _agent_purchase_parents(winner) == [] and await _agent_purchase_parents(loser["id"]) == []
+    # By purchase id, not "the table has one row": other files' parents can be in this table.
+    [parent] = await _agent_purchase_parents(winner)
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "backfill"}
+    assert await _agent_purchase_parents(loser["id"]) == []
+    # The loser's call carried the neutral plan only: none of its own decision's keys.
+    assert calls[1] == (winner, {"basis": "backfill"})
+
+
+@pytest.mark.parametrize("winner_was_routed", [True, False])
+async def test_a_request_that_lost_its_key_cannot_change_the_parent_the_winner_wrote(
+    client, monkeypatch, winner_was_routed
+):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+    from services.payment_orchestration import router as rail_router
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    same_body = _body()
+    plain_app = client._app
+    if winner_was_routed:
+        choice = rail_router.choose_rail(
+            agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+            currency="USD", worker_alive=True)
+        client._app = _with_request_state(
+            plain_app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    first = await client.post(f"{BASE}/purchases", json=same_body)
+    winner = first.json()["purchase_id"]
+    [written] = await _agent_purchase_parents(winner)
+    assert _plan(written)["basis"] == ("orchestrator_selected_rail" if winner_was_routed else "agent_selected_rail")
+
+    client._app = plain_app
+    second = await _lose_the_key_race(client, monkeypatch, same_body, loser_was_routed=not winner_was_routed)
+    assert second.json()["purchase_id"] == winner
+    [after] = await _agent_purchase_parents(winner)
+    assert (after["id"], _plan(after)) == (written["id"], _plan(written))
 
 
 def test_only_the_decisions_own_keys_are_taken_from_the_request_state():

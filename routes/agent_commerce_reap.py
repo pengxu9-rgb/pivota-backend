@@ -92,6 +92,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -2878,6 +2879,9 @@ _RECORD_PARENT_TIMEOUT_S = 1.0
 
 
 _ROUTING_KEYS = frozenset({"basis", "dropped", "policy", "market"})
+#: The plan for a parent written on behalf of ANOTHER request's purchase (a key-race loser, for the
+#: winner): the same word the heal and the backfill use for "how this purchase was routed is not known".
+_NEUTRAL_ROUTING: Mapping[str, Any] = MappingProxyType({"basis": "backfill"})
 
 
 def _handed_routing(request: Request) -> Dict[str, Any]:
@@ -2904,9 +2908,10 @@ async def _record_purchase_parent(purchase_id: str, routing: Optional[Mapping[st
     agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
     or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
     out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent
-    replay returns before this hook, and a request that lost its key to an earlier one skips it (the
-    caller's `adopted_winner`): this is called only for the purchase the request itself opened. The
-    others get their parent from the winner's own request, the heal or the backfill.
+    replay returns before this hook. A request that lost its key to an earlier one calls it for the
+    WINNER's purchase with `_NEUTRAL_ROUTING` (`basis="backfill"`), never with its own decision: that
+    covers a winner whose own write was cut, and cannot overwrite one that landed. Whatever is still
+    missing is written by the heal on a read, or by the backfill.
 
     `routing` (see `_handed_routing`) IS BEST-EFFORT, LIKE THE ROW. The first parent write wins and is
     never updated, so the router's decision is stored only when THIS write is the first. When the 1 s
@@ -3520,12 +3525,15 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
-        if not adopted_winner:
-            # ONLY FOR THE PURCHASE THIS REQUEST OPENED. A request that lost its key answers with the
-            # winner's purchase, and how THIS request came to this rail says nothing about that one:
-            # the first parent write wins, so writing here could record a purchase an agent opened
-            # itself as router-chosen, or the reverse. The winner's own request writes its parent
-            # (or the heal does).
+        if adopted_winner:
+            # NOT THIS REQUEST'S DECISION. A request that lost its key answers with the winner's
+            # purchase, and how THIS request came to this rail says nothing about that one. But it is
+            # also the winner's only second chance at a parent row when its own write was cut (the 1 s
+            # bound, a fault): nothing scheduled heals a parent, and a purchase with no parent emits no
+            # events. So write a NEUTRAL parent: `backfill` (how it was routed is not known), never the
+            # handed decision. Insert-only: it cannot overwrite the parent the winner wrote.
+            await _record_purchase_parent(purchase_id, _NEUTRAL_ROUTING)
+        else:
             await _record_purchase_parent(purchase_id, _handed_routing(request))
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
