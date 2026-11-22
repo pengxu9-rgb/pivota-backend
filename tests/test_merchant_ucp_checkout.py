@@ -2418,3 +2418,35 @@ async def test_the_isError_plain_text_is_flattened_not_only_capped(monkeypatch):
     detail = str(excinfo.value)
     assert "\n" not in detail, "a newline inside the cap must still be flattened"
     assert "Invalid arguments CRITICAL - card issued" in detail
+
+
+_PLACEHOLDER_DOOR = "https://ucp-door.example"
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "a b", "a!b", "a$b", "a&b", "a'b", "a(b", "a)b", "a*b", "a+b", "a,b", "a=b", "a:b", "a@b",
+        "a|b", "a\\b", 'a"b', "a<b", "a>b", "a^b", "a`b", "a{b", "a}b", "a[b", "a]b",
+        "a%b", "a%4", "a%zzb",
+        # encoded forms of the refused characters, whitespace, overlong UTF-8 and fullwidth `../`
+        "jobs%3b", "a%40b", "a%3ab", "a%2bb", "a%26b", "a%3db", "a%20b", "a%09b", "a%41b", "a%e9",
+        "%c0%ae%c0%ae/admin", "%e0%80%ae%e0%80%ae", "%ef%bc%8e%ef%bc%8e%ef%bc%8fadmin",
+    ],
+)
+def test_validated_endpoint_admits_only_unreserved_and_slash(monkeypatch, segment):
+    """Anything outside unreserved + `/` is refused, sub-delims and every `%XX` included: a target
+    may decode before routing, so an encoded character is as dangerous as the character itself."""
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    assert muc._validated_endpoint(f"{_PLACEHOLDER_DOOR}/ecom/{segment}/mcp") is None, segment
+
+
+def test_validated_endpoint_still_admits_the_real_platform_path_shapes(monkeypatch):
+    monkeypatch.setattr(muc, "resolves_only_public", lambda d: True)
+    for path in (
+        "/api/ucp/mcp",
+        "/ecom/ucp/53b84487-eb3f-4f9d-a68b-583b9677dc65/mcp",
+        "/ecom/ucp/53B84487-EB3F-4F9D-A68B-583B9677DC65/mcp",
+        "/a_b~c.d/mcp",
+    ):
+        assert muc._validated_endpoint(f"{_PLACEHOLDER_DOOR}{path}") == f"{_PLACEHOLDER_DOOR}{path}", path
