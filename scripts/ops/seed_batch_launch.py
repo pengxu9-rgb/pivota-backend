@@ -57,8 +57,19 @@ SECRET_IDS = {"MANIFEST": "seed-batch-manifest", "PLAN": "seed-batch-plan", "APP
 NEEDED = {"plan": {"MANIFEST", "NAMED"}, "apply": {"MANIFEST", "PLAN", "APPROVAL", "NAMED"},
           "rollback": {"MANIFEST", "PLAN", "APPROVAL", "RECEIPTS", "NAMED"}}
 EXECUTION_POLL_SECONDS = 15
+DESCRIBE_TIMEOUT_SECONDS = 60
 READBACK_TIMEOUT_SECONDS = 30       # the disarm read-back (`gcloud run jobs describe`)
-EXECUTION_DEADLINE_SECONDS = 1900      # task timeout 1800 s + cold start; under the run step's timeout
+EXECUTION_DEADLINE_SECONDS = 1900      # task timeout 1800 s + cold start
+# The run step has RUN_STEP_SECONDS (the yaml's `run` timeout). The wait is budgeted FROM THE STEP'S START so the
+# disarm deploy (300) + its read-back always fit before the step's end: a step killed mid-disarm would leave the write
+# flag on the job. The seed launcher never cancels a running batch (it writes), so a wait that runs out leaves the
+# execution non-terminal and the lock HELD, and the step itself still ends cleanly. PRE_WAIT_WORST_SECONDS is the
+# most the step can spend before the wait: the gate (420) + two execution lists (120 each) + the armed deploy (300)
+# + execute (120); even then the wait keeps at least the task's own 1800 s timeout.
+RUN_STEP_SECONDS = 3300
+DISARM_RESERVE_SECONDS = 300 + READBACK_TIMEOUT_SECONDS
+PRE_WAIT_WORST_SECONDS = 420 + 120 + 120 + 300 + 120
+TASK_TIMEOUT_SECONDS = 1800
 LOG_POLL_SECONDS = 20
 LOG_DEADLINE_SECONDS = 300
 TERMINAL = {"EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED"}
@@ -211,7 +222,8 @@ def job_spec_args(*, mode: str, batch_id: str, release: str, digest: str, secret
     return ["gcloud", "run", "jobs", "deploy", job_name(batch_id), "--project", PROJECT, "--region", REGION,
             "--image", f"{REPO}@{digest}", "--service-account", SERVICE_ACCOUNT,
             "--network", "default", "--subnet", "pivota-crawl" if mode == "apply" else "default",
-            "--vpc-egress", "all-traffic", "--tasks", "1", "--max-retries", "0", "--task-timeout", "1800s",
+            "--vpc-egress", "all-traffic", "--tasks", "1", "--max-retries", "0",
+            "--task-timeout", f"{TASK_TIMEOUT_SECONDS}s",
             "--labels", f"build-id={build_id()},batch-mode={mode}",
             # --args=VALUE in ONE token: the value starts with a dash, so `--args -m,...` is read as a second flag
             # (gcloud exits 2, "argument --args: expected one argument"; #2367).
@@ -312,19 +324,28 @@ def release_lock() -> str:
     return f"lock {generation} released"
 
 
-def wait_for_execution(name: str, *, sleep=None, monotonic=None) -> str | None:
+def wait_budget(step_started: float, now: float) -> float:
+    """Seconds the wait may take: at most EXECUTION_DEADLINE_SECONDS, and never past the point where the disarm and
+    its read-back still fit inside the run step."""
+    return max(0.0, min(EXECUTION_DEADLINE_SECONDS, RUN_STEP_SECONDS - DISARM_RESERVE_SECONDS - (now - step_started)))
+
+
+def wait_for_execution(name: str, *, deadline: float = EXECUTION_DEADLINE_SECONDS, sleep=None,
+                       monotonic=None) -> str | None:
+    """Poll BY NAME to a terminal state for at most `deadline` seconds. No poll starts unless its sleep AND its
+    describe still fit before the deadline."""
     sleep, monotonic = sleep or time.sleep, monotonic or time.monotonic
     started = monotonic()
     while True:
         try:
             execution = json.loads(run(["gcloud", "run", "jobs", "executions", "describe", name, "--project", PROJECT,
-                                        "--region", REGION, "--format", "json"], timeout=60))
+                                        "--region", REGION, "--format", "json"], timeout=DESCRIBE_TIMEOUT_SECONDS))
             state = execution_state(execution)
             if state:
                 return state
         except (LaunchRefused, subprocess.TimeoutExpired, ValueError):
             pass  # a client error is not a terminal state: keep polling until the deadline
-        if monotonic() - started > EXECUTION_DEADLINE_SECONDS:
+        if monotonic() - started + EXECUTION_POLL_SECONDS + DESCRIBE_TIMEOUT_SECONDS > deadline:
             return None
         sleep(EXECUTION_POLL_SECONDS)
 
@@ -345,7 +366,9 @@ def find_started_execution(job: str, before: list[str]) -> str | None:
     return new[0] if len(new) == 1 else None
 
 
-def cmd_run(args) -> None:
+def cmd_run(args, *, monotonic=None) -> None:
+    monotonic = monotonic or time.monotonic
+    step_started = monotonic()
     state = {"execution": None, "state": None, "error": None, "execute_attempted": False, "armed": False}
     path = WORK / "run.json"
     path.write_text(json.dumps(state))
@@ -391,7 +414,8 @@ def cmd_run(args) -> None:
             require(state["execution"] is not None,
                     "execute failed and exactly one execution since arming could not be found: lock stays held")
         path.write_text(json.dumps(state))
-        state["state"] = wait_for_execution(state["execution"])
+        state["wait_budget_s"] = round(wait_budget(step_started, monotonic()), 1)
+        state["state"] = wait_for_execution(state["execution"], deadline=state["wait_budget_s"])
         path.write_text(json.dumps(state))
         require(state["state"] is not None, "the execution did not reach a terminal state before the deadline")
     except Exception as error:  # noqa: BLE001 - publish reads run.json whatever happened

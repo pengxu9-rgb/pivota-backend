@@ -639,6 +639,57 @@ def test_step_order_and_failure_policy():
     assert all("timeout" in s for s in steps()) and total < int(yaml.safe_load(CONFIG.read_text())["timeout"].rstrip("s"))
 
 
+def test_the_run_step_fits_the_worst_pre_wait_a_full_task_and_the_disarm():
+    run_step = int(next(s for s in steps() if s["id"] == "run")["timeout"].rstrip("s"))
+    assert run_step == launch.RUN_STEP_SECONDS
+    # Even after the slowest gate, listings, deploy and execute, the wait still covers the task's own timeout plus
+    # one poll, and the disarm + read-back still fit after it.
+    worst_wait = launch.wait_budget(0, launch.PRE_WAIT_WORST_SECONDS)
+    assert worst_wait >= launch.TASK_TIMEOUT_SECONDS + launch.EXECUTION_POLL_SECONDS + launch.DESCRIBE_TIMEOUT_SECONDS
+    assert launch.PRE_WAIT_WORST_SECONDS + worst_wait + launch.DISARM_RESERVE_SECONDS <= run_step
+    assert launch.DISARM_RESERVE_SECONDS >= 300 + launch.READBACK_TIMEOUT_SECONDS
+    assert launch.PRE_WAIT_WORST_SECONDS >= 420 + 120 + 120 + 300 + 120
+    assert f"--task-timeout={launch.TASK_TIMEOUT_SECONDS}s" not in spec("apply")         # two tokens, a plain value
+    assert spec("apply")[spec("apply").index("--task-timeout") + 1] == "1800s"
+
+
+def test_the_wait_budget_counts_from_the_step_start():
+    assert launch.wait_budget(0, 0) == launch.EXECUTION_DEADLINE_SECONDS
+    late = launch.RUN_STEP_SECONDS - launch.DISARM_RESERVE_SECONDS - 100
+    assert launch.wait_budget(0, late) == 100
+    assert launch.wait_budget(0, launch.RUN_STEP_SECONDS) == 0 and launch.wait_budget(50, 50 + late) == 100
+
+
+def test_no_poll_starts_unless_its_sleep_and_describe_fit_before_the_deadline(monkeypatch):
+    calls = []
+    monkeypatch.setattr(launch, "run", lambda args, **kw: calls.append(kw.get("timeout")) or json.dumps({"status": {}}))
+    clock = iter([0, 0, 15, 30, 45])
+    # deadline 89: after the poll at t=0 one more fits (0 + 15 + 60 <= 89); after the poll at t=15 none does (90 > 89)
+    deadline = launch.EXECUTION_POLL_SECONDS * 2 + launch.DESCRIBE_TIMEOUT_SECONDS - 1
+    state = launch.wait_for_execution("x", deadline=deadline, sleep=lambda s: None, monotonic=lambda: next(clock))
+    assert state is None and len(calls) == 2 and set(calls) == {launch.DESCRIBE_TIMEOUT_SECONDS}
+
+
+def test_the_run_waits_only_for_what_is_left_of_the_step(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(states=("EXECUTION_SUCCEEDED",))
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    seen = {}
+    real_wait = launch.wait_for_execution
+
+    def spy(name, *, deadline, **kw):
+        seen["deadline"] = deadline
+        return real_wait(name, deadline=deadline, **kw)
+
+    monkeypatch.setattr(launch, "wait_for_execution", spy)
+    clock = iter([0] + [2500] * 50)          # the step started at 0; the wait begins 2500 s in
+    launch.cmd_run(run_args(), monotonic=lambda: next(clock))
+    state = json.loads((tmp_path / "run.json").read_text())
+    left = launch.RUN_STEP_SECONDS - launch.DISARM_RESERVE_SECONDS - 2500
+    assert seen["deadline"] == state["wait_budget_s"] == left and state["disarmed"] is True
+
+
 def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():
     # Build 99b4e02b (2026-11-20, the test-transaction twin of this config): with --no-source /workspace is root's,
     # and the backend image runs as `USER app`, so release-scripts could not mkdir. A root step (the pinned cloud-sdk
