@@ -123,6 +123,7 @@ _REAP_ROWS_SQL = """
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=chr(58))
        OR (state='quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+       OR (state='awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
                 THEN 1 ELSE 0 END AS held,
            CASE WHEN EXISTS (
                     SELECT 1 FROM reap_agentic_purchases e

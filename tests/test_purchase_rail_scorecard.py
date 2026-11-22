@@ -305,6 +305,8 @@ async def test_held_on_the_hosted_approval_rail_is_its_ledgers_own_count():
                last_error_code="checkout_unresolvable:read")
     parked = await _reap(owner=BOB)
     await _set("reap_agentic_purchases", parked, state="quoting", checkout_dispatch_key="dk_1")
+    legacy = await _reap(owner="9" * 64)  # awaiting approval, no checkout id, not version-1 tracked
+    await _set("reap_agentic_purchases", legacy, state="awaiting_approval", dispatch_tracking_version=0)
     for state, columns in (
         ("processing", dict(reap_checkout_id="chk_2", last_error_code="transport_error:x")),
         ("processing", dict(last_error_code="checkout_unresolvable:read")),  # no checkout id
@@ -315,7 +317,7 @@ async def test_held_on_the_hosted_approval_rail_is_its_ledgers_own_count():
         await _set("reap_agentic_purchases", other, state=state, **columns)
     report = await _report()
     held = sum(g["held"] for g in report["groups"])
-    assert held == await reap_ledger.count_checkout_needs_human() and held >= 2
+    assert held == await reap_ledger.count_checkout_needs_human() == 3
     # ... and the predicate TEXT is the ledger's, on both dialects: a change there fails here.
     squash = lambda sql: re.sub(r"\s+", " ", sql)  # noqa: E731
     for mine, theirs in ((scorecard._REAP_ROWS_SQL, reap_ledger._COUNT_CHECKOUT_NEEDS_HUMAN_SQL),
