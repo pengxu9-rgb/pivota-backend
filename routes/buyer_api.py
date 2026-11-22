@@ -1158,6 +1158,26 @@ async def buyer_list_orders(
     return {"orders": items, "next_cursor": next_cursor, "has_more": bool(next_cursor)}
 
 
+def _checkout_token_may_claim_order(
+    payload: Dict[str, Any], order_id: str, order_row: Optional[Dict[str, Any]]
+) -> bool:
+    """Whether a save under this checkout token may claim `order_id`.
+
+    A loaded order must pass `routes.agent_auth.checkout_token_may_use_order` (the token's agent, and
+    the token's bound order or one created under its intent). An order that could not be loaded
+    passes only when it is the token's own bound order (nothing is written to it then), so a token
+    cannot tell another order id that exists from one that does not.
+    """
+    if order_row is not None:
+        # Imported here: routes.agent_auth pulls in the agent registry, which this module does not
+        # otherwise need at import time.
+        from routes.agent_auth import checkout_token_may_use_order
+
+        return checkout_token_may_use_order(payload, order_row)
+    bound_order_id = str((payload or {}).get("order_id") or "").strip()
+    return bool(bound_order_id) and bound_order_id == str(order_id or "").strip()
+
+
 @router.post("/save_from_checkout")
 async def save_from_checkout(
     request: Request,
@@ -1258,6 +1278,13 @@ async def save_from_checkout(
             order_row = None
     if order_id and not order_row and not checkout_token:
         raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Order not found")
+    if checkout_token and order_id and not _checkout_token_may_claim_order(checkout_payload, order_id, order_row):
+        # The token binds the save to ONE checkout: its agent, and the order it was minted for or
+        # one created under it (the rule the token's order routes use). Without this, any valid
+        # token plus another order id claimed that order, and within one agent re-stamped the
+        # agent_user_ref that v1 order reads and refunds authorize on. Checked before the step-up,
+        # so a save_token is never issued for an order the token may not use.
+        raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Order does not belong to this checkout")
 
     if not agent_id and order_row:
         agent_id = str(order_row.get("agent_id") or "").strip() or None
@@ -1340,10 +1367,22 @@ async def save_from_checkout(
     if not checkout_token:
         if not order_id or not order_row:
             raise _error(status.HTTP_400_BAD_REQUEST, "INVALID_INPUT", "order_id is required without checkout token")
+        # With no token, the order's email is the only proof the order is the buyer's: an order with
+        # no email (or a buyer with none) proves nothing, so it is refused like a mismatch.
         order_email_norm = str(order_row.get("customer_email") or "").strip().lower()
         principal_email_norm = str(getattr(principal, "email_normalized", "") or principal.email or "").strip().lower()
-        if order_email_norm and principal_email_norm and order_email_norm != principal_email_norm:
+        if not order_email_norm or not principal_email_norm or order_email_norm != principal_email_norm:
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Order email does not match logged-in buyer")
+
+    if order_row is not None:
+        # An order already saved to another account stays theirs (the UPDATE below re-checks this,
+        # for a concurrent save).
+        order_buyer_id = str(order_row.get("buyer_id") or "").strip()
+        if order_buyer_id and order_buyer_id != str(principal.user_id or "").strip():
+            raise _error(status.HTTP_409_CONFLICT, "CONFLICT", "Order is already saved to another account")
+    # Only the order loaded and checked here is ever written (the address step below may load one
+    # later; that load is not a check).
+    order_claim_checked = order_row is not None
 
     # If redeeming via save_token, require the nonce cookie and atomically mark as redeemed.
     if raw_save_token:
@@ -1480,31 +1519,18 @@ async def save_from_checkout(
     # Pairwise buyer_ref for this agent.
     pairwise_ref = await _get_or_create_pairwise_buyer_ref(buyer_id=principal.user_id, agent_id=agent_id)
 
-    raw_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
-    legacy_buyer_ref = str(checkout_payload.get("buyer_ref") or "").strip() or None
-    if not raw_agent_user_ref and order_row:
-        raw_agent_user_ref = str(order_row.get("agent_user_ref") or "").strip() or None
-        if not raw_agent_user_ref:
-            meta = order_row.get("metadata")
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = None
-            if isinstance(meta, dict):
-                raw_agent_user_ref = str(meta.get("agent_user_ref") or meta.get("agentUserRef") or "").strip() or None
-
-    # Keep backward compatibility: fall back to legacy buyer_ref when no explicit agent_user_ref.
-    agent_user_ref = raw_agent_user_ref or legacy_buyer_ref
-
     # The identity link maps (agent_id, ref) -> this buyer, and the upsert MOVES an existing link,
     # so only a ref the checkout token marks verified (it came from an X-Agent-User-JWT at mint) may
-    # write it. An unverified token ref, the order's agent_user_ref column and its metadata are all
-    # caller-assertable: with them, a partner could re-point another buyer's link (and so their
-    # vault prefill) to whoever saves. They stay attribution only, on the order update below.
+    # write it. An unverified token ref, the token's legacy buyer_ref, the order's agent_user_ref
+    # column and its metadata are all caller-assertable: with them, a partner could re-point another
+    # buyer's link (and so their vault prefill) to whoever saves.
     link_agent_user_ref: Optional[str] = None
     if checkout_payload.get(_AGENT_USER_REF_VERIFIED_CLAIM) is True:
         link_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
+    # The order's agent_user_ref is what v1 order reads and refunds authorize an agent user JWT on,
+    # so the save stamps it by the same rule: only the verified ref. With none, the order keeps the
+    # ref it has (the UPDATE leaves the column and metadata.agent_user_ref as they are).
+    agent_user_ref = link_agent_user_ref
     identity_linked = False
     if link_agent_user_ref:
         identity_linked = bool(
@@ -1517,15 +1543,17 @@ async def save_from_checkout(
 
     # Update order linkage best-effort (do not fail save on DB schema drift).
     try:
-        if order_id:
+        if order_id and order_claim_checked:
             # Update columns + metadata in one shot (metadata remains the agent-facing compat surface).
+            # Only an order loaded and checked above is written. The WHERE re-checks the owner, so a
+            # concurrent save by another account cannot be overwritten either.
             await database.execute(
                 """
                 UPDATE orders
                 SET
                   buyer_id = :buyer_id,
                   intent_id = :intent_id,
-                  agent_user_ref = CAST(:agent_user_ref AS text),
+                  agent_user_ref = COALESCE(CAST(:agent_user_ref AS text), agent_user_ref),
                   agent_scoped_buyer_ref = CAST(:pairwise_ref AS text),
                   -- `orders.metadata` is json, not jsonb, and `||` is a jsonb
                   -- operator: without the round-trip this whole statement fails
@@ -1540,6 +1568,7 @@ async def save_from_checkout(
                     || CASE WHEN :agent_user_ref IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('agent_user_ref', CAST(:agent_user_ref AS text)) END
                   )::json
                 WHERE order_id = :order_id
+                  AND (buyer_id IS NULL OR buyer_id = '' OR buyer_id = :buyer_id)
                 """,
                 {
                     "buyer_id": principal.user_id,

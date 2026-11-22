@@ -8,8 +8,8 @@ the caller's too, so a partner could name another buyer's ref and the saver's ac
 buyer's link (and with it the identity-linked prefill of their saved email and address).
 
 Now only a token carrying `agent_user_ref_verified: true` (set at mint only when the ref came from a
-verified JWT) writes the link. Everything else the save does is unchanged, including the order's
-agent_user_ref attribution.
+verified JWT) writes the link. The order's agent_user_ref stamp follows the same rule (see
+tests/test_save_from_checkout_claims_only_the_tokens_order.py): an unverified ref leaves it as it is.
 
 Tokens are minted by the real signer and read by the route's real verifier; the link upsert is the
 real `_upsert_buyer_identity_link` against a fake table that keeps its ON CONFLICT semantics.
@@ -179,8 +179,8 @@ def test_only_a_literal_true_marker_counts_as_verified(client, world, marker):
 )
 def test_the_order_ref_is_never_used_for_the_link(client, world, order_fields):
     world.order_row = _order(**order_fields)
-    # Via a checkout token that names no ref...
-    _save(client, _token(), order_id=ORDER)
+    # Via a checkout token that names no ref (bound to this order)...
+    _save(client, _token(order_id=ORDER), order_id=ORDER)
     assert world.links == {}
     # ...and via the legacy order-only path (no checkout token).
     _save(client, None, order_id=ORDER)
@@ -196,7 +196,7 @@ def test_an_unverified_save_does_not_repoint_another_buyers_link(client, world):
 
     _save(client, _token(agent_user_ref=REF))
     world.order_row = _order(agent_user_ref=REF, metadata={"agent_user_ref": REF})
-    _save(client, _token(agent_user_ref=REF), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, order_id=ORDER), order_id=ORDER)
     _save(client, None, order_id=ORDER)
 
     assert world.links == {key: OWNER}
@@ -213,17 +213,17 @@ def test_a_verified_token_ref_links_the_saver(client, world):
 
 def test_a_verified_token_ref_is_the_ref_linked_even_when_the_order_names_another(client, world):
     world.order_row = _order(agent_user_ref="https://issuer.placeholder.example:user_two")
-    _save(client, _token(agent_user_ref=REF, agent_user_ref_verified=True), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, agent_user_ref_verified=True, order_id=ORDER), order_id=ORDER)
     assert world.links == {(AGENT, _ref_hash(REF)): SAVER}
 
 
 # -- the rest of the save is unchanged -------------------------------------------------------------
 
 
-def test_an_unverified_ref_is_still_stamped_on_the_order_as_attribution(client, world):
+def test_an_unverified_ref_saves_the_order_without_stamping_its_ref(client, world):
     world.order_row = _order()
-    _save(client, _token(agent_user_ref=REF), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, order_id=ORDER), order_id=ORDER)
     assert world.links == {}
     assert len(world.order_updates) == 1
-    assert world.order_updates[0]["agent_user_ref"] == REF
+    assert world.order_updates[0]["agent_user_ref"] is None
     assert world.order_updates[0]["buyer_id"] == SAVER
