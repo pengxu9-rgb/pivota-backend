@@ -143,8 +143,8 @@
   - text read from the pack image;
   - the description.
 - **Which fields must be known.** The spec marks each variant field per category:
-  - **required:** net content, pack count, form, and shade wherever the hub lists shade options. Each must be known on both sides for any automatic acceptance;
-  - **conditional:** stated strength, edition, market version. Absent on both sides is agreement. Stated on both sides, they are compared. Stated on one side only is a hold, as today's conflict-token rule treats it.
+  - **required:** net content, and shade wherever the hub lists shade options. Each must be known on both sides for any automatic acceptance;
+  - **conditional:** pack count, form, stated strength, edition, market version. A listing rarely states "single" or "full size", so absent on both sides is agreement. Stated on both sides, they are compared. Stated on one side only is a hold, as today's conflict-token rule treats a refill, mini or set word.
 - **Not stated means unknown.** A field is never inferred from the fact that a listing shows a single option.
 - **Extraction:** the existing deterministic parsers first, then the lexicon. A vision-language model fills what they cannot, as a weak source, in two calls: one extracts, a second checks the first against the inputs. Units are converted in a separate deterministic step.
 - **An identifier is evidence, never a requirement.** It is collected wherever a lane or a feed gives one and attached to the cross-merchant variant. No stage needs one to exist.
@@ -168,7 +168,7 @@
 | Stage | What decides | Automatic acceptance |
 |---|---|---|
 | **A. Exact tiers** (exist) | T0a, T0b, T0c, with every veto and hold of `cmss.v4` unchanged | per tier, after that tier passes the gate (M9) and the owner turns it on |
-| **B. Typed agreement** (ADR-010 Tier 1) | the listing attaches to the hub's family, and every variant field is filled on both sides **from a strong source** and is equal | after the stage passes the gate and the owner turns it on |
+| **B. Typed agreement** (ADR-010 Tier 1) | the listing attaches to the hub's family; every required variant field is known on both sides **from a strong source** and is equal; and no conditional field conflicts or is stated on one side only | after the stage passes the gate and the owner turns it on |
 | **C. Score** (ADR-010 Tier 2) | a small model over field agreement, text and image similarity, price relation, token overlap and cluster agreement | none under this ADR; it orders the queue |
 | **D. Adjudication** (ADR-010 Tier 3) | a matcher and a sceptic, each given both records and both images, answer per field: agree, conflict or unknown, citing what they read. A deterministic verifier checks each citation exists in the input | none under this ADR; it prepares the case for a person |
 | **E. A person** | approves or rejects with the case in front of them | n/a |
@@ -278,7 +278,7 @@ Moving `OFFERS_RESOLVE_GROUP_SEED_SIBLINGS` from shadow to on is a separate owne
 1. **Fix first, and measure.** M11. The gold table, seeded from the labels the owner has already given. Attribute records built offline for stored listings. Exit: a measured baseline for today's tiers on the gold set.
 2. **Stage B for listings with a hub.** Same size first, then shade (question 1). Propose, audit, then the gate. Exit: the gate passes for one vertical in one market.
 3. **Retrieval, score and adjudication in shadow.** Each measured against the gold set before it proposes anything. Exit: retrieval recall and stage precision are known numbers.
-4. **Lane intake.** M8, with store-door search and the platform catalog as sources (ADR-031 phase 4). Exit: the share of asked-for products with a second resolved seller.
+4. **Lane intake.** M8, with store-door search as the source (ADR-031 phase 4). The platform catalog is added once ADR-031's open dependency 1 is answered. Exit: the share of asked-for products with a second resolved seller.
 5. **A second language pair.** Its own gold slice and gate.
 
 ## Risks
