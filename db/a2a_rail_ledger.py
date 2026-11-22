@@ -1002,12 +1002,17 @@ _PARK_FOR_SHIPPING_ADDRESS_SQL = """
            claimed_at = NULL,
            -- The buyer's submit can land while this worker holds the row (it takes no claim): when both parts
            -- are there by now, the wait is over. The code and the deadline are cleared, never re-armed, so the
-           -- expiry sweep can never end a purchase whose contact is complete.
+           -- expiry sweep can never end a purchase whose contact is complete. An address still EXACTLY the
+           -- incomplete one the worker read (incomplete_address) is not there: it counts as absent, as in
+           -- a2a_shipping_address.awaits_contact and the submit below.
            buyer_action_expires_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
                 THEN NULL ELSE COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)) END,
            last_error_code = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
                 THEN NULL ELSE 'shipping_address_required' END,
            next_poll_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
                 THEN clock_timestamp() ELSE CAST(:next_poll_at AS TIMESTAMPTZ) END,
            updated_at = clock_timestamp()
      WHERE id = :id AND claimed_by = :holder AND state = 'opened' AND pending_write IS NULL
@@ -1017,20 +1022,25 @@ _PARK_FOR_SHIPPING_ADDRESS_SQL_SQLITE = (
     _PARK_FOR_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
     .replace("CAST(:expires_at AS TIMESTAMPTZ)", ":expires_at")
     .replace("CAST(:next_poll_at AS TIMESTAMPTZ)", ":next_poll_at")
+    .replace("CAST(:incomplete_address AS JSONB)", ":incomplete_address")
 )
 
 
 async def park_for_shipping_address_as_holder(
-    purchase_id: str, worker_id: str, *, expires_at: Any, next_poll_at: Any
+    purchase_id: str, worker_id: str, *, expires_at: Any, next_poll_at: Any,
+    incomplete_address: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Park an `opened` row the worker holds until the buyer's contact arrives: the claim given back, the
     deadline set once (never moved later), the park code written. When the contact landed meanwhile, the
-    row is due at once. None when the row is not held, not `opened`, or has a pending write."""
+    row is due at once. `incomplete_address`: the stored address the worker read when it lacks a required
+    field (a2a_shipping_address.incomplete_address); while the row still holds exactly that, its address is
+    not there. None when the row is not held, not `opened`, or has a pending write."""
     values = {
         "id": _require(_ID_RE, purchase_id, "purchase_id"),
         "holder": _require(_WORKER_RE, worker_id, "worker_id"),
         "expires_at": _bind_dt(expires_at),
         "next_poll_at": _bind_dt(next_poll_at),
+        "incomplete_address": _address_text(incomplete_address),
     }
     if values["expires_at"] is None or values["next_poll_at"] is None:
         raise ValueError("expires_at and next_poll_at are required")
@@ -1042,10 +1052,15 @@ async def park_for_shipping_address_as_holder(
 # THE COMPARE-AND-SWAP. Only while the row waits (`opened`, a part of the contact empty, the deadline not
 # passed, the contact never purged, no write pending), and only into an EMPTY part: a stored email (compared
 # case-insensitively) or address that differs is never overwritten. Owner-scoped like every agent read.
+# "Empty" is THE waiting rule's (a2a_shipping_address.awaits_contact): an address that lacks a required field
+# counts as absent. The caller passes the incomplete address it read (:replaces_address), and only a row that
+# still holds exactly that one may have it replaced (a compare-and-swap on the value, so a concurrent write
+# of a complete address is never overwritten).
 _SUBMIT_SHIPPING_ADDRESS_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = COALESCE(buyer_email, CAST(:buyer_email AS TEXT)),
-           shipping_address = COALESCE(shipping_address, CAST(:shipping_address AS JSONB)),
+           shipping_address = CASE WHEN shipping_address IS NULL OR shipping_address = CAST(:replaces_address AS JSONB)
+                THEN COALESCE(CAST(:shipping_address AS JSONB), shipping_address) ELSE shipping_address END,
            last_error_code = CASE WHEN last_error_code = 'shipping_address_required'
                 THEN NULL ELSE last_error_code END,
            buyer_action_expires_at = CASE WHEN buyer_action_kind IS NULL
@@ -1054,29 +1069,45 @@ _SUBMIT_SHIPPING_ADDRESS_SQL = """
            updated_at = clock_timestamp()
      WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
        AND state = 'opened' AND pending_write IS NULL AND contact_purged_at IS NULL
-       AND (buyer_email IS NULL OR shipping_address IS NULL)
+       AND (buyer_email IS NULL OR shipping_address IS NULL OR shipping_address = CAST(:replaces_address AS JSONB))
        AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
        AND (buyer_email IS NOT NULL OR CAST(:email_sent AS TEXT) IS NOT NULL)
-       AND (shipping_address IS NOT NULL OR CAST(:address_sent AS TEXT) IS NOT NULL)
+       AND ((shipping_address IS NOT NULL AND CAST(:replaces_sent AS TEXT) IS NULL)
+            OR CAST(:address_sent AS TEXT) IS NOT NULL)
        AND (CAST(:email_sent AS TEXT) IS NULL OR buyer_email IS NULL
             OR lower(buyer_email) = lower(CAST(:buyer_email AS TEXT)))
        AND (CAST(:address_sent AS TEXT) IS NULL OR shipping_address IS NULL
-            OR shipping_address = CAST(:shipping_address AS JSONB))
+            OR shipping_address = CAST(:shipping_address AS JSONB)
+            OR shipping_address = CAST(:replaces_address AS JSONB))
     RETURNING *
 """
 _SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE = (
     _SUBMIT_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
     .replace("CAST(:shipping_address AS JSONB)", ":shipping_address")
+    .replace("CAST(:replaces_address AS JSONB)", ":replaces_address")
 )
+
+
+def _address_text(address: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """An address as the door stores it (create_purchase): one canonical text, so equal addresses compare
+    equal on both dialects. None for none."""
+    if address is None:
+        return None
+    if not isinstance(address, Mapping):
+        raise ValueError("an address must be an object")
+    return json.dumps(dict(address), sort_keys=True) if address else None
 
 
 async def submit_shipping_address(
     purchase_id: str, agent_id: str, agent_user_ref_hash: str, *,
     buyer_email: Optional[str], shipping_address: Optional[Mapping[str, Any]],
+    replaces_address: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fill the waiting row's empty email and/or address (the compare-and-swap above) and make it due now.
-    None when the row is not this owner's, does not wait, or a part sent differs from the stored one: the
-    caller re-reads to tell an identical resubmission (idempotent) from a conflict."""
+    `replaces_address`: the stored address the caller read when it lacks a required field
+    (a2a_shipping_address.incomplete_address); it counts as empty, and is replaced only while the row still
+    holds exactly it. None when the row is not this owner's, does not wait, or a part sent differs from the
+    stored one: the caller re-reads to tell an identical resubmission (idempotent) from a conflict."""
     if not _ID_RE.match(str(purchase_id or "")):
         return None
     if buyer_email is None and not shipping_address:
@@ -1094,6 +1125,8 @@ async def submit_shipping_address(
     # Whether each part was sent, as its own TEXT parameter: one placeholder is never cast two ways.
     values["email_sent"] = "1" if values["buyer_email"] is not None else None
     values["address_sent"] = "1" if values["shipping_address"] is not None else None
+    values["replaces_address"] = _address_text(replaces_address)
+    values["replaces_sent"] = "1" if values["replaces_address"] is not None else None
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL, values))
     return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE, values))

@@ -230,6 +230,7 @@ SHIPPING_ADDRESS_SECONDS = 1800
 POLL_SHIPPING_ADDRESS = 60
 SHIPPING_ADDRESS_REQUIRED = a2a_shipping_address.SHIPPING_ADDRESS_REQUIRED
 SHIPPING_ADDRESS_EXPIRED = a2a_shipping_address.SHIPPING_ADDRESS_EXPIRED
+SHIPPING_ADDRESS_NOT_COLLECTED = a2a_shipping_address.SHIPPING_ADDRESS_NOT_COLLECTED
 
 ADD_METHOD = ("payment.method-add", "submit")
 BOUND = ("payment.method-add-required-card", "bound")
@@ -495,11 +496,22 @@ async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -
 def _awaits_contact(row: Mapping[str, Any]) -> bool:
     """A purchase whose email or shipping address is incomplete while capture is on: nothing may be sent for it
     (the card binding needs the email, the checkout the address). Capture is THE predicate the door and the
-    view read too (a2a_shipping_address.capture_enabled: the read dial, the checkout step and the token step),
-    so the worker waits exactly when the door let the purchase open without its contact. With capture off the
-    purchase goes on exactly as before (an email-less row is refused below)."""
-    return a2a_shipping_address.capture_enabled() and bool(
-        a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address")))
+    view read too (a2a_shipping_address.capture_enabled), so the worker waits exactly when the door let the
+    purchase open without its contact. The deadline is `_await_contact`'s."""
+    return a2a_shipping_address.contact_missing(row) and a2a_shipping_address.capture_enabled()
+
+
+def _contact_never_coming(row: Mapping[str, Any]) -> bool:
+    """A purchase with its email or its shipping address ABSENT while capture is OFF. Only the door with capture
+    ON opens such a row (with capture off it requires both parts, routes/agent_commerce_purchases.py), so this
+    is a purchase that opened to wait for its contact and a dial was turned off since (parked or not yet seen):
+    the gateway's write, the only writer of a contact, now refuses (`shipping_address_not_collected`), so the
+    contact can never arrive. ABSENT, not the per-field rule: a row the capture-off door took whole (an address
+    without a region, say) goes on exactly as before. (A purged row lacks both parts too, and nothing can go
+    on for it either: it ends here as well, with no rail call.)"""
+    if a2a_shipping_address.capture_enabled():
+        return False
+    return not row.get("buyer_email") or row.get("shipping_address") in (None, "", {})
 
 
 async def _await_contact(s: _Step) -> str:
@@ -512,13 +524,19 @@ async def _await_contact(s: _Step) -> str:
             s.id, s.worker, from_states=["opened"], to_state="expired", last_error_code=SHIPPING_ADDRESS_EXPIRED)
         return await _settled(s, moved, "expired")
     parked = await ledger.park_for_shipping_address_as_holder(
-        s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS))
+        s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS),
+        incomplete_address=a2a_shipping_address.incomplete_address(s.row.get("shipping_address")))
     return SHIPPING_ADDRESS_REQUIRED if parked is not None else "lost"
 
 
 async def _opened(s: _Step) -> str:
     if _awaits_contact(s.row):
         return await _await_contact(s)
+    if _contact_never_coming(s.row):
+        # Ended here, before any rail call: never carried into a card read or a binding.
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["opened"], to_state="expired", last_error_code=SHIPPING_ADDRESS_NOT_COLLECTED)
+        return await _settled(s, moved, "expired")
     methods, read = await s.methods()
     if methods is None:
         return await _read_failed(s, read, "cards_read")
