@@ -3,6 +3,7 @@ the lock is released only once the execution is known to be over."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -194,6 +195,40 @@ def test_disarmed_spec_has_no_gate_write_flag_plan_approval_or_receipts(mode):
                 "REVIEWED_SEED_BATCH_APPROVAL_PATH", "REVIEWED_SEED_BATCH_RECEIPTS_PATH"} & env.keys()
     mounts = args[args.index("--set-secrets") + 1]
     assert "seed-batch-plan" not in mounts and "seed-batch-approval" not in mounts and "seed-batch-receipts" not in mounts
+
+
+class _GcloudArgs(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+@pytest.mark.parametrize("armed", [True, False], ids=["armed", "disarmed"])
+@pytest.mark.parametrize("mode", launch.MODES)
+def test_every_deploy_spec_parses_as_gcloud_reads_it(mode, armed):
+    """gcloud reads its flags with stdlib argparse: `--args -m,...` (two tokens) exits 2, "argument --args: expected
+    one argument" (prod test-transaction build 798b8dd8 died on it); the value rides in ONE `--args=` token."""
+    parser = _GcloudArgs(add_help=False, allow_abbrev=False)
+    parser.add_argument("job")
+    for name in ("--project", "--region", "--image", "--service-account", "--network", "--subnet", "--vpc-egress",
+                 "--tasks", "--max-retries", "--task-timeout", "--labels", "--command", "--args", "--set-secrets",
+                 "--set-env-vars"):
+        parser.add_argument(name)
+    args = spec(mode, armed=armed)
+    assert args[:4] == ["gcloud", "run", "jobs", "deploy"]
+    parsed = parser.parse_args(args[4:])
+    assert parsed.job == "reviewed-seed-batch-batch-one" and parsed.command == "python"
+    assert parsed.args == f"-m,scripts.ops.reviewed_seed_batch,{mode}"
+    with pytest.raises(ValueError, match="argument --args: expected one argument"):
+        parser.parse_args(["j", "--args", parsed.args])
+
+
+def test_stderr_excerpt_keeps_the_error_line_and_the_tail():
+    assert launch.stderr_excerpt("  short failure \n") == "short failure"
+    noise = "WARNING: something first\n" + "usage line\n" * 100
+    text = launch.stderr_excerpt(noise + "ERROR: (gcloud.x) the reason\n" + "more usage\n" * 100 + "the end")
+    assert text.startswith("ERROR: (gcloud.x) the reason ... ") and text.endswith("the end")
+    no_error = launch.stderr_excerpt("x" * 300 + "y" * 600)
+    assert no_error == "x" * 300 + "y" * 100 + " ... " + "y" * 200
 
 
 def test_spec_refusals():

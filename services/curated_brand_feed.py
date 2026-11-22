@@ -2499,6 +2499,17 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         "brows": "beauty/makeup/eye/brow",
         "lip care": "beauty/makeup/lip/balm",
     },
+    # Read 2026-11-21, every product on two shelves of the brand's own US store (73 in the crawl). Neither
+    # type names a pattern family, so every product on them was left unresolved -- the whole shelf:
+    #   "Creme Shadow" (2): one cream eyeshadow in two listings.
+    #   "Brow Gel" (1): a brow pomade.
+    # LEFT OUT: "Lash Curler" / "Lash Curler Refill Pads" (no leaf: tools/* are brushes and sponges),
+    # "Curated Palette" / "Palette" (eye and face palettes, more than one class), and the blank, "Sale"
+    # and "Skin Care" shelves, which the head-noun rule below reads product by product.
+    "surrattbeauty.com": {
+        "creme shadow": "beauty/makeup/eye/eyeshadow",
+        "brow gel": "beauty/makeup/eye/brow",
+    },
 }
 
 
@@ -2593,6 +2604,10 @@ _MEASURED_TITLE_HOST_TYPES = {
     # eyeliners, liquid eyeshadows, a primer, a mascara and bundles; the "Hidden" free minis are not
     # on the list.
     "stilacosmetics.com": frozenset({"", "sale", "new", "eye products"}),
+    # Read 2026-11-21, every product on these three shelves (9). Blank: three loyalty "(Reward)"
+    # redemptions, which the giveaway veto below refuses. "Sale" (4): an eyeshadow and three lip products
+    # (lip heads are the lip door's). "Skin Care" (2): a cleansing oil and a facial mist.
+    "surrattbeauty.com": frozenset({"", "sale", "skin care"}),
 }
 # Distinct from every other writer's value (see CATEGORY_CONFIDENCE_LIP_TITLE).
 CATEGORY_CONFIDENCE_MEASURED_HOST_TITLE = 0.81
@@ -2623,7 +2638,7 @@ _HEAD_AREAS = (
 _TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
     r"\b(?:free|gwp|brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|mirrors?|removers?|"
     r"wipes?|organi[sz]ers?|bags?|totes?|clips?|tees?|t-?shirts?|shirts?|hoodies?|crewnecks?|sweatshirts?|"
-    r"hats?|caps?|refills?|wands?)\b", re.I)
+    r"hats?|caps?|refills?|wands?|rewards?)\b", re.I)
 # A measured host's own head noun that no CATEGORY_PATTERNS entry reads. Read 2026-10-10: tower28's
 # only "spray" is the SOS Daily Rescue Facial Spray (singles, a travel size, a refill and a duo, all
 # with a blank type). A facial mist is a toner here: the Toner pattern already claims "mist", and the
