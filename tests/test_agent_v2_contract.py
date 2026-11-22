@@ -672,7 +672,7 @@ async def test_agent_v2_order_and_tracking_include_pricing_breakdown(
             "fulfillment_status": "shipped",
         }
 
-    async def fake_track_order(**_: Any) -> Dict[str, Any]:
+    def fake_track_order(order_id: str, order: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "tracking": {
                 "status": "shipped",
@@ -683,7 +683,7 @@ async def test_agent_v2_order_and_tracking_include_pricing_breakdown(
 
     app.dependency_overrides[get_agent_context] = _override_get_agent_context
     monkeypatch.setattr(agent_v2, "get_order", fake_get_order)
-    monkeypatch.setattr(agent_v2, "agent_v1_track_order", fake_track_order)
+    monkeypatch.setattr(agent_v2, "fulfillment_tracking_answer", fake_track_order)
 
     transport = httpx.ASGITransport(app=app)
     try:

@@ -23,6 +23,75 @@ def _owned_by_caller(order: Dict[str, Any], context: AgentContext) -> bool:
     return bool(owner) and bool(caller) and owner == caller
 
 
+def fulfillment_tracking_answer(order_id: str, order: Dict[str, Any]) -> Dict[str, Any]:
+    """The tracking answer for an order the CALLER IS ALREADY AUTHORIZED FOR. No owner or merchant check here: each
+    route asks its own rule first (track_order_fulfillment below: the order's own agent; GET /agent/v2/orders/{id}/
+    tracking: routes.agent_forwarded_owner.order_access_allowed, as GET /agent/v2/orders/{id}). No log, no write."""
+    # Build fulfillment response
+    fulfillment_status = order.get("fulfillment_status", "pending")
+    
+    # Determine delivery status
+    delivery_status = "not_shipped"
+    if fulfillment_status == "shipped":
+        delivery_status = "in_transit"
+    elif fulfillment_status == "delivered":
+        delivery_status = "delivered"
+    elif fulfillment_status == "failed":
+        delivery_status = "failed"
+    
+    tracking_info = {
+        "order_id": order_id,
+        "fulfillment_status": fulfillment_status,
+        "delivery_status": delivery_status,
+        "tracking_number": order.get("tracking_number"),
+        "carrier": order.get("carrier"),
+        "shipped_at": order.get("shipped_at").isoformat() if order.get("shipped_at") else None,
+        "estimated_delivery": None,  # TODO: Calculate based on carrier and location
+        "timeline": [
+            {
+                "status": "ordered",
+                "timestamp": order["created_at"].isoformat(),
+                "completed": True
+            },
+            {
+                "status": "paid",
+                "timestamp": order.get("paid_at").isoformat() if order.get("paid_at") else None,
+                "completed": order.get("payment_status") == "paid"
+            },
+            {
+                "status": "shipped",
+                "timestamp": order.get("shipped_at").isoformat() if order.get("shipped_at") else None,
+                "completed": fulfillment_status in ["shipped", "delivered"]
+            },
+            {
+                "status": "delivered",
+                "timestamp": None,  # TODO: Track delivery confirmation
+                "completed": fulfillment_status == "delivered"
+            }
+        ]
+    }
+    
+    # Add tracking URL if available
+    if tracking_info["tracking_number"] and tracking_info["carrier"]:
+        carrier = tracking_info["carrier"].lower()
+        tracking_number = tracking_info["tracking_number"]
+        
+        # Generate carrier tracking URLs
+        tracking_urls = {
+            "ups": f"https://www.ups.com/track?tracknum={tracking_number}",
+            "fedex": f"https://www.fedex.com/fedextrack/?trknbr={tracking_number}",
+            "usps": f"https://tools.usps.com/go/TrackConfirmAction?tLabels={tracking_number}",
+            "dhl": f"https://www.dhl.com/en/express/tracking.html?AWB={tracking_number}"
+        }
+        
+        tracking_info["tracking_url"] = tracking_urls.get(carrier)
+    
+    return {
+        "status": "success",
+        "tracking": tracking_info
+    }
+
+
 @router.get("/track/{order_id}")
 async def track_order_fulfillment(
     order_id: str,
@@ -64,69 +133,7 @@ async def track_order_fulfillment(
             order_id=order_id
         )
         
-        # Build fulfillment response
-        fulfillment_status = order.get("fulfillment_status", "pending")
-        
-        # Determine delivery status
-        delivery_status = "not_shipped"
-        if fulfillment_status == "shipped":
-            delivery_status = "in_transit"
-        elif fulfillment_status == "delivered":
-            delivery_status = "delivered"
-        elif fulfillment_status == "failed":
-            delivery_status = "failed"
-        
-        tracking_info = {
-            "order_id": order_id,
-            "fulfillment_status": fulfillment_status,
-            "delivery_status": delivery_status,
-            "tracking_number": order.get("tracking_number"),
-            "carrier": order.get("carrier"),
-            "shipped_at": order.get("shipped_at").isoformat() if order.get("shipped_at") else None,
-            "estimated_delivery": None,  # TODO: Calculate based on carrier and location
-            "timeline": [
-                {
-                    "status": "ordered",
-                    "timestamp": order["created_at"].isoformat(),
-                    "completed": True
-                },
-                {
-                    "status": "paid",
-                    "timestamp": order.get("paid_at").isoformat() if order.get("paid_at") else None,
-                    "completed": order.get("payment_status") == "paid"
-                },
-                {
-                    "status": "shipped",
-                    "timestamp": order.get("shipped_at").isoformat() if order.get("shipped_at") else None,
-                    "completed": fulfillment_status in ["shipped", "delivered"]
-                },
-                {
-                    "status": "delivered",
-                    "timestamp": None,  # TODO: Track delivery confirmation
-                    "completed": fulfillment_status == "delivered"
-                }
-            ]
-        }
-        
-        # Add tracking URL if available
-        if tracking_info["tracking_number"] and tracking_info["carrier"]:
-            carrier = tracking_info["carrier"].lower()
-            tracking_number = tracking_info["tracking_number"]
-            
-            # Generate carrier tracking URLs
-            tracking_urls = {
-                "ups": f"https://www.ups.com/track?tracknum={tracking_number}",
-                "fedex": f"https://www.fedex.com/fedextrack/?trknbr={tracking_number}",
-                "usps": f"https://tools.usps.com/go/TrackConfirmAction?tLabels={tracking_number}",
-                "dhl": f"https://www.dhl.com/en/express/tracking.html?AWB={tracking_number}"
-            }
-            
-            tracking_info["tracking_url"] = tracking_urls.get(carrier)
-        
-        return {
-            "status": "success",
-            "tracking": tracking_info
-        }
+        return fulfillment_tracking_answer(order_id, order)
         
     except HTTPException:
         raise

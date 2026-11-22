@@ -467,8 +467,7 @@ def test_every_route_refuses_a_token_for_every_other_money_op(world, label, meth
     assert set(forwarded.FORWARDED_OWNER_OUTCOMES) == {"rejected_op"}
 
 
-@pytest.mark.parametrize("label,method,path,route_ops,body,rid",
-                         [r for r in ROUTES if r[0] != "tracking"], ids=[r[0] for r in ROUTES if r[0] != "tracking"])
+@pytest.mark.parametrize("label,method,path,route_ops,body,rid", ROUTES, ids=[r[0] for r in ROUTES])
 def test_every_route_adopts_its_own_op(world, label, method, path, route_ops, body, rid):
     if rid == "ORD_1":
         _partner_a_order(world)
@@ -576,6 +575,121 @@ def test_after_sales_is_requested_as_the_partner(world):
     res = as_partner(world, PARTNER_B, "request_after_sales", "POST", path, body, rid=order_id)
     assert res.status_code == 403
     assert world["refunds"] == [{"order_id": order_id, "agent_id": PARTNER_A}]
+
+
+def test_tracking_reaches_the_order_exactly_as_the_order_read_does(world):
+    """Review 11-11 P2-A / audit 11-22 F5: the gateway's kernel get_order reads /tracking FIRST, unsigned, on its own
+    key. A strict owner check there answered 403 on every partner-owned order, which the gateway turns into "that
+    quote is no longer available" (and a second checkout). /tracking now asks the same rule as GET /orders/{id}."""
+    order_id = _partner_a_order(world)
+    path = f"{ORDERS}/{order_id}/tracking"
+    track_as = lambda sub, key=GATEWAY_KEY: as_partner(world, sub, "get_order_status", "GET", path, rid=order_id, key=key)  # noqa: E731
+
+    res = track_as(PARTNER_A)
+    assert res.status_code == 200, res.text
+    assert res.json()["tracking"]["order_id"] == order_id and res.json()["tracking"]["total"] == "10.00"
+    assert track_as(PARTNER_B).status_code == 403
+    assert send(world, "GET", path, PARTNER_A_KEY).status_code == 200, "the partner's own key reads its MCP order"
+    assert send(world, "GET", path, PARTNER_B_KEY).status_code == 403, "another agent: refused as today"
+    assert track_as(PARTNER_A, key=PARTNER_B_KEY).status_code == 403
+    before = forwarded.FORWARDED_OWNER_OUTCOMES.get("via_access", 0)
+    res = send(world, "GET", path, GATEWAY_KEY)
+    assert res.status_code == 200, "the vouching gateway's unsigned kernel read reaches the partner-owned order"
+    assert forwarded.FORWARDED_OWNER_OUTCOMES["via_access"] == before + 1
+    del world["orders"][order_id]
+    assert send(world, "GET", path, GATEWAY_KEY).status_code == 404, "a deleted order is not found"
+    assert track_as(PARTNER_A).status_code == 404
+
+
+def test_tracking_with_the_flag_off_or_on_a_partners_own_order_is_owner_only(world, monkeypatch):
+    own = send(world, "POST", ORDERS, PARTNER_A_KEY, ORDER_BODY)
+    assert own.status_code == 200
+    own_id = world["created"][-1]["order_id"]
+    assert send(world, "GET", f"{ORDERS}/{own_id}/tracking", GATEWAY_KEY).status_code == 403, \
+        "no via access to an order a partner made over its own key"
+    mcp_id = _partner_a_order(world)
+    monkeypatch.delenv(FLAG)
+    assert send(world, "GET", f"{ORDERS}/{mcp_id}/tracking", GATEWAY_KEY).status_code == 403, "flag off: owner only"
+    world["orders"]["ORD_NOBODY"] = {**world["orders"][mcp_id], "order_id": "ORD_NOBODY", "agent_id": ""}
+    monkeypatch.setenv(FLAG, "1")
+    assert send(world, "GET", f"{ORDERS}/ORD_NOBODY/tracking", GATEWAY_KEY).status_code == 403, "no owner = nobody's"
+
+
+def test_tracking_still_needs_the_callers_merchant_scope(world):
+    order_id = _partner_a_order(world)
+    world["orders"][order_id]["merchant_id"] = "m_not_in_scope"          # partner A's keys cover m_shop_a only
+    res = send(world, "GET", f"{ORDERS}/{order_id}/tracking", PARTNER_A_KEY)
+    assert res.status_code == 403, "the owner outside its merchant scope is refused, as the fulfillment route did"
+
+
+@pytest.mark.asyncio
+async def test_an_order_with_no_owner_is_nobodys_even_for_a_caller_with_no_agent_id(world, monkeypatch):
+    # order_access_allowed compares two strings, so "" would match "". No real caller has an empty agent id; the
+    # routes refuse an ownerless order outright rather than rely on that.
+    import services.checkout_cancel_upstream as cancel_module
+    from types import SimpleNamespace
+
+    world["orders"]["ORD_NOBODY"] = {**ORDER_ROW_FOR_DIRECT_CALLS, "order_id": "ORD_NOBODY", "agent_id": ""}
+    nobody = SimpleNamespace(agent_id="", can_access_merchant=lambda merchant_id: True)
+    with pytest.raises(agent_v2.HTTPException) as refused:
+        await agent_v2.track_order_v2("ORD_NOBODY", context=nobody)
+    assert refused.value.status_code == 403
+    monkeypatch.setenv(cancel_module.CHECKOUT_CANCEL_UPSTREAM_FLAG, "1")
+    with pytest.raises(agent_v2.HTTPException) as refused:
+        await agent_v2.cancel_order_v2("ORD_NOBODY", _enabled=None, context=nobody)
+    assert refused.value.status_code == 404
+
+
+ORDER_ROW_FOR_DIRECT_CALLS = {
+    "merchant_id": "m_shop_a", "total": "10.00", "subtotal": "10.00", "currency": "USD", "status": "pending",
+    "payment_status": "awaiting_payment", "metadata": {}, "created_at": datetime.now(timezone.utc),
+}
+
+
+@pytest.fixture()
+def cancels(world, monkeypatch):
+    """The cancel route on (CHECKOUT_CANCEL_UPSTREAM_ENABLED), its PSP side stubbed: records who cancelled what."""
+    import services.checkout_cancel_upstream as cancel_module
+
+    made: List[Dict[str, Any]] = []
+
+    async def cancel_order_upstream(order, *, agent_id):
+        made.append({"order_id": order["order_id"], "agent_id": agent_id})
+        return {"outcome": cancel_module.OUTCOME_CANCELED, "order": {**order, "status": "cancelled",
+                                                                       "payment_status": "cancelled"}}
+
+    monkeypatch.setenv(cancel_module.CHECKOUT_CANCEL_UPSTREAM_FLAG, "1")
+    monkeypatch.setattr(cancel_module, "cancel_order_upstream", cancel_order_upstream)
+    return made
+
+
+def test_cancel_reaches_a_partners_order_as_the_partner_or_the_vouching_gateway(world, cancels):
+    order_id = _partner_a_order(world)
+    path = f"{ORDERS}/{order_id}/cancel"
+    res = as_partner(world, PARTNER_A, "cancel_order", "POST", path, rid=order_id)
+    assert res.status_code == 200 and res.json()["cancel"]["canceled"] is True, res.text
+    assert cancels == [{"order_id": order_id, "agent_id": PARTNER_A}], "adopted: the partner is the caller"
+    assert as_partner(world, PARTNER_B, "cancel_order", "POST", path, rid=order_id).status_code == 404
+    assert send(world, "POST", path, PARTNER_B_KEY).status_code == 404, "another agent: not found, as today"
+    res = send(world, "POST", path, GATEWAY_KEY)
+    assert res.status_code == 200, "the vouching gateway, unsigned, cancels the partner-owned order it created"
+    assert cancels[-1] == {"order_id": order_id, "agent_id": GATEWAY_AGENT}
+    assert len(cancels) == 2
+    del world["orders"][order_id]
+    assert send(world, "POST", path, GATEWAY_KEY).status_code == 404 and len(cancels) == 2
+
+
+def test_cancel_refuses_a_token_signed_for_another_op_and_is_owner_only_with_the_flag_off(world, cancels, monkeypatch):
+    order_id = _partner_a_order(world)
+    path = f"{ORDERS}/{order_id}/cancel"
+    for op in ("create_payment_link", "request_after_sales", "get_order_status"):
+        res = as_partner(world, PARTNER_A, op, "POST", path, rid=order_id)
+        assert rejected(res, "op"), (op, res.status_code, res.text)
+    assert cancels == []
+    monkeypatch.delenv(FLAG)
+    assert send(world, "POST", path, GATEWAY_KEY).status_code == 404, "flag off: owner only"
+    assert send(world, "POST", path, PARTNER_A_KEY).status_code == 200, "the owner itself, as before"
+    assert cancels == [{"order_id": order_id, "agent_id": PARTNER_A}]
 
 
 def test_a_service_no_longer_allowed_to_vouch_loses_the_via_access(world, monkeypatch):
