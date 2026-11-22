@@ -1265,6 +1265,12 @@ async def save_from_checkout(
                 raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Missing checkout token")
         if not order_id:
             raise _error(status.HTTP_401_UNAUTHORIZED, "UNAUTHENTICATED", "Missing checkout token")
+        # With no token nothing binds the save to a checkout, so an intent id from the body, or
+        # from a save_token challenge built from a body, is the caller's claim: with one, a buyer
+        # saving their own order named another checkout of the same agent, whose prefill address
+        # then went into their vault and whose intent was linked to them. Only the order's own
+        # intent is used (below); an order with none links no intent.
+        intent_id = None
 
     order_row: Optional[Dict[str, Any]] = None
     if order_id:
@@ -1303,8 +1309,9 @@ async def save_from_checkout(
 
     if not intent_id:
         intent_id = str((order_row or {}).get("intent_id") or "").strip() or None
-    if not intent_id and order_id:
-        intent_id = f"order:{order_id}"
+    # buyer_save_challenges.intent_id is NOT NULL; this stand-in names the challenge only and is
+    # never read back as an intent (a token-less redemption ignores the challenge's intent).
+    challenge_intent_id = intent_id or (f"order:{order_id}" if order_id else None)
 
     # Step-up: require buyer session. If missing, return a save_token + login_url for the UI to use.
     principal: Optional[AccountsPrincipal] = None
@@ -1332,7 +1339,7 @@ async def save_from_checkout(
                 await database.execute(
                     buyer_save_challenges.insert().values(
                         save_token_hash=save_token_hash,
-                        intent_id=intent_id,
+                        intent_id=challenge_intent_id,
                         order_id=order_id,
                         checkout_token_hash=(_sha256_hex(checkout_token) if checkout_token else None),
                         client_nonce_hash=_sha256_hex(nonce),
@@ -1375,10 +1382,11 @@ async def save_from_checkout(
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Order email does not match logged-in buyer")
 
     if order_row is not None:
-        # An order already saved to another account stays theirs (the UPDATE below re-checks this,
-        # for a concurrent save).
-        order_buyer_id = str(order_row.get("buyer_id") or "").strip()
-        if order_buyer_id and order_buyer_id != str(principal.user_id or "").strip():
+        # An order already saved to another account stays theirs. Unowned means exactly what the
+        # UPDATE's WHERE allows: buyer_id NULL or '' (a whitespace-only id counts as owned, not
+        # stripped), or exactly this buyer's id. The UPDATE re-checks it, for a concurrent save.
+        order_buyer_id = order_row.get("buyer_id")
+        if order_buyer_id is not None and str(order_buyer_id) != "" and str(order_buyer_id) != str(principal.user_id):
             raise _error(status.HTTP_409_CONFLICT, "CONFLICT", "Order is already saved to another account")
     # Only the order loaded and checked here is ever written (the address step below may load one
     # later; that load is not a check).
@@ -1412,13 +1420,90 @@ async def save_from_checkout(
         if int(updated or 0) != 1:
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token already used or expired")
 
+    # Pairwise buyer_ref for this agent.
+    pairwise_ref = await _get_or_create_pairwise_buyer_ref(buyer_id=principal.user_id, agent_id=agent_id)
+
+    # The identity link maps (agent_id, ref) -> this buyer, and the upsert MOVES an existing link,
+    # so only a ref the checkout token marks verified (it came from an X-Agent-User-JWT at mint) may
+    # write it. An unverified token ref, the token's legacy buyer_ref, the order's agent_user_ref
+    # column and its metadata are all caller-assertable: with them, a partner could re-point another
+    # buyer's link (and so their vault prefill) to whoever saves.
+    link_agent_user_ref: Optional[str] = None
+    if checkout_payload.get(_AGENT_USER_REF_VERIFIED_CLAIM) is True:
+        link_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
+    # The order's agent_user_ref is what v1 order reads and refunds authorize an agent user JWT on,
+    # so the save stamps it by the same rule: only the verified ref. With none, the order keeps the
+    # ref it has (the UPDATE leaves the column and metadata.agent_user_ref as they are).
+    agent_user_ref = link_agent_user_ref
+
+    # Update the order's linkage FIRST, before anything goes into the vault or is linked: a save
+    # the owner check in the WHERE refuses (another account's concurrent save won the row) then
+    # writes nothing else. Still best-effort on DB schema drift: a statement that fails is skipped.
+    order_write_refused = False
+    try:
+        if order_id and order_claim_checked:
+            # Update columns + metadata in one shot (metadata remains the agent-facing compat surface).
+            # Only an order loaded and checked above is written. The WHERE re-checks the owner, so a
+            # concurrent save by another account cannot be overwritten either. `databases` answers
+            # an UPDATE's execute with fetchval (None without RETURNING), not a row count, so the
+            # count is read as the returned row.
+            written = await database.fetch_one(
+                """
+                UPDATE orders
+                SET
+                  buyer_id = :buyer_id,
+                  intent_id = COALESCE(CAST(:intent_id AS text), intent_id),
+                  agent_user_ref = COALESCE(CAST(:agent_user_ref AS text), agent_user_ref),
+                  agent_scoped_buyer_ref = CAST(:pairwise_ref AS text),
+                  -- `orders.metadata` is json, not jsonb, and `||` is a jsonb
+                  -- operator: without the round-trip this whole statement fails
+                  -- to PREPARE ("COALESCE could not convert type jsonb to
+                  -- json"). It sits under `except Exception: pass`, so it has
+                  -- been a silent no-op since #281 rather than a visible 500.
+                  -- The CASTs are the #1703 rule: jsonb_build_object is
+                  -- variadic "any" and cannot type a bind by position.
+                  metadata = (
+                    COALESCE(metadata::jsonb, '{}'::jsonb)
+                    || jsonb_build_object('buyer_ref', CAST(:pairwise_ref AS text))
+                    || CASE WHEN :agent_user_ref IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('agent_user_ref', CAST(:agent_user_ref AS text)) END
+                  )::json
+                WHERE order_id = :order_id
+                  AND (buyer_id IS NULL OR buyer_id = '' OR buyer_id = :buyer_id)
+                RETURNING order_id
+                """,
+                {
+                    "buyer_id": principal.user_id,
+                    "intent_id": intent_id,
+                    "agent_user_ref": agent_user_ref,
+                    "pairwise_ref": pairwise_ref,
+                    "order_id": order_id,
+                },
+            )
+            order_write_refused = written is None
+    except Exception:
+        pass
+    if order_write_refused:
+        raise _error(status.HTTP_409_CONFLICT, "CONFLICT", "Order is already saved to another account")
+
+    identity_linked = False
+    if link_agent_user_ref:
+        identity_linked = bool(
+            await _upsert_buyer_identity_link(
+                buyer_id=principal.user_id,
+                agent_id=agent_id,
+                agent_user_ref=link_agent_user_ref,
+            )
+        )
+
     # Load intent prefill best-effort (untrusted; only used when order_id not provided).
     intent_prefill = None
     try:
-        row = await database.fetch_one(
-            "SELECT prefill FROM checkout_intents WHERE intent_id = :intent_id AND agent_id = :agent_id LIMIT 1",
-            {"intent_id": intent_id, "agent_id": agent_id},
-        )
+        row = None
+        if intent_id:
+            row = await database.fetch_one(
+                "SELECT prefill FROM checkout_intents WHERE intent_id = :intent_id AND agent_id = :agent_id LIMIT 1",
+                {"intent_id": intent_id, "agent_id": agent_id},
+            )
         if row:
             row_dict = dict(row)
             prefill_value = row_dict.get("prefill")
@@ -1516,78 +1601,14 @@ async def save_from_checkout(
             except Exception:
                 saved_address_id = None
 
-    # Pairwise buyer_ref for this agent.
-    pairwise_ref = await _get_or_create_pairwise_buyer_ref(buyer_id=principal.user_id, agent_id=agent_id)
-
-    # The identity link maps (agent_id, ref) -> this buyer, and the upsert MOVES an existing link,
-    # so only a ref the checkout token marks verified (it came from an X-Agent-User-JWT at mint) may
-    # write it. An unverified token ref, the token's legacy buyer_ref, the order's agent_user_ref
-    # column and its metadata are all caller-assertable: with them, a partner could re-point another
-    # buyer's link (and so their vault prefill) to whoever saves.
-    link_agent_user_ref: Optional[str] = None
-    if checkout_payload.get(_AGENT_USER_REF_VERIFIED_CLAIM) is True:
-        link_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
-    # The order's agent_user_ref is what v1 order reads and refunds authorize an agent user JWT on,
-    # so the save stamps it by the same rule: only the verified ref. With none, the order keeps the
-    # ref it has (the UPDATE leaves the column and metadata.agent_user_ref as they are).
-    agent_user_ref = link_agent_user_ref
-    identity_linked = False
-    if link_agent_user_ref:
-        identity_linked = bool(
-            await _upsert_buyer_identity_link(
-                buyer_id=principal.user_id,
-                agent_id=agent_id,
-                agent_user_ref=link_agent_user_ref,
-            )
-        )
-
-    # Update order linkage best-effort (do not fail save on DB schema drift).
+    # Link the intent to buyer best-effort (checkout-only; internal). No intent, no link.
     try:
-        if order_id and order_claim_checked:
-            # Update columns + metadata in one shot (metadata remains the agent-facing compat surface).
-            # Only an order loaded and checked above is written. The WHERE re-checks the owner, so a
-            # concurrent save by another account cannot be overwritten either.
+        if intent_id:
             await database.execute(
-                """
-                UPDATE orders
-                SET
-                  buyer_id = :buyer_id,
-                  intent_id = :intent_id,
-                  agent_user_ref = COALESCE(CAST(:agent_user_ref AS text), agent_user_ref),
-                  agent_scoped_buyer_ref = CAST(:pairwise_ref AS text),
-                  -- `orders.metadata` is json, not jsonb, and `||` is a jsonb
-                  -- operator: without the round-trip this whole statement fails
-                  -- to PREPARE ("COALESCE could not convert type jsonb to
-                  -- json"). It sits under `except Exception: pass`, so it has
-                  -- been a silent no-op since #281 rather than a visible 500.
-                  -- The CASTs are the #1703 rule: jsonb_build_object is
-                  -- variadic "any" and cannot type a bind by position.
-                  metadata = (
-                    COALESCE(metadata::jsonb, '{}'::jsonb)
-                    || jsonb_build_object('buyer_ref', CAST(:pairwise_ref AS text))
-                    || CASE WHEN :agent_user_ref IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('agent_user_ref', CAST(:agent_user_ref AS text)) END
-                  )::json
-                WHERE order_id = :order_id
-                  AND (buyer_id IS NULL OR buyer_id = '' OR buyer_id = :buyer_id)
-                """,
-                {
-                    "buyer_id": principal.user_id,
-                    "intent_id": intent_id,
-                    "agent_user_ref": agent_user_ref,
-                    "pairwise_ref": pairwise_ref,
-                    "order_id": order_id,
-                },
+                checkout_intents.update()
+                .where((checkout_intents.c.intent_id == intent_id) & (checkout_intents.c.agent_id == agent_id))
+                .values(linked_buyer_id=principal.user_id, used_at=func.now(), updated_at=func.now())
             )
-    except Exception:
-        pass
-
-    # Link the intent to buyer best-effort (checkout-only; internal).
-    try:
-        await database.execute(
-            checkout_intents.update()
-            .where((checkout_intents.c.intent_id == intent_id) & (checkout_intents.c.agent_id == agent_id))
-            .values(linked_buyer_id=principal.user_id, used_at=func.now(), updated_at=func.now())
-        )
     except Exception:
         pass
 

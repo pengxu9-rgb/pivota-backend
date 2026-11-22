@@ -44,15 +44,33 @@ SAVER_EMAIL = "saver@example.com"
 UI_KEY = {"X-Checkout-UI-Key": "test-checkout-ui-key"}
 
 
+_UNSET = object()
+
+
 class _World:
     def __init__(self) -> None:
         self.links: Dict[Tuple[str, str], str] = {}
         self.order_row: Optional[Dict[str, Any]] = None
         self.order_updates: list = []
+        # The row's buyer_id at UPDATE time, when a case makes it differ from the read (a concurrent
+        # save). Unset: the row as read.
+        self.owner_at_write: Any = _UNSET
+
+    def _update_order(self, v: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # The UPDATE's WHERE: the order, and buyer_id NULL, '' or the saver's own. RETURNING order_id.
+        owner = self.owner_at_write
+        if owner is _UNSET:
+            owner = (self.order_row or {}).get("buyer_id")
+        if self.order_row is None or not (owner is None or owner == "" or owner == v.get("buyer_id")):
+            return None
+        self.order_updates.append(dict(v))
+        return {"order_id": v.get("order_id")}
 
     async def fetch_one(self, query, values=None):  # noqa: ANN001
         text = str(query).lower()
         v = values or {}
+        if isinstance(query, str) and text.lstrip().startswith("update orders"):
+            return self._update_order(v)
         if "from buyer_identity_links" in text:
             buyer = self.links.get((v.get("agent_id"), v.get("agent_user_ref_hash")))
             return {"buyer_id": buyer} if buyer else None
