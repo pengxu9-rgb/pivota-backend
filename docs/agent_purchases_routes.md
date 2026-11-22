@@ -367,15 +367,23 @@ asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purch
 in its own conversation. The first lookup comes when the hold's own park ends, about 10 minutes after the
 hold (`POLL_PARKED`); then again each time the time in `paying` has doubled, within 4 hours, and at most 9
 times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 290), so a
-crash in the middle of one still counts. A definite result goes through the ordinary result rules
-(completed only on a verified total; a held code stays held), EXCEPT that on a task the purchase never
-recorded a "not submitted" answer (with `success: false`) keeps the hold and an await keeps the hold too
-(nothing yet ties a lookup's answer to our checkout, so neither may lead to a `failed`); a payment-reached
-answer there is held as payment-reached, never resolvable. SANDBOX MEASUREMENT GATE (before the dial): what a
-lookup's answer echoes (our idempotency key? the checkout URL?) must be measured and bound on; until then an
-unbound lookup that completes may record another purchase's order id on this one (bounded by the approved
-total). An await on the purchase's own task records it and the poll goes on; a money-result answer parks it for good (`money_result_seen`, never
-"not charged"); anything else leaves it held. It never resends a setup or a confirm, and never looks up a
+crash in the middle of one still counts. An answer for the task the purchase recorded from ITS OWN confirm
+answer (bound) goes through the ordinary result rules: completed only on a verified total in the row's
+currency (a `currency` field naming another one is unverified), a held code stays held, a "not submitted"
+fails it, an await goes back to polling. **N1 IS CLOSED BY "NO UNBOUND COMPLETION"**: the provider (11-19)
+creates a checkout task only after our confirm, and a lookup answer echoes nothing we sent (no idempotency
+key, checkout URL or merchant; its `card_last4` names the card, not the purchase), so an answer for a task
+the purchase never recorded (unbound) cannot be verified as ours. It never completes the purchase, never
+records an order id or a total, never adopts the task, never fails it and never makes it "not charged": the
+hold stays, whatever it says. One that says the checkout succeeded or payment happened (`success: true`, or a
+`result_status` / `status` that says paid, completed or payment-reached; a `state` only when it itself names a
+payment, never `completed` alone, which is the task's lifecycle) moves the hold to
+`checkout_payment_reached_unconfirmed`, which resolve-held refuses. Exact binding (an `idempotency_key`
+echo) comes back only in its own review, once the provider confirms it. A result's status is read from
+`status` or the documented `result_status` (both present and different: unrecognised, held); the fields
+not read (`subtotal`, `shipping_fee`, `tax`, `errors`, `duration_ms`, `card_last4`) are ignored and never
+stored. A money-result answer parks it for good (`money_result_seen`, never "not charged"); anything else
+leaves it held. It never resends a setup or a confirm, and never looks up a
 hold written after payment was reported. A 409 on the
 confirm (the same key with another body: our own bug) is held and never looked up. Otherwise a human does:
 
@@ -387,8 +395,24 @@ confirm (the same key with another body: our own bug) is held and never looked u
    (`scripts/ops/run_oneoff_job.sh`, behind the one-off gate):
 
        python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <the code from step 1>
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> --lookup
        python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> \
            --apply --operator <handle> --expect-env production --provider-checked
+
+   `--lookup` (dry run only) adds ONE read-only lookup by our idempotency key and shows its safe fields only
+   (`state`, `result_status`, `total`, `currency`, `task_id`; never `card_last4` or the order id), read at
+   that moment and NEVER stored (not even as a lookup count). An answer for a task the purchase did not
+   record from its own confirm answer is labelled "UNBOUND: this answer may belong to another purchase;
+   not verified as ours": it is a hint for your check in step 2, never proof. An answer that reports payment
+   (bound or not, read as above) makes the preview `eligible: false`, reason `payment_reported_by_lookup`:
+   escalate, never resolve it here. Only a HELD row is looked up.
+
+   `--apply` runs its OWN read-only lookup the same way (when the rail client is configured) and refuses
+   (exit 3, `payment_reported_by_lookup`) on an answer that reports payment: what the preview saw is never
+   stored, so the apply reads again. With no client configured, or a lookup that fails, the apply rests on
+   your `--provider-checked` statement, as before. `--lookup` together with `--apply` is a usage error
+   (exit 2): `--apply` always does its own. That lookup is a provider call too: the go for an `--apply` run
+   covers it only when it says so.
 
    The purchase ends `failed` / `operator_confirmed_not_charged`. The write is a compare-and-swap on the
    code you read and refuses a row a worker holds right now, so a row that moved since is not touched

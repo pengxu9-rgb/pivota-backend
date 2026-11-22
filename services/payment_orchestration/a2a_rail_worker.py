@@ -2196,43 +2196,27 @@ async def _checkout_lookup(s: _Step) -> str:
     known = row.get("checkout_task_id")
     if known and known != task_id:
         return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
-    if not known and final is None:
-        # P2-1a: an AWAIT on a task the row never recorded is NOT adopted (and not noted either: a recorded task
-        # would make the provider's later answer for it look like ours, and a "not submitted" there would fail
-        # this purchase). The hold stays, the write is kept, and the lookup runs again on the backoff, within
-        # the cap, until a result comes back (read by the rules below) or a human resolves it.
-        logger.warning("a2a_rail_worker: held checkout lookup is still in progress on an unbound task "
-                       "purchase=%s code=%s; still held", s.id, code)
+    if not known:
+        # N1 IS CLOSED BY "NO UNBOUND COMPLETION". The provider (11-19): a checkout task exists only after our
+        # confirm, and a lookup answer echoes NOTHING we sent (no idempotency key, checkout URL or merchant;
+        # its card_last4 names the card, not the purchase). So an answer for a task this row never recorded
+        # from its own confirm answer cannot be verified as ours, whatever it says: it NEVER completes the
+        # purchase, never records an order id or a total, never adopts or notes the task (a noted task would
+        # make a later answer for it look like ours), never fails the purchase and never makes it "not
+        # charged". The hold stays and the write is kept. An answer that says the checkout completed or
+        # succeeded (`_answer_says_done`) moves the hold into the payment-reached set, which resolve-held
+        # refuses: money may have moved for this purchase. Anything else stays held as it was and is looked
+        # up again on the backoff, within the cap. Exact binding (an idempotency_key echo) comes back only in
+        # its own review, once the provider confirms it.
+        if _answer_says_done(card.data):
+            logger.warning("a2a_rail_worker: held checkout lookup reported completion on an unbound task "
+                           "purchase=%s code=%s; held as payment reached", s.id, code)
+            return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+        logger.warning("a2a_rail_worker: held checkout lookup answered for an unbound task purchase=%s code=%s "
+                       "found=%s; still held", s.id, code, "result" if final is not None else "await")
         await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
         return "checkout_held"
-    if not known and final is not None:
-        status = str(final.data.get("status") or "").strip().lower()
-        # P2-4: ONLY the outcome that would FAIL the purchase (a not-submitted status, success false) is diverted.
-        # Every other answer goes through the ordinary result rules, which on a held row only hold (a
-        # payment-reached answer escalates to a payment-reached code, never resolvable) or complete on a
-        # verified total.
-        if status in _CHECKOUT_NOT_SUBMITTED and final.data.get("success") is False:
-            # NOTHING TIES THIS ANSWER TO OUR CHECKOUT: the lookup names a task we never recorded, and the
-            # provider's lookup resolution is not measured (another purchase's result could come back). A
-            # "not submitted" on it would fail a purchase that may be charged and invite a second buy: it
-            # KEEPS the hold, and the task is not adopted. Completing on a verified total stays (bounded by the
-            # approved total). Binding a lookup's answer to our idempotency key, our checkout URL or our
-            # merchant waits for the sandbox measurement of what a lookup echoes. SANDBOX MEASUREMENT GATE: until
-            # then an unbound lookup that completes may record ANOTHER purchase's order id on this one (N1:
-            # bounded by the total, no money risk, but the reference shown may be foreign).
-            logger.warning("a2a_rail_worker: held checkout lookup said not submitted on an unbound task "
-                           "purchase=%s code=%s; still held", s.id, code)
-            await ledger.release_claim(s.id, s.worker, next_poll_at=_later(_lookup_wait(row)))
-            return "checkout_held"
-    if not known:
-        try:
-            adopted = await ledger.adopt_checkout_task_as_holder(s.id, s.worker, checkout_task_id=task_id)
-        except ValueError:
-            return await _checkout_hold(s, CHECKOUT_TASK_INVALID)
-        if adopted is None:
-            return await _checkout_hold(s, code)
-        s.row = adopted
-    elif row.get("pending_write"):
+    if row.get("pending_write"):
         # The lookup answered for the write nobody saw: it is resolved (never resent).
         await ledger.clear_pending_write(s.id, s.worker, str(row["pending_write"]))
     logger.warning("a2a_rail_worker: held checkout looked up purchase=%s code=%s found=%s",
@@ -2264,12 +2248,41 @@ async def _checkout_progress(s: _Step, result: Any, wait: int) -> str:
     return "rail_read_failed"
 
 
+def _result_status(data: Mapping[str, Any]) -> str:
+    """A result's status, lower-cased: `status`, or `result_status` (the field the provider documents for a
+    lookup's answer, 11-19). Both present and different: "" (unrecognised, so held)."""
+    values = {str(data.get(key) or "").strip().lower() for key in ("status", "result_status") if data.get(key)}
+    return values.pop() if len(values) == 1 else ""
+
+
+#: The task LIFECYCLE states the provider documents (11-19: "on completed / failed" a lookup adds the result):
+#: they say the task finished, never that it charged.
+_CHECKOUT_LIFECYCLE_DONE_STATES = frozenset({"completed", "complete"})
+
+
+def _answer_says_done(data: Mapping[str, Any]) -> bool:
+    """Whether a checkout answer (bound or not) says the checkout succeeded or payment happened, read on the
+    DOCUMENTED SIGNALS, the same way everywhere (the worker's unbound lookup, resolve-held's preview and its
+    --apply): `success` true, or a `result_status` (or `status`) that says payment happened by the status
+    rules (`_status_says_paid`: paid, completed, payment-reached, captured, chargeback, ...). `state` is the
+    task's lifecycle, so "completed" alone is NOT done (a finished task that placed nothing is completed too);
+    a state that itself names a payment (paid, captured, ...) still counts."""
+    if data.get("success") is True:
+        return True
+    if any(_status_says_paid(str(data.get(key) or "")) for key in ("status", "result_status")):
+        return True
+    state = str(data.get("state") or "").strip().lower()
+    return state not in _CHECKOUT_LIFECYCLE_DONE_STATES and _status_says_paid(state)
+
+
 async def _checkout_result(s: _Step, card: Any) -> str:
-    """The merchant's answer, as the provider reports it. Only `payment-reached` with an order id completes."""
+    """The merchant's answer, as the provider reports it. Only `payment-reached` with an order id completes.
+    Fields this does not read (subtotal, shipping_fee, tax, errors, duration_ms, card_last4) are ignored and
+    never stored."""
     data = card.data
     if data.get("task_id") != s.row.get("checkout_task_id"):
         return await _checkout_hold(s, CHECKOUT_TASK_MISMATCH)
-    status = str(data.get("status") or "").strip().lower()
+    status = _result_status(data)
     raw_order = data.get("order_id")
     order_id = str(raw_order).strip() if isinstance(raw_order, (str, int)) and not isinstance(raw_order, bool) else ""
     # A store's order NAME is often its number with a leading "#": the number is what is kept.
@@ -2292,6 +2305,10 @@ async def _checkout_result(s: _Step, card: Any) -> str:
                          s.id, withheld, len(order_id))
         total = checkout_total_minor(data.get("total"), s.row.get("currency"))
         approved = s.row.get("quoted_total_minor")
+        if data.get("currency") is not None and str(data.get("currency")).strip().upper() != str(
+                s.row.get("currency") or "").upper():
+            # The answer names a currency other than ours (the documented `currency` field): unverified.
+            total = None
         if total is None or total <= 0 or not isinstance(approved, int) or isinstance(approved, bool):
             # COMPLETED ONLY ON A VERIFIED TOTAL. Unreadable, another currency ("€230.00", "CA$250.00",
             # "$250.00 CAD"), a bare "250.00", or $0.00 (on a positive ceiling more likely a misread than a
@@ -2348,6 +2365,62 @@ def held_checkout_codes() -> frozenset:
 def operator_resolvable_codes() -> frozenset:
     """The hold codes a human may end as `operator_confirmed_not_charged` (never one that recorded payment)."""
     return _OPERATOR_RESOLVABLE_HOLD_CODES
+
+
+#: What resolve-held's preview says of a lookup answer it cannot tie to the purchase (N1: an answer echoes
+#: nothing we sent), and of one for the task the purchase recorded from its own confirm answer.
+CHECKOUT_LOOKUP_UNBOUND_LABEL = "UNBOUND: this answer may belong to another purchase; not verified as ours"
+CHECKOUT_LOOKUP_BOUND_LABEL = "BOUND: the task this purchase recorded from its own confirm answer"
+#: The ONLY fields of a lookup answer the preview shows. Never card_last4 (the card, not the purchase), never
+#: the order id, nothing else the answer carries.
+_OPERATOR_LOOKUP_FIELDS = ("state", "result_status", "total", "currency", "task_id")
+_OPERATOR_LOOKUP_MAX_CHARS = 64
+
+
+async def operator_lookup_preview(client: Any, row: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """For resolve-held's dry run (`--lookup`): ONE read-only lookup of a held checkout by our idempotency
+    key, in the lookup conversation, and the answer's safe fields (`_OPERATOR_LOOKUP_FIELDS`), labelled bound
+    or UNBOUND. READ AT PREVIEW TIME AND NEVER PERSISTED: nothing is written, not even the lookup count (a
+    human's single read; the worker's cap is for its own schedule). Never logs a value."""
+    if row is None or row.get("state") != "paying" or str(row.get("last_error_code") or "") not in _CHECKOUT_HOLD_CODES:
+        # Only a HELD checkout is looked up (never a purchase being placed, so a go is not spent on one).
+        return {"ran": False, "reason": "no such held checkout"}
+    if client is None:
+        return {"ran": False, "reason": "the rail client is not configured here"}
+    if not a2a_rail.checkout_step_enabled():
+        return {"ran": False, "reason": "the checkout dial is off"}
+    result = await client.send_action(
+        member_id=str(row["member_id"]), context_id=client.context_for(str(row["member_id"]), f"{row['id']}_l"),
+        component=CHECKOUT_LOOKUP[0], action=CHECKOUT_LOOKUP[1],
+        payload={"task_id": _checkout_idempotency_key(str(row["id"]))})
+    if getattr(result, "kind", None) == "money_result":
+        return {"ran": True, "found": False, "money_result_seen": True}
+    if _card_code_echoed(result):
+        return {"ran": True, "found": False, "answer_scrubbed": True}
+    ok = getattr(result, "ok", False)
+    card = (result.card("checkout.result") or result.card("checkout.await")) if ok else None
+    if card is None:
+        return {"ran": True, "found": False}
+    fields: Dict[str, Any] = {}
+    for key in _OPERATOR_LOOKUP_FIELDS:
+        value = card.data.get(key)
+        if key == "result_status" and value is None:
+            value = card.data.get("status")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)) or (
+                isinstance(value, str) and len(value) <= _OPERATOR_LOOKUP_MAX_CHARS and not _card_shaped(value)):
+            fields[key] = value
+    recorded = row.get("checkout_task_id")
+    bound = bool(recorded) and card.data.get("task_id") == recorded
+    return {"ran": True, "found": True, "bound": bound,
+            "label": CHECKOUT_LOOKUP_BOUND_LABEL if bound else CHECKOUT_LOOKUP_UNBOUND_LABEL, "fields": fields,
+            # Bound or not: money may have moved for this purchase. resolve-held then never resolves it.
+            "says_done": _answer_says_done(card.data)}
+
+
+#: resolve-held's refusal when its own lookup (preview or --apply) reports a payment.
+OPERATOR_PAYMENT_REPORTED_BY_LOOKUP = "payment_reported_by_lookup"
 
 
 def operator_eligibility(row: Optional[Mapping[str, Any]], expected_code: str) -> Tuple[bool, str]:
