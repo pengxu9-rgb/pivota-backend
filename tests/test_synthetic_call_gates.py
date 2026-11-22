@@ -1058,7 +1058,8 @@ def test_the_variant_route_never_resolves_a_token_for_a_synthetic_call(monkeypat
         async def set(self, *a, **k):
             return True
 
-    async def details(*, req, merchant_id, product_id, background_tasks, context):
+    # The variant route now passes market and the payment context (None) too, never the detail route's Query objects.
+    async def details(*, req, merchant_id, product_id, background_tasks, context, **_explicit_nones):
         served.append(product_id)
         return {"status": "success", "product": {"id": product_id}}
 

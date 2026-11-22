@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-06-13
-**Deciders:** Founder (peng), Claude
+**Deciders:** Founder, Claude
 **Supersedes assumption:** merchant-sync-first enrichment (the implicit model behind the #841/#842/#847 enrichment pipeline)
 
 ## Context

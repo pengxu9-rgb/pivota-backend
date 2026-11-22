@@ -2,8 +2,8 @@
 
 For retailers that refuse crawlers but publish through affiliate networks. Measured 2026-09-23:
 global.oliveyoung.com and us.oliveyoung.com answer 403 "Access restricted" to robots.txt,
-/products.json and /.well-known/ucp, while Olive Young runs affiliate programs (Involve Asia for
-Global/SEA, Rakuten Advertising for the US store). Scraping around an explicit block is not an
+/products.json and /.well-known/ucp, while Olive Young runs affiliate programs through affiliate
+networks (one for Global/SEA, another for the US store). Scraping around an explicit block is not an
 option; the partner feed is.
 
 A feed row becomes the SAME record the Shopify lane builds (curated_brand_feed.shopify_product_to_record),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Step-5 Lane 4 — ownist seed↔first-party twin cut (4 groups, signed off).
 
-The lane-4 review (reports/step5/lane4_review_2026-07-10.md) adjudicated four
+The 2026-07-10 lane-4 review (kept off main, in the private ops bundle) adjudicated four
 ownist.com content_keys as SUPPRESS_seed_twin_pending_signoff: each has a
 claimed first-party shopify row (merch_test_ownist_001) AND an external_seed
 mirror of the SAME canonical_url. Founder signed off 2026-07-10.
@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SUPPRESSION_REASON = "cross_merchant_redundant_external_seed"
 FIRST_PARTY_MERCHANT = "merch_test_ownist_001"
 
-# The four signed-off groups (full keys from reports/step5/lane4_review_2026-07-10.json).
+# The four signed-off groups (full keys from the 2026-07-10 lane-4 review, in the private ops bundle).
 CONTENT_KEYS_PREFIXES = [
     "ck_07993a56a",
     "ck_207b48883",
@@ -113,7 +113,7 @@ async def _run(apply: bool) -> int:
             {
                 "script": "step5_lane4_ownist_twin_cut",
                 "run_id": run_id,
-                "review": "reports/step5/lane4_review_2026-07-10.md",
+                "review": "lane4_review_2026-07-10 (private ops bundle)",
                 "decision": "founder sign-off 2026-07-10: suppress seed mirror, keep first-party",
             }
         )

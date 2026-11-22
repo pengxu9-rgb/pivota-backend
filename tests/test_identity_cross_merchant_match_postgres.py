@@ -10,7 +10,7 @@ Runs the real script entry point (scripts/ops/propose_cross_merchant_matches.run
   2. --write-proposals refuses a stale digest (nothing written), then inserts status 'proposed' rows
      with one proposal run id; the script never approves or applies;
   3. #2637's approve_module_run approves exactly that run (dry run -> ira_ digest -> execute, as
-     Peng would), and the M3 engine dry-runs an apply over them: a listing
+     the owner would), and the M3 engine dry-runs an apply over them: a listing
      whose membership vanished since is blocked_no_membership, the rest plan; an apply without a
      digest skips every proposal (strategy_needs_expect_digest); with the dry run's digest it applies,
      moving content_keys and groups exactly as the evidence says.
@@ -264,13 +264,13 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
                  if json.loads(line)["section"] == "written")
     assert again["inserted"] == 0 and again["deduped"] == 3
 
-    # 3. the engine reads them. Approval is Peng's step (here: the test). Then Sephora's membership
+    # 3. the engine reads them. Approval is the owner's step (here: the test). Then Sephora's membership
     # vanishes before the apply: the pre-flight blocks that one proposal instead of aborting the run.
     ids = [r["proposal_id"] for r in rows]
-    dry = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="peng")
+    dry = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="owner")
     assert dry.get("dry_run") and sorted(dry["proposals"]) == sorted(ids) and dry["problems"] == {}
     assert {r["status"] for r in await _proposals(c)} == {"proposed"}
-    done_approve = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="peng",
+    done_approve = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="owner",
                                             expect_digest=dry["digest"], dry_run=False)
     assert sorted(done_approve["approved"]) == sorted(ids)
     await c.execute("DELETE FROM product_group_members WHERE platform_product_id = $1", _spid(SEPH))

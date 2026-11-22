@@ -5,7 +5,7 @@ plan, run the guards, read every row, apply only a clean cohort through the appl
 the written rows back. Every stage writes one `retailer_ingest_runs` row, including the ones that
 end early, so "why did store X not land?" is answered by the ledger, not by log archaeology.
 
-Policy (Peng, 2026-09-23): a dry run with zero BLOCK flags is applied automatically; any BLOCK flag
+Policy (the owner, 2026-09-23): a dry run with zero BLOCK flags is applied automatically; any BLOCK flag
 holds the job until someone approves it (optionally excluding handles or accepting flag keys).
 The apply stage re-crawls and RE-RUNS every check before writing, so a store that changed between
 its dry run and its apply cannot slip a new row past the review.
@@ -50,7 +50,7 @@ _OPTION_TYPES = {
     "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
     "only_resolved_category": bool, "lip_title_evidence": bool, "lash_nail_title_evidence": bool,
     "exclude_handles": list,
-    # Reviewer decision (Peng 2026-09-25): a bundle of different products the store filed on a
+    # Reviewer decision (the owner 2026-09-25): a bundle of different products the store filed on a
     # single-product shelf ("Cologne & Hand Cream Duo" under fragrance/perfume) is RE-FILED to the
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
     # are filed under REFILE_SETS_LEAF before any check runs.
@@ -65,7 +65,7 @@ _OPTION_TYPES = {
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
     # or "shopify_markets" (services/retailer_ingest/shopify_markets.py: USD SIBLING offers, read inside
     # a US-localized session whose /cart.js proves USD, for products a base-currency crawl of the same
-    # storefront already wrote; multi-market storefronts ADR Phase 2). Since 2026-10-10 (Peng: "Build the
+    # storefront already wrote; multi-market storefronts ADR Phase 2). Since 2026-10-10 (the owner: "Build the
     # SG currency support") its options.market may be SG too: SGD siblings from an SG-localized session.
     "source": str, "feed": dict,
     # Storefront crawls only (2026-10-10): refuse the crawl (status `nothing`) unless the store's own
@@ -102,10 +102,19 @@ _OPTION_TYPES = {
     "retire_stale_brand": str,
     # Fold a store's per-shade / per-size listings into their base listing's variants
     # (curated_brand_feed.fold_shade_listings(extended=True): "<Line> - Ruby" beside "<Line>"). Opt-in per
-    # cohort (Peng approved 2026-10-12): a retailer storefront crawl only, and a cohort whose fold would
+    # cohort (the owner approved 2026-10-12): a retailer storefront crawl only, and a cohort whose fold would
     # supersede listings that already have LIVE rows on the host is held (fold_supersedes_live_rows) -- the
     # retire of those rows is a follow-up, so a fold may only take over a store it has not ingested per shade.
     "fold_shades": bool,
+    # A brand's own store that ALREADY sells under an `agent_seed::<slug>` offer seller another lane wrote
+    # (2026-11-19): every offer of the cohort is written under exactly this id, and no new catalog_merchants
+    # row is minted for it. brand_official only; the dry run refuses an id catalog_merchants does not hold
+    # (a typo must not mint a seller). Without it the offer seller is the slug of the job's `brand`, so a
+    # re-spelled brand ("Brand A" vs "Brand A Cosmetics") lands as a second seller for the same store --
+    # which the seller_id_split check reports (holds with RETAILER_INGEST_SELLER_SPLIT_BLOCK_ENABLED). The id
+    # must sell live on the job's own host. product_key derivation does not read it. It is scope
+    # (db.retailer_ingest.scope_key): to pin an open cohort, cancel its job and re-enqueue with the pin.
+    "seller_merchant_id": str,
 }
 SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
 MARKETS_SOURCE = "shopify_markets"
@@ -116,13 +125,13 @@ DEFAULT_MARKET = "US"
 #: writer that declares one. normalize_curated_brand_payload accepts exactly this list from this lane.
 INGEST_MARKETS = ("US", "AU", "JP", "SG")
 #: The ingest markets that are SERVED, not acquired: a job's rows must read back serving-eligible. SG
-#: (Peng 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
+#: (the owner 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
 #: list crawled SG stores). Its rows are written like every other market's: catalog_offers.market 'SG' priced
 #: in SGD, and the seed in the "US" partition (ingestion.SEED_PARTITION_MARKET) -- where SG buyers already
 #: find SGD seeds by currency (external_seed_search serving currency, #2389). Only the offer stamp is new:
 #: jsmbeauty.sg / makeupforever.sg, written before this, carry market 'US' with SGD (INSERT-only column).
 SERVED_INGEST_MARKETS = tuple(m for m in INGEST_MARKETS if m not in ACQUISITION_MARKETS)
-#: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
+#: Multi-market storefronts ADR Phase 2 (approved by the owner 2026-09-26): ACQUISITION markets. A job for
 #: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
 #: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
 #: served regions (index_pipeline_state has_serving_region_offer, PIVOTA_SERVING_PRICING_REGIONS = US,SG):
@@ -293,6 +302,12 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if market not in INGEST_MARKETS:
             raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)})")
         options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    if "seller_merchant_id" in options:
+        from services.catalog_enrichment_agent.ingestion import validate_pinned_merchant_id
+        if options.get("source_role") != "brand_official" or source != "storefront":
+            # A retailer's offer seller is derived from its host (agent_seed::retailer::<host>): nothing to pin.
+            raise ValueError("options.seller_merchant_id supports only a brand_official storefront cohort")
+        options["seller_merchant_id"] = validate_pinned_merchant_id(options["seller_merchant_id"])
     if options.get("fold_shades") and (source != "storefront" or options.get("source_role", "retailer") != "retailer"):
         # The supersede preview derives each folded listing's old key as an ext:retailer: listing key; a brand's
         # own store keys rows by (brand, title), and a feed or a capture crawls no /products.json to fold.
@@ -308,8 +323,8 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"options.source = shopify_markets captures the {' and '.join(CAPTURE_MARKETS)} "
                              f"markets only")
         if options.get("source_role") != "brand_official" and job_market(options) != "SG":
-            # Brand stores first (Peng 2026-09-26) still holds for the US: US retailers follow later.
-            # SG retailers are allowed (Peng 2026-10-10, "Build the SG currency support": nearly every SG
+            # Brand stores first (the owner 2026-09-26) still holds for the US: US retailers follow later.
+            # SG retailers are allowed (the owner 2026-10-10, "Build the SG currency support": nearly every SG
             # pair the coverage wave found is a retailer). The gate is the
             # MARKET, in code, not an env or a job option: an env would have to match on the enqueue runner
             # and on the drain (whose image and env have a single writer), and a job option is the operator
@@ -317,7 +332,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             # base offer (merchant_id, offer_type, offer_mode redirect), so nothing new is claimed for it.
             raise ValueError("options.source = shopify_markets supports source_role = retailer for market SG "
                              "only; a US capture is source_role = brand_official only (brand stores first, "
-                             "Peng 2026-09-26; US retailers follow later)")
+                             "the owner 2026-09-26; US retailers follow later)")
     elif job_market(options) in ACQUISITION_MARKETS and source != "storefront":
         # An acquisition job is the BASE-CURRENCY crawl of a storefront (ADR Phase 2, operator step 1):
         # the rows a shopify_markets capture later prices in USD. A feed has no such storefront.
@@ -559,7 +574,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
         that types an offer brand_direct) -- us.examplebrand.example for "Example Brand";
       * Tier B: the store's own /meta.json (`storefront`, from the crawl) names the brand, ships to
         the job's `market` and prices in its currency (storefront_tier_b) -- brand-store.example.com,
-        "Example Brand Naturals USA", for "Example Brand". Peng approved it as automatic on 2026-09-26;
+        "Example Brand Naturals USA", for "Example Brand". The owner approved it as automatic on 2026-09-26;
       * otherwise a human accepts the flag (a host whose name is not the brand's, with no /meta.json
         that proves it): held, never auto-applied. A failed Tier B yields exactly that flag, same key.
 
@@ -617,7 +632,7 @@ def verified_brand_storefront(job: Dict[str, Any], checks: Optional[Dict[str, An
     brand_official_domain_unproven key (a human vouched). A known retailer, a job that is not
     source_role=brand_official, or evidence for another domain proves nothing. Only a proven brand's
     rows on this host get 'self' seeds (catalog_enrichment_agent.apply.VerifiedBrandStorefront), which
-    lets trust serve them without a manual live-read promotion (Peng, 2026-09-29)."""
+    lets trust serve them without a manual live-read promotion (the owner, 2026-09-29)."""
     from services.catalog_enrichment_agent.apply import VerifiedBrandStorefront, _storefront_host
 
     o = job.get("options") or {}
@@ -670,6 +685,8 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         "max_pdp_inci_fetches": (DRAIN_PDP_INCI_FETCHES if o.get("max_pdp_inci_fetches") is None
                                  else int(o["max_pdp_inci_fetches"])),
         "pdp_inci_budget_s": DRAIN_PDP_INCI_BUDGET_S,
+        # Only when pinned: an unpinned job's payload stays exactly what it was.
+        **({"seller_merchant_id": o["seller_merchant_id"]} if o.get("seller_merchant_id") else {}),
     }
 
 
@@ -996,6 +1013,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         if report.get("status") in ("conflicts", "error"):
             flags.append({"key": name, "rule": name, "severity": detectors.BLOCK, "acceptable": False,
                           "detail": json.dumps(report, default=str)[:600]})
+    # One store, one seller: an existing seller id on this host that the plan would not write under is a
+    # second seller for the same store (seller_id_split). Every role that reaches _check (a shopify_markets
+    # capture does not); reads only; holds only with SELLER_SPLIT_BLOCK_ENV on, shadow (recorded) otherwise.
+    flags.extend(await _seller_identity_checks(job, plan, checks))
 
     row_flags = detectors.detect(records, store_verdict=store_verdict)
     if refiled:
@@ -1116,6 +1137,307 @@ async def _catalog_read(sql: str, values: Dict[str, Any]) -> tuple:
     """One read on its own connection: (rows as dicts, None), or (None, why)."""
     async with _catalog_reader() as read:
         return await read(sql, values)
+
+
+#: seller_id_split holds a job only when this is "true" (strip, case-insensitive). Off (the default) the check runs
+#: in SHADOW: it reads and records what it would flag (checks.seller_identity, plus one structured WARNING line) and
+#: adds no flag, so a cohort's verdict is exactly what it was. Turned on after a census of the shadow records.
+#: The options.seller_merchant_id checks are NOT gated: the pin is opt-in, so they change no unpinned job.
+SELLER_SPLIT_BLOCK_ENV = "RETAILER_INGEST_SELLER_SPLIT_BLOCK_ENABLED"
+#: At most this many ids per list on a run's checks.seller_identity.
+SELLER_IDENTITY_LIST_CAP = 50
+#: At most this many candidate sellers are read per host (each nominating query, and their union); beyond it the
+#: run records checks.seller_identity.truncated -- a host with that many sellers is a census item, not a cohort.
+SELLER_CANDIDATE_CAP = 200
+
+
+def seller_split_block_enabled() -> bool:
+    return str(os.getenv(SELLER_SPLIT_BLOCK_ENV) or "").strip().lower() == "true"
+
+
+def _host_sql(expr: str) -> str:
+    """`expr` as a host, exactly the way _norm_host spells one: trimmed, lower-cased, a trailing `:port` and a
+    trailing dot dropped, and a leading `www.` dropped -- so `www.<host>` and `<host>` are ONE value here, and a
+    DISTINCT over it (PINNED_LIVE_HOSTS_SQL) returns each store once. (:hosts still lists both spellings; the
+    `www.` one simply never matches.)"""
+    # The same steps in the same order as _norm_host: strip whitespace (tabs and newlines too), lower-case, drop a
+    # trailing `:port`, then every trailing dot, then a leading `www.`. lower() of a NON-ASCII letter follows the
+    # database's collation (Python's always folds it): such a host may compare unequal, which holds a pin and can
+    # only miss a split -- stored hosts are URL hostnames, ASCII (punycode) in practice.
+    trimmed = f"regexp_replace(lower({expr}), '^[[:space:]]+|[[:space:]]+$', '', 'g')"
+    return f"regexp_replace(regexp_replace(regexp_replace({trimmed}, ':[0-9]+$', ''), '[.]+$', ''), '^www[.]', '')"
+
+
+_OFFER_HOST = _host_sql("coalesce(o.source_domain, o.offer_payload->>'domain', '')")
+
+#: Candidate sellers catalog_merchants ties to the store: the lanes that mint a seller write the host it sells on
+#: into source_ref (ingestion._build_merchant_upserts). source_ref is last-writer-wins, so it only NOMINATES a
+#: candidate: a candidate counts only with live offers at the host (SELLER_LIVE_AT_HOST_SQL). Small table.
+SELLERS_ON_HOST_SQL = f"""
+SELECT merchant_id
+FROM catalog_merchants
+WHERE {_host_sql("coalesce(source_ref, '')")} = ANY(:hosts)
+  AND left(merchant_id, 10) <> 'merch_obs_'
+ORDER BY merchant_id
+LIMIT {SELLER_CANDIDATE_CAP + 1}
+"""
+#: More candidates: every seller with an offer on one of the plan's own products (catalog_offers.product_key is
+#: indexed), whatever minted it -- a seller written without a catalog_merchants row on the host still shows.
+OFFER_SELLERS_ON_PLANNED_SQL = f"""
+SELECT DISTINCT merchant_id
+FROM catalog_offers
+WHERE product_key = ANY(:keys)
+  AND left(merchant_id, 10) <> 'merch_obs_'
+ORDER BY merchant_id
+LIMIT {SELLER_CANDIDATE_CAP + 1}
+"""
+#: Which candidates sell LIVE at the host, and which brands they sell there. Live = the offer and its product are
+#: both unsuppressed: a retired retailer chain (scripts/retire_retailer_chain_for_brand_official.py suppresses the
+#: products with retailer_chain_superseded_by_brand_official and cascades the suppression to their offers) and
+#: every other tombstone drop out. At the host = the offer's source_domain, else the domain its payload recorded.
+#: catalog_offers.merchant_id is indexed.
+SELLER_LIVE_AT_HOST_SQL = f"""
+SELECT o.merchant_id, p.brand, count(*) AS offers
+FROM catalog_offers o
+JOIN catalog_products p ON p.product_key = o.product_key
+WHERE o.merchant_id = ANY(:ids)
+  AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL
+  AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+  AND {_OFFER_HOST} = ANY(:hosts)
+GROUP BY o.merchant_id, p.brand
+"""
+#: The plan's products that already exist, with their stored seller: apply keeps it (apply._prepare_seller_of_record
+#: step 1), so it is never a new seller. How many exist is recorded too (checks.seller_identity.planned_products_
+#: existing): a pinned seller with none of its store's products is the same split one level down (a re-spelled
+#: record brand mints new product_keys), for the reviewer to see.
+PRODUCT_SELLERS_SQL = """
+SELECT product_key, merchant_id
+FROM catalog_products
+WHERE product_key = ANY(:keys)
+"""
+#: A VERIFIED brand claim's tenant for the store's registrable domain: apply attaches the rows to it
+#: (apply._prepare_seller_of_record step 3), so it is never a new seller either. A suffix compare, not LIKE: a
+#: `_` or `%` in the domain is a character here, never a wildcard.
+CLAIMED_TENANT_SQL = """
+SELECT merchant_id
+FROM brand_claims
+WHERE verification_status = :verified
+  AND (lower(coalesce(brand_domain, '')) = :reg
+       OR right(lower(coalesce(brand_domain, '')), length(:reg) + 1) = '.' || :reg)
+"""
+PINNED_SELLER_SQL = """
+SELECT merchant_id
+FROM catalog_merchants
+WHERE merchant_id = :mid
+"""
+#: The hosts a pinned seller sells LIVE on (same liveness and host spelling as above). The pin is accepted only
+#: when the job's own host is one of them: catalog_merchants.source_ref is last-writer-wins and proves nothing.
+PINNED_LIVE_HOSTS_SQL = f"""
+SELECT DISTINCT {_OFFER_HOST} AS host
+FROM catalog_offers o
+JOIN catalog_products p ON p.product_key = o.product_key
+WHERE o.merchant_id = :mid
+  AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL
+  AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+"""
+
+#: Per-brand sellers of record (ADR-009 W2, the external-seed mirror's ensure_observed_seller): keyed on
+#: (brand, etld1) for any seed domain, so several sit on one host by design. Never a split.
+_OF_RECORD_PREFIX = "merch_obs_"
+
+
+def _norm_host(value: Any) -> str:
+    """One host however a row spelled it: lower-cased, a trailing `:port` and a trailing dot dropped, `www.`
+    dropped (as ingestion._domain_of drops it). `WWW.Brand-A.Example.:443` is `brand-a.example`."""
+    host = str(value or "").strip().lower()
+    host = re.sub(r":[0-9]+$", "", host).rstrip(".")
+    return host.removeprefix("www.")
+
+
+def _store_hosts(domain: Optional[str]) -> tuple:
+    """(host, the spellings :hosts matches -- the host and its `www.` twin; the SQL drops port and dot)."""
+    host = _norm_host(domain)
+    return host, (sorted({host, f"www.{host}"}) if host else [])
+
+
+def _cohort_brand_keys(job: Dict[str, Any], plan: Dict[str, Any]) -> set:
+    """The brands this cohort writes (folded): the job's, every planned product's, and options.brands'."""
+    o = job.get("options") or {}
+    named = [job.get("brand"), *[p.get("brand") for p in plan.get("pdps") or []],
+             *((o.get("brands") or {}).values() if isinstance(o.get("brands"), dict) else [])]
+    from services.brand_spelling import brand_key
+    return {k for k in (brand_key(b) for b in named) if k}
+
+
+def _brand_carry(brands: List[Any], cohort: set) -> str:
+    """What a seller's live stock at the host says about this cohort's brand: "cohort" (it carries it -- the
+    rule resolve_record_brand calls one brand: services.brand_spelling.brand_key, `&` read as `and`, equal or
+    one containing the other, both at least 3 chars), else "unknown" (some of it names no brand, so it cannot
+    be ruled out), else "other" (every row names another brand: a sibling sharing the host, or a vendor the
+    store no longer lists -- not this cohort's)."""
+    from services.brand_spelling import brand_key
+    unknown = False
+    for brand in brands:
+        b = brand_key(brand)
+        if not b:
+            unknown = True
+        elif any(b == c or (len(b) >= 3 and len(c) >= 3 and (b in c or c in b)) for c in cohort):
+            return "cohort"
+    return "unknown" if unknown else "other"
+
+
+def _planned_sellers(plan: Dict[str, Any]) -> Dict[str, List[str]]:
+    """The seller ids the plan writes: its offers' sellers and its products' sellers of record."""
+    offers = sorted({str(r.get("merchant_id") or "") for r in plan.get("offers") or []} - {""})
+    of_record = sorted({str(r.get("merchant_id") or "") for r in (plan.get("pdps") or []) + (plan.get("skus") or [])}
+                       - {""})
+    return {"offers": offers, "of_record": of_record}
+
+
+def _stale_spelling_sellers(job: Dict[str, Any]) -> set:
+    """options.retire_stale_brand re-spells a store on purpose: its OLD spelling's offer seller is expected on the
+    host (the retire handles its rows), so it is not a split."""
+    stale = str((job.get("options") or {}).get("retire_stale_brand") or "").strip()
+    if not stale:
+        return set()
+    from services.catalog_enrichment_agent.ingestion import derive_merchant_id
+    return {derive_merchant_id(stale, None)}
+
+
+async def _seller_identity_checks(job: Dict[str, Any], plan: Dict[str, Any],
+                                  checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """seller_id_split: a cohort that would write a store's rows under a seller id other than the one the store
+    already sells THIS cohort's brand under. Measured 2026-11-19: one brand's own store carried offers under the
+    slugs of two spellings of its brand (the offer seller is the slug of the job's `brand`). Every read runs on ONE
+    SELECT-only catalog connection (_catalog_reader), the stage's read handle; nothing is written. Runs from
+    _check, so a source=shopify_markets job (which never reaches _check) is not checked; the pin is refused there.
+
+    Existing seller = a candidate (catalog_merchants.source_ref is the host, or it has an offer on a planned
+    product) with LIVE offers at the host whose products carry the cohort's brand. Never a split: per-brand
+    sellers of record (merch_obs_*), the plan's own sellers, a planned product's stored seller (apply keeps it), a
+    verified claim's tenant (apply attaches to it), the old spelling options.retire_stale_brand retires. Sibling
+    brands on a shared host and a vendor that disappeared sell another brand, so they are not this cohort's split
+    -- one per-seller rule, where a per-host accept would pre-accept every future split on that host (accepted
+    flags ride along to the next weekly run). Each split is one BLOCK flag per existing id (acceptable).
+
+    Gated: with SELLER_SPLIT_BLOCK_ENV off, everything above is recorded (checks.seller_identity, mode "shadow",
+    `would_flag`) and logged, and NO flag is added. The pin is checked either way (see seller_merchant_id_*)."""
+    from db.brand_claims import STATUS_VERIFIED
+    from services.seller_identity import etld1
+
+    o = job.get("options") or {}
+    pinned = o.get("seller_merchant_id")
+    block = seller_split_block_enabled()
+    host, hosts = _store_hosts(job.get("domain"))
+    planned = _planned_sellers(plan)
+    keys = sorted({str(p.get("product_key") or "") for p in plan.get("pdps") or []} - {""})
+    mode = "block" if block else "shadow"
+    if not host or not (planned["offers"] or planned["of_record"]):
+        checks["seller_identity"] = {"status": "not_applicable", "mode": mode, "host": host}
+        return []
+    registrable = etld1(host)
+    async with _catalog_reader() as read:
+        why = None
+        pinned_rows = pinned_hosts = []
+        if pinned:
+            pinned_rows, why = await read(PINNED_SELLER_SQL, {"mid": pinned})
+            if why is None:
+                pinned_hosts, why = await read(PINNED_LIVE_HOSTS_SQL, {"mid": pinned})
+        on_host = on_offers = stored = claimed = live = []
+        if why is None:
+            on_host, why = await read(SELLERS_ON_HOST_SQL, {"hosts": hosts})
+        if why is None and keys:
+            on_offers, why = await read(OFFER_SELLERS_ON_PLANNED_SQL, {"keys": keys})
+        if why is None and keys:
+            stored, why = await read(PRODUCT_SELLERS_SQL, {"keys": keys})
+        if why is None and registrable:
+            claimed, why = await read(CLAIMED_TENANT_SQL, {"verified": STATUS_VERIFIED, "reg": registrable})
+        nominated = [sorted({str(r.get("merchant_id") or "") for r in rows or []} - {""}) for rows in (on_host, on_offers)]
+        # Each nominating query reads at most SELLER_CANDIDATE_CAP + 1 rows; their union is cut to the cap too.
+        union = sorted(set(nominated[0]) | set(nominated[1]))
+        truncated = any(len(n) > SELLER_CANDIDATE_CAP for n in nominated) or len(union) > SELLER_CANDIDATE_CAP
+        candidates = [m for m in union if not m.startswith(_OF_RECORD_PREFIX)][:SELLER_CANDIDATE_CAP]
+        if pinned and pinned not in candidates:
+            candidates.append(pinned)  # its live stock at the host must carry the cohort's brand (below)
+        if why is None and candidates:
+            live, why = await read(SELLER_LIVE_AT_HOST_SQL, {"ids": candidates, "hosts": hosts})
+    if why:
+        checks["seller_identity"] = {"status": "unchecked", "mode": mode, "host": host, "reason": why}
+        logger.warning("retailer_ingest seller_identity %s", json.dumps(
+            {"job_id": job.get("id"), "host": host, "mode": mode, "status": "unchecked", "reason": why}))
+        if not (block or pinned):
+            return []  # shadow: recorded only (a pin cannot be verified unread: it holds below)
+        if any((plan.get(k) or {}).get("status") in ("unchecked", "error")
+               for k in ("current_listings", "listing_spellings")):
+            return []  # the plan's own listing read already holds this unread catalog (not acceptable either)
+        return [{"key": "seller_ids_unread", "rule": "seller_ids_unread", "severity": detectors.BLOCK,
+                 "acceptable": False,
+                 "detail": f"could not read the sellers {host} already has ({why}): a second seller for the "
+                           f"store cannot be told from a first ingest"}]
+    if pinned and not pinned_rows:
+        checks["seller_identity"] = {"status": "pinned_unknown", "mode": mode, "host": host, "pinned": pinned}
+        raise _Stop("seller_merchant_id_unknown", "failed",
+                    f"options.seller_merchant_id {pinned!r} is not a seller in catalog_merchants: the pin names "
+                    f"the seller the store ALREADY has and never mints one -- fix the id, then re-queue",
+                    checks=checks)
+    cohort = _cohort_brand_keys(job, plan)
+    brands_of: Dict[str, List[Any]] = {}
+    for r in live or []:
+        brands_of.setdefault(str(r.get("merchant_id") or ""), []).append(r.get("brand"))
+    brands_of.pop("", None)
+    carry = {m: _brand_carry(brands, cohort) for m, brands in brands_of.items()}
+    named = {m: sorted({str(b) for b in brands if b}) for m, brands in brands_of.items()}
+    existing = {m: named[m] for m in carry if carry[m] == "cohort"}
+    allowed = (set(planned["offers"]) | set(planned["of_record"])
+               | {str(r.get("merchant_id") or "") for r in stored or []}
+               | {str(r.get("merchant_id") or "") for r in claimed or []}
+               | _stale_spelling_sellers(job))
+    splits = sorted(m for m in existing if m not in allowed)
+    # A live seller on the host whose stock names NO brand (NULL / blank) cannot be ruled out: never invisible.
+    unknown = sorted(m for m in carry if carry[m] == "unknown" and m not in allowed)
+    other_brand = sorted(m for m in carry if carry[m] == "other" and m not in allowed)
+    split_flags = (detectors.seller_split_flags(host, splits, existing, planned)
+                   + detectors.seller_brand_unknown_flags(host, unknown, named, planned))
+    cap = SELLER_IDENTITY_LIST_CAP
+    checks["seller_identity"] = {
+        "status": "split" if splits else ("brand_unknown" if unknown else "clear"), "mode": mode, "host": host,
+        "pinned": pinned, "planned_offer_sellers": planned["offers"][:cap],
+        "existing": {m: existing[m][:cap] for m in sorted(existing)[:cap]}, "split": splits[:cap],
+        "brand_unknown": unknown[:cap],
+        # Live on the host but selling only other brands (siblings, vanished vendors): recorded, never flagged.
+        "other_brand_sellers": {m: named[m][:cap] for m in other_brand[:cap]},
+        "would_flag": [f["key"] for f in split_flags][:cap],
+        "candidates": len(candidates), "truncated": truncated,
+        "planned_products": len(keys),
+        "planned_products_existing": len({str(r.get("product_key") or "") for r in stored or []} - {""}),
+    }
+    if split_flags or truncated:
+        logger.warning("retailer_ingest seller_identity %s", json.dumps(
+            {"job_id": job.get("id"), "host": host, "mode": mode, "status": checks["seller_identity"]["status"],
+             "split": splits[:cap], "brand_unknown": unknown[:cap], "truncated": truncated,
+             "planned_offer_sellers": planned["offers"][:cap]}))
+    flags = list(split_flags) if block else []
+    if pinned:
+        # The pin names THIS store's seller of THIS cohort's brand: proven by its live offers on this very host
+        # (www./apex only) carrying the brand. None here -- none at all, only on another host, only on the apex
+        # when the job is a subdomain -- holds; so does live stock here of another brand only (a sibling's seller)
+        # or of no named brand.
+        live_hosts = sorted({_norm_host(r.get("host")) for r in pinned_hosts or []} - {""})
+        checks["seller_identity"]["pinned_live_hosts"] = live_hosts[:cap]
+        checks["seller_identity"]["pinned_brand_carry"] = carry.get(pinned)
+        if host not in live_hosts:
+            flags.append({"key": f"seller_merchant_id_off_host:{pinned}", "rule": "seller_merchant_id_off_host",
+                          "severity": detectors.BLOCK, "existing_merchant_id": pinned,
+                          "detail": f"options.seller_merchant_id {pinned} has no live offer on {host} (live on "
+                                    f"{live_hosts[:5] or 'no host'}): accept this key only if that seller really "
+                                    f"is this store's"})
+        elif carry.get(pinned) != "cohort":
+            flags.append({"key": f"seller_merchant_id_other_brand:{pinned}", "rule": "seller_merchant_id_other_brand",
+                          "severity": detectors.BLOCK, "existing_merchant_id": pinned,
+                          "detail": f"options.seller_merchant_id {pinned} sells live on {host}, but none of that stock "
+                                    f"carries this cohort's brand (it carries {named.get(pinned, [])[:5] or 'no named brand'}): "
+                                    f"another brand's seller; accept this key only if it really is this brand's"})
+    return flags
 
 
 async def _superseded_rows(keys: List[str], read: Any = None) -> tuple:
@@ -2281,7 +2603,7 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     """One stage of a source=shopify_markets job (services/retailer_ingest/shopify_markets.py).
 
     Same shape as a crawl job: the dry run proves the session in the job's market (US, or SG since
-    2026-10-10) and reads every price, writing nothing; a clean dry run is applied automatically (Peng's
+    2026-10-10) and reads every price, writing nothing; a clean dry run is applied automatically (the owner's
     policy); the apply RE-proves the session, re-reads every price, and only then writes the siblings
     (USD/US or SGD/SG) under the catalog write lock, republishes the touched content_keys and reads them
     back. A store that does not confirm the market's currency is a clean refusal (status `nothing`, the

@@ -64,6 +64,21 @@ def payment_context_from_mapping(value: Any) -> Optional[PivotPaymentContext]:
     return PivotPaymentContext(**payload) if payload else None
 
 
+class UnreadPaymentContext(PivotPaymentContext):
+    """A payment context the caller never read: it meets NO payment requirement and names no value.
+
+    The SDK product search and the /products/resolve fallback used to hand the search FastAPI's Query objects
+    for every payment field (routes.agent_api.agent_search_products was called as a plain function), whose text
+    filled every field. So every offer with a requirement was rejected as a mismatch, and that text was echoed
+    as the decision's `actual`. Until AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT is on, those callers pass this
+    instead: the same decisions and counts, with `actual` None, so a parameter object's text never reaches a
+    response or an analytics event."""
+
+
+#: The one instance callers pass (see UnreadPaymentContext).
+UNREAD_PAYMENT_CONTEXT = UnreadPaymentContext()
+
+
 def payment_context_to_dict(payment_context: Optional[PivotPaymentContext]) -> Dict[str, str]:
     if payment_context is None:
         return {}
@@ -328,6 +343,21 @@ def _payment_context_status(
     decisions: List[Dict[str, Any]],
 ) -> Optional[Tuple[str, List[str]]]:
     required = {k: v for k, v in _requirements(row).items() if v}
+    if isinstance(payment_context, UnreadPaymentContext):
+        # Meets no requirement: the first one the offer names is the mismatch, as it was with the old text.
+        if not required:
+            return "potential", []
+        key, required_value = next(iter(required.items()))
+        decisions.append(
+            {
+                "type": "payment_offer_rejected",
+                "payment_offer_id": row.get("incentive_id"),
+                "reason": f"{key}_mismatch",
+                "required": required_value,
+                "actual": None,
+            }
+        )
+        return None
     context = {k: v.lower() for k, v in payment_context_to_dict(payment_context).items()}
     if not context:
         return "potential", []

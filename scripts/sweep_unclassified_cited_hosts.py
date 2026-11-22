@@ -81,7 +81,7 @@ Run after each audit batch, or weekly if audits trickle in:
   public proxy it used to read is the ROLLBACK's database, and a queue computed
   there proposes registry entries for hosts nobody is served from.
 
-  cd /Users/pengchydan/dev/pivota-backend
+  cd ~/dev/pivota-backend
   DB="$(gcloud secrets versions access latest --secret=DATABASE_URL --project pivota-prod)"
   .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \\
       --database-url "$DB" \\

@@ -28,10 +28,11 @@ where the pay write-ahead lives. A merchant challenge (3DS) during `paying` is a
 buyer states, `paying` included: a worker must never end `paying` on an attempts cap (money may be
 moving); only the rail's answer ends it. A purchase that ends (expired, failed, refused) while it
 holds a `payment_token_id` keeps the id on purpose: the worker must void that token on the rail
-(`list_orphan_tokens` / `forget_orphan_token`; until the rail has a void, the worker counts them). A re-quote (`awaiting_authorization -> quoting`) replaces the
-quote, order and token fields rather than keeping the stale ones, and is REFUSED while a payment
-token is recorded: the buyer may have approved it, and an abandoned authorization must be voided,
-which needs its id. The worker voids it on the rail, then `forget_voided_token`, then re-quotes.
+(`list_orphan_tokens` / `forget_orphan_token`; until the rail has a void, the worker counts them). There is NO re-quote edge (`awaiting_authorization ->
+quoting`): nothing wrote it, and the AgenPas approval consent binds to a purchase's one approval
+(re-adding it needs an approval epoch on agent_purchase_consents). The transition's quoting branch
+still replaces the quote, order and token fields on entry and refuses entry while a payment token is
+recorded: an abandoned authorization must be voided, which needs its id (`forget_voided_token`).
 Entering `quoting` also requires the contact not to have been purged (the quote needs the address).
 
 ── WRITE-AHEAD, BECAUSE THE RAIL CANNOT DEDUPLICATE (YET) ────────────────────────────────────
@@ -94,8 +95,10 @@ ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
     "opened": frozenset({"needs_payment_method", "quoting", "refused", "failed", "expired"}),
     "needs_payment_method": frozenset({"quoting", "expired", "failed"}),
     "quoting": frozenset({"awaiting_authorization", "refused", "failed", "expired"}),
-    # -> quoting: a re-quote (the merchant's price changed) BEFORE any pay was sent.
-    "awaiting_authorization": frozenset({"paying", "quoting", "refused", "failed", "expired"}),
+    # NO -> quoting (re-quote) edge: nothing wrote it, and the AgenPas approval consent
+    # (db/agent_purchase_consents, services/payment_orchestration/purchase_consent.approval_epoch) binds to the
+    # purchase's one approval. Re-adding needs an approval epoch on agent_purchase_consents.
+    "awaiting_authorization": frozenset({"paying", "refused", "failed", "expired"}),
     # Money may be moving: only the rail's own answer ends it. No expiry, no refusal after the fact.
     "paying": frozenset({"completed", "failed"}),
     "completed": frozenset(),

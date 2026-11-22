@@ -659,7 +659,7 @@ def test_parse_proposal_ids_reads_lines_or_a_json_list_through_the_one_normalisa
 
 def test_load_selection_normalises_both_forms_identically_and_shell_quotes_the_path(tmp_path):
     script = _script()
-    d = tmp_path / "Peng's labels"
+    d = tmp_path / "Owner's labels"
     d.mkdir()
     f = d / "clean 42.json"
     f.write_text(json.dumps([EB, EA]))

@@ -1,4 +1,4 @@
-"""Lash and nail products get leaves (Peng 2026-09-26).
+"""Lash and nail products get leaves (the owner 2026-09-26).
 
 Before this, `beauty/makeup/nails/*` were declared TAXONOMY_GAPS and false lashes had no leaf: such
 a product fell to whatever other noun it carried ("Peel Off Nail Polish" -> exfoliant, a dip powder
