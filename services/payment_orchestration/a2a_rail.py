@@ -205,12 +205,16 @@ READ_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
 #: Key prefixes whose whole subtree is a payment credential. Matched case-insensitively with `_`,
 #: `-` and `.` removed, at any depth.
 _CREDENTIAL_SUBTREE_PREFIXES = ("networktoken",)
-#: THE ONE NAME of the token-result field that carries the DAVV, inside `networkToken`. PENDING THE PROVIDER'S
-#: A2A UPDATE AND SANDBOX MEASUREMENT: the A2A skill does not return a DAVV yet (the provider is adding it), so
-#: no real answer carries this field today and every checkout fails closed (`davv_missing`, nothing sent).
-#: When the provider names the field, this constant changes and nothing else. NEVER the cryptogram: that is
-#: the TAVV, for gateway token transactions, and a card form cannot take it.
-DAVV_FIELD = "davv"
+#: THE ONE NAME of the token-result field that carries the DAVV, inside `networkToken`. The provider's documented
+#: token-result (11-19): networkToken {brand, value (the DPAN), expiryDate, cvv, cryptogram, eci,
+#: dynamicDataType: "DAVV"}: the DAVV is `cvv`, read ONLY when `DAVV_MARKER_FIELD` is exactly `DAVV_MARKER`
+#: (`davv_from_network_token`). A `cvv` without that marker could be a real card's CVV: it is never read or
+#: relayed (`davv_missing`, nothing sent). NEVER the cryptogram: that is the TAVV, for gateway token
+#: transactions, and a card form cannot take it.
+DAVV_FIELD = "cvv"
+#: The marker that makes `networkToken.cvv` a DAVV: exact and case-sensitive ("davv", "CVV", null or absent: no).
+DAVV_MARKER_FIELD = "dynamicDataType"
+DAVV_MARKER = "DAVV"
 #: Keys whose value is a credential wherever they appear (same matching).
 _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
@@ -605,9 +609,14 @@ def has_card_code(text: Any) -> bool:
 def davv_echo_matcher(davv: str) -> Callable[[Any], bool]:
     """The rule for the relay's setup answer (BEFORE the confirm): only OUR DAVV, digits folded to ASCII and
     separators allowed between them ("7 1 5", "7-1-5"), beside a card-code word, at most three words away.
-    "CVV verified. Order 123" is not our code, so the purchase is not cancelled for it."""
-    digits = r"[\W_]?".join(re.escape(d) for d in davv)
-    code = r"(?<![0-9])" + digits + r"(?![0-9])"
+    "CVV verified. Order 123" is not our code, so the purchase is not cancelled for it. A leading-zero DAVV
+    ("077") is also caught without its zeros ("cvv 77"), as it reads once echoed as a number."""
+    forms = {davv}
+    short = _davv_short_form(davv)
+    if short is not None:
+        forms.add(short)
+    digits = "|".join(r"[\W_]?".join(re.escape(d) for d in form) for form in sorted(forms, key=len, reverse=True))
+    code = r"(?<![0-9])(?:" + digits + r")(?![0-9])"
     pattern = re.compile(
         r"(?<![a-z0-9])(?:" + _CARD_CODE_WORDS + r")(?![a-z])" + _CARD_CODE_GAP + code
         + r"|" + code + r"[\W_]*(?:[a-z]+[\W_]+){0,3}?(?:" + _CARD_CODE_WORDS + r")(?![a-z])")
@@ -714,9 +723,14 @@ _DAVV_RE = re.compile(r"^[0-9]{3}\Z")
 
 
 def davv_from_network_token(network_token: Any) -> Optional[str]:
-    """The token's DAVV (`networkToken[DAVV_FIELD]`), or None unless it is exactly 3 ASCII digits. Pure; never
-    logs. There is no fallback to any other field."""
+    """The token's DAVV (`networkToken[DAVV_FIELD]`, i.e. `cvv`), or None. ONLY when `networkToken.dynamicDataType`
+    is exactly "DAVV" (case-sensitive; missing, null, "davv" or any other value: None), and only a STRING of
+    exactly 3 ASCII digits, kept as is: "077" stays "077" (an int 77 is None: its leading zero is lost). Pure;
+    never logs. There is no fallback to any other field."""
     if not isinstance(network_token, Mapping):
+        return None
+    marker = network_token.get(DAVV_MARKER_FIELD)
+    if not isinstance(marker, str) or marker != DAVV_MARKER:
         return None
     value = network_token.get(DAVV_FIELD)
     return value if isinstance(value, str) and _DAVV_RE.match(value) else None
@@ -729,7 +743,8 @@ def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: An
     THE PROVIDER'S ANSWER (11-18): `checkout.setup` has no network-token field; the card is filled as a
     normal card, EXACTLY these five keys (their example: {"number", "expiry", "cvv", "name", "brand"}):
       number = `networkToken.value` (the DPAN); expiry = `networkToken.expiryDate` read as MMYY and sent as
-      "MM/YY"; cvv = the 3-digit DAVV (`davv_from_network_token`, minted with `dynamic_data_type: "DAVV"`);
+      "MM/YY"; cvv = the 3-digit DAVV (`davv_from_network_token`: `networkToken.cvv`, only when the token's
+      `dynamicDataType` is exactly "DAVV"; minted with `dynamic_data_type: "DAVV"`);
       name = the buyer's first + last name from the purchase's shipping contact (no cardholder name is
       received); brand = the card's brand (visa).
     The cryptogram and the ECI (the TAVV, for gateway token transactions) are NEVER sent. No DAVV: None (the
@@ -848,10 +863,25 @@ _SCRUB_SUBSTRING_MIN = 8
 
 
 
+def _davv_short_form(davv: str) -> Optional[str]:
+    """A leading-zero DAVV without its zeros ("077" -> "77"), as an echo reads once it went through a number; None
+    when there is no leading zero, or when fewer than TWO digits would remain ("007", "000"): a one-digit needle
+    would cancel on any `quantity: 7`, `errorCount: "0"` or "Ships in 7 days". Such a DAVV is caught verbatim
+    ("007"), and in prose beside a card word as written. RESIDUAL: a short form split across two values
+    ({"a": "7", "b": "7"}) is not caught; nothing stores or sends it."""
+    if not (davv.isdigit() and davv.isascii()):
+        return None
+    short = str(int(davv))
+    return short if short != davv and len(short) >= 2 else None
+
+
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
     expiry (raw and as "MM/YY") and its DAVV (`DAVV_FIELD`) only as a WHOLE value: "715" alone, never inside
-    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context."""
+    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context; a leading-zero
+    DAVV also without its zeros when two digits remain (`_davv_short_form`).
+    ON PURPOSE the needle reads `networkToken.cvv` WITHOUT the dynamicDataType marker: an unmarked cvv is never
+    relayed (davv_missing comes first), and scrubbing it if echoed is only stricter. Do not "fix" it."""
     contains: List[str] = []
     exact = set()
     for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
@@ -859,6 +889,10 @@ def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], F
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
+        short = _davv_short_form(raw) if key == DAVV_FIELD else None
+        if short is not None:
+            # A leading-zero DAVV ("077") may come back as the number 77 or the string "77": the same code.
+            exact.add(short)
         # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
         for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
             if len(form) >= _SCRUB_SUBSTRING_MIN and key != DAVV_FIELD:
@@ -1204,7 +1238,8 @@ class A2ARailClient:
                 relay.refused = "network_token_missing"
                 return relay
             if davv_from_network_token(network_token) is None:
-                # No DAVV (the A2A skill does not return one yet), or not exactly 3 ASCII digits: the card form
+                # No DAVV: no `cvv`, a `cvv` on a token not marked dynamicDataType "DAVV" (it could be a real
+                # card's CVV: never read, never relayed), or not a string of exactly 3 ASCII digits: the card form
                 # cannot be filled. Never the cryptogram instead. Nothing goes to the checkout.
                 relay.refused = "davv_missing"
                 return relay
