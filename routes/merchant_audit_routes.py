@@ -1047,6 +1047,25 @@ def _parse_free_audit_count_since(raw: Optional[str]) -> Optional[datetime]:
 _FREE_AUDIT_COUNT_SINCE = _parse_free_audit_count_since(
     _os.getenv("FREE_AUDIT_COUNT_SINCE")
 )
+
+
+async def free_url_audit_allowance(merchant_id: str) -> Dict[str, Optional[int]]:
+    """The free link-check allowance exactly as the audit gate counts it, for display.
+
+    The merchant portal's credits panel showed "0 available, monthly allowance 0" while every
+    merchant had _FREE_URL_AUDITS_PER_MERCHANT free link checks: the count was only returned on
+    a check's own quote. Same counter, same FREE_AUDIT_COUNT_SINCE cutoff, same "failed runs don't
+    count" rule as the gate. `allowed` and `remaining` are None when the cap is lifted (<= 0),
+    which means link checks are unmetered. Deep scans are always metered and never use this.
+    """
+    cap = _FREE_URL_AUDITS_PER_MERCHANT
+    if cap <= 0:
+        return {"allowed": None, "used": None, "remaining": None}
+    used = await count_runs_for_merchant_by_subject(
+        merchant_id=merchant_id, subject_type="merchant_url", since=_FREE_AUDIT_COUNT_SINCE,
+    )
+    used = max(0, int(used or 0))
+    return {"allowed": cap, "used": min(used, cap), "remaining": max(0, cap - used)}
 # Two sequential upstream runs keep a real evidence floor instead of binary
 # 1-sample verdicts; the LLM probe timeout is sized for grounded searches.
 _WEDGE_MAX_RUNS = int(_os.getenv("WEDGE_MAX_RUNS", "2"))
