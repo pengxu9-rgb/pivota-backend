@@ -143,6 +143,14 @@ def test_each_rails_code_is_read_from_its_own_end_and_a_detail_is_never_echoed()
         assert leaked not in text
 
 
+def test_a_hold_code_on_a_token_rail_row_that_is_not_paying_is_not_a_hold():
+    """The operator's list is `paying` rows only: a code left on an earlier state is still moving."""
+    report = _build(a2a=[_row("awaiting_authorization", last_error_code=HOLD), _row("paying", last_error_code=HOLD)])
+    [group] = report["groups"]
+    assert (group["held"], group["in_flight"], group["finished"]) == (1, 1, 1)
+    assert group["ended_by"] == {f"held:{HOLD}": 1}
+
+
 def test_groups_split_by_merchant_market_and_buyer_and_the_token_rails_market_is_the_plans():
     plans = [{"rail": "a2a", "rail_purchase_id": "ap_1", "routing_plan": json.dumps({"basis": "orchestrator_selected_rail",
               "policy": "env_v1", "market": "SG", "dropped": {"reap": "a2a_preferred"}})},
