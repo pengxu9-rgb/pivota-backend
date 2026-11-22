@@ -351,7 +351,7 @@ def test_no_token_a_foreign_body_intent_is_ignored(client, world, monkeypatch):
     world.order_row = _order(shipping_address=UNUSABLE_ADDR)
     res = _post_no_token(client, intent_id=FOREIGN_INTENT)
     assert res.status_code == 200, res.text
-    assert FOREIGN_INTENT not in seen.prefill_reads
+    assert seen.prefill_reads == []  # no intent, so no prefill is read at all
     assert seen.address_inserts == []
     assert seen.intent_links == []
     assert len(world.order_updates) == 1
@@ -437,11 +437,14 @@ def test_the_update_keeps_the_orders_intent_when_none_is_given(client, world, mo
 
 
 @pytest.mark.parametrize("owner", [" ", SAVER + " "], ids=["whitespace_only", "saver_with_a_space"])
-def test_an_owner_id_the_where_would_not_match_is_refused_before_the_write(client, world, owner):
+def test_an_owner_id_the_where_would_not_match_is_refused_before_the_write(client, world, monkeypatch, owner):
     # The read check is the WHERE's own rule: unowned is NULL or '' exactly, the saver is the exact id.
+    # So it refuses before any write is even sent (and before a save_token would be redeemed).
+    sent = _update_sql(world, monkeypatch)
     world.order_row = _order(buyer_id=owner)
     res = _post(client, _token(order_id=ORDER), ORDER)
     assert res.status_code == 409, res.text
+    assert sent == []
     assert world.order_updates == []
 
 
