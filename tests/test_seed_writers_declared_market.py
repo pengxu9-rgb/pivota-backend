@@ -125,7 +125,7 @@ def _backfill(client: TestClient, **body):
     [
         ({}, "MARKET_REQUIRED"),
         ({"market": "  "}, "MARKET_REQUIRED"),
-        ({"market": "EU-DE"}, "UNKNOWN_MARKET:EU-DE"),
+        ({"market": "EU-DE"}, "UNKNOWN_MARKET:'EU-DE'"),
         ({"market": "fr"}, "MARKET_NOT_INGESTED:FR"),
     ],
 )
@@ -233,10 +233,10 @@ def _install_create(monkeypatch) -> List[Dict[str, Any]]:
     "path,extra,detail",
     [
         ("/employee/products/external-seeds", {}, "MARKET_REQUIRED"),
-        ("/employee/products/external-seeds", {"market": "EU-DE"}, "UNKNOWN_MARKET:EU-DE"),
+        ("/employee/products/external-seeds", {"market": "EU-DE"}, "UNKNOWN_MARKET:'EU-DE'"),
         ("/employee/products/external-seeds", {"market": "FR"}, "MARKET_NOT_INGESTED:FR"),
         ("/employee/products/m|shopify|1/external-links", {}, "MARKET_REQUIRED"),
-        ("/employee/products/m|shopify|1/external-links", {"market": "EU-DE"}, "UNKNOWN_MARKET:EU-DE"),
+        ("/employee/products/m|shopify|1/external-links", {"market": "EU-DE"}, "UNKNOWN_MARKET:'EU-DE'"),
     ],
 )
 def test_creating_a_seed_without_an_ingestible_declared_market_is_refused(monkeypatch, client, path, extra, detail):
@@ -283,7 +283,8 @@ def _install_edit(monkeypatch, stored_market: str) -> List[Dict[str, Any]]:
 
 @pytest.mark.parametrize(
     "market,detail",
-    [("", "MARKET_REQUIRED"), ("EU-DE", "UNKNOWN_MARKET:EU-DE"), ("FR", "MARKET_NOT_INGESTED:FR")],
+    [("", "MARKET_REQUIRED"), ("EU-DE", "UNKNOWN_MARKET:'EU-DE'"), ("FR", "MARKET_NOT_INGESTED:FR"),
+     ("ſg", "UNKNOWN_MARKET:'ſg'"), ("Q" * 40, "UNKNOWN_MARKET:" + repr("Q" * 16) + "...")],
 )
 def test_editing_a_seed_into_a_missing_or_unknown_market_is_refused(monkeypatch, client, market, detail):
     writes = _install_edit(monkeypatch, "US")
@@ -362,10 +363,10 @@ _CATALOG = "product_url,market,sku,price,currency,product_title\n"
     "sheet,row_market,detail",
     [
         (_PLAIN, "", "MARKET_REQUIRED"),
-        (_PLAIN, "EU-DE", "UNKNOWN_MARKET:EU-DE"),
+        (_PLAIN, "EU-DE", "UNKNOWN_MARKET:'EU-DE'"),
         (_PLAIN, "FR", "MARKET_NOT_INGESTED:FR"),
         (_CATALOG, "", "MARKET_REQUIRED"),
-        (_CATALOG, "EU-DE", "UNKNOWN_MARKET:EU-DE"),
+        (_CATALOG, "EU-DE", "UNKNOWN_MARKET:'EU-DE'"),
     ],
 )
 def test_a_csv_row_with_no_ingestible_market_is_refused_and_never_defaults_to_us(
@@ -387,7 +388,7 @@ def test_a_csv_row_with_no_ingestible_market_is_refused_and_never_defaults_to_us
     assert writes == []
 
 
-@pytest.mark.parametrize("market,detail", [("EU-DE", "UNKNOWN_MARKET:EU-DE"), ("FR", "MARKET_NOT_INGESTED:FR")])
+@pytest.mark.parametrize("market,detail", [("EU-DE", "UNKNOWN_MARKET:'EU-DE'"), ("FR", "MARKET_NOT_INGESTED:FR")])
 def test_a_csv_import_declaring_an_unknown_sheet_market_is_refused_whole(monkeypatch, client, market, detail):
     writes = _install_csv(monkeypatch)
 

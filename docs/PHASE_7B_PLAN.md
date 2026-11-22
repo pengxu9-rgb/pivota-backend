@@ -15,7 +15,7 @@ the gateway can't see.
 - **Result trajectory:**
   - probe v15 (prod, post Step 2 + 2.5): 69.8%, lipstick 9/9, beauty 35/37 (94.6%)
   - **probe v17 (prod, post Step 3): 72%, beauty 37/37 = 100% ✅**, skincare_serum 0/2 → 2/2 PASS
-- Owner: peng (review) + codex (Step 2 implementation) + claude (Step 1 + spec)
+- Owner: Founder (review) + codex (Step 2 implementation) + claude (Step 1 + spec)
 - Actual cost so far: ~3 hours Step 1 (helper + tests + spec) + ~2 hours Step 2 (codex implementation, locally green)
 
 ---

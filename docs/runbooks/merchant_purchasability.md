@@ -505,7 +505,7 @@ unions a third lane (`_CONNECTED_LANE_SQL`):
   they are never defaulted. A wrong region costs one abandoned checkout and a negative fact,
   which is the same answer as no fact.
 
-**Every connected store is a test store today** (Peng, 2026-09-29). There is no real
+**Every connected store is a test store today** (the owner, 2026-09-29). There is no real
 outside-merchant connection yet; the lane exists so the first one is covered on day one.
 
 Measured on prod 2026-09-29, applying the policy to the lane's own rows: **6 rows → 4
@@ -1252,7 +1252,7 @@ as a one-click cart. Measured on prod 2026-09-27: 432 active-seed offers mint a 
 
 Under `MERCHANT_PURCHASABILITY_ENFORCE` the mint (`routes/agent_shop_gateway._CartPurchasabilityGate`)
 now asks first. **It asks the HUMAN cart's question, `human_handoff_allowed`, not the Reap rail's
-`is_purchasable`** (Peng, 2026-10-09):
+`is_purchasable`** (the owner, 2026-10-09):
 
 | state | cart? | DB read |
 |---|---|---|
@@ -1295,7 +1295,7 @@ The market is the **request's** (`payload.market`), never the seed row's listing
 the `or "US"` serving default. So a market-less caller (the UCP `get_offers` tool today) loses its
 carts even on merchants that are positive for US — the same answer the gateway's own gate gives.
 
-**A declared storefront market is a market; a per-request fallback is not** (Peng, 2026-10-09).
+**A declared storefront market is a market; a per-request fallback is not** (the owner, 2026-10-09).
 "Never default a market" forbids a *fallback*: a value a door fills in when the caller said nothing
 (`or "US"`, a browser language, a geo-IP guess made on the caller's behalf). It does not forbid a
 *declaration*: a surface that serves exactly one market may state that market on every call, and

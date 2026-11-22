@@ -6,7 +6,7 @@ retailer-ingest drain. Path C attaches every seed to a synthetic pk_<hash>, so n
 owned the domain and derive_seed_seller filed the brand's own store as 'cross' -- which strips the
 observed-seller identity-coverage exemption in catalog_trust_policy.
 
-Peng (2026-09-29): a brand-official storefront the drain VERIFIED (Tier A, Tier B, or a human-accepted
+The owner (2026-09-29): a brand-official storefront the drain VERIFIED (Tier A, Tier B, or a human-accepted
 brand_official_domain_unproven flag) gets 'self' seeds. source_role=brand_official alone is not proof:
 the curated onboard queue defaults a role-less job to brand_official and auto-applies with no domain
 check, and is_known_retailer misses resellers (luxiface.com, tripletraders.com, perfumania.com,

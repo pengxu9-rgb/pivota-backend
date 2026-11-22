@@ -1,6 +1,6 @@
 """A seed is served only in the currency of the market it is served to.
 
-Peng 2026-09-26: "Fallback results are essentially wrong results -- we should not show them to the
+The owner 2026-09-26: "Fallback results are essentially wrong results -- we should not show them to the
 agent frontend." Measured on prod the same day, the find_products_multi seed lane (which binds NO
 partition) could reach 1,061 active non-USD / currency-less seeds (SGD 666, JPY 306, KRW 23,
 GBP 20, NULL 46) beside 21,096 USD ones, and 7 of its 57 caller requests since 09-20 served SGD

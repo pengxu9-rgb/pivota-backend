@@ -8,7 +8,7 @@ as a product already in the catalog and proposes moving each onto it (its conten
 group), through the identity engine (services.identity_resolution): attach_membership for a listing
 alone on its content_key, merge_content_key when several live rows share it and must move together.
 
-IDENTITY (Peng, 2026-10-16). A product is brand + line + formulation; size and shade are variants.
+IDENTITY (the owner, 2026-10-16). A product is brand + line + formulation; size and shade are variants.
 PHASE 1 MERGES SAME-SIZE ONLY, in EVERY market: the product joined has exactly one size, and every
 offer and SKU of every row that moves is that size (offers.resolve, agent_pdp_view and the gateway
 sibling path have no size awareness yet: they aggregate price ranges and variants per content_key).
@@ -50,7 +50,7 @@ THE JUDGEMENT (listing vs anchor), in order:
   6. `offer_not_variant_pinned`: the matched size is only on a mirror offer (one per product, its
      price rewritten on every seed sync) or a '::canonical' SKU -- nothing names the variant
      (identity_resolution.is_variant_sku_key). The dry run also counts how many of these a
-     read-time re-checked mirror pin would admit (`mirror_recheck_additional`), for Peng;
+     read-time re-checked mirror pin would admit (`mirror_recheck_additional`), for the owner;
      `offer_sku_not_on_listing`: a per-variant offer of the listing whose sku_key is not
      `<the listing's product_key>::v:<non-empty variant>` (another product's SKU, `x::v:`) -- the
      pin would name something the proposal does not move; `market_currency_mismatch`: ANY offer of
@@ -87,7 +87,7 @@ key is ABSENT when they state none (a "Default Title" offer pinned through the r
 anchor's size is never copied onto an offer.
 
 CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the
-content Peng reviewed: a selected write refuses a proposal whose fingerprint changed (a proposal_id pins
+content the owner reviewed: a selected write refuses a proposal whose fingerprint changed (a proposal_id pins
 only the structural move). THE RULE: everything the review page renders from an audit row is hashed,
 plus the verdict's PINS: each matched offer as (offer_id, sku_key) and each matched seed as (seed_id,
 variant_id). NOT hashed, on purpose: matcher_verdict.matched_offers[].price / currency / market / size,
@@ -119,7 +119,7 @@ cmd_ digest still pins the full evidence). Canonical form:
      decimal value rounded half away from zero), so 67 and 67.0 both give "67.00" (Cloud Logging turns
      67.0 into 67), 10.125 gives "10.13", 1.005 gives "1.00". Finite values below 1e21 only.
      THE PAGE DISPLAYS EXACTLY THESE STRINGS (toFixed(2) prices, toFixed(4) sizes and ratio), so
-     what Peng reads is what is hashed.
+     what the owner reads is what is hashed.
   4. Ordering: hosts sorted; matched_offers and matched_seeds sorted by each element's JSON text
      (JSON.stringify of the array); rows sorted by listing.product_key, then anchor.product_key. Every
      comparison is by UTF-16 code units (JS `a < b`). A (listing, anchor) pair appears once.
@@ -741,7 +741,7 @@ def _side_price(offers: Iterable[Offer]) -> Tuple[Optional[float], str, str]:
 
 
 def _off_market_currency(o: Offer) -> bool:
-    """Peng's rule broken: the offer states a price or a currency, and its currency is not its
+    """The owner's rule broken: the offer states a price or a currency, and its currency is not its
     market's (region_pricing; a market the map does not know never matches). An offer with neither a
     price nor a currency is not judged."""
     if o.price is None and not o.currency:
@@ -1058,7 +1058,7 @@ class Planner:
         # pinned on its remaining offers. Same helper as the engine's, so the two cannot drift.
         if any(not sku_key_on_moved_listing(o.sku_key, [li.product_key]) for o in variant_all):
             return Verdict("held", ["offer_sku_not_on_listing"], **held)
-        # Peng's standing rule (controller 10-17): an offer's price currency IS its market's currency
+        # The owner's standing rule (controller 10-17): an offer's price currency IS its market's currency
         # (services.region_pricing.REGION_PRICING_CURRENCY, the one market -> currency map; never a
         # second copy here). EVERY offer of the listing is judged -- per-variant, mirror and
         # '::canonical' alike, every market: they all move with the listing onto the keeper's product.
@@ -1629,7 +1629,7 @@ class Plan:
              "mirror_recheck_additional": mirror_extra,
              "note": ("listings held offer_not_variant_pinned whose mirror / ::canonical offer is priced in the "
                       "market at the anchor's size: proposable only if mirror offers were pinned with a "
-                      "read-time price + size re-check (Peng decides)")},
+                      "read-time price + size re-check (the owner decides)")},
             {"section": "outcomes", "market": self.market,
              "held": {r: n for (s, r), n in sorted(status_reason.items()) if s == "held"},
              "deferred": {r: n for (s, r), n in sorted(status_reason.items()) if s == "deferred"},
@@ -1662,7 +1662,7 @@ class Plan:
         return {k: info[k] for k in ("mode", "selected", "of")}
 
     def audit_rows(self, *, size: int = 600, seed: int = 20261016) -> List[Dict[str, Any]]:
-        """A seeded RANDOM sample of (moved listing, anchor) pairs for Peng's side-by-side review.
+        """A seeded RANDOM sample of (moved listing, anchor) pairs for the owner's side-by-side review.
         Catalog fields only: no personal data."""
         pool = list(self.pairs)
         rng = random.Random(seed)

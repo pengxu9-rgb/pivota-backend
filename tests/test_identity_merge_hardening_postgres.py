@@ -1003,21 +1003,21 @@ async def test_an_m4_run_is_approved_exactly_under_its_digest(db, conn):
     run = [await _m4_proposal(conn, 1), await _m4_proposal(conn, 2), await _m4_proposal(conn, 3,
                                                                                          kind="merge_content_key")]
     other_run = await _m4_proposal(conn, 4, run="m4run_2")
-    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     assert dry["dry_run"] is True and sorted(dry["proposals"]) == sorted(run) and dry["problems"] == {}
     assert [await _status(conn, p) for p in run] == ["proposed"] * 3
 
-    refused = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+    refused = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                                        dry_run=False)
     assert refused["refused"] == "expect_digest_required"
     late = await _m4_proposal(conn, 5)  # the run grew after the dry run: a different set
     with pytest.raises(DigestMismatch):
-        await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+        await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                                  expect_digest=dry["digest"], dry_run=False)
     assert [await _status(conn, p) for p in [*run, late]] == ["proposed"] * 4
 
-    again = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
-    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+    again = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                                    expect_digest=again["digest"], dry_run=False)
     assert sorted(out["approved"]) == sorted([*run, late])
     assert [await _status(conn, p) for p in [*run, late]] == ["approved"] * 4
@@ -1039,10 +1039,10 @@ async def test_an_m4_run_with_one_bad_proposal_approves_nothing(db, conn, make, 
 
     good = await _m4_proposal(conn, 1)
     bad = await _m4_proposal(conn, 2, **make)
-    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     assert out["refused"] == "invalid_proposals" and list(out["problems"]) == [bad]
     assert any(needle in p for p in out["problems"][bad])
-    written = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+    written = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                                        expect_digest=out["digest"], dry_run=False)
     assert written["refused"] == "invalid_proposals"
     assert [await _status(conn, p) for p in (good, bad)] == ["proposed", "proposed"]
@@ -1052,11 +1052,11 @@ async def test_approve_module_run_refuses_without_a_run_or_for_another_strategy(
     from services.identity_resolution import approve_module_run
 
     with pytest.raises(ValueError):
-        await approve_module_run(conn, strategy=M4, proposal_run_id="", decided_by="peng")
+        await approve_module_run(conn, strategy=M4, proposal_run_id="", decided_by="owner")
     with pytest.raises(ValueError):
         await approve_module_run(conn, strategy="retailer_listing_brand_prefix", proposal_run_id="r",
-                                 decided_by="peng")
-    out = await approve_module_run(conn, strategy=M4, proposal_run_id="no_such_run", decided_by="peng")
+                                 decided_by="owner")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="no_such_run", decided_by="owner")
     assert out["refused"] == "no_proposed_proposals_in_run"
 
 
@@ -1064,9 +1064,9 @@ async def test_an_m4_approval_is_recorded_per_proposal_with_its_digest(db, conn)
     from services.identity_resolution import approve_module_run
 
     run = [await _m4_proposal(conn, 1), await _m4_proposal(conn, 2)]
-    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     assert await _events(conn) == []  # a dry run records nothing
-    await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+    await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                              expect_digest=dry["digest"], dry_run=False)
     rows = await conn.fetch("SELECT proposal_id, action, run_id, detail FROM identity_resolution_events ORDER BY id")
     assert sorted(r["proposal_id"] for r in rows) == sorted(run)
@@ -1074,7 +1074,7 @@ async def test_an_m4_approval_is_recorded_per_proposal_with_its_digest(db, conn)
         detail = json.loads(r["detail"]) if isinstance(r["detail"], str) else r["detail"]
         assert (r["action"], r["run_id"]) == ("approved", "m4run_1")
         assert (detail["digest"], detail["decided_by"], detail["proposal_run_id"], detail["strategy"]) == (
-            dry["digest"], "peng", "m4run_1", M4)
+            dry["digest"], "owner", "m4run_1", M4)
         assert detail["approved_at"]
 
 
@@ -1083,14 +1083,14 @@ async def test_an_m4_approval_digest_covers_each_proposals_content_not_only_its_
     from services.identity_resolution import DigestMismatch, approve_module_run
 
     run = [await _m4_proposal(conn, 1), await _m4_proposal(conn, 2)]
-    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     await conn.execute(
         "UPDATE identity_resolution_proposals SET evidence = jsonb_set(evidence, '{matcher_verdict,rule_version}',"
         " '\"t0.v2\"') WHERE proposal_id = $1", run[0])
-    again = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    again = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     assert again["proposals"] == dry["proposals"] and again["problems"] == {}  # still valid, same ids
     with pytest.raises(DigestMismatch):
-        await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+        await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                                  expect_digest=dry["digest"], dry_run=False)
     assert [await _status(conn, p) for p in run] == ["proposed", "proposed"] and await _events(conn) == []
 
@@ -1103,7 +1103,7 @@ async def test_a_module_run_proposal_of_another_kind_is_not_approvable(db, conn)
                      merchant_id=RET_M, content_key="ck_x",
                      evidence={"proposer": M4, "proposal_run_id": "m4run_1", "matcher_verdict": _verdict()})
     await upsert_proposals(conn, [p], module_writer=M4)
-    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
     assert out["refused"] == "invalid_proposals" and list(out["problems"]) == [p["proposal_id"]]
     assert any("kind is 'suppress_dup'" in x for x in out["problems"][p["proposal_id"]])
     assert await _status(conn, good) == "proposed"
@@ -1114,8 +1114,8 @@ async def test_an_approved_m4_attach_never_applies_without_a_digest(db, conn):
     from services.identity_resolution import apply_approved, approve_module_run
 
     pid = await _m4_proposal(conn, 1)
-    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
-    await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner")
+    await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="owner",
                              expect_digest=dry["digest"], dry_run=False)
     out = await apply_approved(conn, run_id="R_M4", strategies=[M4])
     assert out["applied"] == [] and out["skipped"] == [(pid, "module_only_strategy_needs_expect_digest")]

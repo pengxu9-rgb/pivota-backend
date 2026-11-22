@@ -5,7 +5,7 @@ Self-contained Codex prompts ready to dispatch in parallel waves.
 ## Quick start
 
 ```bash
-cd /Users/pengchydan/dev/pivota-backend-receipt-suppress-fix/docs/monetization/codex_dispatch
+cd ~/dev/pivota-backend-receipt-suppress-fix/docs/monetization/codex_dispatch
 
 # Wave 1 (parallel) — read-only audits, no dependencies
 ./dispatch_wave1.sh

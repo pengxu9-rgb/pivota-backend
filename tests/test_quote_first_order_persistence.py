@@ -79,7 +79,7 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
         create_replacement_quote_on_mismatch: bool = False,
     ):
         assert quote.quote_id == "q_test"
-        assert customer_email == "peng@chydan.com"
+        assert customer_email == "buyer@example.com"
         assert create_replacement_quote_on_mismatch is True
         return {"status": "validated", "engine": "shopify_storefront_cart", "engine_ref": "cart_ref_live"}
 
@@ -120,12 +120,12 @@ async def test_quote_first_create_order_persists_authoritative_pricing(monkeypat
 
     req = CreateOrderRequest(
         merchant_id="merch_1",
-        customer_email="peng@chydan.com",
+        customer_email="buyer@example.com",
         quote_id="q_test",
         discount_codes=["PIVOTA_AUDIT_20260421C_FIXPROD60"],
         items=[{"product_id": "10064558129449", "variant_id": "53012602618153", "quantity": 1}],
         shipping_address={
-            "name": "Peng Chydan",
+            "name": "Test Buyer",
             "address_line1": "1 Market St",
             "address_line2": "",
             "city": "San Francisco",

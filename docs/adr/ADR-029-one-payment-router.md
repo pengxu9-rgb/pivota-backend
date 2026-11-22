@@ -2,7 +2,7 @@
 
 **Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR.
 
-**Decision owner:** peng. **Runtime owner of the router:** the payment orchestration code owner (to be named at acceptance).
+**Decision owner:** Founder. **Runtime owner of the router:** the payment orchestration code owner (to be named at acceptance).
 
 **Builds on.** All of these are Proposed (SIGNOFF.md is unsigned); this ADR assumes them as written and names where it amends one.
 - **ADR-012-agent-transaction-rail-boundary:** the path is chosen by caller class × settlement, not freely; the buyer's consent and its ceiling.

@@ -163,7 +163,7 @@ _alias("beauty/makeup/lip/oil", "beauty/makeup/lips/lip_oil")
 _alias("beauty/makeup/eye/eyeliner", "beauty/makeup/eyes/eyeliner")
 _alias("beauty/makeup/eye/brow", "beauty/makeup/eyebrow")
 _alias("beauty/makeup/eye/mascara", "beauty/makeup/eyes/lash")
-# False lashes got a leaf on 2026-09-26 (Peng). `eyes/lashes` was a declared gap ("no false-lash
+# False lashes got a leaf on 2026-09-26 (the owner). `eyes/lashes` was a declared gap ("no false-lash
 # leaf"); it and the two spellings measured since (Sigma's `eyes/false-lashes`, `eyes/false_lashes`)
 # are the plural-`eyes/` typo of the one leaf. NOT `eyes/lash` above: that cohort is mascara.
 _alias("beauty/makeup/eye/false-lashes", "beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false-lashes",
@@ -267,7 +267,7 @@ TAXONOMY_GAPS: Dict[str, str] = {
     "beauty/skincare/moisturizer/balm": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
     "beauty/skincare/oil": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/oil",
     # beauty/makeup/nails/{nail-polish,cuticle-oil,nail-polish-remover} were gaps here until
-    # 2026-09-26 (Peng: "add the nail category"). They are LEAVES now -- CATEGORY_PATTERNS carries
+    # 2026-09-26 (the owner: "add the nail category"). They are LEAVES now -- CATEGORY_PATTERNS carries
     # them -- 4 segments deep, so their browse prefix is `beauty/makeup/nails/`, never the whole of
     # `beauty/makeup/` (the over-broadening the set paths below would cause).
     "wellness/supplements": "no wellness root",

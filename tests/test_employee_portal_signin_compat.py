@@ -21,9 +21,9 @@ def test_auth_signin_accepts_users_table_when_employees_missing(monkeypatch):
     password = "Admin123!"
     user_record = {
         "id": 123,
-        "email": "peng@pivota.cc",
+        "email": "employee@example.com",
         "password_hash": bcrypt_hash_password(password),
-        "full_name": "Peng",
+        "full_name": "Owner",
         "role": "admin",
         "active": True,
         "merchant_id": None,

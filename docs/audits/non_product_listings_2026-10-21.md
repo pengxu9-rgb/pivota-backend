@@ -61,7 +61,7 @@ The full rule was then replayed in prod over **all 26,907 live, unsuppressed cat
 - **3 are new**: Heart To Tarte Donation (serving → blocked) and the two blindbarber donations (relabelled from `low_quality`).
 - No real product was hit.
 
-The effect of shipping is that one public PDP leaves serving at the first 04:00 UTC nightly after deploy. That is a prod change, so the PR waits for Peng.
+The effect of shipping is that one public PDP leaves serving at the first 04:00 UTC nightly after deploy. That is a prod change, so the PR waits for the owner.
 
 *Seen in passing, not changed here:* 5 serving rows match the **old** rule but stay eligible through a sibling on the same `content_key`, because IPS is content-key grained and prefers the eligible row. They are an OHUI set "+ FREE GIFT", an INIKA "-gwp" brush, two microperfumes "Sample Vial" listings and a Tower 28 gift-with-purchase mini. This is the grain documented in `withdraw_catalog_rows.py`, not a rule gap.
 
@@ -79,7 +79,7 @@ None of them is approved, verified or served. As an anchor, there are another 26
 
 Suppressing a listing in the catalog doesn't rewrite the labels already generated for it, and an active seed can keep proposing the listing until the seed is deactivated. Both are handled outside this PR:
 
-- **Existing labels:** on 2026-10-21 ~01:00Z, with Peng's go, the relationship-graph owner moved all 46 `generated` labels on these four listings to `needs_evidence`, flagged `non_product_listing` (run `relgraph_nonproduct_20261021T0100`, undoable by run id). A read-back shows none left `generated`; the 15 `prefilter_rejected` labels are untouched.
+- **Existing labels:** on 2026-10-21 ~01:00Z, with the owner's go, the relationship-graph owner moved all 46 `generated` labels on these four listings to `needs_evidence`, flagged `non_product_listing` (run `relgraph_nonproduct_20261021T0100`, undoable by run id). A read-back shows none left `generated`; the 15 `prefilter_rejected` labels are untouched.
 - **New candidates:** a PIVOTA-Agent change makes relationship-graph candidates respect the catalog's serving gate.
 
 Follow-ups this census does not cover: non-English gift-card and donation titles (기프트카드, 寄付, 礼品卡, Gutschein, bon cadeau), and protection apps listed as products under other names (Extend, Seel, EcoCart, Navidium, Corso).

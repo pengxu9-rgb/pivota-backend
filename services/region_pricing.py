@@ -79,8 +79,13 @@ def normalize_region(region: str) -> str:
     GB — an ISO-3166 code is case-insensitive and a request field routinely
     arrives lower-cased). Everything else is REFUSED by the lookup below; this
     function only spells the canonical form, it does not validate membership.
+
+    Only an ASCII value is upper-cased. Unicode case mapping turns look-alikes into
+    ASCII ('ſg' -> 'SG', the ligature 'ﬁ' -> 'FI'), which then priced as that region;
+    a non-ASCII value is returned trimmed, matches no region and is refused below.
     """
-    return str(region or "").strip().upper()
+    text = str(region or "").strip()
+    return text.upper() if text.isascii() else text
 
 
 def pricing_currency_for_region(region: str) -> str:
@@ -260,7 +265,7 @@ def has_offer_priced_for_any_region_sql(
     ) + ")"
 
 
-#: The registry statuses whose currency a seed may store (Peng, 2026-10-14). A served market's currency is
+#: The registry statuses whose currency a seed may store (the owner, 2026-10-14). A served market's currency is
 #: one a buyer is shown; an acquisition market's is one its lane ingests and stores truthfully (AU/JP seeds
 #: sit in the 'US' seed partition priced in AUD/JPY). Every other market's currency is refused.
 SEED_CURRENCY_STATUSES = ("served", "acquisition")
@@ -287,7 +292,7 @@ def foreign_seed_currencies(
 ) -> List[str]:
     """The `stated` currencies a seed may NOT take from a page read, sorted; empty when it may.
 
-    The ONE seed-writer rule for a read's currency (Peng, 2026-10-14). The seed variant gates in
+    The ONE seed-writer rule for a read's currency (the owner, 2026-10-14). The seed variant gates in
     routes/employee_products use it; every other path that writes a page read's price into a seed
     is to share it rather than restate it. A store can geo-serve another market's page to the
     crawler, so the currency a read states is the page's, not necessarily the seed's.

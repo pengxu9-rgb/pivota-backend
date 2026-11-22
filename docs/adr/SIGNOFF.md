@@ -1,6 +1,6 @@
 # Founder Sign-off — Agentic-Commerce ADR Set
 
-**Status:** **DRAFT for founder (peng) review.** Nothing below is Accepted until you sign each line. This is a decision aid, not a decision.
+**Status:** **DRAFT for founder review.** Nothing below is Accepted until you sign each line. This is a decision aid, not a decision.
 **Date:** 2026-07-18
 **Prepared by:** eng (with Claude), from the ADRs in `docs/adr/`.
 **Read this first:** the set has converged on a coherent position, and **one decision (ADR-016) reframes the rest** — accepting or rejecting it is the point of this review. Two facts up front:

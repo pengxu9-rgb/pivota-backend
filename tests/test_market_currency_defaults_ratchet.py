@@ -155,7 +155,7 @@ NON_PARTNER_ROUTES: Dict[str, Tuple[str, ...]] = {
     ),
     "staff (employee login) tools: review queues, finance, governance and dashboards. "
     "employee_products.py is the one staff route among the seeds, so this family is named file by file": (
-        "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
+        "employee_affiliate_programs.py", "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
         "employee_kb_monitoring.py", "employee_missing_endpoints.py", "employee_payouts.py",
         "employee_pdp_governance.py", "employee_reviews.py", "employee_routing_dashboard.py",
         "employee_settlement_rules.py", "employee_shopify_orders.py", "employee_store_psp_fixes.py", "employees_security.py",
@@ -221,13 +221,13 @@ REGISTRY_TABLE = REPO / "config" / "market_registry.json"
 
 #: The size of the baseline per kind. ONLY EVER LOWER THESE. When a default is removed, delete
 #: its entry from the baseline file and lower the number here in the same change.
-BASELINE_COUNTS = {"a": 184, "b": 90, "c": 4}
+BASELINE_COUNTS = {"a": 184, "b": 89, "c": 4}
 
 #: Entries that were already in the code when the ratchet landed carry `"origin": "2026-11-12"`
 #: and need no reason. Every entry added later must say why (`reason`) or name the entry it
 #: replaces (`moved`). This is how many grandfathered entries are left. ONLY EVER LOWER THIS.
 GRANDFATHER_ORIGIN = "2026-11-12"
-GRANDFATHERED_COUNT = 278
+GRANDFATHERED_COUNT = 277
 #: The fingerprints of those 278, frozen. An entry may say `origin` only if its fingerprint is in
 #: this file, and the file is pinned by its sha256, so nobody can grandfather a new default by
 #: typing `origin` on it. NEVER EDIT THE FILE OR THIS DIGEST: a removed default simply stops

@@ -1,0 +1,11 @@
+{
+  "_comment": "The pinned cloud-sdk image every non-backend Cloud Build step uses, as its registry config records it (read 2026-11-20 from gcr.io: manifest -> config blob; no image was run). Re-record this file when the pin changes. 'present' lists only what the image's own build proves: bash from the Debian base it names, gcloud via `gcloud-crc32c /usr/bin/gcloud`, and gcloud's Python via `test \"$GCLOUD_PYTHON\" = /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3`. 'absent_on_path' is what that build asserts is NOT on PATH (`! command -v python3`).",
+  "image": "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd",
+  "config_digest": "sha256:865e245853a2d358812be343279faabf774d26f384d7994ba91b5f173d90e0ec",
+  "created": "2026-11-17T15:51:23.459217495Z",
+  "cloud_sdk_version": "594.0.0",
+  "base": "debian trixie",
+  "path": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "present": ["bash", "/usr/bin/gcloud", "/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3"],
+  "absent_on_path": ["python3", "python"]
+}

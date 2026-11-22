@@ -19,8 +19,9 @@
  *           SKUS (8), COMPETITORS="A,B,C" (else inferred), OUTDIR.
  */
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const AGENT = '/Users/pengchydan/dev/PIVOTA-Agent';
+const AGENT = path.join(os.homedir(), 'dev/PIVOTA-Agent');
 const { GoogleGenAI } = require(`${AGENT}/node_modules/@google/genai`);
 const vertexGemini = require(`${AGENT}/src/llm/vertexGemini`);
 

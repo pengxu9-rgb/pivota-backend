@@ -26,17 +26,17 @@ def test_api_auth_login_does_not_promote_a_merchant_row_with_the_merchant_passwo
     password = "Admin123!"
     user_record = {
         "id": 44,
-        "email": "peng@pivota.cc",
+        "email": "employee@example.com",
         "password_hash": hash_password(password),
-        "full_name": "Public Peng",
+        "full_name": "Public Owner",
         "role": "merchant",
         "active": True,
         "merchant_id": "merch_old",
     }
     employee_record = {
-        "employee_id": "emp_peng",
-        "name": "Peng Xu",
-        "email": "peng@pivota.cc",
+        "employee_id": "emp_owner",
+        "name": "Owner Example",
+        "email": "employee@example.com",
         "password": None,
         "role": "admin",
         "status": "active",
@@ -76,13 +76,13 @@ def test_api_auth_login_does_not_promote_a_merchant_row_with_the_merchant_passwo
 
     res = _client().post(
         "/api/auth/login",
-        json={"email": " peng@pivota.cc ", "password": password},
+        json={"email": " employee@example.com ", "password": password},
     )
 
     assert res.status_code == 200
     payload = res.json()
     assert payload["success"] is True
-    assert payload["user"]["email"] == "peng@pivota.cc"
+    assert payload["user"]["email"] == "employee@example.com"
     assert payload["user"]["role"] == "merchant"
     assert payload["user"]["merchant_id"] == "merch_old"
     assert "employee_id" not in payload["user"]
@@ -100,7 +100,7 @@ def test_api_auth_login_does_not_promote_a_merchant_row_with_the_merchant_passwo
     # Portal-scoped: the employee portal is refused outright.
     res = _client().post(
         "/api/auth/login",
-        json={"email": "peng@pivota.cc", "password": password, "portal": "employee"},
+        json={"email": "employee@example.com", "password": password, "portal": "employee"},
     )
     assert res.status_code == 403
 
@@ -112,17 +112,17 @@ def test_api_auth_login_employee_password_still_reclaims_a_merchant_row(monkeypa
     employee_password = "Employee123!"
     user_record = {
         "id": 44,
-        "email": "peng@pivota.cc",
+        "email": "employee@example.com",
         "password_hash": hash_password(merchant_password),
-        "full_name": "Public Peng",
+        "full_name": "Public Owner",
         "role": "merchant",
         "active": True,
         "merchant_id": "merch_old",
     }
     employee_record = {
-        "employee_id": "emp_peng",
-        "name": "Peng Xu",
-        "email": "peng@pivota.cc",
+        "employee_id": "emp_owner",
+        "name": "Owner Example",
+        "email": "employee@example.com",
         "password": hashlib.sha256(f"{employee_password}pivota_employee_salt_v1".encode()).hexdigest(),
         "role": "admin",
         "status": "active",
@@ -155,13 +155,13 @@ def test_api_auth_login_employee_password_still_reclaims_a_merchant_row(monkeypa
 
     res = _client().post(
         "/api/auth/login",
-        json={"email": "peng@pivota.cc", "password": employee_password},
+        json={"email": "employee@example.com", "password": employee_password},
     )
 
     assert res.status_code == 200
     payload = res.json()
     assert payload["user"]["role"] == "admin"
-    assert payload["user"]["employee_id"] == "emp_peng"
+    assert payload["user"]["employee_id"] == "emp_owner"
 
     upserts = [values for query, values in executed if "INSERT INTO users" in query]
     assert upserts and upserts[0]["role"] == "admin"
@@ -176,35 +176,35 @@ def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypa
     password = "Admin123!"
     user_record = {
         "id": 44,
-        "email": "peng@pivota.cc",
+        "email": "employee@example.com",
         "password_hash": hash_password(password),
-        "full_name": "Public Peng",
+        "full_name": "Public Owner",
         "role": "merchant",
         "active": True,
         "merchant_id": "merch_old",
     }
     employee_record = {
-        "employee_id": "emp_peng",
-        "name": "Peng Xu",
-        "email": "peng@pivota.cc",
+        "employee_id": "emp_owner",
+        "name": "Owner Example",
+        "email": "employee@example.com",
         "password": hashlib.sha256(f"{password}pivota_employee_salt_v1".encode()).hexdigest(),
         "role": "admin",
         "status": "active",
         "permissions": ["reviews.read"],
     }
     employee_membership = {
-        "membership_id": "membership_emp_peng",
-        "identity_id": "identity_peng",
+        "membership_id": "membership_emp_owner",
+        "identity_id": "identity_owner",
         "membership_type": "employee",
         "role": "admin",
         "status": "active",
-        "entity_id": "emp_peng",
+        "entity_id": "emp_owner",
         "permissions": ["reviews.read"],
         "identity": {
-            "identity_id": "identity_peng",
-            "email": "peng@pivota.cc",
-            "email_normalized": "peng@pivota.cc",
-            "full_name": "Peng Xu",
+            "identity_id": "identity_owner",
+            "email": "employee@example.com",
+            "email_normalized": "employee@example.com",
+            "full_name": "Owner Example",
             "status": "active",
         },
     }
@@ -221,7 +221,7 @@ def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypa
         return None
 
     async def fake_get_active_membership(email, membership_type):
-        if email == "peng@pivota.cc" and membership_type == "employee":
+        if email == "employee@example.com" and membership_type == "employee":
             return employee_membership
         return None
 
@@ -231,22 +231,22 @@ def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypa
 
     res = _client().post(
         "/api/auth/login",
-        json={"email": "peng@pivota.cc", "password": password, "portal": "employee"},
+        json={"email": "employee@example.com", "password": password, "portal": "employee"},
     )
 
     assert res.status_code == 200
     payload = res.json()
-    assert payload["user"]["id"] == "identity_peng"
+    assert payload["user"]["id"] == "identity_owner"
     assert payload["user"]["membership_type"] == "employee"
-    assert payload["user"]["employee_id"] == "emp_peng"
+    assert payload["user"]["employee_id"] == "emp_owner"
     assert "merchant_id" not in payload["user"]
 
     token_payload = decode_token(payload["token"])
-    assert token_payload["sub"] == "identity_peng"
+    assert token_payload["sub"] == "identity_owner"
     assert token_payload["aud"] == "employee-portal"
     assert token_payload["membership_type"] == "employee"
-    assert token_payload["membership_id"] == "membership_emp_peng"
-    assert token_payload["employee_id"] == "emp_peng"
+    assert token_payload["membership_id"] == "membership_emp_owner"
+    assert token_payload["employee_id"] == "emp_owner"
     assert "merchant_id" not in token_payload
 
 
@@ -320,9 +320,9 @@ def test_api_auth_login_employee_portal_rejects_customer_or_merchant_only_identi
     password = "Admin123!"
     user_record = {
         "id": 44,
-        "email": "peng@pivota.cc",
+        "email": "employee@example.com",
         "password_hash": hash_password(password),
-        "full_name": "Public Peng",
+        "full_name": "Public Owner",
         "role": "merchant",
         "active": True,
         "merchant_id": "merch_old",
@@ -348,7 +348,7 @@ def test_api_auth_login_employee_portal_rejects_customer_or_merchant_only_identi
 
     res = _client().post(
         "/api/auth/login",
-        json={"email": "peng@pivota.cc", "password": password, "portal": "employee"},
+        json={"email": "employee@example.com", "password": password, "portal": "employee"},
     )
 
     assert res.status_code == 403
@@ -358,9 +358,9 @@ def test_api_auth_login_employee_portal_rejects_customer_or_merchant_only_identi
 def test_api_auth_login_backfills_users_row_for_legacy_employee_only(monkeypatch):
     password = "Admin123!"
     employee_record = {
-        "employee_id": "emp_peng",
-        "name": "Peng Xu",
-        "email": "peng@pivota.cc",
+        "employee_id": "emp_owner",
+        "name": "Owner Example",
+        "email": "employee@example.com",
         "password": hashlib.sha256(f"{password}pivota_employee_salt_v1".encode()).hexdigest(),
         "role": "employee",
         "status": "active",
@@ -389,16 +389,16 @@ def test_api_auth_login_backfills_users_row_for_legacy_employee_only(monkeypatch
 
     res = _client().post(
         "/api/auth/login",
-        json={"email": "peng@pivota.cc", "password": password},
+        json={"email": "employee@example.com", "password": password},
     )
 
     assert res.status_code == 200
     payload = res.json()
     assert payload["user"]["role"] == "employee"
-    assert payload["user"]["employee_id"] == "emp_peng"
+    assert payload["user"]["employee_id"] == "emp_owner"
 
     sync_values = [values for query, values in executed if "INSERT INTO users" in query]
     assert sync_values
-    assert sync_values[0]["email"] == "peng@pivota.cc"
+    assert sync_values[0]["email"] == "employee@example.com"
     assert sync_values[0]["role"] == "employee"
     assert sync_values[0]["password_hash"].startswith("$2")

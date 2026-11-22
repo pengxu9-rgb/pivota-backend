@@ -172,7 +172,7 @@ def market_refusal(market: Any) -> Optional[str]:
         return "MARKET_REQUIRED"
     entry = market_registry.market_or_none(code)
     if entry is None:
-        return f"UNKNOWN_MARKET:{code}"
+        return f"UNKNOWN_MARKET:{market_registry.market_echo(code)}"
     if not entry["ingest"]:
         return f"MARKET_NOT_INGESTED:{code}"
     return None
