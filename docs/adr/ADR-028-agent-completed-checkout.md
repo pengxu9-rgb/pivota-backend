@@ -1,8 +1,8 @@
 # ADR-028: Pivota completes the order on the merchant's own checkout; the buyer stays in the agent front
 
-**Status:** Proposed, 2026-11-02. peng decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms); it was decided on 2026-11-10 for a payment partner's checkout agent (ADR-030 D11) and stays open for any other agent. **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place. **Also since 2026-11-10, D6 is the rule for now:** Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a compliance assessment and a separate owner decision (ADR-030, "D3. Who completes the payment").
+**Status:** Proposed, 2026-11-02. The owner decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms); it was decided on 2026-11-10 for a payment partner's checkout agent (ADR-030 D11) and stays open for any other agent. **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place. **Also since 2026-11-10, D6 is the rule for now:** Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a compliance assessment and a separate owner decision (ADR-030, "D3. Who completes the payment").
 
-**Decision owner:** peng
+**Decision owner:** Founder
 
 **Builds on:**
 - ADR-014 (agent-protocol interoperability): each completion protocol, and each card network's agent program, is an edge adapter on one spine.
@@ -68,7 +68,7 @@ Today a recommendation ends in a click-out: the `/r` redirect sends the buyer to
 - Attribution depends on what the buyer's own browser carries to the merchant.
 - Pivota cannot show the merchant's final total, with discounts, shipping and tax, before the buyer commits.
 
-peng decided on 2026-11-02 that the buyer checks out in the agent front, and that Pivota completes the order on the merchant's own storefront checkout, with the buyer's agent payment token. The buyer is sent to the merchant only when no offer for that product can be completed by Pivota.
+The owner decided on 2026-11-02 that the buyer checks out in the agent front, and that Pivota completes the order on the merchant's own storefront checkout, with the buyer's agent payment token. The buyer is sent to the merchant only when no offer for that product can be completed by Pivota.
 
 > **Amended 2026-11-08 (D6):** the buyer still checks out in the agent front, but Pivota never handles the agent payment token. The payment partner fills the merchant's checkout with it. *(Narrowed 2026-11-10: for now; see D6.)*
 
@@ -92,7 +92,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 
 - An offer is **completable** when Pivota holds a stored, current fact that at least one completion route (D2) works for that seller and market. The fact comes from probes (D5) and from completed orders, never from a guess at request time.
 - **Serving, for one product:**
-  - when the product has at least one completable offer, click-out offers for **that product** are not recommended. A completable offer ranks above every click-out offer for the same product, **even at a higher price** (peng, Q2 below);
+  - when the product has at least one completable offer, click-out offers for **that product** are not recommended. A completable offer ranks above every click-out offer for the same product, **even at a higher price** (the owner, Q2 below);
   - among the completable offers for that product, ADR-027 Q6 orders them: the served price, and the verified effective price only once Q6's measurement gate has opened for this lane (ADR-027 Q16);
   - whether an offer carries our attribution never affects its rank (ADR-025 Q4). An offer completed without commission (D4) ranks like any other completable offer;
   - completability orders **sellers within one product** only. It never reorders products in a recommendation slate.
@@ -133,7 +133,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 
 ### D4. No route carries attribution: complete the order, then fix the loop
 
-- The buyer's order comes first: Pivota completes it without commission (peng, Q1 below).
+- The buyer's order comes first: Pivota completes it without commission (the owner, Q1 below).
 - The order is recorded as **unattributed**, with why: no program for this merchant, the program does not allow agent-placed orders, the route drops the tracking, or the network did not credit it.
 - An unattributed order opens a task for a Pivota employee to fix the commission loop for that merchant: join its program, ask permission for agent-placed orders, or set up conversion reporting.
   - The task names the merchant, the market and the reason. It carries **no buyer data**.
@@ -284,7 +284,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 - **Pivota passes a credential, encrypted to the merchant's key, through unread.** Not taken 2026-11-08: Pivota would still receive the credential, and few merchants have such a key.
 - **The payment partner acquires for its own merchants**, so the credential never leaves the partner. Compatible with D6 and D10 where the merchant stays merchant of record, but it covers only merchants on that partner. It stays a fallback to ask the partner about, not the plan.
 
-## Resolved questions (peng, 2026-11-02)
+## Resolved questions (the owner, 2026-11-02)
 
 1. **No route carries attribution:** complete the order without commission first, then notify a Pivota employee to fix the commission loop (D4).
 2. **A completable offer costs more than a click-out offer for the same product:** the completable offer always wins (D1). This overrides ADR-027 Q6 between lanes, for one product. Among completable offers, Q6 still orders them.

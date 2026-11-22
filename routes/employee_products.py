@@ -56,6 +56,7 @@ from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     _is_domain_allowed,
+    allowlist_market_refusal,
     apply_utm,
     make_redirect_token,
     request_market_observed,
@@ -1276,7 +1277,7 @@ def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
     - `description` is the page's real copy (JSON-LD or its long-description block), with its
       `description_source`. og/meta description text (SEO copy), or text whose source a snapshot
       from before the split never recorded, is never `description`: it is `fill_only_description`,
-      which may fill a seed that has NO description and nothing else (Peng 2026-10-15), and
+      which may fill a seed that has NO description and nothing else (the owner 2026-10-15), and
       `description_refused_source` names why ("meta" | "unknown").
     - `meta_description` is the page's own meta text, so a seed already storing that exact SEO
       line can be upgraded to real copy.
@@ -1826,7 +1827,10 @@ def _seed_merchant_display_name(seed_data: Dict[str, Any], domain: Optional[str]
 
 
 def _normalize_market(market: Optional[str]) -> str:
-    m = str(market or "").strip().upper()
+    # Absent (None / blank) reads as US, as before. Only an ASCII value is upper-cased: case mapping reads a
+    # look-alike ('ſg') as a real market ('SG'); a non-ASCII value stays as sent and matches no market.
+    m = str(market or "").strip()
+    m = m.upper() if m.isascii() else m
     return m or "US"
 
 
@@ -1843,7 +1847,7 @@ def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
         return "MARKET_REQUIRED"
     entry = market_registry.market_or_none(code)
     if entry is None:
-        return f"UNKNOWN_MARKET:{code}"
+        return f"UNKNOWN_MARKET:{market_registry.market_echo(code)}"
     if not entry["ingest"]:
         return f"MARKET_NOT_INGESTED:{code}"
     return None
@@ -2010,6 +2014,33 @@ def _request_base_url(request: Request) -> str:
 
 def _seed_id() -> str:
     return f"eps_{uuid.uuid4().hex[:24]}"
+
+
+async def _redirect_url_or_market_refusal(
+    *,
+    request: Request,
+    market: str,
+    tool: str,
+    destination_url: str,
+    utm_template: Optional[str],
+    ctx: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    """The redirect URL for a STORED row, or (None, reason) when its market is one the allowlist cannot key.
+
+    The read lanes (one seed, a product's external links and offers) and refresh mint for rows already stored, some
+    under '*' or a legacy partition the registry does not list (services.outbound_links_service.
+    allowlist_market_refusal). Such a row gets no link and a named reason; the rest of the answer is unaffected, and
+    refresh never answers 400 after its write. A domain the market's allowlist does not list is refused as before."""
+    refusal = allowlist_market_refusal(market)
+    if refusal is not None:
+        return None, refusal
+    return await _make_redirect_url(
+        request=request, market=market, tool=tool, destination_url=destination_url, utm_template=utm_template, ctx=ctx,
+    ), None
+
+
+def _redirect_refused_fields(reason: Optional[str]) -> Dict[str, Any]:
+    return {"redirect_refused_reason": reason} if reason else {}
 
 
 async def _make_redirect_url(
@@ -4159,6 +4190,9 @@ async def preview_external_seed(
 ):
     market = _normalize_market(body.market)
     dest = _require_http_url(body.destination_url)
+    # A market the allowlist cannot key allows no domain, named, on every answer below (allowlist_market_refusal).
+    domain_refusal = allowlist_market_refusal(market)
+    domain_refusal_fields = {"domain_allowed_reason": domain_refusal} if domain_refusal else {}
 
     snapshot = None
     try:
@@ -4185,7 +4219,8 @@ async def preview_external_seed(
                 "price_currency": None,
                 "availability": None,
                 "variants": [],
-                "domain_allowed": True,
+                "domain_allowed": domain_refusal is None,
+                **domain_refusal_fields,
             },
         }
 
@@ -4201,6 +4236,8 @@ async def preview_external_seed(
         domain_allowed = await _is_domain_allowed(market=market, destination_url=canonical_url)
     except Exception:
         domain_allowed = True
+    if domain_refusal:
+        domain_allowed = False
 
     variants = []
     image_urls: list[str] = []
@@ -4256,6 +4293,7 @@ async def preview_external_seed(
             "availability": getattr(snapshot, "availability", None),
             "variants": variants,
             "domain_allowed": domain_allowed,
+            **domain_refusal_fields,
         },
     }
 
@@ -5485,7 +5523,7 @@ async def create_external_seed(
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
-    # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
+    # Where `description` came from, and SEO copy that may only fill an empty one (the owner 2026-10-15).
     description_origin = (
         SEED_DESCRIPTION_SOURCE_EMPLOYEE if (body.description or "").strip() else (content["description_source"] if snap_description else None)
     )
@@ -6079,7 +6117,7 @@ async def get_external_seed(
         or seed_data.get("external_product_id")
         or _stable_external_product_id(row.get("canonical_url") or row.get("destination_url") or "")
     )
-    redirect_url = await _make_redirect_url(
+    redirect_url, redirect_refused = await _redirect_url_or_market_refusal(
         request=request,
         market=row.get("market"),
         tool=row.get("tool"),
@@ -6131,7 +6169,7 @@ async def get_external_seed(
             # A revision draft names the live seed it replaces once approved.
             "revision_of": seed_data.get(SEED_REVISION_OF_KEY),
         },
-        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+        "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text, **_redirect_refused_fields(redirect_refused)},
     }
 
 
@@ -7851,7 +7889,7 @@ async def _refresh_external_seed_by_id(
                 seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
             elif page_read_is_the_product and content["fill_only_description"]:
                 # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
-                # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+                # copy from a later read replaces it (the owner 2026-10-15). It never reaches
                 # `snapshot.description`, which the gateway serves ahead of the seed's own.
                 seed_data["description"] = content["fill_only_description"]
                 seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
@@ -8401,7 +8439,7 @@ async def refresh_external_seed(
     refreshed = await _refresh_external_seed_by_id(seed_id)
     if refreshed.get("status") == "degraded":
         return refreshed
-    redirect_url = await _make_redirect_url(
+    redirect_url, redirect_refused = await _redirect_url_or_market_refusal(
         request=request,
         market=refreshed["market"],
         tool=refreshed["tool"],
@@ -8419,6 +8457,7 @@ async def refresh_external_seed(
             "type": "redirect",
             "redirect_url": redirect_url,
             "disclosure_text": refreshed["disclosure_text"],
+            **_redirect_refused_fields(redirect_refused),
         },
     }
 
@@ -8650,7 +8689,7 @@ async def list_attached_external_links(
         r = dict(r)
         seed_data = _ensure_json_obj(r.get("seed_data"))
         merchant_display_name = _seed_merchant_display_name(seed_data, r.get("domain"))
-        redirect_url = await _make_redirect_url(
+        redirect_url, redirect_refused = await _redirect_url_or_market_refusal(
             request=request,
             market=r.get("market"),
             tool=r.get("tool"),
@@ -8686,7 +8725,7 @@ async def list_attached_external_links(
                 # panel can say it is not served until it is published (NEW_EMPLOYEE_SEED_STATUS).
                 "status": _seed_status_of(r),
                 "is_draft": _seed_status_of(r) == NEW_EMPLOYEE_SEED_STATUS,
-                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text, **_redirect_refused_fields(redirect_refused)},
             }
         )
     return {"status": "success", "items": items}
@@ -8793,7 +8832,7 @@ async def _build_external_seed_offers(
     for r in rows:
         r = dict(r)
         seed_data = _ensure_json_obj(r.get("seed_data"))
-        redirect_url = await _make_redirect_url(
+        redirect_url, redirect_refused = await _redirect_url_or_market_refusal(
             request=request,
             market=r.get("market"),
             tool=r.get("tool"),
@@ -8826,7 +8865,7 @@ async def _build_external_seed_offers(
                 "availability": seed_data.get("availability") or r.get("availability"),
                 "variants_count": len(_seed_variants(seed_data)),
                 "attached_variant_id": r.get("attached_variant_id") or "∅",
-                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text, **_redirect_refused_fields(redirect_refused)},
             }
         )
     return offers
@@ -8852,7 +8891,7 @@ async def _build_external_seed_offers_for_external_product_id(
             continue
 
         seed_data = _ensure_json_obj(r.get("seed_data"))
-        redirect_url = await _make_redirect_url(
+        redirect_url, redirect_refused = await _redirect_url_or_market_refusal(
             request=request,
             market=r.get("market"),
             tool=r.get("tool"),
@@ -8888,7 +8927,7 @@ async def _build_external_seed_offers_for_external_product_id(
                 "notes": r.get("notes"),
                 "created_at": _to_iso(r.get("created_at")),
                 "updated_at": _to_iso(r.get("updated_at")),
-                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+                "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text, **_redirect_refused_fields(redirect_refused)},
             }
         )
     return offers

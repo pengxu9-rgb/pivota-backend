@@ -34,7 +34,7 @@ CONSERVATIVE: WHEN IN DOUBT THE SEED IS HELD (untouched, listed with its reason)
                        entry passes the read-time rule `entry_is_the_sole_variant_read_again` (no other
                        merchant-issued-shaped id: a GTIN never folds this way), its title (if any) is the product's
                        name or the kept entry's, and it states no size the kept entry does not. The snapshot is
-                       EVIDENCE only, never copied (Peng, 2026-10-16). A sole pair drops the duplicate and writes
+                       EVIDENCE only, never copied (the owner, 2026-10-16). A sole pair drops the duplicate and writes
                        NOTHING of it onto the kept entry, and is written only with `--include-sole-pair`.
      The kept entry is the LINK entry (its `variant_id` and every other field kept); on positive evidence the folded
      entry's key is added to it as `sku` (iv) or `barcode` (ii), with the folded entry's own `sku`/`barcode` fields
@@ -674,7 +674,7 @@ def plan_seed(row: Mapping[str, Any]) -> Dict[str, Any]:
 def cap(seeds: List[Dict[str, Any]], *, kinds: Optional[Iterable[str]] = None,
         max_seeds: Optional[int] = None, include_sole_pair: bool = False) -> List[Dict[str, Any]]:
     """Narrow the writes BEFORE the digest: a capped dry run and its apply carry the same caps. A fold whose only
-    evidence is `sole_pair` is written only with `include_sole_pair` (Peng approves that lane explicitly)."""
+    evidence is `sole_pair` is written only with `include_sole_pair` (the owner approves that lane explicitly)."""
     want = set(kinds or ())
     kept = 0
     for s in sorted(seeds, key=lambda s: s["seed_id"]):
@@ -1056,7 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed-ids", dest="seed_ids", nargs="+", help="only these seeds")
     p.add_argument("--kinds", nargs="+", choices=KINDS, help="only these kinds")
     p.add_argument("--include-sole-pair", dest="include_sole_pair", action="store_true",
-                   help="also write folds whose only evidence is sole_pair (needs Peng's explicit approval)")
+                   help="also write folds whose only evidence is sole_pair (needs the owner's explicit approval)")
     p.add_argument("--batch-size", dest="batch_size", type=int, default=BATCH_SIZE)
     p.add_argument("--sleep", type=float, default=SLEEP_S, help="seconds between write batches")
     p.add_argument("--page", type=int, default=PAGE)

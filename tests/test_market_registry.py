@@ -84,3 +84,49 @@ def test_generator_writes_and_checks(tmp_path):
     assert gen.main(["--check", str(target)]) == 0
     target.write_text(target.read_text().replace('"SGD"', '"XXX"'))
     assert gen.main(["--check", str(target)]) == 1
+
+
+# UNICODE LOOKALIKES ARE NOT MARKETS. The shape is checked BEFORE upcasing: case mapping turned 'uſ' (long s) into
+# 'US' and the ligature 'ﬁ' into 'FI', which then matched a listed market.
+_LOOKALIKES = ["uſ", "ﬁ", "ＵＳ", "ｕｓ", "УС", "ЅG", "ıt", "İT", "ſg", "Uſ"]
+_PRICED = ["US", "SG", "GB", "JP", "FR", "HR", "FI", "AU", "SE", "KR", "HK", "CA"]
+
+
+@pytest.mark.parametrize("raw", _LOOKALIKES)
+def test_a_unicode_lookalike_is_no_listed_market(raw):
+    assert reg.normalize_market(raw) == raw.strip(), "returned as itself, never folded to ASCII"
+    assert reg.market_or_none(raw) is None
+    with pytest.raises(ValueError):
+        reg.market(raw)
+
+
+@pytest.mark.parametrize("raw, code", [("us", "US"), (" US ", "US"), ("\tsg\n", "SG"), ("Gb", "GB")])
+def test_two_ascii_letters_are_trimmed_and_upcased_as_before(raw, code):
+    assert reg.normalize_market(raw) == code
+    assert reg.market_or_none(raw) is not None
+
+
+@pytest.mark.parametrize("raw, out", [("usa", "USA"), ("eu-de", "EU-DE"), ("", ""), (None, ""), (" ", "")])
+def test_other_ascii_values_normalise_exactly_as_before(raw, out):
+    assert reg.normalize_market(raw) == out
+
+
+def test_the_twelve_priced_markets_still_normalise_to_themselves():
+    for code in _PRICED:
+        assert reg.normalize_market(code.lower()) == code and reg.market_or_none(code) is not None, code
+
+
+@pytest.mark.parametrize("raw, shown", [
+    ("ZZ", "ZZ"), ("DE", "DE"), ("EU-DE", "'EU-DE'"), ("USA", "'USA'"), ("ſg", "'ſg'"), ("ＵＳ", "'ＵＳ'"),
+    ("Z\nZ", "'Z\\nZ'"), ("", "''"), (None, "''"),
+])
+def test_a_refusal_names_a_market_bare_only_when_it_is_two_ascii_letters(raw, shown):
+    # Two ASCII letters cannot hide anything: named bare, as before. Anything else is quoted (repr), so a
+    # look-alike shows as itself and a control character is escaped.
+    assert reg.market_echo(raw) == shown
+
+
+def test_a_refusal_names_at_most_sixteen_characters_of_what_it_was_sent():
+    shown = reg.market_echo("X" * 500)
+    assert shown == repr("X" * 16) + "..."
+    assert reg.market_echo("Y" * 16) == repr("Y" * 16)

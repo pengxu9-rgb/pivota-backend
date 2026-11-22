@@ -1,7 +1,7 @@
 # ADR-024: Region is a request dimension, not a global constant
 
 **Status:** Accepted (2026-08-21; Phase 0 + Phase 1 merged same day — #1798, #1799, #2071, #1803, then #1807 invariant + #2078 tripwire; open questions resolved and the Phase 2 entry gate RUN, below)
-**Decision owner:** peng
+**Decision owner:** Founder
 **Builds on:** ADR-001 (canonical record vs supplier), ADR-012 (catalog convergence),
 ADR-018 (connection layer and priced serving lane), ADR-021 (PIVOTA-Agent is the protocol gateway)
 **Numbering note:** ADR-023 is claimed by the open UCP hosted-payment-escalation ADR in PIVOTA-Agent (#2005).

@@ -1276,6 +1276,21 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
+            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
+            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
+            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            try:
+                from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
+                await ensure_agent_purchase_consents_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+            # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
+            # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
+            try:
+                from db.affiliate_programs import ensure_affiliate_programs_schema
+                await ensure_affiliate_programs_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: affiliate_programs (mig 291) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -4068,6 +4083,21 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
+            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
+            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
+            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            try:
+                from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
+                await ensure_agent_purchase_consents_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+            # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
+            # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
+            try:
+                from db.affiliate_programs import ensure_affiliate_programs_schema
+                await ensure_affiliate_programs_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: affiliate_programs (mig 291) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

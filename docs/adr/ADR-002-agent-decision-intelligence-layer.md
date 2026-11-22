@@ -2,7 +2,7 @@
 
 **Status:** Accepted — Tier-G review governance ratified 2026-06-14
 **Date:** 2026-06-13 (governance addendum 2026-06-14)
-**Deciders:** Founder (peng), Claude
+**Deciders:** Founder, Claude
 **Builds on:** ADR-001 (canonical record + merchant-as-supplier)
 
 ## Context

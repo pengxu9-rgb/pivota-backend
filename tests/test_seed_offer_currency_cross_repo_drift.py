@@ -1,6 +1,6 @@
 """CROSS-REPO DRIFT PIN (PR controller review of #2657).
 
-The backend and the PIVOTA-Agent gateway each spell the seed-projected offer guard (Peng 2026-10-19:
+The backend and the PIVOTA-Agent gateway each spell the seed-projected offer guard (the owner 2026-10-19:
 an offer copied off a seed is a price only in its seed's own currency) in their own language, and
 neither CI can read the other repo. So both pin the SAME literal:
 

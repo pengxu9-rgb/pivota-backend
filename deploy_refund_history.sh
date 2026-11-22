@@ -5,22 +5,22 @@ echo "🚀 Deploying Refund History Feature..."
 
 # 1. Copy updated frontend files
 echo "📁 Copying frontend files..."
-cp "/Users/pengchydan/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota-merchants-portal 3/app/dashboard/orders/page.tsx" \
-   "/Users/pengchydan/Desktop/temp_fix/pivota-merchants-portal/app/dashboard/orders/page.tsx"
+cp "$HOME/Desktop/Pivota Infra/Pivota-cursor-create-project-directory-structure-8344/pivota-merchants-portal 3/app/dashboard/orders/page.tsx" \
+   "$HOME/Desktop/temp_fix/pivota-merchants-portal/app/dashboard/orders/page.tsx"
 
-cp "/Users/pengchydan/Desktop/temp_fix/pivota-merchants-portal/components/RefundHistoryTimeline.tsx" \
-   "/Users/pengchydan/Desktop/temp_fix/pivota-merchants-portal/components/RefundHistoryTimeline.tsx"
+cp "$HOME/Desktop/temp_fix/pivota-merchants-portal/components/RefundHistoryTimeline.tsx" \
+   "$HOME/Desktop/temp_fix/pivota-merchants-portal/components/RefundHistoryTimeline.tsx"
 
 # 2. Deploy Backend
 echo "🔧 Deploying backend..."
-cd /Users/pengchydan/Desktop/temp_fix
+cd "$HOME/Desktop/temp_fix"
 git add -A
 git commit -m "feat: add enhanced refund history with timeline view"
 git push origin main
 
 # 3. Deploy Frontend  
 echo "🎨 Deploying frontend..."
-cd /Users/pengchydan/Desktop/temp_fix/pivota-merchants-portal
+cd "$HOME/Desktop/temp_fix/pivota-merchants-portal"
 git add -A
 git commit -m "feat: add RefundHistoryTimeline component with enhanced UI"
 git push origin main

@@ -3,7 +3,7 @@
 WHY THIS EXISTS (2026-09-28). The sweep's cart-mint lane (jobs/merchant_purchasability_sweep.
 `_cart_mint_lane`) pages every active seed — ~23.8k rows with their `seed_data` — through the
 cart minter. The sweep runs 21 times a day on the 2-vCPU prod primary, where database load
-already caused serving timeouts on 2026-09-26/27. Peng asked for the scan to run at most once a
+already caused serving timeouts on 2026-09-26/27. The owner asked for the scan to run at most once a
 day and for the other runs to read its result. The job is a fresh process every hour, so the
 result has to live in the database; this table is that cache.
 

@@ -85,6 +85,10 @@ ALLOWED_DATABASE_CONSTRUCTION = {
     # An offline restore tool that connects to a DIFFERENT database (the archive
     # DSN passed on the command line), not a second pool onto the primary.
     ("scripts/recover_seed_data_from_archive.py", "_drive"),
+    # The reviewed seed batch ONE-OFF job's independent read-back after a failed or lost COMMIT: it must not reuse
+    # the shared pool's (possibly broken, possibly in-transaction) connection. One connection (max_size=1), opened
+    # and closed per read, in a one-off job process, never in a service.
+    ("scripts/ops/reviewed_seed_batch.py", "read_back"),
 }
 
 

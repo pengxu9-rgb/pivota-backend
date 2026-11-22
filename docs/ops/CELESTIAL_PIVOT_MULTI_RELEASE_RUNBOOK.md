@@ -19,30 +19,30 @@
 - `Aurora`: shadow only
 
 ## Required Assets
-- SQL migration: [058_catalog_core.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/db/migrations/058_catalog_core.sql)
-- Search index migration: [059_catalog_pivot_search_indexes.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/db/migrations/059_catalog_pivot_search_indexes.sql)
-- Migration apply/verify CLI: [catalog_migration_058.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_migration_058.py)
-- Search index apply/verify CLI: [catalog_migration_059.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_migration_059.py)
-- Backfill / verify CLI: [catalog_backfill_verify.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_backfill_verify.py)
-- Release gate CLI: [pivot_multi_release_gate.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/pivot_multi_release_gate.py)
-- Catalog/Pivot live smoke: [smoke_catalog_pivot_v1.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_catalog_pivot_v1.py)
-- Commerce channels signoff smoke: [smoke_commerce_channels_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
-- Employee/admin JWT mint helper: [mint_employee_jwt.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/mint_employee_jwt.py)
-- Generic commerce shadow audit: [commerce_shadow_audit.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/commerce_shadow_audit.py)
-- Generic commerce shadow compare: [compare_commerce_shadow_audit.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/compare_commerce_shadow_audit.py)
-- Release evidence builder: [build_pivot_release_evidence.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/build_pivot_release_evidence.py)
-- Bundle orchestrator: [run_pivot_release_bundle.py](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_pivot_release_bundle.py)
-- Grafana dashboard: [celestial_pivot_multi_release_dashboard.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/grafana/celestial_pivot_multi_release_dashboard.json)
-- Merchant readiness dashboard query pack: [merchant_commerce_readiness_queries.sql](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
-- Alert rules: [celestial_pivot_multi_release_alerts.yml](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/prometheus/celestial_pivot_multi_release_alerts.yml)
-- Follow-on phase plan: [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
+- SQL migration: [058_catalog_core.sql](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/db/migrations/058_catalog_core.sql)
+- Search index migration: [059_catalog_pivot_search_indexes.sql](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/db/migrations/059_catalog_pivot_search_indexes.sql)
+- Migration apply/verify CLI: [catalog_migration_058.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_migration_058.py)
+- Search index apply/verify CLI: [catalog_migration_059.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_migration_059.py)
+- Backfill / verify CLI: [catalog_backfill_verify.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/catalog_backfill_verify.py)
+- Release gate CLI: [pivot_multi_release_gate.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/pivot_multi_release_gate.py)
+- Catalog/Pivot live smoke: [smoke_catalog_pivot_v1.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_catalog_pivot_v1.py)
+- Commerce channels signoff smoke: [smoke_commerce_channels_signoff.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/smoke_commerce_channels_signoff.py)
+- Employee/admin JWT mint helper: [mint_employee_jwt.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/mint_employee_jwt.py)
+- Generic commerce shadow audit: [commerce_shadow_audit.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/commerce_shadow_audit.py)
+- Generic commerce shadow compare: [compare_commerce_shadow_audit.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/compare_commerce_shadow_audit.py)
+- Release evidence builder: [build_pivot_release_evidence.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/build_pivot_release_evidence.py)
+- Bundle orchestrator: [run_pivot_release_bundle.py](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/run_pivot_release_bundle.py)
+- Grafana dashboard: [celestial_pivot_multi_release_dashboard.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/grafana/celestial_pivot_multi_release_dashboard.json)
+- Merchant readiness dashboard query pack: [merchant_commerce_readiness_queries.sql](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/observability/grafana/merchant_commerce_readiness_queries.sql)
+- Alert rules: [celestial_pivot_multi_release_alerts.yml](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/observability/prometheus/celestial_pivot_multi_release_alerts.yml)
+- Follow-on phase plan: [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
 
 ## Corpus Assets
-- Fast beauty smoke corpus: [beauty_ranking_golden_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/beauty_ranking_golden_corpus.json)
-- Expanded beauty rollout corpus: [beauty_ranking_golden_corpus_v2.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/beauty_ranking_golden_corpus_v2.json)
-- Generic commerce parity corpus: [generic_commerce_shadow_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/generic_commerce_shadow_corpus.json)
-- Source-stage serve canary corpus: [serve_canary_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/serve_canary_corpus.json)
-- Staging/prod release gate corpora: [staging_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/pivot_release_gate/staging_corpus.json), [prod_corpus.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/pivot_release_gate/prod_corpus.json)
+- Fast beauty smoke corpus: [beauty_ranking_golden_corpus.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/beauty_ranking_golden_corpus.json)
+- Expanded beauty rollout corpus: [beauty_ranking_golden_corpus_v2.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/beauty_ranking_golden_corpus_v2.json)
+- Generic commerce parity corpus: [generic_commerce_shadow_corpus.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/generic_commerce_shadow_corpus.json)
+- Source-stage serve canary corpus: [serve_canary_corpus.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/serve_canary_corpus.json)
+- Staging/prod release gate corpora: [staging_corpus.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/pivot_release_gate/staging_corpus.json), [prod_corpus.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/scripts/fixtures/pivot_release_gate/prod_corpus.json)
 
 ## Feature Flags
 - `AGENT_SHOP_PIVOT_MULTI_SHADOW_ENABLED=true`
@@ -381,7 +381,7 @@ When to rerun:
 - rerun when closing a new production stage if the direct merchant signoff is part of that phase's acceptance
 
 For the next step beyond this merchant-specific signoff, use the separate follow-on phase plan:
-- [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
+- [CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/docs/ops/CELESTIAL_PIVOT_FOLLOW_ON_PHASES.md)
 
 ## Merchant Portal Readiness And Signals
 This release train now exposes merchant-facing readiness and commerce diagnostics in addition to the existing product-level optimization views.
@@ -393,17 +393,17 @@ Treat these surfaces as complementary:
 
 Merchant-facing endpoints:
 - `GET /merchant/analytics/readiness-state`
-  - source: [merchant_analytics_routes.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/merchant_analytics_routes.py)
-  - computation: [merchant_commerce_readiness_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_readiness_service.py)
+  - source: [merchant_analytics_routes.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/merchant_analytics_routes.py)
+  - computation: [merchant_commerce_readiness_service.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_readiness_service.py)
 - `GET /merchant/analytics/commerce-funnel`
   - grouped summary/read model for indexed, surfaced, clicked, ordered, refunded, and listing status breakdown
-  - computation: [merchant_commerce_funnel_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_funnel_service.py)
+  - computation: [merchant_commerce_funnel_service.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_funnel_service.py)
 - `GET /merchant/analytics/commerce-funnel/issues`
   - merchant-facing diagnostic buckets such as `LISTING_ERROR`, `MISSING_INFO`, `VARIANT_MISMATCH`, `TRACE_BROKEN`, `UNATTRIBUTED_ORDER`
-  - computation: [merchant_commerce_diagnostics_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_diagnostics_service.py)
+  - computation: [merchant_commerce_diagnostics_service.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/merchant_commerce_diagnostics_service.py)
 - `GET /merchant/analytics/commerce-interactions/{interaction_id}`
   - drilldown for a single interaction ledger trace
-  - lookup: [commerce_interaction_service.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/commerce_interaction_service.py)
+  - lookup: [commerce_interaction_service.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/services/commerce_interaction_service.py)
 
 Portal expectation:
 - `/dashboard/analytics` now has four complementary blocks:
@@ -452,7 +452,7 @@ Endpoints:
 - `POST /agent/v2/commerce/checkouts/{checkout_id}/returns`
 
 Implementation:
-- route surface: [agent_commerce.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/agent_commerce.py)
+- route surface: [agent_commerce.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/routes/agent_commerce.py)
 - the public contract requires `interaction_id` plus normalized item references
 - Shopify uses the readiness/native PSP orchestration already present
 - Wix shares the same public contract; return sync can still report `pending_external_platform` until full adapter automation lands
@@ -471,7 +471,7 @@ Why this is separate from readiness payment signoff:
 - this run must start from `POST /api/links/resolve`, then carry the same `pvt_*` values into `POST /agent/v2/commerce/checkouts`
 
 Operator script:
-- [smoke_real_click_order_funnel_signoff.py](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/scripts/smoke_real_click_order_funnel_signoff.py)
+- [smoke_real_click_order_funnel_signoff.py](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/scripts/smoke_real_click_order_funnel_signoff.py)
 
 Default target:
 - API base: `https://api.pivota.cc`
@@ -502,10 +502,10 @@ Current prod status as of `2026-03-30T13:26:59Z`:
 - the script now defaults the `/api/links/resolve` `skuId` candidate to the selected readiness `variant_id`, so operators do not need to pass `--sku-id` for normal `sku`-scoped rules
 - prod now has a published `market=US`, `tool=ucp`, `scope=sku` outbound rule set covering all current `ucp/exported` variants for this merchant
 - rule-set rollout artifacts:
-  - [summary.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/summary.json)
-  - [ucp-sku-rules.csv](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/ucp-sku-rules.csv)
-  - [import-response.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/import-response.json)
-  - [publish-response.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/publish-response.json)
+  - [summary.json](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/summary.json)
+  - [ucp-sku-rules.csv](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/ucp-sku-rules.csv)
+  - [import-response.json](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/import-response.json)
+  - [publish-response.json](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/outbound-link-rules/prod-merchant-ucp-sku-20260330T132009Z/publish-response.json)
 - rollout summary:
   - `created = 2098`
   - `updated = 0`
@@ -528,8 +528,8 @@ python3 scripts/smoke_real_click_order_funnel_signoff.py \
 
 Observed default prod outcome on `2026-03-30T13:25:40Z`:
 - evidence:
-  - [click-order-funnel-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.md)
-  - [click-order-funnel-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.json)
+  - [click-order-funnel-signoff.md](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.md)
+  - [click-order-funnel-signoff.json](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-default-ucp-20260330T132540Z/click-order-funnel-signoff.json)
 - verdict:
   - `overall_ok = true`
   - `resolve_ok = true`
@@ -577,8 +577,8 @@ python3 scripts/smoke_real_click_order_funnel_signoff.py \
 
 Historical pre-rule-set outcome on `2026-03-30T13:04:16Z`:
 - evidence:
-  - [click-order-funnel-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.md)
-  - [click-order-funnel-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.json)
+  - [click-order-funnel-signoff.md](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.md)
+  - [click-order-funnel-signoff.json](~/dev/_worktrees/pivota-backend-celestial-four-domains-default-on-20260330/output/click-order-funnel-signoff/prod-sku-override-20260330T130416Z/click-order-funnel-signoff.json)
 - verdict:
   - `overall_ok = true`
   - `resolve_ok = true`
@@ -632,8 +632,8 @@ Current follow-on status as of `2026-03-30 UTC`:
 
 - `Phase A` current-environment gate is green.
   - Evidence:
-    - [commerce-signoff-batch.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
-    - [commerce-signoff-batch.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
+    - [commerce-signoff-batch.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.md)
+    - [commerce-signoff-batch.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/commerce-signoff/prod-batch-20260329-current-gate/commerce-signoff-batch.json)
   - Current gate outcome:
     - `overall_ok = true`
     - `enabled_cases = 1`
@@ -657,8 +657,8 @@ Current follow-on status as of `2026-03-30 UTC`:
     - run `refund`
     - confirm post-refund audit convergence
   - Evidence:
-    - [bridge-paid-reference-signoff.md](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
-    - [bridge-paid-reference-signoff.json](/Users/pengchydan/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
+    - [bridge-paid-reference-signoff.md](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.md)
+    - [bridge-paid-reference-signoff.json](~/dev/_worktrees/pivota-backend-hyaluronic-aliases-20260325/output/phase-b-signoff/prod-bridge-paid-reference-complete-20260330T003949Z/bridge-paid-reference-signoff.json)
   - Outcome:
     - `normalized_payment_status = paid`
     - `bridge payment_status = paid`

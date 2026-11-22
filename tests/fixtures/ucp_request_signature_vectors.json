@@ -1,0 +1,235 @@
+{
+  "note": "RFC 9421 UCP request-signing vectors produced by the gateway signer (src/services/ucpBuyerAgentClient.js buildUcpSignatureBase/signUcpRequest). The backend signer (services/ucp_request_signing.py) must reproduce signature_base, signature_input and content_digest byte for byte. The key is TEST-ONLY. ECDSA is randomized, so signatures are checked by verifying, not by comparing. The url_* cases pin @authority/@path/@query as the WIRE carries them (percent-encoded space and non-ASCII, dot segments removed, punycode host, bracketed IPv6), never the raw URL text.",
+  "public_jwk": {
+    "kty": "EC",
+    "x": "qfGka7i7W6vj_V-Yzo26Tjq4El_jH68dkZeXGBIXCvA",
+    "y": "klue0wZB4YOhNeqZomySA213zWQL5M5SNEt_O-9VFTg",
+    "crv": "P-256",
+    "kid": "pivota-test-key-1",
+    "use": "sig"
+  },
+  "created": 1795000000,
+  "expires": 1795000300,
+  "cases": [
+    {
+      "name": "search_catalog_no_idempotency",
+      "method": "POST",
+      "url": "https://shop.example/ucp/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0001\",\"method\":\"tools/call\",\"params\":{\"name\":\"search_catalog\",\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}},\"catalog\":{\"query\":\"lip tint\"}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:dFElGCwwtARjbvd4LGHxErNdFYYQBkWyKorO782bROo=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:dFElGCwwtARjbvd4LGHxErNdFYYQBkWyKorO782bROo=:",
+        "gateway_signature": "sig1=:ZQR2cFrDI3h9Au2eBtpot6qWrOPlVC27CimTxUqZRG+pBye7X1rmB+JhZROdfxiUB2gPRs/nfQpHHpBTxc/lxA==:"
+      }
+    },
+    {
+      "name": "create_checkout_with_idempotency",
+      "method": "POST",
+      "url": "https://shop.example/ucp/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0001\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_checkout\",\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}},\"checkout\":{\"line_items\":[{\"item\":{\"id\":\"variant-1\"},\"quantity\":1}]}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": "efc9d77a-4d05-4ea4-bfda-5aec10010a0c",
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "idempotency-key",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"idempotency-key\": efc9d77a-4d05-4ea4-bfda-5aec10010a0c\n\"content-digest\": sha-256=:GqdCEnvIDnPH68F1kv09QBmFWmMtaCQSSYfDS8yJgEs=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"idempotency-key\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"idempotency-key\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:GqdCEnvIDnPH68F1kv09QBmFWmMtaCQSSYfDS8yJgEs=:",
+        "gateway_signature": "sig1=:QNGEg0bIsxUBh8Kxo5fL0V/Msc4AGGpswS8ab1XRCPUe8WV5YJ4PbKnPygh7ZHdqbkDGBWIJt2YpJ11twPEbPQ==:"
+      }
+    },
+    {
+      "name": "query_string_and_non_ascii_body",
+      "method": "POST",
+      "url": "https://shop.example:8443/ucp/mcp?shop=demo",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0001\",\"method\":\"tools/call\",\"params\":{\"name\":\"search_catalog\",\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}},\"catalog\":{\"query\":\"crème — 唇釉\"}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "@query",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example:8443\n\"@path\": /ucp/mcp\n\"@query\": ?shop=demo\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:LNEtu73IvJo3hlAVNOnx469jUdoRn/h5HA2RbXSYXN0=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"@query\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:LNEtu73IvJo3hlAVNOnx469jUdoRn/h5HA2RbXSYXN0=:",
+        "gateway_signature": "sig1=:/BAXLzfeUPaxaFzDoONmXWCt40wDbGL3Rz7avwMzcWar/HI3iueR5nqBsHFhxxPPi3UANNf1NgJ3zsrXs9yqVw==:"
+      }
+    },
+    {
+      "name": "no_body_no_profile",
+      "method": "GET",
+      "url": "https://shop.example/ucp/status",
+      "body": null,
+      "ucp_agent": null,
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path"
+        ],
+        "signature_base": "\"@method\": GET\n\"@authority\": shop.example\n\"@path\": /ucp/status\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": null,
+        "gateway_signature": "sig1=:130YdK0VeMVrNUqGJXlcrf+ZFoCQ4FwXoPX0mt4XBumWaL1NnoMsXgB1pR/tOgHm6ybYI5gvKhULkvrlgj3Egw==:"
+      }
+    },
+    {
+      "name": "url_path_with_space",
+      "method": "POST",
+      "url": "https://shop.example/ucp/a b/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/a%20b/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:xB3U0+uV8wRporRBFMRGsPc9X9QehVe4vftPI5LdGEeFwB4kusYHUp9fo6O0+z5tj3uTNGBJwYq7RB7wA5tB2Q==:"
+      }
+    },
+    {
+      "name": "url_path_non_ascii",
+      "method": "POST",
+      "url": "https://shop.example/ucp/café/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/caf%C3%A9/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:5rAG0TJHZ97zQqMurz1VHnHXrESbXAyApuN659zWwZ7f4FmSgIPfs7iKVozIrpikRdqjWiA/t/8sxCZa8BXhyg==:"
+      }
+    },
+    {
+      "name": "url_dot_segments",
+      "method": "POST",
+      "url": "https://shop.example/a/../ucp/./mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:fivuMueEKGM2TQULdnh0Hs9X43PbJOArDR03jXFD33+k4WAC1MUicKUxjuwFHenQh8yYxQBtFK+4vPrDzOS6dg==:"
+      }
+    },
+    {
+      "name": "url_query_space_and_non_ascii",
+      "method": "POST",
+      "url": "https://shop.example/ucp/mcp?q=a b&r=é",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "@query",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": shop.example\n\"@path\": /ucp/mcp\n\"@query\": ?q=a%20b&r=%C3%A9\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"@query\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:brbjU82DaKmL24H58sahLhZdU7o0I4KrKc9mhpflkdLFsEsn5EZS+Twmq0HnLAWpvLx17byzHKVMSo1Hoz5/7w==:"
+      }
+    },
+    {
+      "name": "url_idn_host",
+      "method": "POST",
+      "url": "https://bücher.example/ucp/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": xn--bcher-kva.example\n\"@path\": /ucp/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:29hGyy9BfBTg4RyNYumOhEJAZRWtBR3LNCYR9NwoYw3FTIUcwPF36V/XFRpiC917LCiYDS42FV2i55OQBOgQXg==:"
+      }
+    },
+    {
+      "name": "url_ipv6_host_with_port",
+      "method": "POST",
+      "url": "https://[2001:db8::1]:8443/ucp/mcp",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":\"req-0002\",\"method\":\"tools/list\",\"params\":{\"arguments\":{\"meta\":{\"ucp-agent\":{\"profile\":\"https://ucp.pivota.cc/.well-known/ucp-agent\"}}}}}",
+      "ucp_agent": "profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"",
+      "idempotency_key": null,
+      "expected": {
+        "covered": [
+          "@method",
+          "@authority",
+          "@path",
+          "ucp-agent",
+          "content-digest",
+          "content-type"
+        ],
+        "signature_base": "\"@method\": POST\n\"@authority\": [2001:db8::1]:8443\n\"@path\": /ucp/mcp\n\"ucp-agent\": profile=\"https://ucp.pivota.cc/.well-known/ucp-agent\"\n\"content-digest\": sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:\n\"content-type\": application/json\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "signature_input": "sig1=(\"@method\" \"@authority\" \"@path\" \"ucp-agent\" \"content-digest\" \"content-type\");created=1795000000;expires=1795000300;keyid=\"pivota-test-key-1\"",
+        "content_digest": "sha-256=:R9JCxZLltNW/sKnxcVUk4MXiF3YU7OZoIrS71iEwpTE=:",
+        "gateway_signature": "sig1=:8HY7ENild/kIHBYQnMYHU/4fPet3ITcUuCr1oEFoxM+ikqcPZCyXHfxy7PJB85M+NnsRqFb8EtkqUjtUNiXvng==:"
+      }
+    }
+  ]
+}

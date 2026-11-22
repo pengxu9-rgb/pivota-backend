@@ -1,11 +1,11 @@
 """Our click id in the affiliate network's sub-ID parameter, on the `/r` click-out (ADR-025 D2).
 
-WHY. A network (Rakuten Advertising, Awin, ...) reports commissions keyed by a sub-ID the publisher
-puts on the tracking link, e.g. Rakuten's `u1`. A feed's `link` is that tracking link
-(services/retailer_ingest/affiliate_feed.py), but nothing put our click id in a sub-ID, so a
-commission report could not be tied to a click, and through it to a product or a partner agent.
-ADR-025 D2 names the carrier: "the network's tracking link, with our click id in its sub-id
-parameter", and decision 2 there: the sub-ID is the click id, NEVER the agent id.
+WHY. An affiliate network reports commissions keyed by a sub-ID the publisher puts on the
+tracking link. A feed's `link` is that tracking link (services/retailer_ingest/affiliate_feed.py),
+but nothing put our click id in a sub-ID, so a commission report could not be tied to a click, and
+through it to a product or a partner agent. ADR-025 D2 names the carrier: "the network's tracking
+link, with our click id in its sub-id parameter", and decision 2 there: the sub-ID is the click id,
+NEVER the agent id.
 
 WHAT GOES IN IT. Only our opaque click id (`clk_<24 hex>`, services.commerce_attribution_service
 .new_click_id), the SAME id `/r` records for the click. Never a partner, agent, merchant or buyer
@@ -26,12 +26,13 @@ verified, on the URL put in the Location header. The signed `dest` is never chan
 The click's ctx records the parameter and value (`affiliate_subid_param` / `affiliate_subid_value`),
 so a commission import can join on them.
 
-WHICH HOSTS. A small code map, host suffix -> (parameter name, value form), matched on a label boundary (the host
-IS the suffix or ends with "." + suffix; `evil-linksynergy.com` and `linksynergy.com.example` do not
-match). Every entry's host is already in services.outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES, and
-each parameter name is from the network's public link documentation (cited per entry). Networks
-whose parameter could not be confirmed are left out. AFFILIATE_SUBID_PARAMS_JSON merges over the map,
-but never with a parameter on SUBID_PARAM_DENYLIST (one that carries the destination or an id).
+WHICH HOSTS. A small map, host suffix -> (parameter name, value form), matched on a label boundary (the
+host IS the suffix or ends with "." + suffix; `evil-<suffix>` and `<suffix>.example` do not match).
+Every entry's host is also on the warm-handoff affiliate list (services.outbound_warm_handoff), and
+each parameter name is from the network's public link documentation; the per-network citations are
+kept privately, not in this repository. Networks whose parameter could not be confirmed are left
+out. AFFILIATE_SUBID_PARAMS_JSON merges over the map, but never with a parameter on
+SUBID_PARAM_DENYLIST (one that carries the destination or an id).
 """
 
 from __future__ import annotations
@@ -68,37 +69,11 @@ class SubidRule:
     form: str
 
 
-#: Host suffix -> the network's sub-ID query parameter and value form. Sources (public publisher
-#: docs, read only); the form follows each network's documented character rule:
-#:  * linksynergy.com   u1        Rakuten Advertising publisher help: the u1 "Member ID" on
-#:                                click.linksynergy.com links, up to 72 alphanumeric characters; it
-#:                                says never to put an email, phone or other private data in it.
-#:                                Alphanumeric: FORM_HEX.
-#:  * awin1.com         clickref  Awin publisher help ("click reference"), cread.php links; the
-#:                                Click Reference report shows the first 50 characters. Lowercase
-#:                                letters, digits and listed specials, `_` among them: FORM_CLK.
-#:  * shareasale.com    afftrack  ShareASale "Affiliate Defined Tracking": afftrack= on r.cfm
-#:                                links, up to 255 alphanumeric characters: FORM_HEX.
-#:  * skimresources.com xcust     Skimlinks LinkWrapper guide: xcust, <= 50 characters of letters,
-#:                                digits, underscores and pipes: FORM_CLK.
-#:  * go2cloud.org      aff_sub   TUNE (HasOffers) partner sub IDs aff_sub..aff_sub5 on go2cloud.org
-#:                                links, URL-encoded, up to 500 characters; no character set is
-#:                                stated beyond URL encoding, and `_` needs none: FORM_CLK.
-#:  * sjv.io, pxf.io    subId1    impact.com partner help ("Sub ID and Shared ID parameters"):
-#:                                subId1..subId3, alphanumeric, 255 characters (older docs: 64):
-#:                                FORM_HEX.
-#: Left out on purpose: rakuten.com and rakutenadvertising.com (not the tracking-link host; Rakuten's
-#: u1 is documented on linksynergy.com links), impact.com (corporate domain, not a link host),
-#: prf.hn (Partnerize carries `pubref:` as a PATH segment, not a query parameter), and every network
-#: not in AFFILIATE_HOST_SUFFIXES. Two networks are left out until their docs confirm BOTH the click
-#: host and the parameter:
-#:  * Involve Asia: the publisher help documents the click host, but names no sub-ID URL parameter;
-#:    `aff_sub` appears only as a report/API field, and the help says sub-IDs are set in the link
-#:    generator. Unconfirmed: the parameter on the link, and its character rule.
-#:  * CJ: a `SID` query value appears only in one developer-portal script example (the page could not
-#:    be read in full); the reports now name the field shopperId; no case or character rule is
-#:    published; and CJ's tracking hosts are not in AFFILIATE_HOST_SUFFIXES. Unconfirmed: the
-#:    parameter's spelling and rule, and the full host list.
+#: Host suffix -> the network's sub-ID query parameter and value form. Each entry was confirmed from
+#: the network's public publisher documentation (parameter name, length and character rule); the
+#: form follows the documented character rule: alphanumeric only -> FORM_HEX, `_` allowed ->
+#: FORM_CLK. The per-network citations, and the networks left out until both the click host and the
+#: parameter are confirmed, are kept privately (not in this repository).
 AFFILIATE_SUBID_PARAMS: Mapping[str, SubidRule] = MappingProxyType({
     "linksynergy.com": SubidRule("u1", FORM_HEX),
     "awin1.com": SubidRule("clickref", FORM_CLK),
@@ -111,13 +86,10 @@ AFFILIATE_SUBID_PARAMS: Mapping[str, SubidRule] = MappingProxyType({
 
 #: Query parameters AFFILIATE_SUBID_PARAMS_JSON may never name (compared lowercased): writing our
 #: click id into one would replace the link's destination or the publisher / merchant / offer
-#: identity that decides who is paid.
-#:  * the destination: murl (Rakuten deep link), url (Skimlinks, TUNE, CJ), u (impact deep link),
-#:    p and ued (Awin), urllink (ShareASale), and generic spellings (dest, destination, deeplink,
-#:    dl, link, redirect, redirect_url, goto, target);
-#:  * an identity: id (Rakuten and Skimlinks publisher), mid (Rakuten merchant), awinmid, awinaffid,
-#:    b and m (ShareASale banner, merchant; its u is the affiliate), offerid, tmpid and type (Rakuten
-#:    link), offer_id, aff_id and affid (TUNE), pid and aid (CJ publisher, ad).
+#: identity that decides who is paid. Two kinds: the destination (each mapped network's deep-link
+#: parameter, plus generic spellings: dest, destination, deeplink, dl, link, redirect, redirect_url,
+#: goto, target), and an identity (publisher, merchant, banner, offer, link-type and ad ids as the
+#: mapped networks spell them). The per-network sources are kept privately.
 SUBID_PARAM_DENYLIST = frozenset({
     "murl", "url", "u", "p", "ued", "urllink",
     "dest", "destination", "deeplink", "dl", "link", "redirect", "redirect_url", "goto", "target",
@@ -125,8 +97,8 @@ SUBID_PARAM_DENYLIST = frozenset({
     "offer_id", "aff_id", "affid", "pid", "aid",
 })
 
-#: The longest sub-ID value we send. The tightest documented limit among the mapped networks is 50
-#: (Awin's report display, Skimlinks' xcust); a network added through the env gets the same bound.
+#: The longest sub-ID value we send. The tightest documented limit among the mapped networks is 50;
+#: a network added through the env gets the same bound.
 #: Our click ids are 28 characters (`clk_` + 24 hex) and 24 in FORM_HEX, well inside it.
 SUBID_VALUE_MAX_LEN = 50
 
@@ -263,7 +235,7 @@ def set_query_param(url: str, param: str, value: str) -> Tuple[str, bool]:
     case-insensitively, since a network may read either spelling) takes the new value in place, and
     any further copies are dropped. With none, it is added at the end of the query. Every other
     query segment is kept byte-for-byte, in order, and the fragment is untouched. String surgery on
-    purpose: a parse/re-encode round trip would re-encode other parameters (a deep link's `murl`).
+    purpose: a parse/re-encode round trip would re-encode other parameters (a deep link's destination parameter).
     """
     head, hash_sep, fragment = url.partition("#")
     base, q_sep, query = head.partition("?")

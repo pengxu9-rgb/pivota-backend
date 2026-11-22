@@ -92,7 +92,10 @@ def normalize_tool(tool: Optional[str]) -> str:
 
 
 def normalize_market(market: Optional[str]) -> str:
-    m = str(market or "").strip().upper()
+    # ABSENT (None / blank) serves as US, by design (see MARKET PROVENANCE below). A SENT value is kept: only an
+    # ASCII value is upper-cased, since case mapping reads a look-alike ('ſg') as a real market ('SG').
+    m = str(market or "").strip()
+    m = m.upper() if m.isascii() else m
     return m or "US"
 
 
@@ -746,7 +749,9 @@ def is_domain_allowed_for_market_domains(*, destination_url: str, allowed_domain
 
 
 def _normalize_market_key(market: str) -> str:
-    return str(market or "").strip().upper() or "US"
+    # The serving market's own rule (normalize_market): ASCII-first, so a look-alike ('ſg') no longer keys SG's
+    # allowlist the way upcasing first did; absent still keys US. One rule, one default, not a second copy.
+    return normalize_market(market)
 
 
 async def _fetch_allowed_domains_for_market(cache_market: str) -> List[str]:
@@ -808,14 +813,34 @@ async def get_active_allowed_domains_for_market(*, market: str) -> list[str]:
     return list(await get_allowed_domains_for_market(market=market))
 
 
+#: Why a destination is not allowed for a market the allowlist cannot key: one the market registry does not list.
+ALLOWLIST_MARKET_UNKNOWN_REASON = "allowlist_market_unknown"
+
+
+def allowlist_market_refusal(market: Any) -> Optional[str]:
+    """Why no destination may be allowed for `market`, or None when the allowlist can key it.
+
+    An empty allowlist allows every domain (backward compatible, for a market with no rows yet). That reading is
+    only safe for a market the registry lists: a look-alike ('ſg', kept as sent by _normalize_market_key), a
+    three-letter code or a code no registry entry names keys its OWN empty allowlist, so it allowed every domain
+    (the employee seed preview answered `domain_allowed: true` under 'ſg'). Absent and blank still key US."""
+    from services import market_registry
+
+    key = _normalize_market_key(market)
+    return None if market_registry.market_or_none(key) is not None else ALLOWLIST_MARKET_UNKNOWN_REASON
+
+
 async def _is_domain_allowed(*, market: str, destination_url: str) -> bool:
     """
     Backward compatible:
     - If allowlist is empty for this market, allow everything.
     - If allowlist has at least 1 active entry, enforce it.
+    - A market the registry does not list allows nothing (allowlist_market_refusal); absent reads as US.
     """
     dest_domain = url_domain(destination_url).strip().lower()
     if not dest_domain:
+        return False
+    if allowlist_market_refusal(market) is not None:
         return False
 
     allowed = await get_allowed_domains_for_market(market=market)
@@ -895,6 +920,10 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     dest_with_utm = apply_utm(dest, utm_template, tokens)
     dest_with_tracking = apply_pvt_params(dest_with_utm, attribution)
 
+    # A rule filed under a market key the registry does not list allows no destination (POST /api/links/resolve
+    # answers matched:false with this reason); a listed market's allowlist is enforced as before.
+    if allowlist_market_refusal(market) is not None:
+        raise ValueError(ALLOWLIST_MARKET_UNKNOWN_REASON)
     if not await _is_domain_allowed(market=market, destination_url=dest_with_tracking):
         raise ValueError("DOMAIN_NOT_ALLOWED")
 

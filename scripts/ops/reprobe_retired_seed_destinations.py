@@ -16,7 +16,7 @@ redirect hops, challenge -> unverifiable -- under a global pacer (0.5 rps, 6 new
 
 WHAT IT NEVER DOES. Write. Nothing calls record_destination_observation, retire or reactivate, and
 the only database statement is the SELECT below. A seed that comes back `live` is reactivated, if
-at all, by a separate coordinator dry run with Peng's go.
+at all, by a separate coordinator dry run with the owner's go.
 
 RUN. A merchant fetch, so SUBNET=pivota-crawl (the default subnet leaves by the payment NAT):
 

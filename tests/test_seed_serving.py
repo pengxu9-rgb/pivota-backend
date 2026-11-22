@@ -239,12 +239,13 @@ def test_seed_row_served_for_a_buyer_market():
     assert m.seed_row_served_for({"market": "US", "price_currency": "GBP"}, "GB") is False
 
 
-_BUYER_MARKETS = ["US", "SG", "GB", "gb", "DE", None, "", "FR", "CA", "SE", "KR", "HK", "AU", "JP", "ZZ", "EU-DE"]
+_BUYER_MARKETS = ["US", "SG", "GB", "gb", "DE", None, "", "FR", "CA", "SE", "KR", "HK", "AU", "JP", "ZZ", "EU-DE", "ſg", "uſ"]
 _ROW_CURRENCIES = ["USD", "SGD", "GBP", "EUR", "CAD", "SEK", "KRW", "HKD", "AUD", "JPY", "XYZ", None]
 _REFUSAL = {"US": None, "SG": None, "GB": "market_not_served:GB", "DE": "unknown_market:DE",
             "FR": "market_not_served:FR", "CA": "market_not_served:CA", "SE": "market_not_served:SE",
             "KR": "market_not_served:KR", "HK": "market_not_served:HK", "AU": "market_not_served:AU",
-            "JP": "market_not_served:JP", "ZZ": "unknown_market:ZZ", "EU-DE": "unknown_market:EU-DE",
+            "JP": "market_not_served:JP", "ZZ": "unknown_market:ZZ", "EU-DE": "unknown_market:'EU-DE'",
+            "ſg": "unknown_market:'ſg'", "uſ": "unknown_market:'uſ'",
             "": "market_required"}
 
 

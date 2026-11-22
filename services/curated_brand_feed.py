@@ -2499,6 +2499,17 @@ _MEASURED_HOST_PRODUCT_TYPES = {
         "brows": "beauty/makeup/eye/brow",
         "lip care": "beauty/makeup/lip/balm",
     },
+    # Read 2026-11-21, every product on two shelves of the brand's own US store (73 in the crawl). Neither
+    # type names a pattern family, so every product on them was left unresolved -- the whole shelf:
+    #   "Creme Shadow" (2): one cream eyeshadow in two listings.
+    #   "Brow Gel" (1): a brow pomade.
+    # LEFT OUT: "Lash Curler" / "Lash Curler Refill Pads" (no leaf: tools/* are brushes and sponges),
+    # "Curated Palette" / "Palette" (eye and face palettes, more than one class), and the blank, "Sale"
+    # and "Skin Care" shelves, which the head-noun rule below reads product by product.
+    "surrattbeauty.com": {
+        "creme shadow": "beauty/makeup/eye/eyeshadow",
+        "brow gel": "beauty/makeup/eye/brow",
+    },
 }
 
 
@@ -2593,6 +2604,10 @@ _MEASURED_TITLE_HOST_TYPES = {
     # eyeliners, liquid eyeshadows, a primer, a mascara and bundles; the "Hidden" free minis are not
     # on the list.
     "stilacosmetics.com": frozenset({"", "sale", "new", "eye products"}),
+    # Read 2026-11-21, every product on these three shelves (9). Blank: three loyalty "(Reward)"
+    # redemptions, which the giveaway veto below refuses. "Sale" (4): an eyeshadow and three lip products
+    # (lip heads are the lip door's). "Skin Care" (2): a cleansing oil and a facial mist.
+    "surrattbeauty.com": frozenset({"", "sale", "skin care"}),
 }
 # Distinct from every other writer's value (see CATEGORY_CONFIDENCE_LIP_TITLE).
 CATEGORY_CONFIDENCE_MEASURED_HOST_TITLE = 0.81
@@ -2623,7 +2638,7 @@ _HEAD_AREAS = (
 _TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
     r"\b(?:free|gwp|brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|mirrors?|removers?|"
     r"wipes?|organi[sz]ers?|bags?|totes?|clips?|tees?|t-?shirts?|shirts?|hoodies?|crewnecks?|sweatshirts?|"
-    r"hats?|caps?|refills?|wands?)\b", re.I)
+    r"hats?|caps?|refills?|wands?|rewards?)\b", re.I)
 # A measured host's own head noun that no CATEGORY_PATTERNS entry reads. Read 2026-10-10: tower28's
 # only "spray" is the SOS Daily Rescue Facial Spray (singles, a travel size, a refill and a duo, all
 # with a blank type). A facial mist is a toner here: the Toner pattern already claims "mist", and the
@@ -3086,6 +3101,10 @@ def shopify_product_to_record(
     # The product's `body_html_sentences`, when the caller already computed them (records_for_brand
     # does, for its batch pass); derived here otherwise. Same description either way.
     body_sentences: Optional[Sequence[str]] = None,
+    # A brand's own store pinned to the offer seller it already has (retailer_ingest
+    # options.seller_merchant_id): the offer carries it and ingestion.derive_merchant_id uses it
+    # as is. Brand-official only; None (every other caller) leaves the offer exactly as before.
+    seller_merchant_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -3095,6 +3114,9 @@ def shopify_product_to_record(
         return None
     if source_role not in {"brand_official", "retailer"}:
         raise ValueError("source_role must be brand_official or retailer")
+    if seller_merchant_id and source_role != "brand_official":
+        # A retailer's seller id is its host (ingestion.derive_merchant_id seller_domain): never pinned.
+        raise ValueError("seller_merchant_id is only valid with source_role=brand_official")
     host = _clean_domain(domain)
     title = str(product.get("title") or "").strip()
     handle = str(product.get("handle") or "").strip()
@@ -3351,6 +3373,7 @@ def shopify_product_to_record(
                 "price": price,
                 "in_stock": variant.get("available") if isinstance(variant.get("available"), bool) else None,
                 "validated_at": "shopify_products_json",
+                **({"seller_merchant_id": seller_merchant_id} if seller_merchant_id else {}),
             }
         ],
     }
@@ -4138,6 +4161,8 @@ async def records_for_brand(
     # so a caller that wants extra slack on a specific brand can still ask for it.
     pdp_delay_s: float = 0.0,
     pdp_inci_budget_s: Optional[float] = None,
+    # Brand-official only: the offer seller id the store already has (see shopify_product_to_record).
+    seller_merchant_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch a curated brand's storefront and return Path-C validated records.
 
@@ -4304,7 +4329,7 @@ async def records_for_brand(
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
             source_role=source_role, retailer_name=retailer_name,
-            body_sentences=sentences,
+            body_sentences=sentences, seller_merchant_id=seller_merchant_id,
         )
         if not rec:
             continue

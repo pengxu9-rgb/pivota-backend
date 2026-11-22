@@ -54,7 +54,9 @@ decided before any database read.
 - `rail_state`: the rail's own word for the same state; for Reap, see docs/reap_agentic_routes.md.
 - `next_action`: present only while the buyer must act on a rail-hosted page AND the rail route
   still offers a valid URL (`kind` is `card_binding` or `approval`). Absent means there is
-  nowhere to send the buyer: poll again.
+  nowhere to send the buyer: poll again. With the AgenPas consent gate on (below) and no consent yet
+  for that step, it is `{"kind", "expires_at", "consent_required": true}` with NO `url` (and no
+  `type`): the buyer must accept Pivota's terms on the AgenPas page first.
 - `order_reference`: present on `completed`; the merchant order reference from the rail.
 - `detail`: exactly what `GET /agent/v2/commerce/reap/purchases/{rp_id}` returns.
 - 503 `state_unmapped`: the rail reported a state this service has no unified word for. Do not
@@ -77,8 +79,156 @@ does not exist. Turning it on needs a restart.
   `purchase_not_found` as no purchase. `X-Agenpas-Agent-User-Ref` is ignored (not the backend's user
   identity).
 - The body is exactly the one `GET /agent/v2/commerce/purchases/{purchase_id}` returns for that purchase.
-- A ledger or view fault: 503 `temporarily_unavailable`. Read-only. Not exempt from the rate limiter
-  (only the introspect key is): page reads count as anonymous traffic and can 429 under a burst.
+- A ledger or view fault: 503 `temporarily_unavailable`. The read writes nothing. Not exempt from the rate
+  limiter (only the introspect key is): page reads count as anonymous traffic and can 429 under a burst.
+- With the consent gate on (below), the body is gated like every surface and, in `needs_payment_method`,
+  `locking` and `awaiting_buyer_authorization`, carries a `consent` block (gate off: no block, the body is
+  byte for byte the public one):
+
+```json
+"consent": {
+  "required": true, "step": "approval", "satisfied": false, "available": true, "min_dwell_seconds": 3,
+  "terms_version": "…", "privacy_version": "…", "terms_url": "https://…", "privacy_url": "https://…",
+  "offer": {"id": "<64 hex>", "issued_at": "2026-11-18T12:00:00Z"}
+}
+```
+
+  `offer.id` is 64 hex characters; `offer.issued_at` is ISO-8601 UTC to the second ending in `Z`, and must be
+  echoed byte for byte. `min_dwell_seconds` (0..120) is how long after `issued_at` the write accepts it.
+  `available` is false (and there is no `offer`) when the terms / privacy URL or version, or the offer
+  secret, is not configured, when the consent write is off, or when the consent table could not be read:
+  the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
+  appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
+  the offer is stateless (an HMAC, below).
+
+## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
+
+Records that the holder of the AgenPas link accepted Pivota's terms of service and privacy policy on
+Pivota's page, before the rail's card page (`card_binding`) or approval page (`approval`). A payment
+partner requires that acceptance before a card is stored and before every approval, recorded by us.
+
+- **Dark** until `AGENPAS_CONSENT_WRITE_ENABLED` is on AT STARTUP (like the read's dial: off, the route is
+  not registered and the OpenAPI schema is unchanged; turned off without a restart, it answers the
+  unknown-route 404).
+- **Its own key**: `X-Internal-Key` must equal `AGENPAS_INTERNAL_CONSENT_KEY` (>= 32 characters, and not
+  the read key; the read key stays read-only). Missing / short / equal to the read key on the server: 503
+  `internal_key_not_configured`. Missing or wrong in the request (the read key included): 401.
+- `X-Agenpas-Agent-Id` scopes it as for the read. `purchase_id` may be the `pp_` id or the rail id; the
+  consent is keyed on the RAIL id and the rail row is read agent-scoped (the parent is healed best effort).
+- Body, exactly (strings, at most 1 KiB): the offer the read showed.
+
+```json
+{"step": "approval", "offer_id": "<offer.id>", "issued_at": "<offer.issued_at>",
+ "terms_version": "<consent.terms_version>", "privacy_version": "<consent.privacy_version>"}
+```
+
+| Answer | When |
+|---|---|
+| 201 `{"created": true, "consent": {step, approval_epoch, terms_version, privacy_version, evidence, accepted_at}}` | recorded |
+| 200 `{"created": false, "consent": {…}}` | already recorded for this step (a double click is one row) |
+| 400 `consent_refused` | not exactly that body, or the offer's HMAC does not verify for this purchase, step, approval and the current terms |
+| 404 `purchase_not_found` | no such purchase for this agent |
+| 409 `consent_stale` | the versions are not the configured ones, the purchase is final or not in that step, or the offer is older than 1800 s: re-read and show the fresh offer |
+| 409 `consent_too_soon` | the offer is younger than `consent.min_dwell_seconds` (`AGENPAS_CONSENT_MIN_DWELL_SECONDS`, default 3) |
+| 503 `consent_unavailable` | terms / privacy configuration or offer secret missing |
+| 503 `temporarily_unavailable` | a ledger fault |
+
+Any refusal writes nothing. The write calls no rail.
+
+**A version change after a consent does not ask again.** A consent covers its step as it was offered: once
+recorded for (rail purchase, step, approval epoch), that step is satisfied even if `AGENPAS_TERMS_VERSION`
+or `AGENPAS_PRIVACY_VERSION` changes later in the same purchase. A re-POST with the new versions (and an
+offer minted under them) answers 200 `created: false`, echoing the STORED row's versions, not the new ones.
+The next step (or the next purchase) is offered under the new versions.
+
+**Reap's contact re-entry.** While a Reap purchase asks the agent for the buyer's contact again
+(`detail.contact_reentry_required`), the read's block is `available: false` with no offer, and a POST
+answers 409 `consent_stale`.
+
+**`available` is true only when the POST can succeed now**: the write route is registered (its dial was on
+at startup), `AGENPAS_CONSENT_WRITE_ENABLED` is still on, `AGENPAS_INTERNAL_CONSENT_KEY` is valid (>= 32
+characters, not the read key), the configuration and offer secret are set, and the consent table could be
+read.
+
+**What the record proves, and what it does not.** `evidence = link_holder_on_pivota_page`: whoever held
+the AgenPas link ticked "I agree" on Pivota's page. The agent holds that link too. The dwell, and the
+gateway's `Origin` / `Sec-Fetch-Site` / JSON checks, stop naive automation only; they do not prove a
+human. The row holds no PII (no IP, no user agent, no email).
+
+## The AgenPas consent gate (`AGENPAS_CONSENT_GATE`)
+
+Default off, read per request. Off, every body above is byte for byte what it was (golden-tested).
+
+On, for a step that needs a consent (`card_binding` while the buyer binds a card, `approval` while they
+approve) and while none is recorded for (rail, rail purchase, step, approval epoch), **no surface carries
+the rail's hosted URL**: this door's read and list, the Reap rail's own routes (GET, list, create, resume,
+recover), the `purchase.*` webhook payloads, and the internal AgenPas read. The rail's `detail` drops
+`hosted_url`, keeps its deadline (`hosted_url_expires_at`, `approval_deadline`) and adds
+`buyer_step = {"kind", "expires_at", "consent_required": true, "available"}` (`available` on live reads only);
+`next_action` becomes
+`{"kind", "expires_at", "consent_required": true}`. `purchase.action_required` still fires, with that
+body. Once the consent is recorded, every surface answers today's body (URL included). The A2A rail's 3DS
+page (`authenticate`, while `placing`) is never gated. A consent table that cannot be read withholds
+every page (fail closed). List pages read the consents once per page.
+
+`buyer_step.available` follows the same rule as the internal read's `consent.available`: true only when the
+consent POST could succeed now (configuration and offer secret set, the write registered, its dial on and its
+key valid, the consent table readable) and the step is not blocked by Reap's contact re-entry. **It is only
+meaningful on a live read** (this door's GET and list, the Reap routes, the internal AgenPas read), where the
+serving process computes it for its own routes. Web and the worker run the same app (`main:app`), each with
+its own boot-time dials, so a value computed on the worker could disagree with web's: `purchase.*` webhook
+payloads therefore never carry `buyer_step.available` (it is dropped when an event is recorded and again on
+every hand-over, retry and listing, so an older stored payload goes out without it too). Read the purchase
+for the live value. Set `AGENPAS_CONSENT_WRITE_ENABLED`, `AGENPAS_INTERNAL_CONSENT_KEY` and the rest of the
+configuration identically on web and the worker anyway.
+
+**The offer** binds the agent id, the rail, the rail purchase id, the step, the approval epoch, both versions,
+both URLs and `issued_at` (length-prefixed). **Rotating `AGENPAS_CONSENT_OFFER_SECRET`**: set the old value
+as `AGENPAS_CONSENT_OFFER_SECRET_PREVIOUS` for at least 30 minutes (the offer's lifetime). An offer minted
+under it answers 409 `consent_stale` (the page re-reads and shows a fresh offer), not 400. Without it, offers
+in flight answer 400 `consent_refused`. The previous secret verifies only; nothing is minted with it.
+
+The approval consent may be given while the rail is still pricing (`locking`) or on the approval page,
+and binds to that purchase's single approval (`approval_epoch` 1 on both rails: a Reap re-quote fails the
+purchase, and the A2A ledger has no re-quote edge: `awaiting_authorization -> quoting` is refused; a test
+fails if it is re-added or a raw SQL writer appears, and re-adding it needs an approval epoch on the consents).
+
+Configuration (all on the backend; none is read by the browser):
+
+| Env | |
+|---|---|
+| `AGENPAS_CONSENT_GATE` | the gate, default off. **Set it on BOTH the `web` and the `worker` service** (the worker builds and sends the `purchase.*` webhooks); each logs its state once at boot (WARNING `purchase_consent: service=… AGENPAS_CONSENT_GATE=on|off …`) |
+| `AGENPAS_CONSENT_WRITE_ENABLED` | the write route, default off, read at startup |
+| `AGENPAS_INTERNAL_CONSENT_KEY` | the write's key, >= 32 characters, not the read key |
+| `AGENPAS_TERMS_URL`, `AGENPAS_TERMS_VERSION` | Pivota's buyer terms of service: https URL, version tag (printable ASCII, <= 32) |
+| `AGENPAS_PRIVACY_URL`, `AGENPAS_PRIVACY_VERSION` | Pivota's buyer privacy policy: the same shapes |
+| `AGENPAS_CONSENT_OFFER_SECRET` | the offer HMAC key, >= 32 characters, backend only, and neither the read key nor the consent key (else: unconfigured, `available` false) |
+| `AGENPAS_CONSENT_OFFER_SECRET_PREVIOUS` | optional: the secret before the last rotation, verification only (same rules) |
+| `AGENPAS_CONSENT_MIN_DWELL_SECONDS` | a whole number 0..120, default 3 (anything else: 3); stated to the page as `consent.min_dwell_seconds` |
+
+**Turn on, in this order**: the gateway's consent UI and rails first (`AGENPAS_CONSENT_ENABLED`,
+`AGENPAS_RAILS`), then the backend configuration above and `AGENPAS_CONSENT_WRITE_ENABLED` (a restart),
+then `AGENPAS_CONSENT_GATE` on the **worker FIRST, then on `web`** (worker on and web off leaks nothing new;
+web on and worker off sends every card and approval URL to agents in webhooks). Check both boot lines.
+**Deliveries made before the gate went on** still hold the hosted URL in their stored payload (the
+`purchase.*` event row and the agent webhook delivery row): every send re-applies the gate in the process
+that sends, at send time: the first hand-over, the retry loop, and a manual retry, and the deliveries list
+(the agent webhook deliveries list, `routes/agent_webhooks.py`) shows them gated too. While no consent exists for
+the step, the payload goes out without the URL and with `next_action.consent_required`, so a pending
+`purchase.action_required` backlog never carries a card or approval URL past the gate. The event rows are not
+rewritten (a delivery row records what each attempt actually sent). **Once an attempt has sent the gated body, that
+delivery stays gated**: its row now holds the body without the URL, and a later retry, even after the consent
+is recorded, re-sends that body (the gate only withholds a URL; it never adds one back). An agent that gets a
+gated `purchase.action_required` reads the purchase (`GET /agent/v2/commerce/purchases/{id}`) after the
+buyer has agreed on the AgenPas page; that live read carries the hosted URL. A retry made after the consent
+from a row that still holds the URL sends it as before. Gate on before the rest: every card / approval page is withheld and the
+AgenPas page says "not available right now". **Precondition for scripts/ops/reap_local_e2e.py and the
+Reap staging preflight**: the gate is off (they open the hosted page directly), or the run records the
+consent step first.
+
+**Turn off**: unset `AGENPAS_CONSENT_GATE` on **`web` first, then the worker**; bodies are today's again at
+once. The records stay
+(insert-only: nothing updates or deletes them, no PII scrub touches them).
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address` (server to server, AgenPas)
 
@@ -299,7 +449,7 @@ subscribed events), signing, retries and delivery log as the `order.*` events.
 
 | Event | When | `data` |
 |---|---|---|
-| `purchase.action_required` | the buyer must open a rail-hosted page: `needs_payment_method` (`next_action.kind = card_binding`) or `awaiting_buyer_authorization` (`kind = approval`) | the unified purchase, with `next_action.url` |
+| `purchase.action_required` | the buyer must open a rail-hosted page: `needs_payment_method` (`next_action.kind = card_binding`) or `awaiting_buyer_authorization` (`kind = approval`) | the unified purchase, with `next_action.url` (with the consent gate on and no consent yet: `next_action.consent_required`, no url) |
 | `purchase.completed` | the merchant order was placed | the unified purchase, with `order_reference` |
 | `purchase.failed` | the purchase ended without an order: `failed`, `refused` or `expired` (`data.state` says which) | the unified purchase |
 
