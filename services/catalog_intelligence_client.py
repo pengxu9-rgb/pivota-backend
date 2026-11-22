@@ -2,7 +2,7 @@
 HTTP client for the Pivota-catalog-intelligence service.
 
 Catalog-intelligence is a separate Express + Puppeteer service (in
-`/Users/pengchydan/dev/Pivota-catalog-intelligence`) that does
+`~/dev/Pivota-catalog-intelligence`) that does
 heavy-duty product extraction from brand websites — handles JS-
 rendered storefronts, Shopify variants, schema.org, ad-copy,
 ingredient harvesting. Far more capable than this backend's

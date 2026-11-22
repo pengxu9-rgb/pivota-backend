@@ -83,9 +83,14 @@ class _Probe:
         self.baseline = baseline
 
     async def extra(self) -> int:
+        # Client backends only. Autovacuum workers also carry `datname` and
+        # arrive in bursts on the minute; a sample taken on a tick read +1
+        # with no leak at all. A stranded pool connection is always a client
+        # backend, so the filter hides nothing this file is looking for.
         total = await self._control.fetchval(
             "SELECT count(*) FROM pg_stat_activity "
-            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            "WHERE datname = $1 AND pid <> pg_backend_pid() "
+            "AND backend_type = 'client backend'",
             _database_name(),
         )
         return total - self.baseline
@@ -136,7 +141,8 @@ async def probe():
     try:
         yield _Probe(control, await control.fetchval(
             "SELECT count(*) FROM pg_stat_activity "
-            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            "WHERE datname = $1 AND pid <> pg_backend_pid() "
+            "AND backend_type = 'client backend'",
             _database_name(),
         ))
     finally:

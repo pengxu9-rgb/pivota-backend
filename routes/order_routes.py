@@ -6452,13 +6452,13 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
         # Shopify staff notification subjects are often customized to render the buyer identity using
         # `customer.*` and/or `billing_address.*`. If a last name is blank, Liquid templates may apply
         # a fallback like `{{ last_name | default: first_name }}` which can render duplicated names
-        # (e.g. "peng peng"). We avoid this by using an invisible last name placeholder for single-token names.
+        # (e.g. "jane jane"). We avoid this by using an invisible last name placeholder for single-token names.
         # NOTE: \u200b (ZWSP) may still be treated as "blank" by some template filters; use
         # a non-whitespace invisible character to prevent Liquid `default`/`blank` fallbacks.
         INVISIBLE_LAST_NAME = "\u2060"  # word joiner
         parts = full_name.split()
         normalized_parts = [p for p in parts if p.strip()]
-        # If the name is duplicated (e.g. "peng peng"), treat it as a single-token input.
+        # If the name is duplicated (e.g. "jane jane"), treat it as a single-token input.
         all_same = bool(normalized_parts) and len({p.lower() for p in normalized_parts}) == 1
         include_name_field = False
         if not normalized_parts:

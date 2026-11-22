@@ -128,7 +128,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(uv[-\s/]?led\s+(?:nail\s+)?lamp|nail\s+lamp|gel\s+lamp|nail\s+dryer|"
         r"electric\s+nail\s+file|nail\s+drill)\b",
         re.IGNORECASE)),
-    # ===== Lash and nail products (Peng 2026-09-26: they get leaves). =====
+    # ===== Lash and nail products (the owner 2026-09-26: they get leaves). =====
     # Before these, a false lash or a nail product had NO honest leaf and fell to whatever noun it
     # also carried: "Peel Off Nail Polish" -> exfoliant (peel/polish), a dip powder -> face powder,
     # "Top Coat" -> a fashion coat, "24 Nails" -> nothing. A curated crawl with only_resolved_category

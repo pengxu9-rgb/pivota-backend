@@ -1,6 +1,6 @@
 """The purchase path refuses offers copied off a seed in another currency (real Postgres).
 
-Peng 2026-10-19: a price's currency is the buyer market's, never defaulted, never relabelled. That
+The owner 2026-10-19: a price's currency is the buyer market's, never defaulted, never relabelled. That
 day US search served SKINTIFIC's "Glow Cushion & Peptide Lip Serum Set" at USD 23.56: 20 offers the
 variant backfill had copied off seed_data.variants, while the seed itself had been re-read in AUD
 (snapshot AUD 57, column AUD 56, mirror offer AUD 56). pivota-backend#2652 bounds agent_pdp_view's

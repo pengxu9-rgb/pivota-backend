@@ -63,7 +63,7 @@ catalog fix was executed AND turned into a standing machine. Companions:
   `{proposal_id, run_id}`; `revert_run(run_id)` restores rows AND exactly the
   seeds that run deactivated.
 - **Judge**: tier3.v2, eval-gated (252-group gold fixture,
-  `reports/step5/tier3_eval_fixture_2026-07-10*.json`): 0 confident
+  the 2026-07-10 tier-3 eval fixture, kept off main in the private ops bundle): 0 confident
   mis-merges, 100% collapse coverage, 98.3% keep coverage. It only ever
   emits proposals; `tier3_judge` is NOT in the auto-approve allowlist;
   ~10% deterministic `spot_check` pre-marking exists for the eventual

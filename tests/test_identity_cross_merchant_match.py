@@ -677,8 +677,8 @@ def test_the_strategy_is_the_engines_module_only_strategy_and_never_auto_applied
 @pytest.mark.asyncio
 @pytest.mark.parametrize("argv", [
     ["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k", "--strategy", STRATEGY],
-    ["approve", "irp_x", "--by", "peng", "--strategy", STRATEGY, "--run", "cmss_x"],
-    ["approve", "--strategy", STRATEGY, "--run", "cmss_x", "--by", "peng", "--execute"],
+    ["approve", "irp_x", "--by", "owner", "--strategy", STRATEGY, "--run", "cmss_x"],
+    ["approve", "--strategy", STRATEGY, "--run", "cmss_x", "--by", "owner", "--execute"],
     ["apply", "--strategy", STRATEGY, "--max-proposals", "5", "--execute"],
 ])
 async def test_the_engine_cli_governs_it(monkeypatch, argv):
@@ -1570,7 +1570,7 @@ def _sg_case(sg_currency: str, keeper_sells_sg: bool):
 
 @pytest.mark.parametrize("keeper_sells_sg", [False, True])
 def test_market_currency_mismatch_an_sg_offer_in_usd_holds_whether_or_not_the_keeper_sells_in_sg(keeper_sells_sg):
-    """Peng's rule (controller 10-17): an offer's currency is its market's. Held even where the price
+    """The owner's rule (controller 10-17): an offer's currency is its market's. Held even where the price
     window would skip SG (keeper_has_no_same_size_offer_here), and never named in matched_offers."""
     plan, r = _sg_case("USD", keeper_sells_sg)
     assert plan.proposals == []

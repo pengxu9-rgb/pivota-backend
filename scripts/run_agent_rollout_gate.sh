@@ -4,8 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_REPO="${PIVOTA_BACKEND_REPO:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
-ACP_REPO="${PIVOTA_ACP_REPO:-/Users/pengchydan/dev/pivota-acp-revert}"
-GATEWAY_REPO="${PIVOTA_AGENT_GATEWAY_REPO:-/Users/pengchydan/dev/PIVOTA-Agent}"
+ACP_REPO="${PIVOTA_ACP_REPO:-$HOME/dev/pivota-acp-revert}"
+GATEWAY_REPO="${PIVOTA_AGENT_GATEWAY_REPO:-$HOME/dev/PIVOTA-Agent}"
 
 require_dir() {
   local path="$1"

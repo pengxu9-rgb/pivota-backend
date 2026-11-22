@@ -2797,17 +2797,6 @@
    "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c5ae7c36b5c85beb",
-   "file": "services/outbound_links_service.py",
-   "scope": "_normalize_market_key",
-   "kind": "b",
-   "shape": "or",
-   "literal": "'US'",
-   "expr": "str(market or '').strip().upper() or 'US'",
-   "occurrence": 0,
-   "origin": "2026-11-12"
-  },
-  {
    "fingerprint": "d48ec312f89b25c1",
    "file": "services/outbound_links_service.py",
    "scope": "normalize_market",

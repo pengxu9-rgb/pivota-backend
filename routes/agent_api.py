@@ -9,7 +9,9 @@ from services import agent_search_gateway_proxy
 from config.settings import settings as _app_settings
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
+from fastapi import params as fastapi_params
 from fastapi.responses import JSONResponse
+from services.test_merchant_policy import get_excluded_merchant_ids
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Awaitable, Callable
 from decimal import Decimal
@@ -19,6 +21,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import random
 import os
 import re
 import time
@@ -120,6 +123,7 @@ from services.merchant_psp_config_service import (
 from services.payment_offer_evidence_service import (
     emit_payment_offer_analytics_event,
     enrich_product_cards_with_payment_offers,
+    UNREAD_PAYMENT_CONTEXT,
     payment_context_from_mapping,
     redact_payment_method_evidence,
     stable_payment_offer_hash,
@@ -5360,48 +5364,181 @@ def _normalize_serving_market_param(raw: Any) -> Optional[str]:
     return code if code and expected_currency_for_market(code) else None
 
 
+def _plain_argument(value: Any, default: Any) -> Any:
+    """`value`, unless it is a FastAPI parameter object (a route's `Query(...)` / `Depends(...)` default left in
+    by a caller that called a route function as a plain one): then `default`, the value the route would
+    have resolved for an absent parameter."""
+    if isinstance(value, (fastapi_params.Param, fastapi_params.Depends)):
+        return default
+    return value
+
+
+#: The scope of an UNSCOPED search that reaches `agent_search_products` through one of its direct callers
+#: (the SDK search route, the beauty search route, the /products/resolve fallback). Those callers left
+#: `external_seed_only` out, and the Query default object read as True, so since 2026-02-26 they have
+#: searched external seeds only: connected merchants' products_cache rows were never read, and an agent
+#: with an allowed_merchants list got seeds too. Restoring the cross-merchant scope puts those rows back,
+#: and the products_cache arm of this search applies no test-merchant exclusion
+#: (services/test_merchant_policy is not read on it) and no currency guard without a price bound. So:
+#:   off (default, and any unknown value): today's scope -- external_seed_only=True, unchanged;
+#:   shadow: today's scope, plus one count-only log line per SAMPLED unscoped call (merchants it would
+#:           search, how many are test merchants); DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV, default 0 = none;
+#:   on: the caller's own external_seed_only (False unless asked), i.e. the cross-merchant scope.
+DIRECT_CALL_CROSS_MERCHANT_ENV = "AGENT_SEARCH_DIRECT_CALL_CROSS_MERCHANT"
+
+
+def direct_call_cross_merchant_mode() -> str:
+    raw = str(os.getenv(DIRECT_CALL_CROSS_MERCHANT_ENV) or "").strip().lower()
+    return raw if raw in {"off", "shadow", "on"} else "off"
+
+
+#: Shadow's sample rate, 0..1 (default 0: shadow adds no query at all). Each sampled unscoped call costs one
+#: merchant_onboarding read and the test-merchant set (cached in-process), off the request path.
+DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV = "AGENT_SEARCH_DIRECT_CALL_SHADOW_SAMPLE_RATE"
+
+
+def _direct_call_shadow_sample_rate() -> float:
+    try:
+        rate = float(str(os.getenv(DIRECT_CALL_SHADOW_SAMPLE_RATE_ENV) or "0").strip())
+    except ValueError:
+        return 0.0
+    return min(1.0, max(0.0, rate)) if rate == rate else 0.0
+
+
+#: The payment context the SDK product search and the /products/resolve fallback hand the search. They never
+#: passed one, so FastAPI's Query objects stood in for every field: every payment offer with a requirement
+#: was rejected as a mismatch (and the object's text was echoed). A sibling of the scope flag, because it is
+#: display-only (DISPLAY_ONLY_POLICY: no quote, PSP amount or discount reads it) and can go on alone:
+#:   off (default, and any unknown value): today's decisions and counts (UNREAD_PAYMENT_CONTEXT, which also
+#:        renders the rejected decisions' `actual` as None instead of that text -- the one unflagged change);
+#:   on: no payment context, as the HTTP product-detail route reads it (offers with a requirement are
+#:       `potential`, with their estimated savings).
+DIRECT_CALL_PAYMENT_CONTEXT_ENV = "AGENT_SEARCH_DIRECT_CALL_PAYMENT_CONTEXT"
+
+
+def direct_call_payment_context_unread() -> bool:
+    return str(os.getenv(DIRECT_CALL_PAYMENT_CONTEXT_ENV) or "").strip().lower() != "on"
+
+
+async def _log_direct_call_scope_shadow(*, caller: str, context: Any) -> None:
+    """Counts only: how many merchants the cross-merchant scope would search, and how many are test merchants."""
+    try:
+        allowed = getattr(context, "allowed_merchants", None)
+        if isinstance(allowed, list) and [m for m in allowed if str(m).strip()]:
+            would = [str(m).strip() for m in allowed if str(m).strip() and str(m).strip() != EXTERNAL_SEED_MERCHANT_ID]
+        else:
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id, business_name FROM merchant_onboarding
+                WHERE status = 'approved'
+                AND psp_connected = true
+                LIMIT 100
+                """
+            )
+            would = [str((_row_as_dict(r) or {}).get("merchant_id") or "").strip() for r in rows]
+            would = [m for m in would if m]
+        excluded = await get_excluded_merchant_ids(database)
+        logger.info(
+            "agent_search.direct_call_scope_shadow %s",
+            json.dumps({
+                "event": "agent_search.direct_call_scope_shadow",
+                "caller": caller,
+                "would_search_merchants": len(would),
+                "would_search_test_merchants": len([m for m in would if m in (excluded or set())]),
+            }, sort_keys=True),
+        )
+    except Exception:
+        logger.debug("agent_search direct-call scope shadow failed", exc_info=True)
+
+
+def direct_call_external_seed_only(
+    *,
+    caller: str,
+    background_tasks: BackgroundTasks,
+    context: Any,
+    merchant_id: Optional[str],
+    merchant_ids: Optional[List[str]],
+    search_all_merchants: Any,
+    requested: bool = False,
+) -> bool:
+    """The `external_seed_only` a direct caller passes, by DIRECT_CALL_CROSS_MERCHANT_ENV (see above)."""
+    mode = direct_call_cross_merchant_mode()
+    if mode == "on":
+        return bool(requested)
+    unscoped = not merchant_id and not merchant_ids and search_all_merchants is not True
+    if mode == "shadow" and unscoped and not requested:
+        rate = _direct_call_shadow_sample_rate()
+        if rate > 0 and random.random() < rate:
+            background_tasks.add_task(_log_direct_call_scope_shadow, caller=caller, context=context)
+    return True
+
+
+#: The `metadata.reason_code`s of a search page refused for its serving market (`_serving_market_refusal`). A
+#: caller that replaces an empty page with another lane's (the SDK door's merchant-scoped legacy fallback)
+#: must pass these through: the other lane has no market filter and would serve the market that was refused.
+SERVING_MARKET_REFUSAL_REASONS = frozenset({"market_invalid", "market_not_priced"})
+
+
+def _serving_market_refusal(raw: Any) -> Optional[Dict[str, Any]]:
+    """Why a SENT `serving_market` cannot be served, or None (absent, blank, or a market Pivota prices).
+
+    Only a string is a sent value. Anything else is ABSENT: over HTTP FastAPI hands this a str or None, and a
+    route that calls `agent_search_products` as a plain function and omits the argument leaves FastAPI's
+    `Query(...)` default object in place (the `isinstance(..., str)` coercion routes/merchant_products.py
+    uses for the same reason). Read with `str()`, that object was refused as market_invalid on every call.
+
+    `market_invalid`: not two ASCII letters (a locale, a list, 'USA', a Unicode look-alike such as 'ſg', which
+    case-folding would read as SG); the value is never repeated back. `market_not_priced`: a well-formed code
+    nothing is priced in (DE, ZZ); the code is named. The cross-door tokens offers.resolve and get_offers use.
+    Before, either was ignored and the page held to the partition's currency: a buyer who named a market was
+    silently served another one's."""
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text:
+        return None
+    code = iso2_market(text)
+    if code is None:
+        return {"reason_code": "market_invalid"}
+    if not expected_currency_for_market(code):
+        return {"reason_code": "market_not_priced", "serving_market": code}
+    return None
+
+
 async def agent_search_products(
+    *,
     req: Request,
     background_tasks: BackgroundTasks,
     merchant_id: Optional[str] = None,  # Now optional for cross-merchant search
-    merchant_ids: Optional[List[str]] = Query(None, description="List of merchant IDs to search"),
-    search_all_merchants: bool = Query(
-        default=False,
-        description="Opt-in cross-merchant search (requires explicit intent to avoid irrelevant results)",
-    ),
+    merchant_ids: Optional[List[str]] = None,
+    search_all_merchants: bool = False,
     query: Optional[str] = None,
     category: Optional[str] = None,
-    catalog_surface: Optional[str] = Query(
-        default=None,
-        description="Optional search surface. Set to 'beauty' for beauty-only candidate filtering.",
-    ),
+    catalog_surface: Optional[str] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
     in_stock_filter_explicit: Optional[bool] = None,
-    limit: int = Query(default=20, ge=1),
-    offset: int = Query(default=0, ge=0),
-    allow_external_seed: bool = Query(default=True),
-    external_seed_only: bool = Query(default=False),
-    allow_stale_cache: bool = Query(default=True),
-    external_seed_strategy: str = Query(default="legacy"),
-    fast_mode: bool = Query(default=False),
-    market: Optional[str] = Query(default=None),
-    serving_market: Optional[str] = Query(
-        default=None,
-        description=(
-            "The BUYER's market (ISO-2). Decides the currency every served row must be priced in; "
-            "the seed partitions read stay the deployment's (`market`). `market` alone is the storage "
-            "partition, unchanged. Unpriceable or malformed values are ignored."
-        ),
-    ),
-    psp: Optional[str] = Query(default=None),
-    payment_method_type: Optional[str] = Query(default=None),
-    card_network: Optional[str] = Query(default=None),
-    issuer_name: Optional[str] = Query(default=None),
-    wallet_type: Optional[str] = Query(default=None),
-    installment_provider: Optional[str] = Query(default=None),
-    context: AgentContext = Depends(get_agent_context),
+    limit: int = 20,
+    offset: int = 0,
+    allow_external_seed: bool = True,
+    external_seed_only: bool = False,
+    allow_stale_cache: bool = True,
+    external_seed_strategy: str = "legacy",
+    fast_mode: bool = False,
+    # `market` is the storage partition. `serving_market` is the BUYER's market (ISO-2): it decides the currency
+    # every served row must be priced in. A SENT value that is not two ASCII letters, or one nothing is priced
+    # in, is answered with no products and a named `metadata.reason_code` (`market_invalid` /
+    # `market_not_priced`, _serving_market_refusal); it is never read as the partition's market.
+    market: Optional[str] = None,
+    serving_market: Optional[str] = None,
+    psp: Optional[str] = None,
+    payment_method_type: Optional[str] = None,
+    card_network: Optional[str] = None,
+    issuer_name: Optional[str] = None,
+    wallet_type: Optional[str] = None,
+    installment_provider: Optional[str] = None,
+    # A caller that never read a payment context (see DIRECT_CALL_PAYMENT_CONTEXT_ENV).
+    payment_context_unread: bool = False,
+    context: AgentContext,
 ):
     """
     智能产品搜索 - Cross-Merchant Support
@@ -5413,7 +5550,27 @@ async def agent_search_products(
     - 价格区间筛选
     - 分页支持
     - 相关度评分
+
+    NOT A ROUTE. The search routes (routes/agent_sdk_fixed.search_products, agent_search_products_beauty
+    below) and the /products/resolve fallback call this as a plain function, so its defaults are plain
+    Python values. They used to be FastAPI `Query(...)` objects, and a caller that left one out passed the
+    object itself: `external_seed_only` left out read as True (`bool(Query(default=False))`), so an
+    unscoped search was answered from external seeds only. tests/test_route_functions_called_directly.py
+    holds every direct call of a function with FastAPI parameter defaults to passing each one.
     """
+    # Defence in depth: a FastAPI parameter object is a route's default, never a value a caller chose.
+    (merchant_ids, search_all_merchants, catalog_surface, limit, offset, allow_external_seed, external_seed_only,
+     allow_stale_cache, external_seed_strategy, fast_mode, market, serving_market, psp, payment_method_type,
+     card_network, issuer_name, wallet_type, installment_provider) = (
+        _plain_argument(merchant_ids, None), _plain_argument(search_all_merchants, False),
+        _plain_argument(catalog_surface, None), _plain_argument(limit, 20), _plain_argument(offset, 0),
+        _plain_argument(allow_external_seed, True), _plain_argument(external_seed_only, False),
+        _plain_argument(allow_stale_cache, True), _plain_argument(external_seed_strategy, "legacy"),
+        _plain_argument(fast_mode, False), _plain_argument(market, None), _plain_argument(serving_market, None),
+        _plain_argument(psp, None), _plain_argument(payment_method_type, None), _plain_argument(card_network, None),
+        _plain_argument(issuer_name, None), _plain_argument(wallet_type, None),
+        _plain_argument(installment_provider, None),
+    )
     # Preserve whether the caller actually requested a hard stock filter.
     # FastAPI's historical default is True, but omission is discovery intent
     # and must not erase rows whose inventory still needs a live quote.
@@ -5430,9 +5587,37 @@ async def agent_search_products(
     # gateway's find_products_multi lane -- which binds the deployment's partitions and filters by
     # the buyer's currency -- serves SGD rows. This surfaces the same split on this door. The
     # expected currency follows the serving market when named, else the partition, as before.
+    started = time.perf_counter()
+    # A serving market that was SENT and cannot be served is answered here, with no products and its reason
+    # named, before anything is read. The empty-page shape this door already gives a request it cannot scope
+    # (`no_merchant_scope`), so a caller reading `products` sees an empty page, not an error.
+    serving_refusal = _serving_market_refusal(serving_market)
+    if serving_refusal is not None:
+        background_tasks.add_task(log_agent_request, context=context, status_code=200, merchant_id="serving_market_refused")
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {
+                "total_count": 0, "limit": limit, "offset": offset, "page": (offset // limit) + 1,
+                "total_pages": 0, "has_more": False,
+            },
+            "search_context": {
+                "merchant_id": None, "merchant_ids": [], "merchants_searched": [], "cross_merchant_search": False,
+                "catalog_surface": catalog_surface,
+            },
+            "filters_applied": {
+                "query": query, "category": category, "catalog_surface": catalog_surface,
+                "min_price": min_price, "max_price": max_price, "in_stock_only": in_stock_only,
+            },
+            "metadata": _finalize_search_metadata({
+                "source": "agent_search_products",
+                **serving_refusal,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "external_seed_returned_count": 0,
+            }),
+        }
     normalized_serving_market = _normalize_serving_market_param(serving_market)
     expected_price_currency = expected_currency_for_market(normalized_serving_market or market)
-    started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
     auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
     rate_limit_check_ms = max(0, int(getattr(getattr(req, "state", None), "agent_rate_limit_check_ms", 0) or 0))
@@ -7018,6 +7203,8 @@ async def agent_search_products(
             if str(value or "").strip()
         }
         payment_context = PivotPaymentContext(**payment_context_payload) if payment_context_payload else None
+        if payment_context_unread:
+            payment_context = UNREAD_PAYMENT_CONTEXT
         paginated_products = await enrich_product_cards_with_payment_offers(
             paginated_products,
             merchant_id=merchant_id,
@@ -7441,6 +7628,10 @@ async def agent_search_products_beauty(
         limit=limit,
         offset=offset,
         allow_external_seed=allow_external_seed,
+        external_seed_only=direct_call_external_seed_only(
+            caller="beauty_products_search", background_tasks=background_tasks, context=context,
+            merchant_id=merchant_id, merchant_ids=merchant_ids, search_all_merchants=search_all_merchants,
+        ),
         allow_stale_cache=allow_stale_cache,
         external_seed_strategy=external_seed_strategy,
         fast_mode=fast_mode,
@@ -7918,22 +8109,39 @@ async def agent_resolve_products(
     if search_query and not candidates_by_key:
         async def _resolve_with_search(*, scoped_merchant: Optional[str], source_name: str) -> bool:
             search_started = time.perf_counter()
+            search_background_tasks = BackgroundTasks()
             try:
                 result = await asyncio.wait_for(
                     agent_search_products(
                         req=req,
-                        background_tasks=BackgroundTasks(),
+                        background_tasks=search_background_tasks,
                         merchant_id=scoped_merchant,
                         merchant_ids=None,
                         search_all_merchants=(scoped_merchant is None),
                         query=search_query,
                         category=None,
+                        catalog_surface=None,
                         min_price=None,
                         max_price=None,
                         in_stock_only=True,
                         in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
+                        allow_external_seed=True,
+                        external_seed_only=direct_call_external_seed_only(
+                            caller="products_resolve", background_tasks=search_background_tasks, context=context,
+                            merchant_id=scoped_merchant, merchant_ids=None,
+                            search_all_merchants=(scoped_merchant is None),
+                        ),
+                        allow_stale_cache=True,
+                        external_seed_strategy="legacy",
+                        fast_mode=False,
+                        # This lookup names no market (#2848: passed as None, never a Query default object; the
+                        # search's own defaults are None too) and reads no payment context: every payment field
+                        # was a Query object's text, kept as UNREAD_PAYMENT_CONTEXT until its flag is on.
+                        market=None,
+                        serving_market=None,
+                        payment_context_unread=direct_call_payment_context_unread(),
                         context=context,
                     ),
                     timeout=search_timeout_s,

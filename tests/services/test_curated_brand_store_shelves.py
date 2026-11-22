@@ -328,3 +328,62 @@ def test_a_long_whitespace_run_resolves_in_linear_time(ptype, title, domain):
     started = time.perf_counter()
     resolve(ptype, title, domain)
     assert time.perf_counter() - started < 0.5  # quadratic took 4-36s (third review of #2403)
+
+
+# --- a third brand store's shelves (read 2026-11-21; titles constructed) --------------------------
+
+BRAND_STORE_C = "surrattbeauty.com"
+
+
+@pytest.mark.parametrize("ptype,title,want", [
+    ("CREME SHADOW", "Velvet Lid Colour", "beauty/makeup/eye/eyeshadow"),
+    ("BROW GEL", "Sculpting Brow Pomade", BROW),
+])
+def test_the_third_stores_measured_shelves_resolve_their_products(ptype, title, want):
+    assert resolve(ptype, title, BRAND_STORE_C) == (want, SHELF)
+
+
+@pytest.mark.parametrize("ptype,title,want", [
+    ("SALE", "Satin Eyeshadow", "beauty/makeup/eye/eyeshadow"),
+    ("SKIN CARE", "Botanical Cleansing Oil", "beauty/skincare/cleanse/cleanser"),
+    ("SKIN CARE", "Botanical Facial Mist", "beauty/skincare/tone/toner"),
+    ("", "Satin Eyeshadow", "beauty/makeup/eye/eyeshadow"),
+])
+def test_the_third_stores_untyped_and_house_shelves_read_the_head_noun(ptype, title, want):
+    assert resolve(ptype, title, BRAND_STORE_C) == (want, HEAD)
+
+
+@pytest.mark.parametrize("ptype,title", [
+    # a loyalty redemption is not a product a buyer orders, whatever its head noun
+    ("", "Satin Eyeshadow (Reward)"),
+    ("", "Botanical Cleansing Oil Sample (Reward)"),
+    ("SALE", "Satin Eyeshadow Reward"),
+    # lip heads stay the lip door's; a lash curler has no leaf; a palette shelf is more than one class
+    ("SALE", "Matte Lip Crayon"),
+    ("LASH CURLER", "Precision Lash Curler"),
+    ("LASH CURLER REFILL PADS", "Precision Lash Curler Refill Pads"),
+    ("CURATED PALETTE", "Warm Neutrals"),
+    # a shelf's tool is not its formula
+    ("BROW GEL", "Brow Gel Spoolie"),
+])
+def test_the_third_store_refuses_rewards_lip_heads_tools_and_mixed_shelves(ptype, title):
+    assert unresolved(resolve(ptype, title, BRAND_STORE_C))
+
+
+def test_the_third_stores_shelves_yield_to_a_title_naming_another_leaf():
+    # "cream" names the moisturiser leaf, so the title outranks the shelf (and nothing is guessed)
+    assert unresolved(resolve("CREME SHADOW", "Velvet Lid Cream", BRAND_STORE_C))
+    # a brush on the shelf is still the brush the tool rule files, not the shelf's eyeshadow
+    assert resolve("CREME SHADOW", "Cream Shadow Brush", BRAND_STORE_C)[0] == BRUSH
+
+
+def test_a_reward_is_refused_on_every_measured_title_host():
+    for domain in ("tower28beauty.com", "stilacosmetics.com", BRAND_STORE_C):
+        assert unresolved(resolve("", "Satin Eyeshadow (Reward)", domain))
+
+
+@pytest.mark.parametrize("domain", ["sephora.com", "tartecosmetics.com", "", None])
+def test_the_third_stores_shelves_mean_nothing_elsewhere(domain):
+    assert unresolved(resolve("CREME SHADOW", "Velvet Lid Colour", domain))
+    assert unresolved(resolve("BROW GEL", "Sculpting Brow Pomade", domain))
+    assert unresolved(resolve("SKIN CARE", "Botanical Facial Mist", domain))

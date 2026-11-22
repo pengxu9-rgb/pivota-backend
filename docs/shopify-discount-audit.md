@@ -24,7 +24,7 @@ The Shopify discount integration is no longer just cosmetic. The quote-time path
 
 The paid path is now live-proven for this explicitly approved Stripe + Shopify test merchant across three refunded discounted orders and one additional usage-limit redemption order: free shipping (`ORD_508D4460ACA8DE11`), amount-off (`ORD_E2CC099ACF7A88A7`), BXGY (`ORD_F56E0A1E5DC79E82`), and usage-limit redemption (`ORD_B27BD95A214B40D4`). The refund cleanup exposed and fixed three real defects: agent refund idempotency, Stripe Checkout Session refund resolution, and Shopify refund-webhook double counting.
 
-This is no longer blocked on Shopify discount-node access for the current merchant. The merchant token now has `read_discounts`, `write_discounts`, and `read_customers`; internal fixture creation was used to build live Shopify-native fixed-amount, segment, new-customer, usage-limit, and active-window test discounts, and sync/writeback remained healthy. The last usage-limit gap is now closed as well: order `ORD_B27BD95A214B40D4` redeemed `PIVOTA_AUDIT_20260421A_LIMIT1`, and the post-redemption quote rerun returned `applicable=false`, `discount_total=0`, and `customer_eligibility.shopify_order_count=1` (`/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`).
+This is no longer blocked on Shopify discount-node access for the current merchant. The merchant token now has `read_discounts`, `write_discounts`, and `read_customers`; internal fixture creation was used to build live Shopify-native fixed-amount, segment, new-customer, usage-limit, and active-window test discounts, and sync/writeback remained healthy. The last usage-limit gap is now closed as well: order `ORD_B27BD95A214B40D4` redeemed `PIVOTA_AUDIT_20260421A_LIMIT1`, and the post-redemption quote rerun returned `applicable=false`, `discount_total=0`, and `customer_eligibility.shopify_order_count=1` (`~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`).
 
 One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evidence of fixed-amount discount support. Live behavior on a `29.00` item produced a `2.90` discount, so the validated fixture is a 10% product discount, not a fixed `10` amount discount (`artifacts/shopify-discount-validation/live-us-shipping-final-retest-20260415T051842Z/summary.json:175-214`).
 
@@ -147,13 +147,13 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
 5. Automatic, fixed-amount product, and fixed-amount order execution are all live-proven on the current merchant.
    - Automatic:
      - `Pivota Auto Test` applies with no code on the in-scope Krave product.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/krave_auto_no_code.response.json`
    - Fixed-amount product:
      - `PIVOTA_AUDIT_20260421C_FIXPROD60` returns `applicable=true`, `discount_total=0.60`, `line_discount_total=0.60`, and `unit_price_effective=1.09`.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixed_amount_product_scoped.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/fixed_amount_product_scoped.response.json`
    - Fixed-amount order:
      - `PIVOTA_TEST_COMBO_B` is live-proven as a `$1.00` order discount and stacks positively with BXGY.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
 
 6. Basic non-stacking/conflict handling and positive combinability both work in the tested cases.
    - Shopify-native conflict behavior:
@@ -163,7 +163,7 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
      - `artifacts/shopify-discount-validation/live-us-discount-matrix-post-psp-guard-20260415T075604Z/summary.csv`
    - Positive combinability:
      - `PIVOTA_TEST_BXGY + PIVOTA_TEST_COMBO_B` remains applied as `discount_class=product` plus `discount_class=order`, with total combined discount `10.29`.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/bxgy_plus_combo_b.response.json`
    - Pivota manual promo guard:
      - `services/quote_service.py:437-474`
      - `services/quote_service.py:641-658`
@@ -172,22 +172,22 @@ One important truth point: the fixture named `PIVOTA_TEST_AMOUNT10` is not evide
 7. Segment-restricted and new-customer-restricted Shopify-native discounts are both live-proven on the current merchant.
    - Segment-restricted:
      - `PIVOTA_AUDIT_20260421A_SEGMENT` returned `applicable=true`, synced `context=DiscountCustomerSegments`, and discounted the quote by `0.50`.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/segment_customer.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/segment_customer.response.json`
    - New customer:
      - `PIVOTA_AUDIT_20260421A_NEWCUST` returned `applicable=true`, with `customer_eligibility=verified/new_customer=true`, and discounted the quote by `0.75`.
-     - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/new_customer.response.json`
+     - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/new_customer.response.json`
 
 8. Active-date scheduling is live-proven for before-start and in-window behavior.
    - `PIVOTA_AUDIT_20260421B_UPCOMING` is rejected before `startsAt` and accepted after `startsAt` with `discount_total=0.20`.
-   - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_prestart.response.json`
-   - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_active.response.json`
+   - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_prestart.response.json`
+   - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/fixtures-20260421a/upcoming_b_active.response.json`
 
 9. Usage-limit and per-customer enforcement are now live-proven end to end on the current merchant.
    - `PIVOTA_AUDIT_20260421A_LIMIT1` synced with `usageLimit=1` and `appliesOncePerCustomer=true`.
    - Repeated quote probes stayed `applicable=true`, which proved quote/cart alone does not consume the count.
    - Order `ORD_B27BD95A214B40D4` then redeemed the code successfully, and the post-redemption quote rerun returned `applicable=false`, `discount_total=0`, and `shopify_order_count=1`.
-   - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
-   - `/Users/pengchydan/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
+   - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/02b-order-paid-public-lookup.json`
+   - `~/dev/reports/shopify-discount-validation/20260421-live-legacy-guard/usage-limit-redemption/03-post-redemption-quote.response.json`
 
 10. Quote-backed order creation preserves discounted totals before payment confirmation.
    - Live order-create probe succeeded on retry, created a Pivota order at `55.10`, left `payment_status=awaiting_payment`, did not create a Shopify order before payment confirmation, and was cancelled cleanly:

@@ -140,7 +140,10 @@ def match_score(query, title):
         return 0
     if f" {' '.join(query)} " in f" {' '.join(title)} ":
         return 3
-    if set(query) <= set(title):
+    # Rule A (current line counts): every DISTINCTIVE word of the line name is in the title. Filler and generic
+    # words ("the", "lip", "lipstick", "gloss"...) need not be; the variant-term guard above still rejects a title
+    # that adds a bundle, size or format word the query did not name.
+    if set(query) - GENERIC <= set(title):
         return 2
     return 0
 

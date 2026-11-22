@@ -29,7 +29,7 @@ from typing import Any, Dict
 import db.agent_purchase_events as events_db
 import db.agent_purchase_ledger as purchases_db
 from services import webhook_delivery_gate
-from services.payment_orchestration import purchase_view
+from services.payment_orchestration import purchase_consent, purchase_view
 from services.payment_orchestration.rails import unified_state
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,8 @@ async def _detect_one(parent: Dict[str, Any]) -> str:
     await events_db.record_event(
         purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
         rail_state=rail_state, unified_state=state, event_type=event_type,
-        payload=_json_ready(body),
+        # `buyer_step.available` is a live read's only (purchase_consent.without_live_fields).
+        payload=_json_ready(purchase_consent.without_live_fields(body)),
     )
     return "recorded"
 
@@ -219,10 +220,14 @@ async def _release_untried(events: Any, *, worker: str, max_attempts: int) -> No
 async def _hand_one(event: Dict[str, Any], *, worker: str, max_attempts: int) -> str:
     from services import agent_webhook_service
 
+    # An event recorded before the AgenPas consent gate went on still holds the hosted URL: the gate is
+    # re-applied here (services/payment_orchestration/purchase_consent.gate_stored_payload). Gate off: the
+    # stored payload, untouched.
+    payload = await purchase_consent.gate_stored_payload(event["payload"], agent_id=event["agent_id"])
     try:
         result = await asyncio.wait_for(
             agent_webhook_service.emit_agent_webhook_event(
-                event["agent_id"], event_type=event["event_type"], payload=event["payload"],
+                event["agent_id"], event_type=event["event_type"], payload=payload,
                 event_id=event["event_id"],
             ),
             HAND_OVER_SEND_TIMEOUT_SECONDS,

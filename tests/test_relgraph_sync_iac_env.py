@@ -37,14 +37,14 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_APPLY_REVIEW": "true",
     "RELGRAPH_SYNC_ALLOW_WRITES": "true",
     "RELGRAPH_SYNC_CONFIRM": "APPLY_RELGRAPH_SYNC_ROUTINE",
-    # 2026-10-20 (Peng): 10,000 global-backlog reviews a night at concurrency 12 (16 errored 10.3%).
+    # 2026-10-20 (the owner): 10,000 global-backlog reviews a night at concurrency 12 (16 errored 10.3%).
     "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "300",
     "RELGRAPH_SYNC_REVIEW_LIMIT": "10000",
     "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "12",
     "RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD": "false",
     "RELGRAPH_SYNC_CUTOFF": "2026-01-01T00:00:00Z",
     "RELGRAPH_SYNC_REVIEW_RELATION_TYPES": "competitive_alternative",
-    # 2026-10-20 (Peng, PIVOTA-Agent #2471): review anchors with no served alternative first.
+    # 2026-10-20 (the owner, PIVOTA-Agent #2471): review anchors with no served alternative first.
     "RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST": "true",
     # 2026-10-15: duty-cycle pacing (PIVOTA-Agent #2444), set by hand until 2026-10-20.
     "RELGRAPH_DB_DUTY_CYCLE": "1",

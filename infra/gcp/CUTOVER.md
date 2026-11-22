@@ -235,7 +235,7 @@ does **not** reintroduce live mail credentials. `WORKERS=true PAUSED=0` then too
 line appeared in the logs while armed.
 
 **On the permission:** `roles/secretmanager.secretVersionAdder` was never the obstacle — the account
-running the cutover (`peng@woopay.tech`) holds `roles/owner` on both projects. The earlier block was a
+running the cutover (`<owner-google-account>`) holds `roles/owner` on both projects. The earlier block was a
 local tooling sandbox, not a GCP grant.
 
 Staging was returned to exactly its prior state — 3 databases, both schedulers `PAUSED`,
