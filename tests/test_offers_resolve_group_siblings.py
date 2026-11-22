@@ -981,9 +981,21 @@ def test_no_comparable_offer_means_a_null_best_price_and_no_marker(monkeypatch, 
 
 
 def test_a_declared_market_without_a_known_currency_compares_nothing(monkeypatch, client):
-    body = _invoke(monkeypatch, client, product_id=BRAND_SIG, flag="1", market="EU-DE",
-                   seeds=[_single_size_brand_seed(29.0)])
-    assert body["best_price_offer_id"] is None and _marked(body) == []
+    # A market the registry does not list is refused by name before any read: nothing is compared,
+    # whether the value is a legacy id ('EU-DE', not a country code) or a code it does not list (DE).
+    # (Posted directly: `_invoke` asserts a successful answer, and nothing it plants is read here.)
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    for market, reason in (("EU-DE", "market_invalid"), ("DE", "market_not_priced")):
+        res = client.post("/agent/shop/v1/invoke", json={
+            "operation": "offers.resolve",
+            "payload": {"product": {"product_id": BRAND_SIG}, "limit": 10, "tool": "*",
+                        "commerce_surface": "agent_api", "market": market},
+            "metadata": {"source": "creator-agent-ui"}})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["status"] == "error" and body["error"]["reason"] == reason, market
+        assert body["offers"] == [] and "best_price_offer_id" not in body and _marked(body) == [], market
 
 
 def test_no_marker_outside_a_resolved_group(monkeypatch, client):

@@ -85,3 +85,14 @@ def test_resolve_enforcement_on_denies_without_key_and_allows_with_service_key(m
         headers={"X-Links-Service-Key": "svc-test-key"},
     )
     assert allowed.status_code == 200
+
+
+def test_the_serving_market_defaults_to_us_only_when_absent_and_never_folds_a_lookalike():
+    from services.outbound_links_service import normalize_market
+
+    for absent in (None, "", "  "):
+        assert normalize_market(absent) == "US"
+    assert normalize_market(" sg ") == "SG"
+    assert normalize_market("usa") == "USA"
+    for raw in ("ſg", "uſ", "ﬁ", "ＵＳ"):
+        assert normalize_market(raw) == raw, "a sent look-alike is kept, never served as SG/US/FI"

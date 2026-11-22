@@ -3427,7 +3427,7 @@ async def test_web_bot_auth_signs_the_direct_vantage_and_leaves_the_proxy_vantag
 # that hand a prefilled cart to a human. They part on NO_CARD_PAYMENT: a checkout read with no
 # on-site card line refuses the rail and keeps the human cart, because a human pays by whatever the
 # checkout offers (PayPal, an offsite card provider, a bank transfer). Measured 2026-10-09: 643 of
-# 839 negative cart seeds were NO_CARD_PAYMENT. Peng's decision.
+# 839 negative cart seeds were NO_CARD_PAYMENT. The owner's decision.
 
 _HUMAN_ALLOWED = {"ELIGIBLE", "NO_CARD_PAYMENT", "PRICE_DRIFT"}
 

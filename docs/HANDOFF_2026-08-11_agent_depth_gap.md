@@ -55,7 +55,7 @@ rows in the canonical feed (`GET /api/canonical/products`); ~**11,122** rows in
 > **CORRECTION 2026-08-11 — this section was WRONG TWICE as originally written,
 > and one of its errors was dangerous. Both defects are fixed on branch
 > `claude/enrichment-propagation-backfill` (worktree
-> `/Users/pengchydan/dev/pivota-wt-enrichment`); the prod dry-run and `--apply`
+> `~/dev/pivota-wt-enrichment`); the prod dry-run and `--apply`
 > are still owed. Read this correction before acting.**
 >
 > **(a) The on-write bridge never worked, so the stranded set is GROWING, not

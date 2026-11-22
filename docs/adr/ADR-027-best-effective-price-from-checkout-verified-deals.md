@@ -1,10 +1,10 @@
 # ADR-027: Best effective price comes from checkout-verified deals, never from scraped coupon sites
 
 **Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link) and 2026-10-31 (Q13 program permission to test, Q14 the network lane). Amended 2026-11-02 with ADR-028 (Q15 the completed-checkout lane, Q16 completable offers rank first). Amended 2026-11-07 (amendment 4: Q17 Q2's approval given, Q18 where codes come from, Q19 the UCP cart verification route, Q20 seller identity, Q21 the code and our attribution on storefront checkouts).
-- peng resolved four questions on 2026-10-29, eight more on 2026-10-30, two on 2026-10-31, two on 2026-11-02 and five on 2026-11-07 (see "Resolved questions").
+- The owner resolved four questions on 2026-10-29, eight more on 2026-10-30, two on 2026-10-31, two on 2026-11-02 and five on 2026-11-07 (see "Resolved questions").
 - Phase 0a ran on 2026-10-29. Its base was unusable, so the gate has not been computed (see "Phases and gates").
 
-**Decision owner:** peng
+**Decision owner:** Founder
 
 **Builds on:**
 - ADR-022 (promotions lane deleted). This ADR keeps ADR-022's invariant word for word, and **amends ADR-022's rebuild trigger** (Q5): showing observed, checkout-verified deals is not the gated rebuild, so it does not wait for a merchant commitment. Merchant-created codes (D8) still do.
@@ -133,7 +133,7 @@ What one verification proves, and what it does not:
 - **Shopify, not connected, but in an affiliate program we have joined (Q13):** that program's feed codes may be tested, under every rule below, once all of these hold: the tokenless-cart precondition below; the program's permission is recorded; and `DEAL_VERIFY_PROGRAM_ENABLED` (default off) is set. Q2's approval never applies to such a host.
 - **Shopify, not connected, with no such relationship:** these deals stay stored and unverified until both of these are true:
   - tokenless Storefront carts are confirmed to support the cart mutations we need. Phase 0a answered this from Shopify's documentation only; it has not been tried against any store;
-  - testing codes against non-connected stores with no program relationship (Q13) has been separately and explicitly approved by peng (Q2, Q10). **Testing is off until then.** The verifier refuses such hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` (default off) is set, and the flag stays unset until that approval.
+  - testing codes against non-connected stores with no program relationship (Q13) has been separately and explicitly approved by the owner (Q2, Q10). **Testing is off until then.** The verifier refuses such hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` (default off) is set, and the flag stays unset until that approval.
 - **Any merchant that exposes a UCP checkout (amendment 3):** a UCP `create_checkout` for one unit of the variant in the deal's market, with the code in `discounts.codes`, signed with our agent profile, and never completed. The result is read from `discounts.applied` (the code's allocation, and automatic ones marked `automatic`) and from `messages` (a rejected code). It follows the same permission rules as a Storefront cart: a connected store, a joined program (Q13), or Q2's approval for a store with no relationship. Like every reference cart, it counts against the per-host daily cap and is paced jointly with the crawl jobs (the testing policy and egress rules below). Its `verified_via` is `ucp_checkout`.
 - **Other platforms:** the deal stays stored and unverified.
 
@@ -368,14 +368,14 @@ It needs a merchant commitment first (ADR-022's rebuild trigger). It ships in Ph
 
 **Phase 0 base (dependency, Q7).** The gate is computed only on the recommendation ledger, once the gateway's ledger writer is built and switched on and has recorded **7 full days**. No provisional base is used.
 
-**Gate (exact form).** Per market, the share of **distinct recommended offers** in that base that have at least one variant with a `checkout_verified` deal on a lane that carries it. The threshold is **10.0%**. Each market passes or fails on its own: if US passes and SG fails, US goes ahead and SG waits (Q4). If US fails, stop here and put the effort into cross-seller effective-price comparison instead, which needs no coupons. peng confirmed the threshold and denominator (Q7).
+**Gate (exact form).** Per market, the share of **distinct recommended offers** in that base that have at least one variant with a `checkout_verified` deal on a lane that carries it. The threshold is **10.0%**. Each market passes or fails on its own: if US passes and SG fails, US goes ahead and SG waits (Q4). If US fails, stop here and put the effort into cross-seller effective-price comparison instead, which needs no coupons. The owner confirmed the threshold and denominator (Q7).
 
 **Report two numbers beside the gate.** In Phase 1 only connected stores can be verified (Q2; Q13 adds joined programs' feed codes from Phase 2), and connected stores are a small minority of checkout hosts, so the gate can fail just because few recommended offers come from connected stores. Phase 0 therefore reports, per market:
 - the **verified share**: the gate's measure (connected stores only, in Phase 1);
 - the **published-code share**: distinct recommended offers whose seller has a published code in stored text (all sellers);
 - the share of distinct recommended offers that come from connected stores.
 
-That shows peng whether a failed gate means few deals or few connections.
+That shows the owner whether a failed gate means few deals or few connections.
 
 **Phase 0b: reference carts on connected stores.** Verifying automatic discounts and published codes on connected stores means creating carts in merchant stores. Those carts are writes, however harmless, so each run is a one-off prod job that needs a controller slot and stays under the D3 cap (Q8). Phase 0b does not touch non-connected stores (Q2).
 
@@ -437,7 +437,7 @@ That shows peng whether a failed gate means few deals or few connections.
   - `/r` uses a coded link only when its host equals the signed `dest`'s host, and its embedded destination, parsed the same way as at write time, is exactly the cart permalink of the variant in the token's deal reference, with that deal's code and `country=`. Otherwise, and when the row is missing, its deal reference does not match or the coded link is past its expiry, `/r` goes to the tracking-only link (Q14);
   - a coded network link is never handed out except through `/r` (Q14).
 
-## Resolved questions (peng, 2026-10-29)
+## Resolved questions (the owner, 2026-10-29)
 
 1. **Affiliate networks: `authorized_feed` stays in scope.**
    - Ingestion lands in Phase 2, once affiliate network access exists.
@@ -453,7 +453,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - Phase 0 measures US and SG.
    - SG is a Phase 2 candidate if it passes the gate on its own.
 
-## Resolved questions (peng, 2026-10-30)
+## Resolved questions (the owner, 2026-10-30)
 
 5. **ADR-022's rebuild trigger: amended.**
    - Showing observed, checkout-verified deals is not the rebuild ADR-022 gates. It adds no pricing engine and keeps ADR-022's invariant: only a deal the merchant's checkout applied, for that item, market and lane, is shown.
@@ -475,7 +475,7 @@ That shows peng whether a failed gate means few deals or few connections.
 9. **Affiliate sellers: the network link carries the code.**
    - An `authorized_feed` deal follows ADR-025's carrier: the network's tracking link, with our click id as sub-id. The code rides that link where the network supports it; otherwise the deal is not emitted on that lane.
    - Before a code and a click are combined for a program, that program's terms must allow it in writing.
-10. **Q2's separate approval.** Its form is recorded by peng outside this ADR. The public wording stays: testing codes on non-connected stores needs a separate, explicit approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. Narrowed by Q13: it covers only stores with no relationship to Pivota.
+10. **Q2's separate approval.** Its form is recorded by the owner outside this ADR. The public wording stays: testing codes on non-connected stores needs a separate, explicit approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. Narrowed by Q13: it covers only stores with no relationship to Pivota.
 11. **Coverage before guest checkout.**
    - A verified code must already be on the link when the buyer reaches the merchant's checkout. A buyer who leaves to search for a code may not come back.
    - The verifier puts the merchants and variants we send the most click-outs to first (D5).
@@ -486,7 +486,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - Those lanes are listed as work to do, each with its own review: the Reap cart-link, whose allowlist refuses `discount=` (D7), and any affiliate network whose tracking link drops it (Q9).
    - That both arrive together is checked on the first reconciled orders (Metrics: both-carried rate).
 
-## Resolved questions (peng, 2026-10-31)
+## Resolved questions (the owner, 2026-10-31)
 
 13. **An affiliate program we have joined counts as permission to test its codes.**
    - We treat being an approved publisher in a merchant's program as that merchant's permission to test that program's feed codes, where the program's terms or the merchant in writing allow automated checks. The permission is recorded per program, in the database, with its source and date (D6).
@@ -540,7 +540,7 @@ That shows peng whether a failed gate means few deals or few connections.
      - From then on, the network's conversion reports are this lane's order evidence. Their failure signals, defined as in D7, are counted per program and feed the D7 stop rule for the market, in the same way as connected stores' orders.
    - Agreements made directly with merchants are a separate, later decision.
 
-## Resolved questions (peng, 2026-11-02)
+## Resolved questions (the owner, 2026-11-02)
 
 15. **The completed-checkout lane is the main lane.**
    - The buyer checks out in the agent front, and Pivota completes the order on the merchant's checkout (ADR-028). The buyer is sent to the merchant only when no offer for the product can be completed.
@@ -553,10 +553,10 @@ That shows peng whether a failed gate means few deals or few connections.
    - Completability orders sellers within one product only. It never reorders products in a recommendation slate.
    - Whether an offer carries our attribution never affects its rank (ADR-025 Q4). An offer Pivota can complete without commission ranks like any other completable offer (ADR-028 D4).
 
-## Resolved questions (peng, 2026-11-07): amendment 4
+## Resolved questions (the owner, 2026-11-07): amendment 4
 
 17. **Q2's separate approval is given.**
-   - peng approved, on 2026-11-07, testing codes against stores that have no relationship with Pivota. Its form stays recorded outside this ADR (Q10).
+   - The owner approved, on 2026-11-07, testing codes against stores that have no relationship with Pivota. Its form stays recorded outside this ADR (Q10).
    - D3's testing policy still applies in full to every such test: one unit of one variant in the deal's market, never completed, the per-host daily cart cap, joint pacing with the crawl jobs, the merchant opt-out denylist (D2) and the stop rule (D7).
    - `DEAL_VERIFY_NONCONNECTED_ENABLED` may now be set, on its own go. Until it is set, the verifier still refuses such hosts.
    - Accepted with this approval: every test leaves one anonymous cart on the store, never deleted; our code attempts appear in the merchant's own analytics; and the tests leave from shared egress addresses.
@@ -569,7 +569,7 @@ That shows peng whether a failed gate means few deals or few connections.
      - Google's Service Specific Terms (Grounding with Google Search) forbid caching, storing or analyzing grounded results, and using the feature to collect links or build an index.
      - Grounded results may only be shown, with their search suggestions, to the person who asked.
      - So grounded search may never feed `observed_store_offers`, a verification queue or a metric. D1 is unchanged: coupon aggregators stay out of scope, however they are reached.
-   - **Retention of unverified observations.** An unverified `merchant_published` row that is not seen again and never verified is deleted after a fixed period. peng sets the period; until a deletion job exists, the write flag stays off.
+   - **Retention of unverified observations.** An unverified `merchant_published` row that is not seen again and never verified is deleted after a fixed period. The owner sets the period; until a deletion job exists, the write flag stays off.
 19. **A UCP cart is a verification route (it extends amendment 3).**
    - A store's UCP checkout door may be asked for a `create_cart` with the code in `discounts.codes`, as well as a `create_checkout`. The UCP discount extension allows codes on a cart.
    - Allowed only when the store's own profile advertises the discount capability as extending carts. A store that advertises it for checkouts only is asked through a checkout, or not at all.

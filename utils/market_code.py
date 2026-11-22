@@ -26,7 +26,7 @@ __all__ = ["iso2_market", "MARKET_UNKNOWN"]
 #: (absent, blank, or not ISO-2). Never a buyer identifier.
 MARKET_UNKNOWN = "market_unknown"
 
-_ISO2_MARKET_RE = re.compile(r"[A-Z]{2}")
+_ISO2_ASCII_RE = re.compile(r"[A-Za-z]{2}")
 
 
 def iso2_market(raw: Any) -> Optional[str]:
@@ -40,5 +40,7 @@ def iso2_market(raw: Any) -> Optional[str]:
     """
     if not isinstance(raw, str):
         return None
-    candidate = raw.strip().upper()
-    return candidate if _ISO2_MARKET_RE.fullmatch(candidate) else None
+    # The shape is checked on the trimmed value BEFORE upcasing: Unicode case mapping turns lookalikes into
+    # ASCII ('uſ' -> 'US', 'ﬁ' -> 'FI'), which then passed as a market.
+    candidate = raw.strip()
+    return candidate.upper() if _ISO2_ASCII_RE.fullmatch(candidate) else None

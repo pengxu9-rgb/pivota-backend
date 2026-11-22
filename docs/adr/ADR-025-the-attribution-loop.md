@@ -60,7 +60,7 @@ A per-seller **evidence route** decides the carrier:
 
 | Evidence source (link 4) | Carrier (link 3) | Reads back |
 |---|---|---|
-| Affiliate network (any: Rakuten, Impact, Awin, CJ, …) | the network's tracking link, with our click id in its **sub-id** parameter | the network's transaction/commission report, keyed by sub-id |
+| Affiliate network (any network) | the network's tracking link, with our click id in its **sub-id** parameter | the network's transaction/commission report, keyed by sub-id |
 | Connected store (Shopify/Woo/Wix) | `attributes[pivota_click_id]` cart attribute, or the `pvt_click_id` param | webhook / poller `note_attributes` (exists) |
 | Direct agreement, merchant statement | `pvt_click_id` param / cart attribute / UCP stamp | monthly order report through the self-report API (exists) |
 | UCP agentic checkout | UCP `attribution` member (`click_id_value`) | the merchant's order snapshot, via connection or statement |
@@ -68,8 +68,8 @@ A per-seller **evidence route** decides the carrier:
 
 A seller with **no evidence route** is still served, but it is recorded as `unattributable`.
 Nobody should mistake traffic to it for revenue. The coverage census
-(`scripts/affiliate_coverage_census.py`) is the tool that measures how much of the catalog
-falls there. Rakuten is its first adapter, not its premise. When D2's network link wrapping lands, the warm-handoff affiliate denylist (`outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES`) must cover every wrapper host it emits. Today it misses CJ's (anrdoezrs.net, jdoqocy.com, ...) and Impact vanity domains.
+(an operator script) is the tool that measures how much of the catalog
+falls there. Its first network adapter is one network's publisher API, not its premise; the census itself now lives in the private ops bundle, not on main. When D2's network link wrapping lands, the warm-handoff affiliate denylist (`outbound_warm_handoff.AFFILIATE_HOST_SUFFIXES`) must cover every wrapper host it emits. Today it misses some networks' click and vanity domains (the host lists are private; see the private affiliate-networks manifest).
 
 ### D3. Evidence adapters share one contract
 
@@ -90,7 +90,7 @@ where no source reports an amount. Reversals (network locks, returns) update the
 A closed edge whose click carries `agent_id` accrues that agent's share under a per-agent rate
 schedule (stream `attributed_commission`). Accrual is bookkeeping until the commission is settled.
 
-**Payout (decided, Peng, 2026-09-24).** Pivota pays its agent partners their share under each
+**Payout (decided, the owner, 2026-09-24).** Pivota pays its agent partners their share under each
 partner's revenue-share agreement, against a statement, **only out of commission a network or
 partner has already settled to Pivota**.
 - The 2026-09-06 no-money rule is about the buyer's money and the checkout flow: no float, no
@@ -178,7 +178,7 @@ partner):
 4. **An attribution pass-through.** A field on checkout create that the partner copies into the
    merchant's UCP `attribution` member (referrer `pivota`, our click id), so the merchant's own
    order shows Pivota as the originator. That is what any merchant-side commission rests on.
-5. **Revenue terms.** Pivota asks for **both** (decided, Peng, 2026-09-24): a partner revenue share
+5. **Revenue terms.** Pivota asks for **both** (decided, the owner, 2026-09-24): a partner revenue share
    (e.g. on the token/issuing economics), **and** item 4, so that a merchant fee stays possible.
    Item 4 is therefore **required**, not optional. Protocol mechanics do not decide the split;
    the contract does.
@@ -188,12 +188,12 @@ item 1 exists; store every event against the purchase; update the edge (refund �
 commission and of the agent's accrual).
 
 **Measured 2026-09-23:** prod `reap_agentic_purchases` = **0 rows**. A completed checkout has
-been reported to Peng (plan note, 09-23), but it did not pass through Pivota's purchase ledger,
+been reported to the owner (plan note, 09-23), but it did not pass through Pivota's purchase ledger,
 so no edge exists for it.
 
 #### D6b. Cart-link lane
 
-The flow (Peng, 2026-09-23; code: `services/reap_cart_link.py`, `services/conversion_click_claims.py`):
+The flow (the owner, 2026-09-23; code: `services/reap_cart_link.py`, `services/conversion_click_claims.py`):
 
 1. Pivota hands Reap the merchant's checkout URL. It is exactly one shape, validated by
    `validate_cart_link`:
@@ -269,7 +269,7 @@ Payment-partner lane first (D6), because that is where the orders will be:
   refund.
 
 Status, 2026-09-23:
-- **P1** is drafted for Peng to send (not sent). The draft was updated 2026-09-24 with the Q3 decision: ask for both, item 4 required.
+- **P1** is drafted for the owner to send (not sent). The draft was updated 2026-09-24 with the Q3 decision: ask for both, item 4 required.
 - **P2:** #2267 (open at the time of writing) makes a completed purchase's edge carry the purchase's authenticated `agent_id`.
   Before it, the variant lane closed with no agent, because it writes no click row. The lane
   itself is still dark: prod `reap_agentic_purchases` = 0 rows.
@@ -299,7 +299,7 @@ Then the referral lanes:
 6. **Agentic lanes**: a UCP stamp caller, the gateway injecting the stamp instead of dropping it,
    and Reap arming. These wait on 1–3, because they close through the same evidence contract.
 
-## Decisions on the open questions (Peng, 2026-09-24)
+## Decisions on the open questions (the owner, 2026-09-24)
 
 1. **Agent payouts: paid, from settled revenue only.** Pivota joins the affiliate networks. Once
    a network (or payment partner) settles commission to Pivota, Pivota pays each agent partner

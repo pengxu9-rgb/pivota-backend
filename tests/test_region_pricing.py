@@ -315,3 +315,20 @@ def test_the_inverse_agrees_with_the_map():
     for market, currency in REGION_PRICING_CURRENCY.items():
         shared = sum(1 for priced_in in REGION_PRICING_CURRENCY.values() if priced_in == currency) > 1
         assert market_for_pricing_currency(currency) == (None if shared else market)
+
+
+# Unicode case mapping reads a look-alike as a priced region ('ſg' -> 'SG' -> SGD, 'ﬁ' -> 'FI' -> EUR). Only an
+# ASCII value is upper-cased; anything else is returned trimmed and priced as nothing.
+@pytest.mark.parametrize("raw", ["ſg", "uſ", "ﬁ", "ＵＳ", "ｓｇ", "УС", "ıt", " ſg "])
+def test_a_unicode_lookalike_is_no_pricing_region(raw):
+    from services.region_pricing import pricing_currency_for_region_or_none
+
+    assert normalize_region(raw) == raw.strip()
+    assert pricing_currency_for_region_or_none(raw) is None
+    with pytest.raises(ValueError):
+        pricing_currency_for_region(raw)
+
+
+@pytest.mark.parametrize("raw, currency", [("gb", "GBP"), (" sg ", "SGD"), ("US", "USD"), ("fi", "EUR")])
+def test_an_ascii_region_is_trimmed_and_upcased_as_before(raw, currency):
+    assert pricing_currency_for_region(raw) == currency
