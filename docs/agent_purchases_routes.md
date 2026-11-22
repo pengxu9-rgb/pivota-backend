@@ -311,7 +311,24 @@ The A2A rail's checkout step HOLDS a purchase whenever it cannot prove what happ
 a setup or confirm whose answer nobody saw (`checkout_setup_unresolved`, `checkout_confirm_unresolved`),
 a `paid` sent through the relay whose step was cut, a total it cannot verify, and the other codes in
 `a2a_rail_worker._CHECKOUT_HOLD_CODES`. A held purchase stays in `paying` (the agent sees `placing`) for
-good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human does:
+good: no sweep ends `paying`, and **nothing ends a hold automatically** except one READ: for a hold whose
+cause is an answer nobody saw (`a2a_rail_worker._CHECKOUT_LOOKUP_CODES`: setup / confirm / cancel unresolved,
+the pending check, paying without a task, a prose / unrecognised / error-card confirm answer), the worker
+asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purchase id>-checkout`), read-only,
+in its own conversation. The first lookup comes when the hold's own park ends, about 10 minutes after the
+hold (`POLL_PARKED`); then again each time the time in `paying` has doubled, within 4 hours, and at most 9
+times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 290), so a
+crash in the middle of one still counts. A definite result goes through the ordinary result rules
+(completed only on a verified total; a held code stays held), EXCEPT that on a task the purchase never
+recorded a "not submitted" answer (with `success: false`) keeps the hold and an await keeps the hold too
+(nothing yet ties a lookup's answer to our checkout, so neither may lead to a `failed`); a payment-reached
+answer there is held as payment-reached, never resolvable. SANDBOX MEASUREMENT GATE (before the dial): what a
+lookup's answer echoes (our idempotency key? the checkout URL?) must be measured and bound on; until then an
+unbound lookup that completes may record another purchase's order id on this one (bounded by the approved
+total). An await on the purchase's own task records it and the poll goes on; a money-result answer parks it for good (`money_result_seen`, never
+"not charged"); anything else leaves it held. It never resends a setup or a confirm, and never looks up a
+hold written after payment was reported. A 409 on the
+confirm (the same key with another body: our own bug) is held and never looked up. Otherwise a human does:
 
 1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
    its id, its hold code, whether a write is pending, whether a checkout task id is recorded.
@@ -342,7 +359,9 @@ check the gate itself.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
-`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`, and
+`checkout_answer_scrubbed`, written when an answer that may follow a confirm echoed a card code (the confirm's
+answer, a poll, a result, or a lookup, which may also run on a row whose confirm never went out); the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
 written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
 for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id
