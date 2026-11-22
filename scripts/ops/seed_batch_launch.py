@@ -71,9 +71,20 @@ def require(test, message):
         raise LaunchRefused(message)
 
 
+def stderr_excerpt(stderr: str, *, head: int = 400, tail: int = 200) -> str:
+    """gcloud's stderr, short enough for a message: its FIRST `ERROR:` line (the reason; a parse error is followed by
+    the whole usage text, so a tail alone keeps only the flag list) and then the last `tail` characters."""
+    text = (stderr or "").strip()
+    if len(text) <= head + tail:
+        return text
+    errors = [line.strip() for line in text.splitlines() if line.lstrip().startswith("ERROR:")]
+    first = (errors[0] if errors else text)[:head]
+    return f"{first} ... {text[-tail:]}"
+
+
 def run(args: list[str], *, timeout: int = 300) -> str:
     done = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-    require(done.returncode == 0, f"{' '.join(args[:5])} exited {done.returncode}: {done.stderr.strip()[-400:]}")
+    require(done.returncode == 0, f"{' '.join(args[:5])} exited {done.returncode}: {stderr_excerpt(done.stderr)}")
     return done.stdout
 
 
@@ -195,7 +206,9 @@ def job_spec_args(*, mode: str, batch_id: str, release: str, digest: str, secret
             "--network", "default", "--subnet", "pivota-crawl" if mode == "apply" else "default",
             "--vpc-egress", "all-traffic", "--tasks", "1", "--max-retries", "0", "--task-timeout", "1800s",
             "--labels", f"build-id={build_id()},batch-mode={mode}",
-            "--command", "python", "--args", f"-m,scripts.ops.reviewed_seed_batch,{mode}",
+            # --args=VALUE in ONE token: the value starts with a dash, so `--args -m,...` is read as a second flag
+            # (gcloud exits 2, "argument --args: expected one argument"; #2367).
+            "--command", "python", f"--args=-m,scripts.ops.reviewed_seed_batch,{mode}",
             "--set-secrets", ",".join(["DATABASE_URL=DATABASE_URL:latest", *mounts]),
             # ^@^ makes gcloud split on @ (JSON values contain commas). --set-env-vars REPLACES every env var.
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
@@ -272,7 +285,7 @@ def cmd_lock(args) -> None:
     (WORK / "lock.json").write_text(json.dumps(body))
     done = subprocess.run(["gcloud", "storage", "cp", "--if-generation-match=0", str(WORK / "lock.json"), lock_url()],
                           capture_output=True, text=True, timeout=120, check=False)
-    require(done.returncode == 0, f"lock not taken: {done.stderr.strip()[-300:]}")
+    require(done.returncode == 0, f"lock not taken: {stderr_excerpt(done.stderr)}")
     (WORK / "lock.held").write_text(build_id())
     print("lock held by build", build_id())
 

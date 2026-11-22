@@ -164,7 +164,9 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
             "--image", f"{REPO}@{digest}", "--service-account", SERVICE_ACCOUNT,
             "--tasks", "1", "--max-retries", "0", "--task-timeout", f"{TASK_TIMEOUT_SECONDS}s",
             "--labels", f"build-id={build_id()},armed={'yes' if armed else 'no'}",
-            "--command", "python", "--args", "-m,scripts.ops.prod_test_transactions",
+            # --args=VALUE in ONE token: the value starts with a dash, so `--args -m,...` is read as a second flag
+            # (gcloud exits 2, "argument --args: expected one argument"; build 798b8dd8, 2026-11-21; #2367).
+            "--command", "python", "--args=-m,scripts.ops.prod_test_transactions",
             *secrets,
             # ^@^ makes gcloud split on @ (the gate JSON contains commas). --set-env-vars REPLACES every env var.
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
@@ -243,7 +245,7 @@ def cmd_lock(args) -> None:
     (WORK / "lock.json").write_text(json.dumps(body))
     done = subprocess.run(["gcloud", "storage", "cp", "--if-generation-match=0", str(WORK / "lock.json"), lock_url()],
                           capture_output=True, text=True, timeout=120, check=False)
-    require(done.returncode == 0, f"lock not taken: {done.stderr.strip()[-300:]}")
+    require(done.returncode == 0, f"lock not taken: {sbl.stderr_excerpt(done.stderr)}")
     (WORK / "lock.held").write_text(build_id())
     print("lock held by build", build_id())
 

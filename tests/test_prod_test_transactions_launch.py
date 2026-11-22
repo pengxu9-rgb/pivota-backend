@@ -4,9 +4,11 @@ a clean run with nothing possibly left open."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -161,6 +163,56 @@ def test_disarmed_spec_has_no_secret_no_gate_no_cases():
     args = spec([], gate=None, armed=False)
     assert "--clear-secrets" in args and "--set-secrets" not in args
     assert set(env_of(args)) == {"PIVOTA_ENV", "PROD_TEST_TXN_RELEASE_COMMIT"}
+
+
+class _GcloudArgs(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def gcloud_deploy_parse(args):
+    """`gcloud run jobs deploy` reads its flags with stdlib argparse (calliope): a separate value token that starts
+    with a dash is taken for the NEXT flag, so `--args -m,...` exits 2 ("argument --args: expected one argument")."""
+    parser = _GcloudArgs(add_help=False, allow_abbrev=False)
+    parser.add_argument("job")
+    for name in ("--project", "--region", "--image", "--service-account", "--tasks", "--max-retries",
+                 "--task-timeout", "--labels", "--command", "--args", "--set-secrets", "--set-env-vars"):
+        parser.add_argument(name)
+    parser.add_argument("--clear-secrets", action="store_true")
+    assert args[:4] == ["gcloud", "run", "jobs", "deploy"]
+    return parser.parse_args(args[4:])
+
+
+def test_the_mirror_parser_refuses_what_gcloud_refused_in_build_798b8dd8():
+    with pytest.raises(ValueError, match="argument --args: expected one argument"):
+        gcloud_deploy_parse(["gcloud", "run", "jobs", "deploy", "j", "--command", "python",
+                             "--args", "-m,scripts.ops.prod_test_transactions"])
+
+
+@pytest.mark.parametrize("over", [dict(cases=["OR-US", "OR-DE"]), dict(cases=["MCP-K-US"], user_key_version=2),
+                                  dict(cases=[], gate=None, armed=False)], ids=["armed", "armed-user-key", "disarmed"])
+def test_every_deploy_spec_parses_as_gcloud_reads_it(over):
+    args = spec(**over)
+    parsed = gcloud_deploy_parse(args)
+    assert parsed.job == "prod-test-transactions" and parsed.command == "python"
+    assert parsed.args == "-m,scripts.ops.prod_test_transactions"
+    assert parsed.set_env_vars == flag(args, "--set-env-vars") and parsed.clear_secrets == (not over.get("armed", True))
+
+
+def test_a_refused_deploy_keeps_gclouds_error_line_not_only_its_usage_tail(monkeypatch):
+    usage = "Usage: gcloud run jobs deploy [JOB] [optional flags]\n" + "  optional flags may be  --x |\n" * 80
+    stderr = "ERROR: (gcloud.run.jobs.deploy) argument --args: expected one argument\n" + usage + (
+        "For detailed information on this command and its flags, run:\n  gcloud run jobs deploy --help\n")
+    monkeypatch.setattr(launch.sbl.subprocess, "run",
+                        lambda args, **kw: subprocess.CompletedProcess(args, 2, stdout="", stderr=stderr))
+    with pytest.raises(launch.LaunchRefused) as refused:
+        launch.run(spec(["OR-US"]))
+    message = str(refused.value)
+    assert message.startswith("gcloud run jobs deploy prod-test-transactions exited 2: ERROR: (gcloud.run.jobs.deploy) "
+                              "argument --args: expected one argument ... ")
+    assert message.endswith("gcloud run jobs deploy --help") and len(message) < 700
+    # the run step records the reason in run.json (cut at 500): the ERROR line survives the cut
+    assert "expected one argument" in f"LaunchRefused: {message}"[:500]
 
 
 def test_spec_refusals():
