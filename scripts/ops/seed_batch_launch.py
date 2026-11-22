@@ -332,8 +332,9 @@ def wait_budget(step_started: float, now: float) -> float:
 
 def wait_for_execution(name: str, *, deadline: float = EXECUTION_DEADLINE_SECONDS, sleep=None,
                        monotonic=None) -> str | None:
-    """Poll BY NAME to a terminal state for at most `deadline` seconds. No poll starts unless its sleep AND its
-    describe still fit before the deadline."""
+    """Poll BY NAME to a terminal state for at most `deadline` seconds. A poll starts only if its describe can finish
+    by the deadline; the LAST one starts as late as that allows (deadline - DESCRIBE_TIMEOUT_SECONDS), so a batch that
+    ends just before the deadline is still seen as terminal rather than left for a human to clear."""
     sleep, monotonic = sleep or time.sleep, monotonic or time.monotonic
     started = monotonic()
     while True:
@@ -345,9 +346,13 @@ def wait_for_execution(name: str, *, deadline: float = EXECUTION_DEADLINE_SECOND
                 return state
         except (LaunchRefused, subprocess.TimeoutExpired, ValueError):
             pass  # a client error is not a terminal state: keep polling until the deadline
-        if monotonic() - started + EXECUTION_POLL_SECONDS + DESCRIBE_TIMEOUT_SECONDS > deadline:
+        left = deadline - (monotonic() - started)
+        if left >= EXECUTION_POLL_SECONDS + DESCRIBE_TIMEOUT_SECONDS:
+            sleep(EXECUTION_POLL_SECONDS)
+        elif left > DESCRIBE_TIMEOUT_SECONDS:
+            sleep(left - DESCRIBE_TIMEOUT_SECONDS)       # the final poll, starting at deadline - describe
+        else:
             return None
-        sleep(EXECUTION_POLL_SECONDS)
 
 
 def list_executions(job: str) -> list[dict]:

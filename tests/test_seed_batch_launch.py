@@ -660,14 +660,38 @@ def test_the_wait_budget_counts_from_the_step_start():
     assert launch.wait_budget(0, launch.RUN_STEP_SECONDS) == 0 and launch.wait_budget(50, 50 + late) == 100
 
 
-def test_no_poll_starts_unless_its_sleep_and_describe_fit_before_the_deadline(monkeypatch):
-    calls = []
-    monkeypatch.setattr(launch, "run", lambda args, **kw: calls.append(kw.get("timeout")) or json.dumps({"status": {}}))
-    clock = iter([0, 0, 15, 30, 45])
-    # deadline 89: after the poll at t=0 one more fits (0 + 15 + 60 <= 89); after the poll at t=15 none does (90 > 89)
-    deadline = launch.EXECUTION_POLL_SECONDS * 2 + launch.DESCRIBE_TIMEOUT_SECONDS - 1
-    state = launch.wait_for_execution("x", deadline=deadline, sleep=lambda s: None, monotonic=lambda: next(clock))
-    assert state is None and len(calls) == 2 and set(calls) == {launch.DESCRIBE_TIMEOUT_SECONDS}
+def test_no_poll_starts_unless_its_describe_fits_and_the_last_one_starts_at_deadline_minus_describe(monkeypatch):
+    calls, sleeps, now = [], [], [0.0]
+
+    def describe_running(args, **kw):
+        calls.append(kw.get("timeout"))
+        assert len(calls) < 50, "the wait keeps polling without the clock moving"      # fail, never hang
+        return json.dumps({"status": {}})
+
+    monkeypatch.setattr(launch, "run", describe_running)
+    poll, describe = launch.EXECUTION_POLL_SECONDS, launch.DESCRIBE_TIMEOUT_SECONDS
+    # deadline 89: polls at 0 and 15 (sleep 15), then the final one at 29 = 89 - 60 (sleep 14), then none (60 left)
+    state = launch.wait_for_execution("x", deadline=poll * 2 + describe - 1,
+                                      sleep=lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s)),
+                                      monotonic=lambda: now[0])
+    assert state is None and len(calls) == 3 and set(calls) == {describe}
+    assert sleeps == [poll, poll - 1] and now[0] == poll * 2 + describe - 1 - describe
+    # exactly describe left after a poll: no further poll (it could not finish by the deadline)
+    calls.clear(); sleeps.clear(); now[0] = 0.0
+    assert launch.wait_for_execution("x", deadline=describe, sleep=lambda s: sleeps.append(s),
+                                     monotonic=lambda: now[0]) is None
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_a_batch_that_ends_in_the_last_minute_before_the_deadline_is_seen_terminal(monkeypatch):
+    now, deadline = [0.0], 1000
+    done_at = deadline - launch.DESCRIBE_TIMEOUT_SECONDS - 1      # inside the old guard's blind ~75 s
+    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(
+        {"status": {"completionTime": "t", "conditions": [{"type": "Completed", "status": "True"}]}}
+        if now[0] >= done_at else {"status": {}}))
+    state = launch.wait_for_execution("x", deadline=deadline, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                                      monotonic=lambda: now[0])
+    assert state == "EXECUTION_SUCCEEDED" and now[0] <= deadline - launch.DESCRIBE_TIMEOUT_SECONDS
 
 
 def test_the_run_waits_only_for_what_is_left_of_the_step(monkeypatch, tmp_path):
