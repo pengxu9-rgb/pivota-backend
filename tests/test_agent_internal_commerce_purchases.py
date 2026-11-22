@@ -181,6 +181,7 @@ async def _reap(*, agent_id: str = AGENT, user_ref: str = USER_REF, state: str =
 def test_the_router_is_mounted_on_the_real_app():
     paths = {getattr(r, "path", None) for r in app.routes}
     assert f"{INTERNAL}/{{purchase_id}}" in paths
+    assert f"{INTERNAL}/{{purchase_id}}/shipping-address" in paths  # the gateway's address write, same router
 
 
 async def test_the_happy_path_body_equals_the_public_routes_body_for_the_same_row():
@@ -350,12 +351,14 @@ METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 @pytest.mark.skipif(_ARMED_AT_IMPORT, reason="main.app was built with AGENPAS_INTERNAL_READ_ENABLED on")
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("key", [None, KEY])
-async def test_with_the_dial_off_at_build_every_method_answers_like_a_path_that_does_not_exist(method, key):
+@pytest.mark.parametrize("suffix", ["", "/shipping-address"])
+async def test_with_the_dial_off_at_build_every_method_answers_like_a_path_that_does_not_exist(method, key, suffix):
     rail_id = await _reap()
     transport = httpx.ASGITransport(app=app)
     async with _REAL_ASYNC_CLIENT(transport=transport, base_url="http://test") as http:
-        ours = await http.request(method, f"{INTERNAL}/{rail_id}", headers=_headers(key=key))
-        unknown = await http.request(method, f"/agent/internal/commerce/no-such-path/{rail_id}", headers=_headers(key=key))
+        ours = await http.request(method, f"{INTERNAL}/{rail_id}{suffix}", headers=_headers(key=key))
+        unknown = await http.request(method, f"/agent/internal/commerce/no-such-path/{rail_id}{suffix}",
+                                     headers=_headers(key=key))
     # Byte for byte what a path that does not exist answers (404; OPTIONS is the CORS layer's for both).
     assert ours.status_code == unknown.status_code == (404 if method != "OPTIONS" else unknown.status_code)
     assert ours.headers.get("allow") == unknown.headers.get("allow")
@@ -369,7 +372,18 @@ async def test_with_the_dial_off_at_build_every_method_answers_like_a_path_that_
 def test_with_the_dial_off_at_build_the_route_is_not_registered_or_in_the_openapi_schema():
     assert not any(getattr(r, "path", "").startswith(INTERNAL) for r in app.routes)
     app.openapi_schema = None
-    assert not any(path.startswith(INTERNAL) for path in app.openapi()["paths"])
+    schema = app.openapi()
+    assert not any(path.startswith(INTERNAL) for path in schema["paths"])
+    # The door's body is read by the handler (no model in the schema), so capture adds nothing to it either.
+    assert "CreatePurchaseBuyer" not in json.dumps(schema)
+
+
+def test_with_the_dial_on_the_address_write_is_in_the_openapi_schema():
+    app.openapi_schema = None
+    try:
+        assert f"{INTERNAL}/{{purchase_id}}/shipping-address" in app.openapi()["paths"]
+    finally:
+        app.openapi_schema = None
 
 
 def test_mount_registers_the_route_only_with_the_dial_on(monkeypatch):

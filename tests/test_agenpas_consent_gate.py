@@ -336,7 +336,8 @@ async def test_the_golden_covers_every_surface_and_every_hosted_url():
 
 
 def test_the_internal_routers_openapi_with_the_write_dial_off_is_mains(monkeypatch):
-    """tests/golden/agenpas_internal_read_openapi.json is main's schema for an app with the read mounted."""
+    """tests/golden/agenpas_internal_read_openapi.json is the schema for an app with the read mounted (main's, plus
+    the A2A shipping-address write on the same router)."""
     from fastapi import FastAPI
 
     monkeypatch.delenv(purchase_consent.WRITE_ENABLED_ENV, raising=False)

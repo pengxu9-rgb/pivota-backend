@@ -205,7 +205,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail, checkout_amounts, vic_order
+from services.payment_orchestration import a2a_rail, a2a_shipping_address, checkout_amounts, vic_order
 from services.payment_orchestration import router as rail_router
 
 logger = logging.getLogger(__name__)
@@ -223,6 +223,13 @@ RECONCILE_LIMIT_SECONDS = 1800
 POLL_BINDING = 20
 POLL_RETRY = 60
 POLL_PARKED = 600
+#: How long a checkout-path purchase waits for the buyer's shipping address / email (asked for by AgenPas when
+#: the agent did not send it), from its creation; then it ends `expired` / `shipping_address_expired`.
+SHIPPING_ADDRESS_SECONDS = 1800
+#: How often a waiting purchase is looked at. The gateway's write makes it due at once, so this is a backstop.
+POLL_SHIPPING_ADDRESS = 60
+SHIPPING_ADDRESS_REQUIRED = a2a_shipping_address.SHIPPING_ADDRESS_REQUIRED
+SHIPPING_ADDRESS_EXPIRED = a2a_shipping_address.SHIPPING_ADDRESS_EXPIRED
 
 ADD_METHOD = ("payment.method-add", "submit")
 BOUND = ("payment.method-add-required-card", "bound")
@@ -485,7 +492,33 @@ async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -
     return "lost"
 
 
+def _awaits_contact(row: Mapping[str, Any]) -> bool:
+    """A purchase whose email or shipping address is incomplete while capture is on: nothing may be sent for it
+    (the card binding needs the email, the checkout the address). Capture is THE predicate the door and the
+    view read too (a2a_shipping_address.capture_enabled: the read dial, the checkout step and the token step),
+    so the worker waits exactly when the door let the purchase open without its contact. With capture off the
+    purchase goes on exactly as before (an email-less row is refused below)."""
+    return a2a_shipping_address.capture_enabled() and bool(
+        a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address")))
+
+
+async def _await_contact(s: _Step) -> str:
+    """Park the purchase, SENDING NOTHING, until the gateway's write fills its contact
+    (db/a2a_rail_ledger.submit_shipping_address), or end it when the deadline has passed."""
+    created = _aware(s.row.get("created_at")) or _now()
+    deadline = _aware(s.row.get("buyer_action_expires_at")) or created + timedelta(seconds=SHIPPING_ADDRESS_SECONDS)
+    if deadline <= _now():
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["opened"], to_state="expired", last_error_code=SHIPPING_ADDRESS_EXPIRED)
+        return await _settled(s, moved, "expired")
+    parked = await ledger.park_for_shipping_address_as_holder(
+        s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS))
+    return SHIPPING_ADDRESS_REQUIRED if parked is not None else "lost"
+
+
 async def _opened(s: _Step) -> str:
+    if _awaits_contact(s.row):
+        return await _await_contact(s)
     methods, read = await s.methods()
     if methods is None:
         return await _read_failed(s, read, "cards_read")
