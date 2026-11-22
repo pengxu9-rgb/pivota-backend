@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 
 import httpx
@@ -580,7 +581,7 @@ async def test_a_task_past_the_poll_cap_is_looked_up_in_a_conversation_of_its_ow
     (_checkout_result("timeout", success=False, order_id=None), "paying", "checkout_unknown_timeout"),
     (_checkout_result("script-error", success=False, order_id=None), "paying", "checkout_unknown_script_error"),
     (_checkout_result(total="$51.50"), "paying", "checkout_total_over_approved"),
-    (_checkout_result("payment-reached", success=False), "paying", "checkout_result_unrecognised"),
+    (_checkout_result("payment-reached", success=False), "paying", "checkout_payment_reached_unconfirmed"),
     (_checkout_result("brand-new-status"), "paying", "checkout_result_unrecognised"),
     (_checkout_result(task="ckout_other"), "paying", "checkout_task_mismatch"),
 ])
@@ -875,7 +876,8 @@ def test_no_provider_or_store_name_is_in_the_new_code():
         "routes/agent_internal_commerce_purchases.py", "tests/test_agent_internal_commerce_purchases.py",
         "tests/test_agent_internal_commerce_purchases_postgres.py",
         "tests/test_a2a_rail_checkout.py", "tests/test_a2a_rail_checkout_postgres.py", "tests/test_a2a_rail_client.py",
-        "tests/test_a2a_rail_ledger_postgres.py", "main.py",
+        "tests/test_a2a_rail_ledger_postgres.py", "main.py", "jobs/a2a_rail_operator.py",
+        "services/payment_orchestration/checkout_amounts.py", "tests/a2a_rail_confirm_card_corpus.py",
         "docs/adr/ADR-028-agent-completed-checkout.md", "docs/agent_purchases_routes.md",
         "docs/adr/ADR-030-pivota-as-protocol-platform-card-networks-as-credential-layer.md",
     ):
@@ -1260,9 +1262,18 @@ async def test_the_relay_scrubs_the_tokens_own_values_from_an_echoing_confirm_ca
 
 
 async def test_an_echoed_card_never_reaches_the_ledger_logs_or_view(caplog):
+    # An echo in the SETUP's answer: the relay scrubs it, and a scrubbed card is never confirmed (cancelled).
     pid = await _approving()
     with caplog.at_level(logging.DEBUG):
-        assert await _step(_approved(Rail(), setup_answer=ECHO_CONFIRM), pid) == "placing"
+        rail = _approved(Rail(), setup_answer=ECHO_CONFIRM).on("checkout.confirm#cancel", CANCELLED)
+        assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "checkout_confirm_total_refused"
+    # An echo in the final RESULT (after a clean confirm card): stripped, and the order completes.
+    await database.execute("DELETE FROM a2a_rail_purchases")
+    pid = await _approving()
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(_approved(Rail()), pid) == "placing"
         assert await _step(Rail().on("checkout.await#poll", _echo_result()), pid) == "completed"
     row = await _row(pid)
     assert row["merchant_order_id"] == "1001"
@@ -1273,14 +1284,18 @@ async def test_an_echoed_card_never_reaches_the_ledger_logs_or_view(caplog):
     _no_credential_in(json.loads(json.dumps(view.build_view(row), default=str)))
 
 
-async def test_a_card_shaped_order_id_is_never_stored():
+async def test_a_card_shaped_order_id_is_never_stored_and_the_order_still_completes(caplog):
+    # v6 (P2-H): the merchant placed the order, so it completes; only its reference is withheld, with a
+    # code the operator sees. Never a hold for this.
     pid = await _placing()
-    assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=DPAN)), pid) == (
-        worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=DPAN)), pid) == "completed"
     row = await _row(pid)
     assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == (
-        "paying", None, worker.CHECKOUT_ORDER_ID_CARD_SHAPED)
+        "completed", None, worker.CHECKOUT_ORDER_REFERENCE_WITHHELD)
     assert DPAN not in await _stored_text()
+    [line] = [r for r in caplog.records if "order reference withheld" in r.getMessage()]
+    assert line.levelno == logging.ERROR and "rule=luhn_run" in line.getMessage() and f"length={len(DPAN)}" in line.getMessage()
 
 
 def test_a_long_order_number_that_fails_luhn_is_not_card_shaped():
@@ -1323,7 +1338,8 @@ async def test_with_the_checkout_on_no_paid_goes_out_without_the_relay():
 
 def test_only_validation_4xx_answers_fail_a_confirm():
     assert worker._CONFIRM_NOT_ACCEPTED_4XX == {400, 422}
-    assert worker._CONFIRM_RESEND_4XX == set()  # only our own token exchange (nothing sent) is retried
+    # Nothing a provider answers resends a confirm: only our own token exchange failing (nothing sent).
+    assert not hasattr(worker, "_CONFIRM_RESEND_4XX")
     assert {"checkout_confirm_conflict", "checkout_confirm_ambiguous_4xx"} <= worker._CHECKOUT_HOLD_CODES
 
 
@@ -1368,14 +1384,6 @@ async def test_a_confirm_card_total_above_the_ceiling_is_cancelled_instead_of_co
     assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "checkout_confirm_total_refused", None)
 
 
-@pytest.mark.parametrize("spelling", TOTAL_SPELLINGS, ids=lambda d: json.dumps(d))
-async def test_a_confirm_card_total_within_the_ceiling_is_confirmed(spelling):
-    pid = await _approving()
-    rail = _approved(Rail(), setup_answer=_confirm_with(_fill(spelling, "$51.49")))
-    assert await _step(rail, pid) == "placing"
-    assert "checkout.confirm#confirm" in rail.actions() and "checkout.confirm#cancel" not in rail.actions()
-
-
 @pytest.mark.parametrize("total", ["€40.00", "CA$40.00", "$40.00 CAD", "40.00", 4000, {"value": 4000}, "-$5.00"])
 async def test_an_unreadable_or_foreign_confirm_card_total_is_cancelled(total):
     pid = await _approving()
@@ -1402,7 +1410,7 @@ async def test_a_confirm_card_without_a_monetary_amount_proceeds_only_under_the_
     assert await _step(rail, pid) == "approval_page_issued"
     assert rail.payload("payment.token-setup#submit")["amount_cents"] == TOTAL
     await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, pid)
-    card = _confirm_with({"note": "free gift", "giftWrap": True, "items": 2, "zip": "78701", "sku": "SKU-40000000001",
+    card = _confirm_with({"note": "free gift", "giftWrap": True, "items": "2", "zip": "78701", "sku": "SKU-40000000001",
                           "shipping": {"zip_code": "78701", "phone": "+15125550100", "city": "Austin"}})
     rail = _approved(Rail(), setup_answer=card)
     assert await _step(rail, pid) == "placing"
@@ -1664,11 +1672,13 @@ REFUSED_CARDS = {
     "subtotal_alone": {"subtotal": "$999.00"}, "foreign_symbol": {"note": "approx €40"},
     "deep_in_list": {"x": [[[{"y": [{"z": "$999.00"}]}]]]},
 }
-#: Within the ceiling, or no amount at all: confirmed.
+#: Exactly a named shape within the ceiling (checkout_amounts rule 2), or nothing money-like: confirmed.
 CONFIRMED_CARDS = {
-    "exact": {"total": "$51.49"}, "zero": {"shipping_cost": "$0.00"},
-    "nested_obj_ok": {"total": {"amount": "$51.49", "currency": "USD"}},
-    "nested_amount_ok": {"order": {"lines": [{"price": "$20.00"}, {"price": "US$31.49"}]}},
+    "s1_exact": {"total": "51.49", "currency": "USD"}, "s1_zero": {"total": 0, "currency": "USD"},
+    "s2_receipt": {"line_items": [{"quantity": 2, "price": "20.00"}], "subtotal": "40.00", "shipping": "5.00",
+                   "tax": "3.30", "total": "48.30", "currency": "USD"},
+    "s3_order": {"line_items": [{"quantity": 1, "price": 45, "compare_at_price": "50.00"}], "subtotal_price": "45.00",
+                 "shipping_lines": [{"price": "6.49"}], "total_price": "51.49", "currency": "USD"},
     "documented_card": {"shipping": {"email": EMAIL, "zip_code": "78701", "phone": "+15125550100"},
                         "cardBrand": "visa"},
 }
@@ -1703,9 +1713,9 @@ def test_the_card_scan_refuses_what_it_cannot_read_whole():
     assert worker.confirm_card_refused(wide, TOTAL) is True
     assert worker.confirm_card_refused(deep, TOTAL) is True
     assert worker.confirm_card_refused({"total": "$1.00"}, None) is True  # no ceiling: nothing confirms
-    # Non-monetary numbers are not amounts.
-    assert worker.confirm_card_refused({"zip": "78701", "phone": "+15125550100", "cardLast4": "3478", "items": 3,
-                                        "orderRef": "40000000001", "sku": 40000000001}, TOTAL) is False
+    # Digit strings under keys with no money word are not money-like (checkout_amounts rule 1).
+    assert worker.confirm_card_refused({"zip": "78701", "phone": "+15125550100", "cardLast4": "3478", "items": "3",
+                                        "orderRef": "40000000001", "sku": "40000000001"}, TOTAL) is False
 
 
 @pytest.mark.parametrize("answer", [httpx.Response(403), _task(_card("error", {"code": "NOPE", "recoverable": False}))])
@@ -1723,3 +1733,1058 @@ async def test_a_zero_final_total_is_held_not_completed():
         "checkout_total_unverified")
     row = await _row(pid)
     assert (row["state"], row["final_total_minor"]) == ("paying", None)
+
+
+# ── controller review round 3: the amount scan (fix/a2a-checkout-amount-scan) ────────────────
+
+#: Every amount the v3 review showed the scan confirming, and the other shapes it probed: each one is
+#: CANCELLED against the $51.49 ceiling (amounts we cannot read with certainty, or adding up past it).
+UNREADABLE_OR_OVER = {
+    "usd_lower_suffix": {"total": "999.00 usd"}, "usd_lower_prefix": {"total": "usd 999.00"},
+    "dollars_word": {"total": "999.00 dollars"}, "incl_tax_suffix": {"total": "999.00 incl. tax"},
+    "exponent_string": {"total": "9.99e2"}, "exponent_number": {"total": 9.99e2},
+    "eur_lower": {"total": "999 eur"}, "eur_upper": {"total": "999 EUR"}, "rupees": {"total": "Rs. 999"},
+    "three_spaces": {"total": "$   999.00"}, "zero_width": {"total": "$​999.00"},
+    "no_break_space": {"total": "$ 999.00"},
+    "fullwidth_digits": {"total": "$９９９.００"}, "fullwidth_dollar": {"total": "＄999.00"},
+    "arabic_indic": {"total": "$٩٩٩"}, "comma_euro": {"total": "999,00 €"},
+    "accounting_negative": {"total": "($5.00)"}, "one_decimal": {"total": "$51.5"},
+    "value_currency": {"value": 99900, "currency": "USD"},
+    "money_value_string": {"money": {"value": "999.00", "currency": "USD"}},
+    "vat": {"vat": 999}, "duty": {"duty": 999}, "delivery": {"delivery": 999},
+    "shipping_bare": {"shipping": 999}, "shipping_string": {"shipping": "999.00"}, "payment_bare": {"payment": 999},
+    "payment_due_bare": {"payment": {"due": 999}}, "lookalike_key_bare": {"tоtal": 999},
+    "amount_cents": {"amount_cents": 99900},
+    "json_in_string_bare": {"meta": json.dumps({"total": 999})},
+    "json_in_string_marked": {"meta": json.dumps({"total": "$999.00"})},
+    "amount_in_a_key": {"$999.00": "x"},
+    "shipping_cost": {"shipping": {"cost": "$999.00"}},
+    "shipping_amount_beside_an_address": {"shipping": {"email": EMAIL, "zip_code": "78701", "amount": 999}},
+    # P2-2: the parts add up past the ceiling, though each is under it
+    "components_sum": {"subtotal": "$45.00", "shipping_cost": "$10.00", "tax": "$5.00"},
+    "line_items_sum": {"items": [{"price": "$40.00"}, {"price": "$40.00"}]},
+    "quantity_times_price": {"items": [{"qty": 20, "price": "$50.00"}]},
+    "line_strings_sum": {"lines": ["$30.00", "$30.00"]},
+}
+
+
+@pytest.mark.parametrize("name", ["usd_lower_suffix", "fullwidth_digits", "value_currency", "shipping_bare",
+                                  "json_in_string_bare", "components_sum", "quantity_times_price",
+                                  "shipping_cost"])
+async def test_the_scan_gaps_end_to_end_cancel_instead_of_confirming(name):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(UNREADABLE_OR_OVER[name])).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "checkout_confirm_total_refused"
+
+
+async def test_the_documented_confirm_card_with_a_real_address_still_confirms():
+    pid = await _approving()
+    card = _task(_card("checkout.confirm", MEASURED_CARD, ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=card)
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
+
+
+async def test_an_amount_on_a_sibling_card_of_the_setup_answer_cancels():
+    pid = await _approving()
+    answer = _task(
+        _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+              ("confirm", "edit", "cancel"), kind="confirm"),
+        _card("checkout.summary", {"total": "$999.00"}))
+    rail = _approved(Rail(), setup_answer=answer).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+
+
+async def test_a_value_the_relay_scrubbed_is_unknown_and_cancels():
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with({"total": f"${DPAN}"})).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert DPAN not in await _stored_text()
+
+
+def _deep(levels, leaf):
+    data = leaf
+    for _ in range(levels):
+        data = {"k": data}
+    return data
+
+
+def test_the_scan_bounds_are_exact():
+    # A leaf with nothing money-like in it (checkout_amounts rule 1): read at the bound, refused past it.
+    assert worker.confirm_card_refused(_deep(worker._CARD_SCAN_MAX_DEPTH, "n1"), TOTAL) is False  # read
+    assert worker.confirm_card_refused(_deep(worker._CARD_SCAN_MAX_DEPTH + 1, "n1"), TOTAL) is True
+    assert worker.confirm_card_refused(_deep(worker._CARD_SCAN_MAX_DEPTH, "$999.00"), TOTAL) is True
+    # Every kind of leaf meets the same bound: a container too, not only a string.
+    for leaf in ({}, [], "7", None):
+        assert worker.confirm_card_refused(_deep(worker._CARD_SCAN_MAX_DEPTH, leaf), TOTAL) is False, leaf
+        assert worker.confirm_card_refused(_deep(worker._CARD_SCAN_MAX_DEPTH + 1, leaf), TOTAL) is True, leaf
+    # The data itself, the list, then the items: exactly the cap is read, one more is refused.
+    at_cap = {"items": [str(i) for i in range(worker._CARD_SCAN_MAX_NODES - 2)]}
+    over_cap = {"items": [str(i) for i in range(worker._CARD_SCAN_MAX_NODES - 1)]}
+    assert worker.confirm_card_refused(at_cap, TOTAL) is False
+    assert worker.confirm_card_refused(over_cap, TOTAL) is True
+
+
+async def test_a_crash_after_the_move_to_paying_keeps_the_pending_check_hold(monkeypatch):
+    pid = await _approving()
+    real_mark = ledger.mark_pending_write
+
+    async def _crash_at_the_confirms_mark(purchase_id, worker_id, action):
+        if action == worker.CHECKOUT_CONFIRM_ACTION:
+            raise RuntimeError("crash between the move to paying and the confirm's mark")
+        return await real_mark(purchase_id, worker_id, action)
+
+    monkeypatch.setattr(ledger, "mark_pending_write", _crash_at_the_confirms_mark)
+    rail = _approved(Rail())
+    await _ago("next_poll_at", 1, pid)
+    assert (await worker.run_tick(_client(rail), W, limit=5)).get("error") == 1
+    row = await _row(pid)
+    # The hold the step wrote survives the crash release (not `paid_sent:...:worker_error`).
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == (
+        "paying", "checkout_confirm_pending_check", None)
+    monkeypatch.setattr(ledger, "mark_pending_write", real_mark)
+    rail = _answers_everything()
+    for _ in range(3):
+        await _ago("next_poll_at", 1, pid)
+        assert (await worker.run_tick(_client(rail), W, limit=5)).get("checkout_held") == 1
+    assert rail.sent == []
+
+
+async def test_a_hold_code_is_written_bare_never_behind_the_approval_schedule():
+    pid = await _unconfirmed_paying(code="paid_sent:1:visa")
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write = :w, pending_write_at = CURRENT_TIMESTAMP "
+                           "WHERE id = :i", {"w": worker.CHECKOUT_CANCEL_ACTION, "i": pid})
+    assert await _step(Rail(), pid) == "checkout_cancel_unresolved"
+    assert (await _row(pid))["last_error_code"] == "checkout_cancel_unresolved"
+
+
+# ── the operator's path for a held checkout (never automatic) ────────────────────────────────
+
+
+async def _held_text_only():
+    pid = await _approving()
+    assert await _step(_approved(Rail(), confirm_answer=_text_only("Order placed.")), pid) == "checkout_confirm_text_only"
+    return pid
+
+
+async def _operator(*argv):
+    import io
+    import jobs.a2a_rail_operator as operator
+
+    out = io.StringIO()
+    code = await operator.run(list(argv), out=out)
+    return code, [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+
+
+async def test_the_operator_lists_held_checkouts_without_pii():
+    pid = await _held_text_only()
+    code, rows = await _operator("list-held")
+    assert code == 0 and [r["id"] for r in rows] == [pid]
+    assert rows[0]["last_error_code"] == "checkout_confirm_text_only" and rows[0]["pending_write"]
+    text = json.dumps(rows)
+    for needle in (EMAIL, "1 Main St", "Example", "ptk_1", "pvm_", "https://"):
+        assert needle not in text
+
+
+async def test_the_operator_resolves_a_held_checkout_only_with_every_guard():
+    pid = await _held_text_only()
+    expected = ("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_confirm_text_only")
+    guards = ("--apply", "--operator", "ops-1", "--expect-env", "staging", "--provider-checked")
+    # Held just now: too recent (the provider's staged checkout may still land an order).
+    code, [preview] = await _operator(*expected)
+    assert (code, preview["eligible"], preview["reason"]) == (3, False, "held_too_recently")
+    code, [result] = await _operator(*expected, *guards)
+    assert (code, result["outcome"]) == (3, "refused") and (await _row(pid))["state"] == "paying"
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 60, pid)
+    code, [preview] = await _operator(*expected)
+    assert (code, preview["outcome"], preview["eligible"]) == (0, "dry_run", True)
+    assert (await _row(pid))["state"] == "paying"  # a dry run writes nothing
+    for missing in (("--operator", "ops-1", "--expect-env", "staging"),
+                    ("--operator", "ops-1", "--provider-checked"),
+                    ("--expect-env", "staging", "--provider-checked"),
+                    ("--operator", "ops-1", "--expect-env", "production", "--provider-checked")):
+        code, _ = await _operator(*expected, "--apply", *missing)
+        assert code == 2
+        assert (await _row(pid))["state"] == "paying"
+    code, [result] = await _operator(*expected, "--apply", "--operator", "ops-1", "--expect-env", "staging",
+                                     "--provider-checked")
+    assert (code, result["outcome"]) == (0, "resolved")
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"], row["buyer_email"]) == (
+        "failed", "operator_confirmed_not_charged", None, None)
+
+
+async def test_the_operator_refuses_a_moved_claimed_or_unheld_row():
+    pid = await _held_text_only()
+    guards = ("--apply", "--operator", "ops-1", "--expect-env", "staging", "--provider-checked")
+    code, [result] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code",
+                                     "checkout_confirm_unresolved", *guards)  # not the code it holds now
+    assert (code, result["outcome"]) == (3, "refused")
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 60, pid)  # old enough: the claim refuses
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_by = 'w9' WHERE id = :i", {"i": pid})
+    code, _ = await _operator("resolve-held", "--purchase-id", pid, "--expected-code",
+                              "checkout_confirm_text_only", *guards)
+    assert code == 3 and (await _row(pid))["state"] == "paying"  # a worker holds it right now
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_by = NULL, last_error_code = 'checkout_placing' "
+                           "WHERE id = :i", {"i": pid})
+    result = await worker.operator_fail_held_checkout(pid, expected_code="checkout_placing", operator="ops-1")
+    assert result == {"outcome": "refused", "reason": "not_a_checkout_hold_code"}
+    assert (await _row(pid))["state"] == "paying"
+
+
+def test_nothing_in_the_worker_or_its_jobs_resolves_a_hold_by_itself():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    worker_source = (repo / "services/payment_orchestration/a2a_rail_worker.py").read_text("utf-8")
+    assert worker_source.count("operator_fail_held_checkout(") == 2  # its definition and the ledger call in it
+    for path in ("jobs/a2a_rail_purchase_poll.py", "services/audit_scheduler.py"):
+        assert "operator_fail_held_checkout" not in (repo / path).read_text("utf-8")
+
+
+# ── controller review round 4 (scan fix): sums, guards that must fail, false cancels, operator ───
+
+#: Shapes whose parts add up past the $51.49 ceiling in spellings the round-3 sum check missed.
+SUM_BYPASSES = {
+    "qty_string": {"items": [{"qty": "2", "price": "$30.00"}]},
+    "qty_float": {"items": [{"qty": 2.0, "price": "$30.00"}]},
+    "quantity_ordered": {"items": [{"quantityOrdered": 2, "price": "$30.00"}]},
+    "quantity_ordered_snake": {"items": [{"quantity_ordered": 2, "price": "$30.00"}]},
+    "count_key": {"items": [{"count": 2, "price": "$30.00"}]},
+    "unit_cost": {"items": [{"qty": 2, "unitCost": "$30.00"}]},
+    "unit_cost_snake": {"items": [{"qty": 2, "unit_cost": "$30.00"}]},
+    "unit_price": {"items": [{"qty": 2, "unitPrice": "$30.00"}]},
+    "each": {"items": [{"qty": 2, "each": "$30.00"}]},
+    "price_money_object": {"items": [{"qty": 2, "price": {"amount": "$30.00", "currency": "USD"}}]},
+    "price_value_object": {"items": [{"qty": 2, "price": {"value": "$30.00", "currency": "USD"}}]},
+    "total_named_parts": {"total_line_items_price": "$45.00", "total_shipping": "$10.00", "total_tax": "$5.00"},
+    "json_string_part": {"items": [{"price": "$30.00"}], "extra": json.dumps({"fee": "$30.00"})},
+    "two_money_objects": {"a": {"amount": "$30.00"}, "b": {"amount": "$30.00"}},
+}
+#: The buyer's own data, merchant and item names, booleans and non-ASCII keys: none may cancel.
+DOC_SHIPPING = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100", "country": "US",
+                "address1": "1 Main St", "address2": "Unit 2", "city": "Austin", "state": "TX", "zip_code": "78701"}
+
+
+def _doc(**shipping):
+    return {"merchant": "merchant.example", "cardLast4": "3478", "cardBrand": "visa",
+            "shipping": {**DOC_SHIPPING, **shipping}}
+
+
+NEVER_CANCEL = {
+    "address_pen_rd": _doc(address1="12 Pen Rd"), "address_euro_plaza": _doc(address1="100 Euro Plaza"),
+    "email_aud1": _doc(email="aud1@example.test"), "email_try2buy": _doc(email="try2buy@example.test"),
+    "postcode_plus4": _doc(zip_code="78701-1234"), "phone_formatted": _doc(phone="(512) 555-0100"),
+    "house_number": _doc(house_number="12"), "unit": _doc(unit="4B"), "apartment": _doc(apartment="4"),
+    "company": _doc(company="3M"), "instructions": _doc(instructions="Gate code 1234"),
+    "speed": _doc(speed="2-Day"), "method": _doc(method="2-Day"), "residential": _doc(residential=True),
+    "address2_apt": _doc(address2="Apt 4"),
+    "merchant_euro_24": {**_doc(), "merchant": "Euro 24 Shop"},
+    "item_gel_pen": {**_doc(), "items": [{"name": "Gel Pen 12 pack"}]},
+    "item_pound_bag": {**_doc(), "items": [{"name": "Dog food 30 pound bag"}]},
+    "discount_applied_false": {**_doc(), "discountApplied": False},
+    "card_object": {**_doc(), "card": {"last4": "3478", "brand": "visa"}},
+    "order_ref": {**_doc(), "orderRef": "40000000001"},
+    "accented_key": {**_doc(), "código": "78701"},
+}
+
+
+@pytest.mark.parametrize("name", ["qty_string", "quantity_ordered", "unit_cost", "price_money_object",
+                                  "total_named_parts", "json_string_part"])
+async def test_the_sum_bypasses_end_to_end_cancel_instead_of_confirming(name):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(SUM_BYPASSES[name])).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+
+
+@pytest.mark.parametrize("name", sorted(NEVER_CANCEL))
+def test_the_buyers_own_data_and_ordinary_names_never_cancel(name):
+    assert worker.confirm_card_refused(NEVER_CANCEL[name], TOTAL) is False
+
+
+@pytest.mark.parametrize("name", ["address_pen_rd", "address_euro_plaza", "email_aud1", "email_try2buy"])
+async def test_the_documented_card_echoing_the_buyers_own_contact_confirms_end_to_end(name):
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(NEVER_CANCEL[name]))
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
+
+
+async def test_an_amount_in_the_setup_answers_prose_cancels():
+    pid = await _approving()
+    answer = _task({"kind": "text", "text": "Order total: $999.00"},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=answer).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+
+
+async def test_ordinary_prose_in_the_setup_answer_does_not_cancel():
+    pid = await _approving()
+    answer = _task({"kind": "text", "text": "Please confirm your order. Card ending 3478, ship to 1 Main St."},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=answer)
+    assert await _step(rail, pid) == "placing"
+
+
+async def test_the_prose_check_is_read_in_the_transport_and_never_returns_the_text(caplog):
+    answer = _task({"kind": "text", "text": f"Total: $999.00 on {DPAN}"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    with caplog.at_level(logging.DEBUG):
+        relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+    assert "999.00" not in repr(relay) and DPAN not in repr(relay)
+    assert all(DPAN not in r.getMessage() for r in caplog.records)
+    relay = await _relay(_Provider(_token_result(), answer))  # no ceiling given: any prose refuses
+    assert relay.checkout.text_amounts_refused is True
+
+
+# ── the operator path: never "not charged" over a recorded payment; a minimum hold age ──────
+
+
+def test_every_hold_code_is_classified_and_the_payment_reached_branch_writes_only_payment_codes():
+    import inspect
+    import re as _re
+
+    assert worker._CHECKOUT_PAYMENT_REACHED_CODES | worker._OPERATOR_RESOLVABLE_HOLD_CODES == worker._CHECKOUT_HOLD_CODES
+    assert not worker._CHECKOUT_PAYMENT_REACHED_CODES & worker._OPERATOR_RESOLVABLE_HOLD_CODES
+    source = inspect.getsource(worker._checkout_result)
+    branch = source[source.index('if status == "payment-reached":'):source.index("if status in _CHECKOUT_NOT_SUBMITTED")]
+    held = set(_re.findall(r"_checkout_hold\(s, (CHECKOUT_[A-Z_]+)\)", branch))
+    assert held, "the payment-reached branch writes holds"
+    assert {getattr(worker, name) for name in held} <= worker._CHECKOUT_PAYMENT_REACHED_CODES
+    # The three codes the review named are among them.
+    assert {"checkout_total_over_approved", "checkout_total_unverified", "checkout_order_id_card_shaped",
+            "checkout_payment_no_order", "checkout_payment_reached_unconfirmed"} <= worker._CHECKOUT_PAYMENT_REACHED_CODES
+
+
+@pytest.mark.parametrize("code", sorted([
+    "checkout_total_over_approved", "checkout_total_unverified", "checkout_order_id_card_shaped",
+    "checkout_payment_no_order", "checkout_payment_reached_unconfirmed"]))
+async def test_the_operator_never_marks_a_recorded_payment_not_charged(code):
+    pid = await _placing()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = :c, claimed_by = NULL WHERE id = :i",
+                           {"c": code, "i": pid})
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600, pid)
+    expected = ("resolve-held", "--purchase-id", pid, "--expected-code", code)
+    code_, [preview] = await _operator(*expected)
+    assert (code_, preview["eligible"], preview["reason"]) == (3, False, "payment_reached_recorded")
+    assert "merchant refunds" in preview["message"]
+    code_, [result] = await _operator(*expected, "--apply", "--operator", "ops-1", "--expect-env", "staging",
+                                      "--provider-checked")
+    assert (code_, result["outcome"], result["reason"]) == (3, "refused", "payment_reached_recorded")
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", code)
+
+
+async def test_the_minimum_hold_age_is_in_the_write_itself():
+    pid = await _held_text_only()
+    assert worker.OPERATOR_MIN_HOLD_AGE_SECONDS >= 3600
+    # The ledger refuses a row held too recently even when called directly (the SQL of the compare-and-swap).
+    assert await ledger.operator_fail_held_checkout(
+        pid, expected_code="checkout_confirm_text_only", code="operator_confirmed_not_charged",
+        min_age_seconds=worker.OPERATOR_MIN_HOLD_AGE_SECONDS) is None
+    with pytest.raises(ValueError):
+        await ledger.operator_fail_held_checkout(
+            pid, expected_code="checkout_confirm_text_only", code="operator_confirmed_not_charged", min_age_seconds=60)
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 60, pid)
+    assert await ledger.operator_fail_held_checkout(
+        pid, expected_code="checkout_confirm_text_only", code="operator_confirmed_not_charged",
+        min_age_seconds=worker.OPERATOR_MIN_HOLD_AGE_SECONDS) is not None
+
+
+async def test_the_preview_reads_that_row_by_id_and_says_what_a_resolution_causes(monkeypatch):
+    pid = await _held_text_only()
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 120, pid)
+
+    async def _empty_list(**_):
+        return []  # the row is not among the listed ones: the preview must still find it
+
+    monkeypatch.setattr(ledger, "list_paying_checkouts", _empty_list)
+    code, [preview] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code",
+                                      "checkout_confirm_text_only")
+    assert (code, preview["eligible"], preview["code"]) == (0, True, "checkout_confirm_text_only")
+    assert preview["held_for_seconds"] >= worker.OPERATOR_MIN_HOLD_AGE_SECONDS
+    assert "voids its token" in preview["on_resolve"]
+    text = json.dumps(preview)
+    for needle in (EMAIL, "ptk_1", "pvm_", "https://"):
+        assert needle not in text
+
+
+# ── a discount (S3, total_discounts) ────────────────────────────────────────────────────────
+
+
+async def test_a_discounted_checkout_within_the_ceiling_confirms_end_to_end():
+    pid = await _approving()
+    rail = _approved(Rail(), setup_answer=_confirm_with(S3_DISCOUNTED))
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
+
+
+# ── the setup answer's prose (unchanged by the allowlist) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize("prose", [
+    "Your order total is 999.00", "You will pay 999.00", "Charged 999", "Grand total - 999.00", "Total:\n999.00",
+])
+def test_unmarked_prose_near_a_total_word_cancels(prose):
+    from services.payment_orchestration import checkout_amounts as amounts
+
+    assert amounts.text_refused(prose, TOTAL) is True
+
+
+async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
+    # The token's expiry is "1129": "$1129.00" is an amount, not the expiry, and is read (and refused).
+    answer = _task({"kind": "text", "text": "Order total: $1129.00"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+    answer = _task({"kind": "text", "text": "Order total: $1129"},  # no cents: nothing else to read
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+    # In card context the expiry is still scrubbed, and so are the token's value and cryptogram anywhere.
+    answer = _task({"kind": "text", "text": f"Card {DPAN} exp {EXPIRY_RAW} ({CRYPTO}). Total: $51.49"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is False
+
+
+#: A 13-digit Luhn-valid run (the transport's own card-number strip starts at 14 digits, so this one reaches
+#: the worker), and the cryptogram without its padding (the padded form never gets past the transport).
+LUHN_13 = "4222222222222"
+
+
+#: An unpadded cryptogram that LOOKS like base64 (a "+" or "/" in it; a KSUID-style id never has one).
+TAVV_UNPADDED = "AgAAAAAABk4DWZ4C28yUQ+/AAAA"
+
+
+@pytest.mark.parametrize("order_id,rule", [
+    (TAVV_UNPADDED, "cryptogram_shape"), (LUHN_13, "luhn_run"), (f"ORD-{LUHN_13}", "luhn_run"), (DPAN, "luhn_run"),
+], ids=["cryptogram_unpadded", "luhn_13", "contains_luhn_13", "dpan"])
+async def test_an_order_id_that_may_echo_the_card_or_token_completes_without_its_reference(order_id, rule, caplog):
+    assert worker._credential_rule(order_id) == rule
+    pid = await _placing()
+    with caplog.at_level(logging.DEBUG):
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid) == "completed"
+    row = await _row(pid)
+    assert (row["state"], row["merchant_order_id"], row["last_error_code"]) == (
+        "completed", None, worker.CHECKOUT_ORDER_REFERENCE_WITHHELD)
+    assert worker.CHECKOUT_ORDER_REFERENCE_WITHHELD not in worker._CHECKOUT_HOLD_CODES  # not a hold
+    # Log hygiene: the line names the rule and the length; the value, the order id and the token are nowhere
+    # in the log or the stored row.
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    stored = await _stored_text()
+    assert f"rule={rule}" in logged and f"length={len(order_id)}" in logged
+    for needle in {order_id, LUHN_13, DPAN, CRYPTO, CRYPTO.rstrip("=")}:
+        assert needle not in logged, needle
+        assert needle not in stored, needle
+
+
+async def test_a_padded_cryptogram_or_a_card_number_inside_an_order_id_never_reaches_the_row():
+    # The transport strips them from the answer: the order then names no id, which is held as such.
+    for order_id in (CRYPTO, f"ORD-{DPAN}", f"#{DPAN}"):
+        await database.execute("DELETE FROM a2a_rail_purchases")
+        pid = await _placing()
+        assert await _step(Rail().on("checkout.await#poll", _echo_result(order_id=order_id)), pid) == (
+            worker.CHECKOUT_PAYMENT_NO_ORDER)
+        stored = await _stored_text()
+        assert CRYPTO.rstrip("=") not in stored and DPAN not in stored
+
+
+def test_an_ordinary_order_id_is_not_card_or_cryptogram_shaped():
+    import uuid
+
+    import random
+    import string
+
+    rng = random.Random(7)
+    base62 = string.ascii_letters + string.digits
+    for order_id in ("1001", "ORD-12345", "112-1234567-1234567", str(uuid.uuid4()), uuid.uuid4().hex,
+                     "pvt-ap_01234567.89abcdef.01234567", "SHOP-2026-ABCDEF", "48953700120034781234"):
+        assert not worker._card_shaped(order_id), order_id
+    # v6 (P2-H): modern alphanumeric ids are never taken for a cryptogram (the old rule held ~97% of them).
+    for _ in range(500):
+        for order_id in ("".join(rng.choice(base62) for _ in range(20)),                    # base62, 20
+                         "ord_" + "".join(rng.choice(base62) for _ in range(24)),           # prefixed, 28
+                         "".join(rng.choice(base62 + "_-") for _ in range(21)),             # nanoid, 21
+                         "-".join("".join(rng.choice(string.digits) for _ in range(n)) for n in (3, 7, 7))):
+            assert not worker._card_shaped(order_id), order_id
+
+
+@pytest.mark.parametrize("status", ["unpaid", "payment_failed", "payment-declined", "incomplete", "not_paid",
+                                    "unpaid_balance", "not_completed", "payment-pending", "awaiting-payment",
+                                    "repayment", "payment_cancelled"])
+async def test_a_negated_payment_status_is_unrecognised_never_payment_reached(status):
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_RESULT_UNRECOGNISED)
+
+
+@pytest.mark.parametrize("status", ["paid", "payment_reached", "completed", "payment-completed"])
+async def test_an_unknown_status_that_speaks_of_payment_is_held_as_payment_reached(status):
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    assert worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED in worker._CHECKOUT_PAYMENT_REACHED_CODES
+
+
+async def test_an_unknown_status_that_does_not_speak_of_payment_stays_unrecognised():
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result("queued-elsewhere")), pid) == (
+        worker.CHECKOUT_RESULT_UNRECOGNISED)
+
+
+# ── status words (v6 P2-I, v8 P2-L) ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("status", ["paid_pending_shipment", "paid_awaiting_fulfillment", "completed_with_errors",
+                                    "completed_notification_sent", "payment_completed_non_refundable",
+                                    "paid_cancel_requested", "succeeded", "charged", "settled", "captured",
+                                    "payment reached", "Payment-Completed"])
+async def test_a_status_that_says_payment_happened_is_payment_reached_and_never_resolvable(status):
+    assert worker._status_says_paid(status)
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    assert worker.operator_eligibility(await _row(pid), worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED) == (
+        False, "payment_reached_recorded")
+
+
+@pytest.mark.parametrize("status", ["unpaid", "payment_failed", "payment-declined", "incomplete", "not_paid",
+                                    "not_completed", "non_completed", "never_charged", "payment-pending",
+                                    "awaiting-payment", "repayment", "payment_cancelled", "uncaptured"])
+def test_a_status_that_does_not_say_payment_happened_stays_unrecognised(status):
+    assert not worker._status_says_paid(status)
+
+
+async def test_an_expiry_that_is_a_whole_number_in_prose_but_not_in_card_context_is_read():
+    # H16: "1129" is our expiry, but here it is an amount due, not the card's expiry: it is read (and refused).
+    answer = _task({"kind": "text", "text": "Amount due 1129 today"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.text_amounts_refused is True
+
+
+def test_a_ksuid_or_base64url_order_id_keeps_its_reference():
+    import random
+    import string
+
+    rng = random.Random(11)
+    base62 = string.ascii_letters + string.digits
+    for _ in range(500):
+        ksuid = "".join(rng.choice(base62) for _ in range(27))
+        b64url = "".join(rng.choice(base62 + "-_") for _ in range(27))
+        assert worker._credential_rule(ksuid) is None and worker._credential_rule(b64url) is None
+    assert worker._credential_rule(TAVV_UNPADDED) == "cryptogram_shape"
+    assert worker._credential_rule("AgAAAAAABk4DWZ4C28yUQAAAAAA=") == "cryptogram_shape"
+
+
+@pytest.mark.parametrize("echo,refused", [
+    ({"foo": "715"}, True), ({"securityCode": "715"}, True),
+    ({"ref": "$715.00", "suite": "Suite 715", "n": "715 units"}, False),
+], ids=["whole_value_unknown_key", "card_key", "inside_other_values"])
+async def test_a_davv_under_its_own_field_is_scrubbed_from_the_setup_answer_as_a_whole_value(echo, refused):
+    token = _network_token(**{a2a_rail.DAVV_FIELD: "715"})
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=token), answer), setup=_setup(ceiling_minor=100000))
+    assert (relay.checkout.credential_fields_stripped >= 1) is refused
+    data = relay.checkout.card("checkout.confirm").data
+    assert "715" not in [v for v in data.values() if isinstance(v, str)] or not refused
+
+
+
+
+# ── scan v8: the confirm card is a strict allowlist that fails closed (checkout_amounts rules 1, 2) ──
+
+from services.payment_orchestration import checkout_amounts as amounts  # noqa: E402
+from tests.a2a_rail_confirm_card_corpus import CORPUS  # noqa: E402
+
+#: The MEASURED sandbox confirm card: exactly cardBrand, cardLast4, merchant and shipping, the buyer address
+#: our setup sends. Placeholder values only.
+MEASURED_SHIPPING = {
+    "email": "buyer@example.com", "first_name": "Test", "last_name": "Buyer", "phone": "+15550100000",
+    "country": "US", "address1": "100 Example Way", "address2": "Unit 2", "city": "Sampleville", "state": "CA",
+    "zip_code": "00000",
+}
+MEASURED_CARD = {"cardBrand": "visa", "cardLast4": "4399", "merchant": "merchant.example.com",
+                 "shipping": MEASURED_SHIPPING}
+_KNOWN = {"cardBrand": "visa", "cardLast4": "4399", "merchant": "merchant.example.com"}
+
+
+def _s1(**kw):
+    return {**MEASURED_CARD, "total": "51.49", "currency": "USD", **kw}
+
+
+def _s2(**kw):
+    """$40.00 + $1.49 of lines, $5.00 shipping, $5.00 tax: $51.49."""
+    return {**_KNOWN, "line_items": [{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "1.49"}],
+            "subtotal": "41.49", "shipping": "5.00", "tax": "5.00", "total": "51.49", "currency": "USD", **kw}
+
+
+def _s3(**kw):
+    """$45.00 of lines less a $5.00 discount, $4.49 shipping, $2.00 tax: $46.49; before the discount $51.49, the
+    ceiling (P1-L). Shopify's REST Order fields."""
+    return {**MEASURED_CARD,
+            "line_items": [{"quantity": 2, "price": "20.00", "compare_at_price": "25.00"},
+                           {"quantity": 1, "price": "5.00", "compare_at_price": None}],
+            "subtotal_price": "40.00", "shipping_lines": [{"price": "4.49"}], "total_tax": "2.00",
+            "total_discounts": "5.00", "total_price": "46.49", "currency": "USD", **kw}
+
+
+def _without(card, *keys):
+    return {k: v for k, v in card.items() if k not in keys}
+
+
+S3_DISCOUNTED = _s3()
+
+
+def test_the_measured_confirm_card_has_nothing_money_like_and_proceeds():
+    assert amounts.money_like(MEASURED_CARD) is False
+    assert worker.confirm_card_refused(MEASURED_CARD, TOTAL) is False
+    short = {**MEASURED_CARD, "shipping": _without(MEASURED_SHIPPING, "address2", "state")}
+    assert worker.confirm_card_refused(short, TOTAL) is False
+    # The address keys are the ones our setup sends, and no leaf's key holds a money word (`shipping` does,
+    # but it holds an object, which is never money-like itself).
+    assert set(MEASURED_SHIPPING) == amounts.ADDRESS_KEYS == set(
+        a2a_rail.CHECKOUT_SHIPPING_REQUIRED + a2a_rail.CHECKOUT_SHIPPING_OPTIONAL)
+    assert [k for k in [*MEASURED_CARD, *MEASURED_SHIPPING] if amounts._money_key(k)] == ["shipping"]
+
+
+@pytest.mark.parametrize("extra", [{"x": "1500"}, {"x": "4999"}, {"orderRef": "40000000001"},
+                                   {"shipping": {**MEASURED_SHIPPING, "window": "3-5"}}],
+                         ids=["x_1500", "x_4999", "order_ref", "shipping_window"])
+def test_a_bare_digit_string_under_a_non_money_key_proceeds_the_accepted_residual(extra):
+    # checkout_amounts rule 1, RESIDUAL: not money-like (cents as text cannot be told from a zip code), so the
+    # token cap, minted for exactly the ceiling, decides.
+    card = {**MEASURED_CARD, **extra}
+    assert amounts.money_like(card) is False
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+#: Beside the measured card, nothing money-like (rule 1): proceeds.
+NOT_MONEY_LIKE = {
+    "booleans": {"discountApplied": False, "giftWrap": True}, "none_under_total": {"total": None},
+    "empty_under_price": {"price": ""}, "blank_under_fee": {"fee": "  "},
+    "zip_plus4": {"shipping": {**MEASURED_SHIPPING, "zip_code": "00000-1234"}},
+    "phone_formatted": {"shipping": {**MEASURED_SHIPPING, "phone": "(555) 010-0000"}},
+    "version_string": {"note": "Version 7.1.5"}, "one_decimal": {"note": "1.5 lbs"},
+    "suite": {"note": "Suite 715"},
+    "title_case_code_word": {"shipping": {**MEASURED_SHIPPING, "address1": "12 Top St"}},
+    "lower_case_code_glued_in_an_email": {"shipping": {**MEASURED_SHIPPING, "email": "eur2buy@example.com"}},
+    "object_under_a_money_word": {"delivery": {"city": "Sampleville", "window": "3-5"}},
+    "embedded_without_money": {"meta": '{"sku": "A-1"}'},
+}
+#: Beside the measured card, money-like (rule 1), in no named shape: cancels.
+MONEY_LIKE = {
+    # (a) a JSON number leaf anywhere
+    "int": {"x": 15}, "float": {"x": 15.5}, "zero": {"x": 0}, "negative": {"x": -1}, "number_in_a_list": {"x": ["a", 1]},
+    "number_nested": {"x": {"y": {"z": 2}}}, "card_last4_int": {"cardLast4": 4399},
+    "zip_int": {"shipping": {**MEASURED_SHIPPING, "zip_code": 12345}},
+    # (b) a currency or amount pattern in a string leaf or a key
+    "dollar": {"ref": "$15.00"}, "dollar_no_cents": {"ref": "$15"}, "euro": {"note": "€15"}, "fullwidth": {"note": "＄15"},
+    "symbol_after": {"note": "15 €"}, "code_before": {"note": "USD 15"}, "code_after": {"note": "15 EUR"},
+    "code_glued": {"note": "15EUR"}, "usd_lower": {"note": "usd15"}, "usd_title": {"note": "Usd 15"},
+    "two_decimals": {"x": "15.00"}, "grouped": {"x": "1,234.56"}, "in_prose": {"note": "Total: 40.00 today"},
+    "invisible_inside": {"x": "$​15"}, "arabic_indic": {"x": "٤٠.٠٠"},
+    "three_decimals": {"weightKg": "1.234"}, "lower_case_eur": {"note": "eur 40"},  # P1-K
+    "key_holds_an_amount": {"$15.00": "x"}, "key_holds_a_code_amount": {"USD15": "x"},
+    "embedded_json": {"meta": '{"total": 15}'}, "embedded_literal": {"meta": "{'x': 15}"},
+    "address_with_an_amount": {"shipping": {**MEASURED_SHIPPING, "address2": "Fee $5.00"}},
+    "merchant_with_an_amount": {"merchant": "Deals 40.00"},
+    # (c) a string leaf whose own key holds a money word (any case or separator; a lookalike letter)
+    "shipping_method": {"shipping_method": "standard"}, "upper_total": {"TOTAL": "n/a"},
+    "mixed_case_cost": {"Shipping_Cost": "free"}, "lookalike_total": {"tоtal": "n/a"},
+    "list_item_takes_its_lists_key": {"fees": ["waived"]},
+}
+
+
+@pytest.mark.parametrize("name", sorted(NOT_MONEY_LIKE))
+def test_what_is_not_money_like_proceeds(name):
+    card = {**MEASURED_CARD, **NOT_MONEY_LIKE[name]}
+    assert amounts.money_like(card) is False
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+@pytest.mark.parametrize("name", sorted(MONEY_LIKE))
+def test_money_under_an_innocuous_key_is_money_like_and_cancels(name):
+    card = {**MEASURED_CARD, **MONEY_LIKE[name]}
+    assert amounts.money_like(card) is True
+    assert amounts.matched_shape(card, TOTAL) is None
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+@pytest.mark.parametrize("word", sorted(amounts._MONEY_KEY_WORDS))
+def test_every_money_word_makes_a_string_under_its_key_money_like(word):
+    assert amounts.money_like({word: "n/a"}) is True
+    assert amounts.money_like({f"order_{word.upper()}_x": "n/a"}) is True
+    assert amounts.money_like({word: True}) is False  # a boolean is never money-like
+
+
+@pytest.mark.parametrize("code", sorted(amounts._ISO_4217))
+def test_every_iso_code_next_to_a_digit_is_money_like(code):
+    for text in (f"{code} 15", f"15{code}", f"15 {code}"):
+        assert amounts.money_like({"note": text}) is True, text
+    assert amounts.money_like({"note": f"{code}X 15"}) is False  # not a whole word
+    assert amounts.money_like({"note": f"{code.lower()} 15"}) is (code in ("USD", "EUR", "GBP"))  # P1-K: eur, gbp
+
+
+#: Within the ceiling, exactly a named shape: proceeds (shape name expected).
+SHAPES_WITHIN = {
+    "s1": ("S1", _s1()), "s1_int": ("S1", _s1(total=51)), "s1_float": ("S1", _s1(total=51.49)),
+    "s1_zero": ("S1", _s1(total="0.00")), "s1_lower_usd": ("S1", _s1(currency="usd")),
+    "s1_alone": ("S1", {"total": "40.00", "currency": "USD"}),
+    "s1_known_keys_only": ("S1", _without(_s1(), "shipping")),
+    "s2": ("S2", _s2()), "s2_minimal": ("S2", _without(_s2(total="41.49"), "shipping", "tax")),
+    "s2_numbers": ("S2", _s2(line_items=[{"quantity": 1, "price": 41.49}], subtotal=41.49, shipping=5, tax=5.0,
+                             total=51.49)),
+    "s2_total_above_its_parts": ("S2", _s2(tax="1.00")),
+    "s3": ("S3", _s3()), "s3_no_compare_at": ("S3", _s3(line_items=[{"quantity": 9, "price": "5.00"}])),
+    "s3_minimal": ("S3", _without(_s3(subtotal_price="45.00", total_price="45.00"), "shipping_lines", "total_tax",
+                                  "total_discounts")),
+    "s3_compare_at_above_the_price": ("S3", _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "51.49"},
+                                                            {"quantity": 1, "price": "5.00"}])),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SHAPES_WITHIN))
+def test_each_named_shape_within_the_ceiling_proceeds(name):
+    shape, card = SHAPES_WITHIN[name]
+    assert amounts.money_like(card) is True
+    assert amounts.matched_shape(card, TOTAL) == shape
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+def _line(**kw):
+    return [{"quantity": 2, "price": "20.00", **kw}, {"quantity": 1, "price": "1.49"}]
+
+
+#: Every way a card near a named shape is not exactly it: cancels.
+SHAPES_REFUSED = {
+    # over the ceiling (an amount, the total, a line, a display-only price)
+    "s1_over": _s1(total="51.50"), "s1_int_over": _s1(total=52),
+    "s2_total_over": _s2(total="51.50"), "s2_line_over": _s2(line_items=[{"quantity": 1, "price": "51.50"}], subtotal="51.50"),
+    # 2 x $30.00 is $60.00: read without its quantity, the line would match the $30.00 subtotal
+    "s2_quantity_times_price_over": _s2(line_items=[{"quantity": 2, "price": "30.00"}], subtotal="30.00"),
+    "s3_total_over": _s3(total_price="51.50"), "s3_shipping_line_over": _s3(shipping_lines=[{"price": "51.50"}]),
+    # short: the total does not cover its parts; the subtotal is not its lines
+    "s2_total_short": _s2(total="51.48"), "s2_subtotal_above_lines": _s2(subtotal="41.50"),
+    "s2_subtotal_below_lines": _s2(subtotal="41.48"),
+    "s3_total_short": _s3(total_price="46.48"), "s3_subtotal_before_discounts": _s3(subtotal_price="45.00"),
+    "s3_discount_above_lines": _s3(total_discounts="45.01", subtotal_price="0.00"),
+    # P1-L: the parts BEFORE the discount above the ceiling (the earlier standard fixture: $56.49 before $5.00 off)
+    "s3_old_fixture_56_49_before_the_discount": _s3(
+        line_items=[{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "10.00"}], subtotal_price="45.00",
+        total_price="51.49"),
+    "s3_reviewers_102_98_before_the_discount": _s3(
+        line_items=[{"quantity": 1, "price": "51.49"}], total_discounts="51.49", subtotal_price="0.00",
+        shipping_lines=[{"price": "51.49"}], total_tax="0.00", total_price="51.49"),
+    "s3_2x30_less_10": _s3(line_items=[{"quantity": 2, "price": "30.00"}], total_discounts="10.00",
+                           subtotal_price="50.00", shipping_lines=[{"price": "0.00"}], total_tax="0.00",
+                           total_price="50.00"),
+    "s3_2x50_less_50": _s3(line_items=[{"quantity": 2, "price": "50.00"}], total_discounts="50.00",
+                           subtotal_price="50.00", shipping_lines=[{"price": "0.00"}], total_tax="0.00",
+                           total_price="50.00"),
+    "s3_one_cent_over_before_the_discount": _s3(
+        line_items=[{"quantity": 2, "price": "20.00"}, {"quantity": 1, "price": "5.01"}], subtotal_price="40.01",
+        total_price="46.50"),
+    # an extra key: at the top, in a line, in a shipping line, in the address
+    "s1_extra_charge": _s1(shipping_cost="5.00"), "s1_extra_plain_key": _s1(note="thanks"),
+    "s2_extra_discount": _s2(discount="5.00"), "s2_line_title": _s2(line_items=_line(title="Widget"), subtotal="41.49"),
+    "s3_line_sku": _s3(line_items=[{"quantity": 9, "price": "5.00", "sku": "A-1"}]),
+    "s3_shipping_line_title": _s3(shipping_lines=[{"price": "4.49", "title": "Ground"}]),
+    "s1_address_extra_key": _s1(shipping={**MEASURED_SHIPPING, "company": "Example Co"}),
+    "s3_address_extra_key": _s3(shipping={**MEASURED_SHIPPING, "method": "ground"}),
+    # the wrong type (a money key: a number or a two-decimal string only; a bare digit string is a mismatch)
+    "s1_dollar_string": _s1(total="$51.49"), "s1_bare_digits": _s1(total="1500"), "s1_bare_40": _s1(total="40"),
+    "s1_one_decimal": _s1(total="51.5"), "s1_three_decimals": _s1(total=51.491), "s1_trailing_space": _s1(total="51.49 "),
+    "s1_negative": _s1(total="-5.00"), "s1_negative_number": _s1(total=-5),
+    "s1_bool_beside_money": _s1(total=True, note="$5.00"), "s1_object": _s1(total={"amount": "51.49"}), "s1_list": _s1(total=["51.49"]),
+    "s1_leading_zero": _s1(total="051.49"), "s1_grouped": _s1(total="1,051.49"), "s1_nan": _s1(total=float("nan")),
+    "s2_bare_price": _s2(line_items=[{"quantity": 1, "price": "40"}], subtotal="40.00", total="51.49"),
+    "s2_bare_total": _s2(total="5149"), "s2_bare_subtotal": _s2(subtotal="4149"),
+    "s2_dollar_shipping": _s2(shipping="$5.00"),
+    "s3_bare_price": _s3(line_items=[{"quantity": 1, "price": "40"}], subtotal_price="40.00", total_discounts="0.00"),
+    "s3_bare_total": _s3(total_price="45"), "s3_negative_discount": _s3(total_discounts="-5.00"),
+    "s3_compare_at_dollar": _s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "$12.00"}]),
+    "quantity_string": _s2(line_items=_line(quantity="2"), subtotal="41.49"),
+    "quantity_float": _s2(line_items=_line(quantity=2.0), subtotal="41.49"),
+    "quantity_zero": _s2(line_items=_line(quantity=0), subtotal="1.49"),
+    "quantity_bool": _s2(line_items=[{"quantity": True, "price": "41.49"}], subtotal="41.49"),
+    # the wrong currency
+    "s1_eur": _s1(currency="EUR"), "s1_no_currency": _without(_s1(), "currency"), "s1_title_usd": _s1(currency="Usd"),
+    "s1_padded_usd": _s1(currency=" USD"), "s1_numeric_currency": _s1(currency=840), "s2_eur": _s2(currency="EUR"),
+    "s3_cad": _s3(currency="CAD"),
+    # a duplicate, an alias, a case or separator variant (two totals)
+    "s1_total_and_Total": _s1(Total="51.49"), "s1_upper_total": _without(_s1(TOTAL="51.49"), "total"),
+    "s1_grand_total": _s1(grand_total="51.49"), "s2_sub_total": _s2(sub_total="41.49"),
+    "s2_total_price_beside_total": _s2(total_price="51.49"), "s3_totalPrice": _s3(totalPrice="51.49"),
+    "s3_with_s2_subtotal": _s3(subtotal="45.00"), "s3_shipping_amount_beside_lines": _s3(total_shipping="4.49"),
+    # a quantity outside its line
+    "s1_outer_quantity": _s1(quantity=2), "s2_outer_quantity": _s2(quantity=1), "s3_outer_qty": _s3(qty=2),
+    "s2_quantity_in_a_child": _s2(line_items=[{"quantity": 1, "price": "20.00", "details": {"quantity": 2}},
+                                              {"quantity": 1, "price": "21.49"}]),
+    # unexpected nesting
+    "s2_lines_as_an_object": _s2(line_items={"a": {"quantity": 1, "price": "41.49"}}),
+    "s2_no_lines": _s2(line_items=[], subtotal="0.00"), "s3_no_shipping_lines": _s3(shipping_lines=[]),
+    "s2_line_a_string": _s2(line_items=["41.49"]), "s1_nested_in_summary": {"summary": {"total": "51.49", "currency": "USD"}},
+    # a known key that is not the measured one: money in it, a number, the address where an amount belongs
+    "s1_merchant_with_money": _s1(merchant="Store $60.00"), "s1_last4_int": _s1(cardLast4=4399),
+    "s1_merchant_embedded": _s1(merchant='{"total": 60}'), "s2_address_as_shipping": _s2(shipping=MEASURED_SHIPPING),
+    "s1_shipping_amount": _s1(shipping="5.00"), "s3_shipping_amount": _s3(shipping="4.49"),
+    "s1_address_with_money": _s1(shipping={**MEASURED_SHIPPING, "address2": "$15.00"}),
+    "s1_address_number": _s1(shipping={**MEASURED_SHIPPING, "zip_code": 12345}),
+    "s1_address_list_value": _s1(shipping={**MEASURED_SHIPPING, "state": ["CA"]}),
+    "s1_merchant_object": _s1(merchant={"name": "Example"}),
+    "s2_bool_price": _s2(line_items=[{"quantity": 1, "price": True}], subtotal="1.00", total="11.00"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SHAPES_REFUSED))
+def test_a_card_that_is_not_exactly_a_named_shape_within_the_ceiling_cancels(name):
+    card = SHAPES_REFUSED[name]
+    assert amounts.matched_shape(card, TOTAL) is None
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+#: compare_at_price (S3) is display only: exempt from the ceiling, still type-checked, never summed, never the total
+#: and never a price. Each card is S3-shaped; `None` = it proceeds, else the reason it cancels.
+COMPARE_AT_CASES = {
+    # exempt from the ceiling: a list price above what the buyer approved proceeds when the rest is S3 in range
+    "over_the_ceiling_string": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "99999.00"},
+                                                {"quantity": 1, "price": "5.00"}]), None),
+    "over_the_ceiling_number": (_s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": 1000000},
+                                                {"quantity": 1, "price": "5.00", "compare_at_price": 75.5}]), None),
+    "one_cent_over_the_ceiling": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "51.50"}]), None),
+    # still type-checked
+    "dollar_string": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "$99.00"}]), "type"),
+    "negative": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "-1.00"}]), "type"),
+    "negative_number": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": -1}]), "type"),
+    "bare_digits": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "9999"}]), "type"),
+    "boolean": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": True}]), "type"),
+    "words": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": "was 12"}]), "type"),
+    "object": (_s3(line_items=[{"quantity": 9, "price": "5.00", "compare_at_price": {"amount": "12.00"}}]), "type"),
+    # the price, the total and the sums still cap, whatever the compare_at_price
+    # (a price over the ceiling under a discount that brings the charged sums within it: its own cap and the cap
+    # before the discount both refuse it)
+    "price_over_the_ceiling": (_s3(line_items=[{"quantity": 1, "price": "51.50", "compare_at_price": "60.00"}],
+                                   subtotal_price="41.50", total_discounts="10.00", shipping_lines=[{"price": "0.00"}],
+                                   total_tax="0.00", total_price="41.50"), "price"),
+    "total_over_the_ceiling": (_s3(total_price="51.50"), "total"),
+    "subtotal_over_the_ceiling": (
+        _s3(line_items=[{"quantity": 2, "price": "30.00", "compare_at_price": "40.00"}], subtotal_price="55.00",
+            total_discounts="5.00", total_price="51.49", total_tax="0.00", shipping_lines=[{"price": "0.00"}]),
+        "sums"),
+    "parts_add_up_past_the_ceiling": (
+        _s3(line_items=[{"quantity": 1, "price": "45.00", "compare_at_price": "90.00"}], subtotal_price="45.00",
+            total_discounts="0.00", shipping_lines=[{"price": "5.00"}], total_tax="2.00", total_price="51.49"),
+        "sums"),
+    # never a price, never summed: a compare_at_price that would make the sums reconcile does not
+    # (read as the price, this line would make every sum reconcile: $45.00 + $4.49 + $2.00 = $51.49)
+    "the_only_amount_of_a_line": (_s3(line_items=[{"quantity": 1, "compare_at_price": "45.00"}],
+                                      total_discounts="0.00", subtotal_price="45.00", total_price="51.49"), "shape"),
+    "would_reconcile_a_short_subtotal": (
+        _s3(line_items=[{"quantity": 1, "price": "45.00", "compare_at_price": "30.00"}], subtotal_price="30.00",
+            total_discounts="0.00", total_price="30.00", total_tax="0.00", shipping_lines=[{"price": "0.00"}]), "short"),
+    "would_reconcile_if_added": (
+        _s3(line_items=[{"quantity": 1, "price": "10.00", "compare_at_price": "35.00"}], subtotal_price="45.00",
+            total_discounts="0.00", total_price="51.49"), "short"),
+    "short_total_beside_a_large_compare_at": (
+        _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "500.00"},
+                        {"quantity": 1, "price": "5.00"}], total_price="46.48"), "short"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(COMPARE_AT_CASES))
+def test_compare_at_price_is_display_only_exempt_from_the_ceiling_and_never_counted(name):
+    card, refused_for = COMPARE_AT_CASES[name]
+    assert amounts.matched_shape(card, TOTAL) == (None if refused_for else "S3")
+    assert worker.confirm_card_refused(card, TOTAL) is (refused_for is not None)
+
+
+async def test_an_over_ceiling_compare_at_price_confirms_end_to_end():
+    pid = await _approving()
+    card = _task(_card("checkout.confirm", COMPARE_AT_CASES["over_the_ceiling_string"][0],
+                       ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=card)
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions()
+
+
+def test_the_shape_bounds_are_exact_to_the_cent():
+    # The total at the ceiling proceeds, a cent over cancels; a total equal to its parts proceeds, a cent short cancels.
+    assert worker.confirm_card_refused(_s1(total="51.49"), TOTAL) is False
+    assert worker.confirm_card_refused(_s1(total="51.49"), TOTAL - 1) is True
+    assert worker.confirm_card_refused(_s2(), TOTAL) is False and worker.confirm_card_refused(_s2(), TOTAL - 1) is True
+    assert worker.confirm_card_refused(_s3(), TOTAL) is False and worker.confirm_card_refused(_s3(), TOTAL - 1) is True
+    assert worker.confirm_card_refused(_s3(total_discounts="45.00", subtotal_price="0.00", total_price="6.49"), TOTAL) is False
+    # compare_at_price is display only: never summed (the lines would not reach the subtotal), never the total.
+    shown = _s3(line_items=[{"quantity": 2, "price": "20.00", "compare_at_price": "30.00"},
+                            {"quantity": 1, "price": "5.00", "compare_at_price": "11.00"}])
+    assert amounts.matched_shape(shown, TOTAL) == "S3"
+    assert worker.confirm_card_refused(_s3(total_price="51.49", total_tax="30.00"), TOTAL) is True  # parts 79.49
+
+
+@pytest.mark.parametrize("shape", ["s1", "s2", "s3"])
+async def test_each_named_shape_within_the_ceiling_confirms_end_to_end(shape):
+    pid = await _approving()
+    card = {"s1": _s1, "s2": _s2, "s3": _s3}[shape]()
+    rail = _approved(Rail(), setup_answer=_task(_card("checkout.confirm", card, ("confirm", "edit", "cancel"),
+                                                      kind="confirm")))
+    assert await _step(rail, pid) == "placing"
+    assert "checkout.confirm#confirm" in rail.actions() and "checkout.confirm#cancel" not in rail.actions()
+
+
+@pytest.mark.parametrize("name", ["s1_bare_digits", "s2_total_short", "s3_subtotal_before_discounts",
+                                  "s1_shipping_amount", "s1_total_and_Total"])
+async def test_a_near_shape_cancels_end_to_end(name):
+    pid = await _approving()
+    card = _task(_card("checkout.confirm", SHAPES_REFUSED[name], ("confirm", "edit", "cancel"), kind="confirm"))
+    rail = _approved(Rail(), setup_answer=card).on("checkout.confirm#cancel", CANCELLED)
+    assert await _step(rail, pid) == "failed"
+    assert "checkout.confirm#confirm" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "checkout_confirm_total_refused"
+
+
+# ── the regression corpus: every attack shape of the v4-v7 reviews and the earlier tests ──────
+
+_DOLLARS_RE = re.compile(r"^\$([0-9]+\.[0-9]{2})\Z")
+
+
+def _undollared(value):
+    """Every "$D.DD" string written "D.DD", and currency USD beside the top level: so the shape checks, not
+    the "$", are what refuses the card."""
+    def strip(v):
+        if isinstance(v, dict):
+            return {k: strip(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [strip(x) for x in v]
+        match = _DOLLARS_RE.match(v) if isinstance(v, str) else None
+        return match.group(1) if match else v
+    out = strip(value)
+    return {**out, "currency": "USD"} if isinstance(out, dict) and "currency" not in out else out
+
+
+#: The corpus cards that PROCEED, and why (neither is an over-ceiling charge):
+CORPUS_PROCEEDS = {
+    # rule 1's accepted residual: no number, no currency or amount pattern, no money word ("3-5" is digits)
+    ("492_test_every_amount_the_scan_cannot_read_with_cert", "as_reported"): "rule1",
+    ("492_test_every_amount_the_scan_cannot_read_with_cert", "undollared"): "rule1",
+    # {"total": "40.00"} with currency USD added: literally S1, $40.00 under the $51.49 cap
+    ("082_test_an_unreadable_or_foreign_confirm_card_total", "undollared"): "S1",
+}
+_CORPUS_CASES = [(rid, ceiling, card, "as_reported") for rid, ceiling, card in CORPUS] + [
+    (rid, ceiling, _undollared(card), "undollared") for rid, ceiling, card in CORPUS if _undollared(card) != card]
+
+
+@pytest.mark.parametrize("rid,ceiling,card,variant", _CORPUS_CASES, ids=[f"{c[0]}-{c[3]}" for c in _CORPUS_CASES])
+def test_every_attack_shape_from_the_reviews_cancels_unless_it_is_literally_a_named_shape_under_the_cap(
+        rid, ceiling, card, variant):
+    expected = CORPUS_PROCEEDS.get((rid, variant))
+    assert worker.confirm_card_refused(card, ceiling) is (expected is None)
+    if expected == "rule1":
+        assert amounts.money_like(card) is False
+    elif expected is not None:
+        assert amounts.matched_shape(card, ceiling) == expected
+
+
+def test_the_corpus_is_whole_and_its_exceptions_are_its_own():
+    assert len(CORPUS) == 615 and len({rid for rid, _, _ in CORPUS}) == 615
+    ids = {(c[0], c[3]) for c in _CORPUS_CASES}
+    assert set(CORPUS_PROCEEDS) <= ids
+
+
+# ── v8 P2-L: a status is split on every character that is not a letter or a digit ─────────────
+
+@pytest.mark.parametrize("status", ["Paid.", "paid!", "order.paid", "payment:captured", "status=paid", "paid,shipped",
+                                    "payment.reached", "PAID/SHIPPED", "chargedback", "chargeback", "Charged-Back",
+                                    "not.refunded.paid"])
+async def test_a_status_split_on_any_punctuation_or_a_chargeback_is_payment_reached_and_never_resolvable(status):
+    assert worker._status_says_paid(status)
+    pid = await _placing()
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(status)), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    assert worker.operator_eligibility(await _row(pid), worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED) == (
+        False, "payment_reached_recorded")
+
+
+@pytest.mark.parametrize("status", ["not.paid", "not:paid", "never=charged", "non/captured", "Not paid.", "notpaid",
+                                    "not.completed", "no,charge", "uncaptured", "payment.failed"])
+def test_a_negated_status_split_on_any_punctuation_stays_unrecognised(status):
+    assert not worker._status_says_paid(status)
+
+
+# ── scan v8 review: P1-K (rule 1 reads what the prose rule reads as an amount), P3-v8-1 (base64 JSON) ──
+
+#: Amount strings the v8 rule 1 let through under a plain key: each is money-like now, and the card cancels.
+RULE_1_ESCAPES = ["Total charged: 999 dollars", "Your total is 999", "You will pay 999 at delivery", "999 dollars",
+                  "999 bucks", "999 euros", "999 eur", "999,00", "1.234,56", "999.000", "٩٩٩"]
+#: THE PINNED RESIDUAL (the owner's decision: a known gap; the token cap is the backstop): still not money-like
+#: under a plain key, so the card PROCEEDS. Any change to one of these shows here.
+RULE_1_RESIDUAL = ["999.5", "60.0", "1e3", "Rs 999", "nine hundred ninety-nine dollars", "1 000"]
+#: Ordinary strings that must stay not money-like (the measured card's own fields among them).
+RULE_1_BENIGN = ["visa", "4399", "merchant.example.com", "buyer@example.com", "Test", "Buyer", "+15550100000", "US",
+                 "100 Example Way", "Unit 2", "Sampleville", "CA", "00000", "00000-1234", "(555) 010-0000",
+                 "100 Euro Plaza", "Euro 24 Shop", "30 pound bag", "3-5 days", "Size 10", "5 stars", "v1.2.3",
+                 "2.5 lb", "Rating 4.5", "2026-11-19", "11/19/2026", "Nov 19, 2026", "12 Top St", "Apt 4",
+                 "Gel Pen 12 pack", "Ships in 7 days", "SKU-40000000001", "Order #1001", "Suite 715", "Version 7.1.5",
+                 "Dog food 30 pound bag", "Gate code 1234", "2-Day", "3M", "Size 10.5", "Pack of 12", "7 items"]
+
+
+@pytest.mark.parametrize("text", RULE_1_ESCAPES)
+def test_an_amount_the_prose_rule_would_read_is_money_like_on_a_card_leaf_and_cancels(text):
+    card = {**MEASURED_CARD, "note": text}
+    assert amounts.money_like(card) is True
+    assert worker.confirm_card_refused(card, TOTAL) is True
+
+
+@pytest.mark.parametrize("text", RULE_1_RESIDUAL)
+def test_the_pinned_rule_1_residual_still_proceeds(text):
+    card = {**MEASURED_CARD, "note": text}
+    assert amounts.money_like(card) is False
+    assert worker.confirm_card_refused(card, TOTAL) is False
+
+
+@pytest.mark.parametrize("text", RULE_1_BENIGN)
+def test_ordinary_strings_stay_not_money_like(text):
+    assert amounts.money_like({**MEASURED_CARD, "note": text}) is False
+
+
+def test_the_escape_and_benign_measurement_is_11_of_17_and_0_of_42():
+    assert len(RULE_1_ESCAPES) + len(RULE_1_RESIDUAL) == 17 and len(RULE_1_BENIGN) == 42
+    assert sum(amounts.money_like({"note": t}) for t in RULE_1_ESCAPES + RULE_1_RESIDUAL) == 11
+    assert sum(amounts.money_like({"note": t}) for t in RULE_1_BENIGN) == 0
+
+
+@pytest.mark.parametrize("data", ["Total charged: 999 dollars", "hello", ["x"], [], 5, None],
+                         ids=["string_with_an_amount", "plain_string", "list", "empty_list", "number", "none"])
+def test_card_data_that_is_not_an_object_cancels(data):
+    assert worker.confirm_card_refused(data, TOTAL) is True
+
+
+def test_a_base64_json_blob_is_judged_like_embedded_data():
+    import base64
+
+    blob = base64.b64encode(json.dumps({"total": 999}).encode()).decode()
+    urlsafe = base64.urlsafe_b64encode(json.dumps({"note": "Your total is 999"}).encode()).decode().rstrip("=")
+    plain = base64.b64encode(json.dumps({"sku": "A-1"}).encode()).decode()
+    assert amounts.money_like({**MEASURED_CARD, "blob": blob}) is True
+    assert amounts.money_like({**MEASURED_CARD, "blob": urlsafe}) is True
+    assert amounts.money_like({**MEASURED_CARD, "blob": plain}) is False
+    # An id that merely looks like base64 is not data: never money-like for it.
+    assert amounts.money_like({**MEASURED_CARD, "ref": "AgAAAAAABk4DWZ4C28yUQAAAAAA"}) is False
+
+
+def test_the_prose_rule_and_rule_1_share_one_amount_shape_test():
+    # Reused, not copied: the prose rule refuses what rule 1 now reads as money (and the prose rule is unchanged).
+    for text in ("Your total is 999", "You will pay 999 at delivery", "Total charged: 999 dollars"):
+        assert amounts.text_refused(text, TOTAL) is True and amounts._prose_money(text) is True

@@ -87,6 +87,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 from urllib.parse import urlparse
 
 from config.platform import is_production as _platform_is_production
+from services.payment_orchestration import checkout_amounts
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,9 @@ class A2AResult:
     context_id: Optional[str] = None
     #: Whether the action sent may have changed state on the provider's side.
     may_write: bool = False
+    #: Set on a checkout setup's answer only: a text part shows an amount the ceiling cannot be verified
+    #: against (read here with services/payment_orchestration/checkout_amounts; the text is never returned).
+    text_amounts_refused: bool = False
     elapsed_s: float = 0.0
 
     @property
@@ -669,6 +673,9 @@ class CheckoutSetup:
     cardholder_name: str = field(repr=False)
     #: Deterministic per purchase (the provider lists it as required), so a repeat is one checkout.
     idempotency_key: str = ""
+    #: The approval ceiling (minor units): the setup answer's PROSE is read against it here, in the
+    #: transport, so no text leaves this module (`text_amounts_refused`). None: any text part refuses.
+    ceiling_minor: Optional[int] = None
 
 
 def _setup_problem(setup: Any) -> Optional[str]:
@@ -712,19 +719,27 @@ class TokenRelay:
 _SCRUB_SUBSTRING_MIN = 8
 
 
+#: The token-result field that will carry the DAVV (the 3-digit dynamic CVV the checkout card is filled with:
+#: the provider's 11-18 answer; the mapping lands with the DAVV change). Read here already so a DAVV that
+#: arrives under it is scrubbed from the setup answer BY VALUE, like the expiry: as a WHOLE value only
+#: ("715" alone), never inside another value ("$715.00", "Suite 715"), and in prose only as a whole token in
+#: card context. PENDING THE PROVIDER'S A2A UPDATE AND SANDBOX MEASUREMENT of the field's name.
+DAVV_FIELD = "davv"
+
+
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
-    expiry (raw and as "MM/YY") only as a whole value."""
+    expiry (raw and as "MM/YY") and its DAVV only as a whole value."""
     contains: List[str] = []
     exact = set()
-    for key in ("value", "cryptogram", "expiryDate"):
+    for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
         raw = network_token.get(key)
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
         # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
         for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
-            if len(form) >= _SCRUB_SUBSTRING_MIN:
+            if len(form) >= _SCRUB_SUBSTRING_MIN and key != DAVV_FIELD:
                 contains.append(form)
             exact.add(form)
         match = _TOKEN_EXPIRY_RE.match(raw) if key == "expiryDate" else None
@@ -801,6 +816,45 @@ def _scrub_values(result: Optional[A2AResult], network_token: Any) -> None:
         result.credential_fields_stripped += removed
         cards.append(Card(component=component, kind=kind, data=data, actions=actions))
     result.cards = cards
+
+
+#: A word before a short credential value in prose that says it IS the card's (an expiry): "exp 11/29",
+#: "expires 1129", "valid thru 11/29", "card ending ... 11/29".
+_PROSE_CARD_CONTEXT_RE = re.compile(r"(?i)\b(?:exp\w*|valid|thru|through|card)\b\W*(?:\w+\W+){0,2}\Z")
+
+
+def _scrub_prose(text: str, contains: Tuple[str, ...], exact: FrozenSet[str]) -> str:
+    """The token's value and cryptogram removed from prose anywhere; a short value (the expiry "1129" /
+    "11/29") only as a whole token in card context, never inside an amount or an id: "Order total:
+    $1129.00" keeps its amount, so it is read (and refused) like any other."""
+    for needle in sorted(contains, key=len, reverse=True):
+        text = text.replace(needle, " ")
+    for needle in sorted(set(exact) - set(contains), key=len, reverse=True):
+        pattern = re.compile(r"(?<![\w$.,/])" + re.escape(needle) + r"(?![\w.,/])")
+        text = pattern.sub(lambda m: " " if _PROSE_CARD_CONTEXT_RE.search(m.string[:m.start()]) else m.group(0), text)
+    return text
+
+
+def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -> bool:
+    """Whether any text part of the agent's answer shows an amount the ceiling cannot be verified against
+    (checkout_amounts.text_refused). The token's own values are removed from the text first. No ceiling:
+    any text part refuses. Never raises; the text is not kept."""
+    try:
+        task = body.get("result") if isinstance(body, dict) else None
+        texts = [str(p.get("text") or "") for p in _latest_agent_parts(task) if p.get("kind") == "text"] if isinstance(
+            task, dict) else []
+        if not texts:
+            return False
+        if ceiling is None:
+            return True
+        contains, exact = _scrub_needles(network_token) if isinstance(network_token, Mapping) else ((), frozenset())
+        for text in texts:
+            text = _scrub_prose(text, contains, exact)
+            if checkout_amounts.text_refused(text, ceiling):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - unreadable prose refuses (and nothing of it is logged)
+        return True
 
 
 def _approved_token(body: Any, expected_token_id: str) -> Optional[Mapping[str, Any]]:
@@ -1039,10 +1093,17 @@ class A2ARailClient:
                 "idempotency_key": setup.idempotency_key,
             }
             known = network_token
+            ceiling = setup.ceiling_minor
+
+            def _read_setup_answer(result: A2AResult, body: Any) -> None:
+                _scrub_values(result, known)
+                # The answer's prose: read for amounts HERE, with the token's own values removed first, and
+                # only a yes/no kept. Prose never leaves this module (rule 1).
+                result.text_amounts_refused = _text_parts_refused(body, known, ceiling)
+
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
-                action="submit", payload=checkout_payload,
-                inspect=lambda result, _body: _scrub_values(result, known))
+                action="submit", payload=checkout_payload, inspect=_read_setup_answer)
             known = None
         except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
             # `_send` classifies every transport failure itself; this is anything else. The setup may or

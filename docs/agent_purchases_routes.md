@@ -305,6 +305,74 @@ unavailable rail). Neither names a reason, and neither opens anything.
   backfill again until it exits 0 (`missing_parents=0`).
 - Turn off: unset the dial. The table stays; nothing reads or writes it.
 
+### Held A2A checkouts (operator path)
+
+The A2A rail's checkout step HOLDS a purchase whenever it cannot prove what happened at the rail provider:
+a setup or confirm whose answer nobody saw (`checkout_setup_unresolved`, `checkout_confirm_unresolved`),
+a `paid` sent through the relay whose step was cut, a total it cannot verify, and the other codes in
+`a2a_rail_worker._CHECKOUT_HOLD_CODES`. A held purchase stays in `paying` (the agent sees `placing`) for
+good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human does:
+
+1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
+   its id, its hold code, whether a write is pending, whether a checkout task id is recorded.
+2. **Check the provider's side for that purchase** (its order lookup, its dashboard, its support). Look for
+   an order and for a charge on the purchase's token.
+3. Only if there is **no order and no charge**: preview, then apply. In production run it as a one-off job
+   (`scripts/ops/run_oneoff_job.sh`, behind the one-off gate):
+
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <the code from step 1>
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> \
+           --apply --operator <handle> --expect-env production --provider-checked
+
+   The purchase ends `failed` / `operator_confirmed_not_charged`. The write is a compare-and-swap on the
+   code you read and refuses a row a worker holds right now, so a row that moved since is not touched
+   (exit 3, with the reason).
+4. If the provider DID place the order (or charged the token), do **not** resolve it here: it is not a
+   failed purchase. Record the merchant's order number by hand with an engineer; there is no command for
+   that yet.
+
+`checkout.relay#paid` held as `checkout_setup_unresolved` after a cut step: the setup carrying the token
+may or may not have gone out. If the provider shows no checkout session for the purchase at all, nothing
+was set up, and the purchase can be resolved as above.
+
+**Who may run it.** `list-held`, the preview (`resolve-held` without `--apply`) and `resolve-held --apply`
+all read or write production, so each is a **production one-off**: run it through the one-off gate (`oneoff_gate.sh`,
+GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **the owner's go for that purchase**. The tool does not
+check the gate itself.
+
+**Never "not charged" over a recorded payment.** A hold written after the provider reported
+`payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
+set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
+written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
+for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id
+that may echo the card or the token now COMPLETES without its reference, as `checkout_order_reference_withheld`) is refused, whatever the flags
+(`payment_reached_recorded`): our own ledger says the order may be placed and paid. **Escalate; the merchant
+refunds.**
+
+**Not too soon.** A purchase must have been in `paying` for at least an hour
+(`OPERATOR_MIN_HOLD_AGE_SECONDS`) before it can be resolved: the provider's staged checkout lapses after
+about 30 minutes, and a check made sooner can miss an order that lands later. The write refuses a younger
+row itself (`held_too_recently` in the preview).
+
+**What a resolution causes.** The preview reads that purchase by id and shows its code, how long it has
+been held, and whether the apply would be accepted. A resolved purchase keeps its token id: the next worker
+tick's orphan pass voids that token on the rail (when a voider is configured), a second rail call caused by
+the resolution.
+
+**What it resolves, and what it does not.** `resolve-held` ends ONLY a checkout hold: a purchase in
+`paying` with a token, held with one of the codes in `a2a_rail_worker._CHECKOUT_HOLD_CODES`, the code
+alone (exit 3 otherwise). It does not resolve, and an operator must not try to resolve by other means:
+- a VIC order hold (`vic_*` codes),
+- `money_result_seen` (an answer reported money moving where none should have),
+- a compound code (one carrying a schedule prefix, e.g. `paid_sent:...:...`, or `worker_error`).
+For those, **escalate** to an engineer with the purchase id and the code. Never edit the database by hand:
+the row's pending write and code are the only record of what may have happened at the provider.
+
+**What the buyer sees.** A resolution usually lands after the buyer's 30-minute payment link has expired.
+The buyer learns the outcome from a fresh read: the agent's `get_order` in the chat (the purchase body,
+`state` `failed` with `last_error_code` `operator_confirmed_not_charged`), never from the old link.
+
 ## Webhook events (`purchase.*`)
 
 Agents can be told about a purchase instead of polling. Events go through the existing agent
