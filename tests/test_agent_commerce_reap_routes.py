@@ -1499,10 +1499,11 @@ async def test_a_request_that_lost_its_key_writes_no_parent_for_the_winners_purc
     second = await client.post(f"{BASE}/purchases", json=same_body)
     assert second.status_code == 202, second.text
     assert second.json()["purchase_id"] == winner and misses == [1]
-    loser_rows = await database.fetch_all(
-        "SELECT state, refusal_reason FROM reap_agentic_purchases WHERE id <> :w", {"w": winner})
-    assert [(r["state"], r["refusal_reason"]) for r in loser_rows] == [("refused", "duplicate_idempotency_key")]
-    assert await database.fetch_all("SELECT id FROM agent_purchases") == []
+    [loser] = await database.fetch_all(
+        "SELECT id, state, refusal_reason FROM reap_agentic_purchases WHERE id <> :w", {"w": winner})
+    assert (loser["state"], loser["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
+    # By purchase id, not "the table is empty": other files' parents can be in this table.
+    assert await _agent_purchase_parents(winner) == [] and await _agent_purchase_parents(loser["id"]) == []
 
 
 def test_only_the_decisions_own_keys_are_taken_from_the_request_state():
