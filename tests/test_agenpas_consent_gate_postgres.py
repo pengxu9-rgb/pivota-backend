@@ -1,4 +1,4 @@
-"""The AgenPas consent record's SQL on Postgres (db/agent_purchase_consents.py, migration 289).
+"""The AgenPas consent record's SQL on Postgres (db/agent_purchase_consents.py, migrations 289 and 293).
 
 What only Postgres can show: the module and the migration build the same table; the insert-or-nothing then
 re-select gives one row and says which call wrote it; the page read binds its ids as one jsonb array; the
@@ -15,6 +15,7 @@ THIS MODULE MUST NOT IMPORT `main` (the gate runs every test_*_postgres.py in on
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -108,14 +109,17 @@ async def _checks(database, table: str):
 async def test_the_migration_and_the_module_build_the_same_table(_db):
     database = _db
     twin = "agent_purchase_consents_mig289"
-    sql = (_REPO / "db/migrations/289_agent_purchase_consents.sql").read_text("utf-8")
+    sql = "".join((_REPO / f"db/migrations/{name}.sql").read_text("utf-8") + ";\n" for name in (
+        "289_agent_purchase_consents", "293_agent_purchase_consents_shipping_step"))
     sql = re.sub(r"--[^\n]*", "", sql).replace("agent_purchase_consents", twin)
     await database.execute(f"DROP TABLE IF EXISTS {twin}")
     try:
-        for statement in [s.strip() for s in sql.split(";") if s.strip()]:
-            await database.execute(statement)
+        async with database.transaction():  # 293's SET LOCAL lock_timeout needs one
+            for statement in [s.strip() for s in sql.split(";") if s.strip()]:
+                await database.execute(statement)
         assert await _columns(database, twin) == await _columns(database, "agent_purchase_consents")
         assert await _checks(database, twin) == await _checks(database, "agent_purchase_consents")
+        assert await _check_defs(database, twin) == await _check_defs(database, "agent_purchase_consents")
         index = await database.fetch_one(
             "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = :i",
             {"i": "uq_agent_purchase_consents_step"})
@@ -125,11 +129,140 @@ async def test_the_migration_and_the_module_build_the_same_table(_db):
         await database.execute(f"DROP TABLE IF EXISTS {twin}")
 
 
+async def test_the_boot_heal_widens_a_289_table_keeping_its_rows_then_takes_the_new_step(_db):
+    # Prod's table was built by the boot heal with the 289 CHECK. ensure_agent_purchase_consents_schema (what
+    # db/schema_guard.ensure_required_schema_light runs at every boot, fast mode included) must widen it in place.
+    import db.agent_purchase_consents as consents_db
+
+    database = _db
+    await database.execute("ALTER TABLE agent_purchase_consents DROP CONSTRAINT IF EXISTS ck_agent_purchase_consents_step")
+    await database.execute(
+        f"ALTER TABLE agent_purchase_consents ADD CONSTRAINT ck_agent_purchase_consents_step CHECK ({consents_db._STEP_CHECK_289})")
+    old = [await _record(step="card_binding", epoch=0, rail_purchase_id="rp_" + "b" * 24),
+           await _record(step="approval", epoch=1, rail_purchase_id="rp_" + "b" * 24)]
+    with pytest.raises(Exception):
+        await _record(rail="a2a", step="shipping_address", epoch=0, rail_purchase_id="ap_" + "b" * 24)
+    await consents_db.ensure_agent_purchase_consents_schema()
+    await consents_db.ensure_agent_purchase_consents_schema()  # idempotent: the second run changes nothing
+    rows = await database.fetch_all("SELECT id, step FROM agent_purchase_consents WHERE agent_id = :a", {"a": AGENT})
+    assert sorted((r["id"], r["step"]) for r in rows) == sorted((o[0]["id"], o[0]["step"]) for o in old)
+    row, created = await _record(rail="a2a", step="shipping_address", epoch=0, rail_purchase_id="ap_" + "b" * 24)
+    assert created is True and row["step"] == "shipping_address"
+    with pytest.raises(Exception):
+        await _record(rail="a2a", step="shipping_addresses", epoch=0, rail_purchase_id="ap_" + "c" * 24)
+    step_check = (await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = to_regclass('agent_purchase_consents') "
+        "AND conname = 'ck_agent_purchase_consents_step'"))["def"]
+    assert "'shipping_address'" in step_check and "'card_binding'" in step_check and "'approval'" in step_check
+
+
+async def test_the_migration_widens_a_289_table_with_rows_and_matches_the_heal(_db):
+    database = _db
+    twin = "agent_purchase_consents_mig293"
+    def render(name: str) -> str:
+        sql = re.sub(r"--[^\n]*", "", (_REPO / f"db/migrations/{name}.sql").read_text("utf-8"))
+        return sql.replace("agent_purchase_consents", twin)
+    await database.execute(f"DROP TABLE IF EXISTS {twin}")
+    try:
+        for statement in [s.strip() for s in render("289_agent_purchase_consents").split(";") if s.strip()]:
+            await database.execute(statement)
+        base = dict(agent_id=AGENT, terms_version="t", privacy_version="p", terms_url="https://legal.example/t",
+                    privacy_url="https://legal.example/p", evidence="link_holder_on_pivota_page",
+                    offer_issued_at=datetime.now(timezone.utc))
+        insert = (f"INSERT INTO {twin} (id, rail, rail_purchase_id, agent_id, step, approval_epoch, terms_version, "
+                  "privacy_version, terms_url, privacy_url, evidence, offer_issued_at) VALUES (:id, :rail, :rp, "
+                  ":agent_id, :step, :epoch, :terms_version, :privacy_version, :terms_url, :privacy_url, :evidence, "
+                  ":offer_issued_at)")
+        await database.execute(insert, dict(base, id="pcn_old_1", rail="reap", rp="rp_old", step="card_binding", epoch=0))
+        await database.execute(insert, dict(base, id="pcn_old_2", rail="reap", rp="rp_old", step="approval", epoch=1))
+        for _ in range(2):  # the migration is idempotent
+            async with database.transaction():
+                for statement in [s.strip() for s in render("293_agent_purchase_consents_shipping_step").split(";")
+                                  if s.strip()]:
+                    await database.execute(statement)
+        assert [r["id"] for r in await database.fetch_all(f"SELECT id FROM {twin} ORDER BY id")] == ["pcn_old_1", "pcn_old_2"]
+        await database.execute(insert, dict(base, id="pcn_new_1", rail="a2a", rp="ap_new", step="shipping_address", epoch=0))
+        assert await _check_defs(database, twin) == await _check_defs(database, "agent_purchase_consents")
+    finally:
+        await database.execute(f"DROP TABLE IF EXISTS {twin}")
+
+
+async def _check_defs(database, table: str):
+    """(constraint name with the table name replaced, its definition), sorted: definitions, not only names."""
+    rows = await database.fetch_all(
+        "SELECT replace(c.conname, :t, 'T') AS name, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
+        "WHERE c.conrelid = to_regclass(:t) ORDER BY 1", {"t": table})
+    return [(r["name"], r["def"]) for r in rows]
+
+
 async def test_the_heal_is_idempotent(_db):
     import db.agent_purchase_consents as consents_db
 
     await consents_db.ensure_agent_purchase_consents_schema()
     await consents_db.ensure_agent_purchase_consents_schema()
+
+
+async def _step_check(database) -> str:
+    return (await database.fetch_one(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = to_regclass('agent_purchase_consents') "
+        "AND conname = 'ck_agent_purchase_consents_step'"))["def"]
+
+
+@pytest.mark.parametrize("widened", [True, False], ids=["already_widened", "not_widened"])
+async def test_the_heal_defers_within_its_lock_timeout_behind_an_access_exclusive_holder(_db, widened):
+    # The guard's own catalog check (pg_get_constraintdef on a CHECK) takes ACCESS SHARE on the table: with the
+    # lock_timeout set only inside the branch, a no-op heal waited without bound behind an ACCESS EXCLUSIVE
+    # holder (or a queued ALTER). schema_guard.guarded_ddl now sets it as the block's first statement.
+    import asyncpg
+    import time
+
+    import db.agent_purchase_consents as consents_db
+    from db.schema_guard import HEAL_LOCK_TIMEOUT
+
+    database = _db
+    assert HEAL_LOCK_TIMEOUT == "500ms"
+    if not widened:
+        await database.execute("ALTER TABLE agent_purchase_consents DROP CONSTRAINT IF EXISTS ck_agent_purchase_consents_step")
+        await database.execute(f"ALTER TABLE agent_purchase_consents ADD CONSTRAINT ck_agent_purchase_consents_step "
+                               f"CHECK ({consents_db._STEP_CHECK_289})")
+    before = await _step_check(database)
+    assert ("'shipping_address'" in before) is widened
+    holder = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1))
+    try:
+        hold = holder.transaction()
+        await hold.start()
+        await holder.execute("LOCK TABLE agent_purchase_consents IN ACCESS EXCLUSIVE MODE")
+        started = time.monotonic()
+        # Bounded by the test too, so a regression fails here instead of hanging the gate.
+        await asyncio.wait_for(consents_db.ensure_agent_purchase_consents_schema(), timeout=5)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, elapsed  # one 500 ms lock wait, then deferred (logged, not raised)
+        await hold.rollback()
+    finally:
+        await holder.close()
+    assert await _step_check(database) == before  # deferred: nothing changed, the 289 CHECK still in place
+    await consents_db.ensure_agent_purchase_consents_schema()  # the next boot, the holder gone
+    assert "'shipping_address'" in await _step_check(database)
+
+
+async def test_the_guard_gives_a_callers_transaction_its_own_lock_timeout_back(_db):
+    # The block sets its 500 ms first (P2-1) and puts the caller's value back last: inside a caller's
+    # transaction nothing leaks, whether the guard found nothing to do or ran its DDL.
+    import db.agent_purchase_consents as consents_db
+    from db.schema_guard import guarded_ddl
+
+    database = _db
+    no_op = guarded_ddl("agent_purchase_consents", consents_db._STEP_CHECK_WIDENED, consents_db._WIDEN_STEP_CHECK_DDL)
+    ran = guarded_ddl("agent_purchase_consents", "true", "PERFORM 1;")
+    async with database.transaction():
+        await database.execute("SET LOCAL lock_timeout = '7s'")
+        for statement in (no_op, ran):
+            await database.execute(statement)
+            assert (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"] == "7s"
+    async with database.transaction():
+        before = (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"]
+        await database.execute(ran)
+        assert (await database.fetch_one("SHOW lock_timeout"))["lock_timeout"] == before != "500ms"
 
 
 async def test_a_double_write_is_one_row_and_the_reselect_names_the_winner(_db):

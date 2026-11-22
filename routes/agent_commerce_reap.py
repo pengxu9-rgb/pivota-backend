@@ -210,6 +210,9 @@ _REFUSAL_STATUS: Dict[str, int] = {
     # middleware wraps these in.
     "invalid_request": 400,
     "invalid_address": 400,
+    # The A2A door's market refusals (services/payment_orchestration/a2a_shipping_address).
+    "shipping_country_unsupported": 400,
+    "shipping_market_unknown": 400,
     "invalid_return_url": 400,
     "currency_unsupported": 400,
     # An offer code Reap's field cannot carry (empty, whitespace only, over 128 characters, a

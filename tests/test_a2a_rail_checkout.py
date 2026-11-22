@@ -82,6 +82,8 @@ def _dials(monkeypatch):
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
     monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "1")
+    # Shipping capture is the read dial AND both steps (a2a_shipping_address.capture_enabled): on with them here.
+    monkeypatch.setenv("AGENPAS_INTERNAL_READ_ENABLED", "1")
     # The rail's own per-currency cap (the create route needs it set; the ceiling must fit it too).
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000")
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(HOST.encode()).hexdigest()}))
@@ -134,8 +136,15 @@ def _visa_page(token="ptk_1"):
 
 
 def _network_token(**over):
-    return {"brand": "Visa", "eci": "05", "cryptogram": CRYPTO, "expiryDate": "1129", "value": DPAN,
-            a2a_rail.DAVV_FIELD: DAVV, **over}
+    """The provider's documented token-result `networkToken` (11-19): the DAVV in `cvv`, marked by
+    dynamicDataType "DAVV", an empty cryptogram and no ECI. Placeholder DPAN and DAVV."""
+    return {"brand": "visa", "value": DPAN, "expiryDate": "1129", "cvv": DAVV, "cryptogram": "", "eci": None,
+            "dynamicDataType": "DAVV", **over}
+
+
+#: The older shape, with a cryptogram (the TAVV) and an ECI: neither is ever sent, the cryptogram never as cvv.
+def _network_token_with_cryptogram(**over):
+    return _network_token(cryptogram=CRYPTO, eci="05", **over)
 
 
 def _token_result(token="ptk_1", status="ACTIVE", network_token=None, brand="visa"):
@@ -656,8 +665,23 @@ async def test_an_approved_token_that_cannot_make_a_card_fails_without_a_setup(a
     assert (await _row(pid))["last_error_code"] == code
 
 
+async def _set_address(pid, address):
+    cast = "CAST(:a AS JSONB)" if IS_POSTGRES else ":a"
+    await database.execute(f"UPDATE a2a_rail_purchases SET shipping_address = {cast} WHERE id = :i",
+                           {"a": json.dumps(address, sort_keys=True) if address is not None else None, "i": pid})
+
+
+@pytest.mark.usefixtures("consent_gate_on")
 async def test_an_incomplete_contact_mints_no_token_at_all():
-    pid = await _locked({k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    # Incomplete from the start: parked in `opened`, NOTHING sent (AgenPas asks the buyer for the address).
+    pid = await _open({k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert rail.sent == [] and (await _row(pid))["state"] == "opened"
+    # Incomplete only after the card step (an edited row): still never minted, and failed as before.
+    await database.execute("DELETE FROM a2a_rail_purchases")
+    pid = await _locked()
+    await _set_address(pid, {k: v for k, v in ADDRESS.items() if k != "postalCode"})
     rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
     assert await _step(rail, pid) == "failed"
     assert rail.sent == []
@@ -1279,7 +1303,7 @@ def _echo_result(order_id="1001"):
 
 
 async def test_the_relay_scrubs_the_tokens_own_values_from_an_echoing_confirm_card():
-    provider = _Provider(_token_result(), ECHO_CONFIRM)
+    provider = _Provider(_token_result(network_token=_network_token_with_cryptogram()), ECHO_CONFIRM)
     relay = await _relay(provider)
     confirm = relay.checkout.card("checkout.confirm")
     assert confirm is not None and "confirm" in confirm.action_ids()
@@ -1907,12 +1931,13 @@ async def _held_text_only():
     return pid
 
 
-async def _operator(*argv):
+async def _operator(*argv, client=None):
+    """resolve-held / list-held with NO rail client configured (None) unless a fake one is given."""
     import io
     import jobs.a2a_rail_operator as operator
 
     out = io.StringIO()
-    code = await operator.run(list(argv), out=out)
+    code = await operator.run(list(argv), out=out, client=client)
     return code, [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
 
 
@@ -2201,7 +2226,8 @@ async def test_the_prose_scrub_never_removes_an_expiry_from_inside_an_amount():
     # In card context the expiry is still scrubbed, and so are the token's value and cryptogram anywhere.
     answer = _task({"kind": "text", "text": f"Card {DPAN} exp {EXPIRY_RAW} ({CRYPTO}). Total: $51.49"},
                    _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
-    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token_with_cryptogram()), answer),
+                         setup=_setup(ceiling_minor=TOTAL))
     assert relay.checkout.text_amounts_refused is False
 
 
@@ -2348,8 +2374,6 @@ async def test_a_davv_under_its_own_field_is_scrubbed_from_the_setup_answer_as_a
     assert (relay.checkout.credential_fields_stripped >= 1) is refused
     data = relay.checkout.card("checkout.confirm").data
     assert "715" not in [v for v in data.values() if isinstance(v, str)] or not refused
-
-
 
 
 # ── scan v8: the confirm card is a strict allowlist that fails closed (checkout_amounts rules 1, 2) ──
@@ -2896,9 +2920,13 @@ async def test_the_worker_fails_closed_as_davv_missing_before_anything_reaches_t
 
 
 async def test_the_card_is_exactly_the_five_normal_card_keys_and_never_the_cryptogram_or_eci():
-    card = a2a_rail.checkout_card_from_network_token(_network_token(), brand="visa", name="Pat Example")
+    # THE ONE CASE with a non-empty cryptogram and an ECI ("05"): neither is sent, the cryptogram never as cvv.
+    token = _network_token_with_cryptogram()
+    assert (token["cryptogram"], token["eci"]) == (CRYPTO, "05")
+    card = a2a_rail.checkout_card_from_network_token(token, brand="visa", name="Pat Example")
     assert card == {"number": DPAN, "expiry": "11/29", "cvv": DAVV, "name": "Pat Example", "brand": "visa"}
-    provider = _Provider(_token_result(), CONFIRM_CARD)
+    assert a2a_rail.davv_from_network_token({**token, "cvv": None}) is None  # no fallback to the cryptogram
+    provider = _Provider(_token_result(network_token=token), CONFIRM_CARD)
     await _relay(provider)
     setup = provider.sent()[1]["payload"]
     assert set(setup["card"]) == {"number", "expiry", "cvv", "name", "brand"}
@@ -2997,14 +3025,29 @@ def _lookup_only(rail, pid):
 
 
 @pytest.mark.parametrize("code,pending", LOOKUP_HOLDS, ids=[c for c, _ in LOOKUP_HOLDS])
-async def test_a_lookup_that_finds_the_result_completes_on_a_verified_total(code, pending):
-    pid = await _held(code, pending=pending)
+async def test_a_lookup_that_finds_our_own_tasks_result_completes_on_a_verified_total(code, pending):
+    # Condition 6: a BOUND task (recorded from our own confirm answer) keeps the current rules.
+    pid = await _held(code, pending=pending, task="ckout_abc123")
     rail = Rail().on("checkout.lookup#submit", _checkout_result())
     assert await _step(rail, pid) == "completed"
     _lookup_only(rail, pid)
     row = await _row(pid)
     assert (row["state"], row["merchant_order_id"], row["checkout_task_id"], row["pending_write"]) == (
         "completed", "1001", "ckout_abc123", None)
+
+
+@pytest.mark.parametrize("code,pending", LOOKUP_HOLDS, ids=[c for c, _ in LOOKUP_HOLDS])
+async def test_an_unbound_completed_lookup_answer_never_completes_and_is_held_as_payment_reached(code, pending):
+    # N1, conditions 1 and 2: a completed, successful answer with a verified total on a task this row never
+    # recorded: no completion, no order id, no total, no task; the hold moves to the payment-reached set.
+    pid = await _held(code, pending=pending)
+    rail = Rail().on("checkout.lookup#submit", _checkout_result())
+    assert await _step(rail, pid) == worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED
+    _lookup_only(rail, pid)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["merchant_order_id"], row["final_total_minor"],
+            row["checkout_task_id"], row["pending_write"], row["terminal_at"]) == (
+        "paying", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, None, None, None, pending, None)
 
 
 @pytest.mark.parametrize("answer", [
@@ -3147,7 +3190,7 @@ async def test_a_lookup_result_with_another_task_or_an_unverified_total_stays_he
     pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_other")
     assert await _step(Rail().on("checkout.lookup#submit", _checkout_result()), pid) == worker.CHECKOUT_TASK_MISMATCH
     await database.execute("DELETE FROM a2a_rail_purchases")
-    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_abc123")
     rail = Rail().on("checkout.lookup#submit", _checkout_result(total="€51.49"))
     assert await _step(rail, pid) == worker.CHECKOUT_TOTAL_UNVERIFIED  # a held code stays held
     assert (await _row(pid))["state"] == "paying"
@@ -3382,21 +3425,6 @@ async def test_the_scrubbed_confirm_answer_hold_notes_its_task_id_and_keeps_the_
         "ckout_abc123", worker.CHECKOUT_CONFIRM_ACTION, worker.CHECKOUT_ANSWER_SCRUBBED)
 
 
-async def test_the_adopt_write_needs_no_task_yet_and_only_a_checkout_write_pending():
-    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_known")
-    [_row_claimed] = [r for r in await ledger.claim_due_purchases(W, limit=5) if r["id"] == pid] or [None] * 1
-    await _ago("next_poll_at", 1, pid)
-    await ledger.claim_due_purchases(W, limit=5)
-    assert await ledger.adopt_checkout_task_as_holder(pid, W, checkout_task_id="ckout_other") is None  # M10
-    await database.execute("UPDATE a2a_rail_purchases SET checkout_task_id = NULL, pending_write = :p WHERE id = :i",
-                           {"p": "payment.token-setup#submit", "i": pid})
-    assert await ledger.adopt_checkout_task_as_holder(pid, W, checkout_task_id="ckout_other") is None  # M11
-    await database.execute("UPDATE a2a_rail_purchases SET pending_write = :p WHERE id = :i",
-                           {"p": worker.CHECKOUT_CONFIRM_ACTION, "i": pid})
-    adopted = await ledger.adopt_checkout_task_as_holder(pid, W, checkout_task_id="ckout_other")
-    assert adopted is not None and (adopted["checkout_task_id"], adopted["pending_write"]) == ("ckout_other", None)
-
-
 @pytest.mark.parametrize("token", [{"value": "４" * 16}, {"expiryDate": "11٢٩"}, {"value": "٤" * 16}],
                          ids=["fullwidth_dpan", "arabic_expiry", "arabic_dpan"])
 def test_the_dpan_and_expiry_take_ascii_digits_only(token):
@@ -3457,10 +3485,668 @@ async def test_after_the_confirm_a_code_in_other_digits_is_folded_and_held():
     assert await _step(Rail().on("checkout.await#poll", poll), pid) == worker.CHECKOUT_ANSWER_SCRUBBED
 
 
-async def test_an_unbound_not_submitted_status_without_success_false_goes_through_the_result_rules():
-    # Only a not-submitted status WITH success false is diverted; a contradictory one ("form-error", success true)
-    # is read by the ordinary rules: held as unrecognised, never failed.
-    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+async def test_a_bound_not_submitted_status_without_success_false_goes_through_the_result_rules():
+    # A contradictory answer ("form-error", success true) on OUR task: held as unrecognised, never failed.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_B")
     answer = _checkout_result("form-error", task="ckout_B", success=True, order_id=None, total=None)
     assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == worker.CHECKOUT_RESULT_UNRECOGNISED
     assert (await _row(pid))["state"] == "paying"
+
+
+# ── N1 closed by "no unbound completion" (the provider's lookup answer, 11-19) ─────────────────
+
+def _documented_result(*, task="ckout_abc123", state="completed", success=True, result_status="payment-reached",
+                       total="$51.49", currency="USD", order_id="1001", **extra):
+    """A lookup answer with the provider's documented field set (11-19), placeholder values: in any state
+    task_id, state, card_last4; on completed / failed also success, result_status, total, currency, subtotal,
+    shipping_fee, tax, errors, order_id, duration_ms. It echoes nothing we sent."""
+    data = {"task_id": task, "state": state, "card_last4": "4399", "success": success, "result_status": result_status,
+            "total": total, "currency": currency, "subtotal": "$45.00", "shipping_fee": "$4.49", "tax": "$2.00",
+            "errors": [], "order_id": order_id, "duration_ms": 41000, **extra}
+    return _task(_card("checkout.result", {k: v for k, v in data.items() if v is not None}))
+
+
+#: Unbound answers that say the checkout completed or succeeded (condition 2): payment-reached hold.
+UNBOUND_DONE = {
+    "documented_completed_success": _documented_result(),
+    "success_true_only": _task(_card("checkout.result", {"task_id": "ckout_B", "success": True})),
+    "result_status_payment_reached": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "payment-reached"})),
+    "result_status_completed": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "completed"})),
+    "state_paid": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "paid"})),
+    "status_captured": _task(_card("checkout.result", {"task_id": "ckout_B", "status": "captured"})),
+    "status_paid_punctuated": _task(_card("checkout.result", {"task_id": "ckout_B", "status": "Paid."})),
+    "await_state_captured": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "captured"})),
+    "over_the_ceiling_success": _documented_result(task="ckout_B", total="$999.00"),
+    "other_currency_success": _documented_result(task="ckout_B", currency="EUR"),
+}
+#: Unbound answers that do not (the hold stays exactly as it was).
+UNBOUND_NOT_DONE = {
+    "documented_failed_form_error": _documented_result(state="failed", success=False, result_status="form-error",
+                                                       order_id=None, total=None),
+    "result_status_timeout": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "timeout"})),
+    "result_status_unpaid": _task(_card("checkout.result", {"task_id": "ckout_B", "result_status": "unpaid",
+                                                            "success": False})),
+    "await_running": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "running"})),
+    "state_failed": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "failed", "success": False})),
+    # `state` is the task's lifecycle: "completed" alone is not done (a finished task that placed nothing).
+    "state_completed_alone": _task(_card("checkout.result", {"task_id": "ckout_B", "state": "completed"})),
+    "await_state_completed_alone": _task(_card("checkout.await", {"task_id": "ckout_B", "state": "completed"})),
+    "documented_completed_but_not_submitted": _documented_result(task="ckout_B", state="completed", success=False,
+                                                                  result_status="form-error", order_id=None,
+                                                                  total=None),
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNBOUND_DONE))
+async def test_an_unbound_answer_that_says_completed_or_success_is_held_as_payment_reached_and_never_resolvable(name):
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    assert await _step(Rail().on("checkout.lookup#submit", UNBOUND_DONE[name]), pid) == (
+        worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["merchant_order_id"], row["final_total_minor"],
+            row["checkout_task_id"], row["pending_write"]) == (
+        "paying", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, None, None, None, worker.CHECKOUT_CONFIRM_ACTION)
+    assert worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED in worker._CHECKOUT_PAYMENT_REACHED_CODES
+    assert worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED in worker._CHECKOUT_HOLD_CODES
+    assert worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED not in worker._OPERATOR_RESOLVABLE_HOLD_CODES
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600, pid)
+    expected = ("resolve-held", "--purchase-id", pid, "--expected-code", worker.CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
+    code_, [result] = await _operator(*expected, "--apply", "--operator", "ops-1", "--expect-env", "staging",
+                                      "--provider-checked")
+    assert (code_, result["outcome"], result["reason"]) == (3, "refused", "payment_reached_recorded")
+    assert (await _row(pid))["state"] == "paying"
+
+
+@pytest.mark.parametrize("name", sorted(UNBOUND_NOT_DONE))
+@pytest.mark.parametrize("code,pending", LOOKUP_HOLDS[:2], ids=[c for c, _ in LOOKUP_HOLDS[:2]])
+async def test_any_other_unbound_answer_keeps_the_hold_exactly_as_it_was(name, code, pending):
+    pid = await _held(code, pending=pending)
+    assert await _step(Rail().on("checkout.lookup#submit", UNBOUND_NOT_DONE[name]), pid) == "checkout_held"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["merchant_order_id"], row["final_total_minor"],
+            row["checkout_task_id"], row["pending_write"], row["terminal_at"]) == (
+        "paying", code, None, None, None, pending, None)
+
+
+def test_every_payment_reached_code_is_refused_by_the_operator_test():
+    # Condition 3: the operator refusal test (preview and --apply --provider-checked) covers EVERY payment-reached
+    # code, so a new one cannot be added without it.
+    cases = next(m for m in test_the_operator_never_marks_a_recorded_payment_not_charged.pytestmark
+                 if m.name == "parametrize").args[1]
+    assert set(cases) == worker._CHECKOUT_PAYMENT_REACHED_CODES
+
+
+#: Condition 5: the documented full field set on OUR task (unknown fields ignored, never stored).
+BOUND_DOCUMENTED = {
+    "completes": (_documented_result(), "completed"),
+    "status_key_alone": (_task(_card("checkout.result", {"task_id": "ckout_abc123", "status": "payment-reached",
+                                                         "success": True, "total": "$51.49", "order_id": "1001"})),
+                         "completed"),
+    "over_the_ceiling": (_documented_result(total="$51.50"), worker.CHECKOUT_TOTAL_OVER_APPROVED),
+    "other_currency": (_documented_result(currency="EUR"), worker.CHECKOUT_TOTAL_UNVERIFIED),
+    "other_currency_lower_case": (_documented_result(currency="cad"), worker.CHECKOUT_TOTAL_UNVERIFIED),
+    "usd_lower_case": (_documented_result(currency="usd"), "completed"),
+    # (either one alone would decide differently: payment-reached completes, the other is unrecognised)
+    "status_and_result_status_disagree": (_documented_result(status="payment-reached", result_status="queued-elsewhere"),
+                                          worker.CHECKOUT_RESULT_UNRECOGNISED),
+    "failed_form_error": (_documented_result(state="failed", success=False, result_status="form-error",
+                                             order_id=None, total=None), "failed"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BOUND_DOCUMENTED))
+async def test_a_bound_answer_with_the_documented_field_set_follows_the_result_rules(name):
+    answer, outcome = BOUND_DOCUMENTED[name]
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_abc123")
+    assert await _step(Rail().on("checkout.lookup#submit", answer), pid) == outcome
+    row = await _row(pid)
+    if outcome == "completed":
+        assert (row["merchant_order_id"], row["final_total_minor"]) == ("1001", TOTAL)
+    else:
+        assert row["merchant_order_id"] is None and row["final_total_minor"] is None
+    # card_last4, subtotal, shipping_fee, duration_ms: never a stored value (compared whole, or JSON-quoted
+    # inside a JSON column: a random id may contain "4399" by chance).
+    stored = await _stored_text()
+    values = [str(v) for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")
+              for v in dict(r).values() if v is not None]
+    for needle in ("4399", "41000"):
+        assert needle not in values and f'"{needle}"' not in stored.replace('\\"', '"'), needle
+    for needle in ("$45.00", "$4.49"):
+        assert needle not in stored, needle
+
+
+def _held_row_for_preview(pid):
+    return database.fetch_one("SELECT * FROM a2a_rail_purchases WHERE id = :i", {"i": pid})
+
+
+async def _preview_lookup(pid, answer, code="checkout_confirm_unresolved"):
+    import io
+    import jobs.a2a_rail_operator as operator
+
+    rail = Rail().on("checkout.lookup#submit", answer)
+    out = io.StringIO()
+    exit_code = await operator.run(["resolve-held", "--purchase-id", pid, "--expected-code", code, "--lookup"],
+                                   out=out, client=_client(rail))
+    return exit_code, json.loads(out.getvalue()), rail
+
+
+async def test_resolve_held_shows_an_unbound_answers_safe_fields_labelled_and_stores_nothing():
+    # Condition 4: read at preview time, never persisted; never card_last4 or the order id.
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    before = dict(await _held_row_for_preview(pid))
+    code_, preview, rail = await _preview_lookup(pid, _documented_result(task="ckout_B"))
+    assert code_ == 3 and preview["outcome"] == "dry_run"
+    assert preview["lookup"] == {
+        "ran": True, "found": True, "bound": False, "says_done": True,
+        "label": "UNBOUND: this answer may belong to another purchase; not verified as ours",
+        "fields": {"state": "completed", "result_status": "payment-reached", "total": "$51.49", "currency": "USD",
+                   "task_id": "ckout_B"}}
+    assert worker.CHECKOUT_LOOKUP_UNBOUND_LABEL == preview["lookup"]["label"]
+    _lookup_only(rail, pid)
+    text = json.dumps(preview, default=str)
+    assert "4399" not in text and '"1001"' not in text  # never card_last4, never the order id
+    assert dict(await _held_row_for_preview(pid)) == before  # nothing written, not even the lookup count
+
+
+async def test_resolve_held_labels_an_answer_for_the_recorded_task_bound():
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task="ckout_abc123")
+    _, preview, _ = await _preview_lookup(pid, _documented_result())
+    assert (preview["lookup"]["bound"], preview["lookup"]["label"]) == (True, worker.CHECKOUT_LOOKUP_BOUND_LABEL)
+    _, preview, _ = await _preview_lookup(pid, _documented_result(task="ckout_B"))
+    assert (preview["lookup"]["bound"], preview["lookup"]["label"]) == (False, worker.CHECKOUT_LOOKUP_UNBOUND_LABEL)
+
+
+async def test_resolve_held_lookup_runs_only_when_asked_and_never_with_the_dial_off(monkeypatch):
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    code_, [preview] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code",
+                                       "checkout_confirm_unresolved")
+    assert "lookup" not in preview  # no --lookup: nothing sent
+    monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0")
+    _, preview, rail = await _preview_lookup(pid, _documented_result())
+    assert preview["lookup"] == {"ran": False, "reason": "the checkout dial is off"} and rail.sent == []
+
+
+async def test_resolve_held_lookup_withholds_a_card_shaped_task_id_and_shows_nothing_of_an_echo():
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION)
+    _, preview, _ = await _preview_lookup(pid, _documented_result(task="4222222222222"))
+    assert "task_id" not in preview["lookup"]["fields"]
+    _, preview, _ = await _preview_lookup(pid, _task({"kind": "text", "text": "cvv 715"},
+                                                      _card("checkout.result", {"task_id": "ckout_B"})))
+    assert preview["lookup"] == {"ran": True, "found": False, "answer_scrubbed": True}
+
+
+# ── the buyer's shipping address, asked for when the agent did not send it (AgenPas) ───────────
+
+from services.payment_orchestration import a2a_shipping_address as shipping_capture  # noqa: E402
+from services.payment_orchestration import purchase_view as unified_view  # noqa: E402
+
+OWNER = "h" * 64
+
+
+@pytest.fixture
+def consent_gate_on(monkeypatch):
+    """Shipping capture needs its own dial, the AgenPas consent gate on and a consent that can be given
+    (a2a_shipping_address.capture_enabled). Test values."""
+    for name, value in {
+        "A2A_SHIPPING_CAPTURE_ENABLED": "1", "AGENPAS_CONSENT_GATE": "1", "AGENPAS_CONSENT_WRITE_ENABLED": "1",
+        "AGENPAS_TERMS_URL": "https://legal.example/terms", "AGENPAS_TERMS_VERSION": "terms-test",
+        "AGENPAS_PRIVACY_URL": "https://legal.example/privacy", "AGENPAS_PRIVACY_VERSION": "privacy-test",
+        "AGENPAS_CONSENT_OFFER_SECRET": "offer_secret_for_capture_tests_0123456789",
+        "AGENPAS_INTERNAL_CONSENT_KEY": "agenpas_consent_key_for_capture_tests_0123",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+async def _open_without(*, email=None, address=None):
+    row = await ledger.create_purchase(
+        agent_id="agent_w", agent_user_ref_hash=OWNER, merchant_domain="merchant.example",
+        checkout_url="https://merchant.example/cart/40000000001:1", currency="USD", our_price_minor=4650,
+        buyer_email=email, shipping_address=address)
+    return row["id"]
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_a_checkout_purchase_without_its_contact_parks_sending_nothing():
+    pid = await _open_without()
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    row = await _row(pid)
+    assert rail.sent == []  # not even the card read
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("opened", worker.SHIPPING_ADDRESS_REQUIRED, None)
+    assert (row["buyer_action_kind"], row["buyer_action_url"]) == (None, None)
+    created, deadline = row["created_at"], row["buyer_action_expires_at"]
+    assert abs((deadline - created).total_seconds() - worker.SHIPPING_ADDRESS_SECONDS) < 5
+    # A second park never moves the deadline.
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert (await _row(pid))["buyer_action_expires_at"] == deadline
+
+
+#: Every dial capture needs (a2a_shipping_address.capture_enabled), as (env, how it is turned off).
+CAPTURE_DIALS_OFF = {
+    "gate": ("AGENPAS_CONSENT_GATE", None),
+    "capture_dial": ("A2A_SHIPPING_CAPTURE_ENABLED", "0"),
+    "checkout_step": (a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0"),
+    "token_step": (worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "0"),
+    "consent_write": ("AGENPAS_CONSENT_WRITE_ENABLED", "0"),
+    "consent_key": ("AGENPAS_INTERNAL_CONSENT_KEY", None),
+    "terms_config": ("AGENPAS_TERMS_URL", None),
+    "read_dial": ("AGENPAS_INTERNAL_READ_ENABLED", "0"),
+}
+
+
+@pytest.mark.parametrize("parked", [True, False], ids=["parked", "not_yet_parked"])
+@pytest.mark.parametrize("dial", sorted(CAPTURE_DIALS_OFF))
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_a_dial_turned_off_while_a_purchase_waits_ends_it_before_any_rail_call(monkeypatch, dial, parked):
+    pid = await _open_without()
+    if parked:
+        assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    name, value = CAPTURE_DIALS_OFF[dial]
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert shipping_capture.capture_enabled() is False
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, pid) == "expired"
+    assert rail.sent == []  # no card read, no binding: the contact can never arrive now
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["payment_method_id"], row["buyer_action_kind"]) == (
+        "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None, None)
+    assert (row["buyer_email"], row["shipping_address"]) == (None, None)  # a terminal write drops the contact
+    assert worker.SHIPPING_ADDRESS_NOT_COLLECTED == shipping_capture.SHIPPING_ADDRESS_NOT_COLLECTED == (
+        "shipping_address_not_collected")  # the shipping write's 409 code
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_with_capture_off_only_an_absent_part_ends_the_purchase(monkeypatch):
+    monkeypatch.setenv("A2A_SHIPPING_CAPTURE_ENABLED", "0")
+    # The door with capture off takes a purchase whole (both parts present): an address without a region,
+    # say, goes on exactly as before, to the card read.
+    whole = await _open_without(email=EMAIL, address={k: v for k, v in ADDRESS.items() if k != "region"})
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, whole) != "expired"
+    assert rail.actions()[0] == "payment.method-view#submit"
+    assert (await _row(whole))["state"] != "expired"
+    # An absent email (only the capture door opens one) ends it.
+    emailless = await _open_without(address=ADDRESS)
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, emailless) == "expired" and rail.sent == []
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
+    # The park's "the contact landed meanwhile" check counts an address that is still exactly the incomplete
+    # one the worker read as absent (THE waiting rule): the row parks with its deadline, it is not made due at
+    # once, and a second park keeps the same deadline.
+    partial = {k: v for k, v in ADDRESS.items() if k != "region"}
+    pid = await _open_without(email=EMAIL, address=partial)
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("opened", worker.SHIPPING_ADDRESS_REQUIRED)
+    deadline = row["buyer_action_expires_at"]
+    assert deadline is not None
+    assert pid not in [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)]  # not due at once
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert (await _row(pid))["buyer_action_expires_at"] == deadline
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
+    assert shipping_capture.fields_missing(None, None) == [
+        "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode", "country"]
+    assert shipping_capture.fields_missing(None, ADDRESS) == ["email"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == ["region"]
+    assert shipping_capture.fields_missing(EMAIL, ADDRESS) == []
+    # An address alone still waits for the email: the card binding needs it before anything is sent.
+    pid = await _open_without(address=ADDRESS)
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED and rail.sent == []
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_past_its_deadline_a_waiting_purchase_expires_and_its_contact_is_gone():
+    pid = await _open_without(email=EMAIL)
+    await _ago("created_at", worker.SHIPPING_ADDRESS_SECONDS + 5, pid)
+    assert await _step(Rail(), pid) == "expired"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["buyer_email"]) == ("expired", worker.SHIPPING_ADDRESS_EXPIRED, None)
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_the_expiry_sweep_names_a_passed_shipping_address_deadline():
+    pid = await _open_without()
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    await _ago("buyer_action_expires_at", 5, pid)
+    assert await ledger.expire_overdue_purchases() >= 1
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("expired", ledger.SHIPPING_ADDRESS_EXPIRED_CODE)
+    # Any other passed deadline keeps its own code.
+    other = await _open()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'bound_sent:1' WHERE id = :i", {"i": other})
+    await _ago("buyer_action_expires_at", 5, other)
+    await ledger.expire_overdue_purchases()
+    assert (await _row(other))["last_error_code"] == "buyer_action_expired"
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_the_submitted_contact_fills_only_an_empty_part_and_makes_the_row_due():
+    pid = await _open_without()
+    assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    moved = await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS)
+    assert moved is not None
+    assert (moved["buyer_email"], moved["shipping_address"]) == (EMAIL, ADDRESS)
+    assert (moved["last_error_code"], moved["buyer_action_expires_at"]) == (None, None)
+    # Due at once: the next claim takes it, and the purchase goes on to the card step.
+    assert [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)] == [pid]
+    await ledger.release_claim(pid, W)
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA)), pid) == "method_ready"
+    # Nothing waits any more: the same contact again changes nothing (the route answers it 200), another one
+    # is never written over it.
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    other = {**ADDRESS, "addressLine1": "2 Other St"}
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=other) is None
+    assert (await _row(pid))["shipping_address"] == ADDRESS
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_a_stored_part_is_never_overwritten_and_another_owner_never_writes():
+    pid = await _open_without(email=EMAIL)
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email="other@example.test",
+                                                shipping_address=ADDRESS) is None  # a different email
+    assert await ledger.submit_shipping_address(pid, "agent_other", OWNER, buyer_email=None,
+                                                shipping_address=ADDRESS) is None  # another agent
+    assert await ledger.submit_shipping_address(pid, "agent_w", "g" * 64, buyer_email=None,
+                                                shipping_address=ADDRESS) is None  # another buyer
+    # The stored email may be left out, or sent again in another case.
+    moved = await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL.upper(), shipping_address=ADDRESS)
+    assert moved is not None and moved["buyer_email"] == EMAIL
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_two_submits_at_once_write_exactly_one_contact():
+    pid = await _open_without()
+    first, second = {**ADDRESS, "addressLine1": "1 First St"}, {**ADDRESS, "addressLine1": "2 Second St"}
+    results = await asyncio.gather(
+        ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=first),
+        ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=second))
+    assert sum(r is not None for r in results) == 1
+    winner = next(r for r in results if r is not None)
+    assert (await _row(pid))["shipping_address"] == winner["shipping_address"]
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_a_row_that_does_not_wait_takes_no_contact():
+    pid = await _open_without()
+    await _ago("buyer_action_expires_at", 5, pid)  # the deadline passed (the sweep not yet run)
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    purged = await _open_without(email=EMAIL)
+    await database.execute("UPDATE a2a_rail_purchases SET contact_purged_at = CURRENT_TIMESTAMP WHERE id = :i", {"i": purged})
+    assert await ledger.submit_shipping_address(purged, "agent_w", OWNER, buyer_email=None, shipping_address=ADDRESS) is None
+    # Complete already (still `opened`, the worker about to read the cards): nothing waits, nothing is touched.
+    complete = await _open_without(email=EMAIL, address=ADDRESS)
+    before = await _row(complete)
+    assert await ledger.submit_shipping_address(complete, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+    assert (await _row(complete))["next_poll_at"] == before["next_poll_at"]
+    moved_on = await _open_without()
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'quoting' WHERE id = :i", {"i": moved_on})
+    assert await ledger.submit_shipping_address(moved_on, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS) is None
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_the_park_written_after_the_contact_landed_makes_the_row_due_at_once():
+    pid = await _open_without()
+    [row] = [r for r in await ledger.claim_due_purchases(W, limit=5) if r["id"] == pid]
+    # The gateway's write lands while the worker holds the row (between its read and its park).
+    assert await ledger.submit_shipping_address(pid, "agent_w", OWNER, buyer_email=EMAIL, shipping_address=ADDRESS)
+    parked = await ledger.park_for_shipping_address_as_holder(
+        pid, W, expires_at=worker._later(1800), next_poll_at=worker._later(600))
+    assert parked is not None and parked["claimed_by"] is None
+    assert [r["id"] for r in await ledger.claim_due_purchases(W, limit=5)] == [pid]
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_with_the_checkout_path_off_an_emailless_purchase_ends_before_any_rail_call(monkeypatch):
+    # Only the door with capture on opens an email-less row; with the checkout path off capture is off, the
+    # gateway's write refuses, and the email can never arrive: ended, nothing sent (not even the card read).
+    monkeypatch.setenv(a2a_rail.A2A_RAIL_CHECKOUT_STEP_ENABLED_ENV, "0")
+    pid = await _open_without(address=ADDRESS)
+    rail = Rail().on("payment.method-view#submit", _methods())
+    assert await _step(rail, pid) == "expired"
+    assert rail.sent == []
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["refusal_reason"]) == (
+        "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None)
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+def test_the_view_names_the_missing_fields_and_never_a_stored_value():
+    from datetime import datetime, timedelta, timezone
+
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
+    partial = {**ADDRESS}
+    partial.pop("postalCode")
+    row = {"id": "ap_" + "0" * 24, "state": "opened", "buyer_email": EMAIL, "shipping_address": partial,
+           "buyer_action_expires_at": deadline, "last_error_code": worker.SHIPPING_ADDRESS_REQUIRED,
+           "currency": "USD", "our_price_minor": 4650, "merchant_domain": "merchant.example"}
+    detail = view.build_view(row)
+    assert detail["shipping_address_required"] == {"fields_missing": ["postalCode"], "expires_at": deadline}
+    parent = {"id": "pp_" + "0" * 24, "rail": "a2a", "executor": "rail_managed", "rail_purchase_id": row["id"]}
+    body = unified_view.unified_body(parent, detail)
+    assert body["state"] == "routing"
+    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["postalCode"], "expires_at": deadline}
+    assert "url" not in body["next_action"] and "prefill" not in body["next_action"]
+    text = json.dumps(body, default=str)
+    for value in (EMAIL, *partial.values()):
+        if len(value) > 3:  # not "US" / "TX", which "USD" and other words contain
+            assert value not in text, value
+    # No deadline yet (the worker has not looked): no `expires_at`. Complete, or past `opened`: no action.
+    assert "expires_at" not in view.build_view({**row, "buyer_action_expires_at": None})["shipping_address_required"]
+    assert "shipping_address_required" not in view.build_view({**row, "shipping_address": ADDRESS})
+    assert "shipping_address_required" not in view.build_view({**row, "state": "quoting"})
+
+
+# ── review of dc95b4357: --apply runs its own lookup; one "done"; --lookup with --apply; held rows only ──
+
+async def _aged_hold(task=None):
+    pid = await _held("checkout_confirm_unresolved", pending=worker.CHECKOUT_CONFIRM_ACTION, task=task)
+    await _ago("state_entered_at", worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600, pid)
+    return pid
+
+
+_APPLY = ("--apply", "--operator", "ops-1", "--expect-env", "staging", "--provider-checked")
+
+
+def _resolve(pid, *extra):
+    return ("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_confirm_unresolved", *extra)
+
+
+@pytest.mark.parametrize("answer,task", [
+    (_documented_result(task="ckout_B"), None),                                        # unbound payment-reached
+    (_task(_card("checkout.result", {"task_id": "ckout_B", "success": True})), None),  # unbound success
+    (_documented_result(), "ckout_abc123"),                                            # bound payment-reached
+    (_task(_card("checkout.await", {"task_id": "ckout_B", "state": "captured"})), None),
+], ids=["unbound_payment_reached", "unbound_success", "bound_payment_reached", "unbound_await_captured"])
+async def test_apply_runs_its_own_lookup_and_never_resolves_a_reported_payment(answer, task):
+    # P2-1: the preview's answer is not stored, so --apply reads again and refuses on its own.
+    pid = await _aged_hold(task=task)
+    rail = Rail().on("checkout.lookup#submit", answer)
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"], result["reason"]) == (3, "refused", worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP)
+    assert result["lookup"]["says_done"] is True
+    _lookup_only(rail, pid)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", "checkout_confirm_unresolved")
+
+
+async def test_the_preview_says_not_eligible_and_escalates_when_its_lookup_reports_payment():
+    pid = await _aged_hold()
+    code_, [plain] = await _operator(*_resolve(pid))
+    assert (code_, plain["eligible"]) == (0, True)
+    rail = Rail().on("checkout.lookup#submit", _documented_result(task="ckout_B"))
+    code_, [preview] = await _operator(*_resolve(pid, "--lookup"), client=_client(rail))
+    assert (code_, preview["eligible"], preview["reason"]) == (3, False, worker.OPERATOR_PAYMENT_REPORTED_BY_LOOKUP)
+    assert "escalate" in preview["message"]
+
+
+@pytest.mark.parametrize("answer", [
+    _documented_result(task="ckout_B", state="failed", success=False, result_status="form-error", order_id=None,
+                       total=None),
+    _task(_card("checkout.result", {"task_id": "ckout_B", "state": "completed"})),
+    httpx.Response(404),
+], ids=["not_submitted", "state_completed_alone", "not_found"])
+async def test_apply_resolves_when_its_lookup_reports_no_payment(answer):
+    pid = await _aged_hold()
+    rail = Rail().on("checkout.lookup#submit", answer)
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"]) == (0, "resolved")
+    _lookup_only(rail, pid)
+
+
+@pytest.mark.parametrize("client", ["none", "raising"])
+async def test_without_a_client_or_with_a_failing_lookup_apply_rests_on_provider_checked(client):
+    # The documented semantics: no lookup to read, the apply stands on the operator's --provider-checked statement.
+    pid = await _aged_hold()
+    fake = None if client == "none" else _client(Rail().on("checkout.lookup#submit", httpx.ConnectError("down")))
+    code_, [result] = await _operator(*_resolve(pid, *_APPLY), client=fake)
+    assert (code_, result["outcome"]) == (0, "resolved")
+
+
+async def test_lookup_together_with_apply_is_a_usage_error_and_sends_nothing():
+    pid = await _aged_hold()
+    rail = Rail().on("checkout.lookup#submit", _documented_result(task="ckout_B"))
+    code_, [result] = await _operator(*_resolve(pid, "--lookup", *_APPLY), client=_client(rail))
+    assert (code_, result["outcome"]) == (2, "refused") and "--lookup" in result["reason"]
+    assert rail.sent == [] and (await _row(pid))["state"] == "paying"
+
+
+async def test_the_preview_looks_up_only_a_held_row():
+    pid = await _placing()  # paying, placing: not held
+    rail = Rail().on("checkout.lookup#submit", _documented_result())
+    _, [preview] = await _operator("resolve-held", "--purchase-id", pid, "--expected-code", "checkout_placing",
+                                   "--lookup", client=_client(rail))
+    assert preview["lookup"] == {"ran": False, "reason": "no such held checkout"} and rail.sent == []
+
+
+# ── the provider's documented token-result (11-19): the DAVV is networkToken.cvv, marked dynamicDataType "DAVV" ──
+
+PROVIDER_DAVV = "077"  # a leading-zero placeholder DAVV
+
+
+def _provider_token_result(**over):
+    """The documented token-result, placeholder values: {component: payment.token-result, paymentTokenId,
+    status, paymentBrand, providerId, networkToken: {brand, value, expiryDate, cvv, cryptogram "", eci null,
+    dynamicDataType "DAVV"}}."""
+    network_token = _network_token(cvv=PROVIDER_DAVV, **over)
+    data = {"paymentTokenId": "ptk_1", "status": "ACTIVE", "paymentBrand": "visa", "providerId": "prov_test_1",
+            "networkToken": network_token}
+    return _task(_card("payment.token-result", data))
+
+
+async def test_the_documented_token_result_relays_its_leading_zero_davv_as_the_three_char_cvv():
+    assert a2a_rail.DAVV_FIELD == "cvv"
+    provider = _Provider(_provider_token_result(), CONFIRM_CARD)
+    relay = await _relay(provider)
+    assert relay.refused is None
+    setup = provider.sent()[1]["payload"]
+    assert setup["card"]["cvv"] == "077" and isinstance(setup["card"]["cvv"], str)
+    assert set(setup["card"]) == {"number", "expiry", "cvv", "name", "brand"}
+
+
+@pytest.mark.parametrize("marker", [None, "absent", "CVV", "davv", "Davv", " DAVV", "DAVV ", "TAVV", 1],
+                         ids=["null", "absent", "CVV", "lower_davv", "title_davv", "padded_left", "padded_right",
+                              "TAVV", "int"])
+async def test_a_cvv_on_a_token_not_marked_davv_is_never_read_or_relayed(marker):
+    # Condition 1: a cvv leaf without the exact DAVV marker could be a real CVV: davv_missing, nothing sent.
+    token = _network_token(cvv=PROVIDER_DAVV)
+    if marker == "absent":
+        token.pop("dynamicDataType")
+    else:
+        token["dynamicDataType"] = marker
+    assert a2a_rail.davv_from_network_token(token) is None
+    assert a2a_rail.checkout_card_from_network_token(token, brand="visa", name="Pat Example") is None
+    provider = _Provider(_token_result(network_token=token), CONFIRM_CARD)
+    relay = await _relay(provider)
+    assert relay.refused == "davv_missing"
+    assert [x for x in provider.sent() if x["payload"].get("card")] == []  # nothing went to the checkout
+
+
+@pytest.mark.parametrize("cvv", [77, 715, 77.0, "77", "0770", None], ids=["int_77", "int_715", "float", "two_chars",
+                                                                         "four_chars", "null"])
+async def test_a_davv_that_is_not_a_three_char_string_is_missing(cvv):
+    # Condition 2: an int (its leading zero lost) or any other form is davv_missing.
+    token = _network_token(cvv=cvv)
+    assert a2a_rail.davv_from_network_token(token) is None
+    relay = await _relay(_Provider(_token_result(network_token=token), CONFIRM_CARD))
+    assert relay.refused == "davv_missing"
+
+
+@pytest.mark.parametrize("echo", [{"code": 77}, {"code": "77"}, {"code": "077"}, {"cvv": 77}],
+                         ids=["int_77", "string_77", "string_077", "cvv_int_77"])
+async def test_a_leading_zero_davv_echoed_as_77_or_077_is_scrubbed_and_the_answer_refused(echo):
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=100000))
+    assert relay.checkout.credential_fields_stripped >= 1
+
+
+async def test_a_leading_zero_davv_inside_other_values_is_kept():
+    # The leading-zero equivalents of the "$715.00" / "Suite 715" guards: never a whole value, never scrubbed.
+    echo = {"ref": "$77.00", "suite": "Apt 77", "n": "77 units", "total": "$0.77"}
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=100000))
+    assert relay.checkout.credential_fields_stripped == 0
+    assert {k: relay.checkout.card("checkout.confirm").data[k] for k in echo} == echo
+
+
+def test_the_echo_matcher_on_a_leading_zero_davv_catches_it_without_its_zero():
+    matches = a2a_rail.davv_echo_matcher("077")
+    for text in ("cvv 077", "cvv 77", "CVV: 0 7 7", "security code 7-7", "77 (cvv)", "dcvv 77"):
+        assert matches(text), text
+    for text in ("Apt 77", "Total $77.00", "77 items in stock", "cvv 177", "cvv 770", "cvv verified, order 7"):
+        assert not matches(text), text
+    plain = a2a_rail.davv_echo_matcher("715")  # a DAVV with no leading zero is unchanged
+    assert plain("cvv 715") and not plain("cvv 15")
+
+
+async def test_before_the_confirm_a_leading_zero_davv_echoed_in_prose_without_its_zero_cancels():
+    answer = _task({"kind": "text", "text": "Card verified, cvv 77"},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    relay = await _relay(_Provider(_provider_token_result(), answer), setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.card_codes_scrubbed >= 1
+
+
+# ── review of 995c64e8c (P3-1): no one-digit short form for a "00x" DAVV ──────────────────────────
+
+@pytest.mark.parametrize("davv,echo", [
+    ("007", {"quantity": 7}), ("007", {"errorCount": "7"}), ("000", {"errorCount": "0"}), ("000", {"quantity": 0}),
+    ("001", {"quantity": 1}),
+], ids=["007_quantity_7", "007_count_7", "000_count_0", "000_quantity_0", "001_quantity_1"])
+async def test_a_00x_davv_never_becomes_a_one_digit_needle(davv, echo):
+    answer = _task(_card("checkout.confirm", {"merchant": "merchant.example", **echo}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token(cvv=davv)), answer),
+                         setup=_setup(ceiling_minor=100000))
+    assert relay.refused is None and relay.checkout.credential_fields_stripped == 0
+    assert relay.checkout.card("checkout.confirm").data == {"merchant": "merchant.example", **echo}
+
+
+async def test_a_00x_davv_in_prose_ships_in_7_days_does_not_cancel_and_is_caught_verbatim():
+    matches = a2a_rail.davv_echo_matcher("007")
+    assert not matches("Ships in 7 days · CVV verified") and not matches("cvv 7")
+    assert matches("cvv 007") and matches("CVV: 0 0 7")
+    answer = _task({"kind": "text", "text": "Ships in 7 days · CVV verified"},
+                   _card("checkout.confirm", {"merchant": "merchant.example", "cardLast4": "3478"},
+                         ("confirm", "edit", "cancel"), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(network_token=_network_token(cvv="007")), answer),
+                         setup=_setup(ceiling_minor=TOTAL))
+    assert relay.checkout.card_codes_scrubbed == 0
+    exact = a2a_rail._scrub_needles(_network_token(cvv="007"))[1]
+    assert "007" in exact and "7" not in exact
+
+
+def test_the_short_form_needs_two_digits_left_and_077_still_catches_77():
+    assert a2a_rail._davv_short_form("077") == "77" and a2a_rail._davv_short_form("715") is None
+    assert a2a_rail._davv_short_form("007") is None and a2a_rail._davv_short_form("000") is None
+    exact = a2a_rail._scrub_needles(_network_token(cvv="077"))[1]
+    assert {"077", "77"} <= exact
+    assert a2a_rail.davv_echo_matcher("077")("cvv 77")

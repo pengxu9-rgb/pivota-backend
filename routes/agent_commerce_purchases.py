@@ -35,7 +35,7 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 import db.a2a_rail_ledger as a2a_ledger
 import db.agent_purchase_ledger as purchases
@@ -51,6 +51,7 @@ from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
 from services.payment_orchestration import a2a_purchase_view, purchase_consent, purchase_view
+from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import router as rail_router
 from services.payment_orchestration.rails import A2A_STATE_MAP, RAIL_ID_PREFIX
 
@@ -214,10 +215,22 @@ class PaymentPreference(BaseModel):
     rail: Optional[Literal["reap", "a2a"]] = None
 
 
+class CreatePurchaseBuyer(reap_routes.ReapBuyer):
+    """The Reap route's buyer with the email and the address OPTIONAL in the model. Required unless
+    shipping-address capture is on (services/payment_orchestration/a2a_shipping_address.capture_enabled):
+    with it off, a body without them is refused here exactly as the Reap model refuses it; with it on, a
+    purchase on the A2A rail may open without them and AgenPas asks the buyer. A request handed to Reap is
+    parsed by the Reap route's own model, which still requires both."""
+
+    email: Optional[str] = Field(None, min_length=3)
+    shipping_address: Optional[reap_routes.ReapShippingAddress] = None
+
+
 class CreatePurchaseRequest(reap_routes.StartPurchaseRequest):
     """The Reap route's create body, plus the caller's rail choice (optional). The Reap route parses
     the same body when a request is handed to it; it ignores `payment_preference`."""
 
+    buyer: CreatePurchaseBuyer
     payment_preference: Optional[PaymentPreference] = None
 
 
@@ -291,6 +304,10 @@ async def create_purchase(
         except ValidationError:
             # The pydantic error can quote the buyer's address: never forwarded, never logged.
             raise reap_svc.PurchaseRefused("invalid_request", "the request body did not validate")
+        capture = shipping_capture.capture_enabled()
+        if not capture and (req.buyer.email is None or req.buyer.shipping_address is None):
+            # Capture off: the Reap model's requirement, with the Reap model's answer.
+            raise reap_svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
         # THE REAP ROUTE'S NORMALISATION, IN ITS ORDER, so the fingerprint below is byte-for-byte the
         # one the Reap route computes for the same body: one key is one attempt on either rail.
@@ -300,15 +317,25 @@ async def create_purchase(
         merchant_domain = reap_routes._merchant_domain_key(merchant_host)
         product_key, hashed_product, product_url = reap_routes._product_selector(req, merchant_host)
         variant_key, hashed_variant = reap_routes._variant_selector(req)
-        market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
-        if market_country is None:
-            raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
+        # The market is the address's country. NEVER A DEFAULT: with no address (capture on) it is the one
+        # market of the purchase's own currency, and with no such market the purchase is refused by name. A
+        # request the router hands to Reap is refused there by Reap's own model, which needs the address.
+        if req.buyer.shipping_address is not None:
+            market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
+            if market_country is None:
+                raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
+        else:
+            market_country = shipping_capture.market_for_currency(req.expected_currency, reap_routes._MARKET_CURRENCY)
+            if market_country is None:
+                raise reap_svc.PurchaseRefused(
+                    shipping_capture.SHIPPING_MARKET_UNKNOWN, "no shipping address and no currency naming one market")
         agent_id = str(context.agent_id)
         owner = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
         if not owner:
             raise reap_svc.PurchaseRefused("agent_user_required")
         idempotency_key = reap_routes._identifier(req.idempotency_key, "idempotency_key", max_chars=128)
-        shipping_address = reap_routes._buyer_address_for_client(req.buyer)
+        shipping_address = (
+            reap_routes._buyer_address_for_client(req.buyer) if req.buyer.shipping_address is not None else {})
         buyer_email = str(req.buyer.email or "").strip()
         return_url = str(req.return_url or "").strip() or reap_routes._default_return_url()
         request_hash = reap_routes._request_hash(
@@ -355,12 +382,17 @@ async def create_purchase(
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
             logger.warning("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
             raise reap_svc.PurchaseRefused("not_available_on_this_rail")
+        if market_country not in shipping_capture.PILOT_COUNTRIES:
+            # THE A2A PILOT IS THE US, in code (not only by the router's merchant list): any other market, from
+            # the address or the currency, is refused by name on this rail.
+            raise reap_svc.PurchaseRefused(
+                shipping_capture.SHIPPING_COUNTRY_UNSUPPORTED, "the A2A rail ships to the US only")
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,
             product_key=product_key, product_url=product_url, variant_key=variant_key, market_country=market_country,
             consent_version=consent_version, buyer_email=buyer_email, shipping_address=shipping_address,
-                idempotency_key=idempotency_key, request_hash=request_hash, choice=choice,
+                idempotency_key=idempotency_key, request_hash=request_hash, choice=choice, capture=capture,
             )
         except _LostKeyRace:
             # A concurrent request with this key opened a Reap purchase first: Reap replays it.
@@ -375,14 +407,26 @@ async def _open_a2a_purchase(
     *, req: CreatePurchaseRequest, agent_id: str, owner: str, merchant_host: str, merchant_domain: str,
     product_key: Optional[str], variant_key: Optional[str], market_country: str, consent_version: str, buyer_email: str,
     shipping_address: Mapping[str, Any], idempotency_key: str, request_hash: str, choice: "rail_router.RailChoice",
-    product_url: Optional[str] = None,
+    product_url: Optional[str] = None, capture: bool = False,
 ) -> JSONResponse:
     """The A2A rail's create: every check the Reap cart-link lane makes, in its order, then one durable
     unit (the purchase and its key). Refusals raise `PurchaseRefused`; nothing is written before them."""
     # The Reap rail's own buyer admission (pure): a real email, printable text, the client's required
     # address fields. Its cleaned values are what is stored and later sent to the rail.
-    buyer_email, shipping_address = reap_svc._validated_buyer(
-        reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
+    stored_email: Optional[str]
+    stored_address: Optional[Dict[str, Any]]
+    if not capture:
+        stored_email, stored_address = reap_svc._validated_buyer(
+            reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
+    else:
+        # Capture on: each part is optional; one that is given is read by the same rules (the address also by
+        # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.
+        stored_email = shipping_capture.door_email(buyer_email) if buyer_email else None
+        stored_address = shipping_capture.door_address(shipping_address) if shipping_address else None
+        if stored_email is not None and stored_address is not None:
+            # Both given: exactly the stored values the capture-off path stores, plus the US rules above.
+            stored_email, stored_address = reap_svc._validated_buyer(
+                reap_svc.BuyerContact(email=stored_email, shipping_address=dict(stored_address)))
     # The same purchasability gate as the Reap route (dark unless enforced; fails closed).
     if purchasability.is_enforcement_enabled():
         if not await purchasability.is_purchasable(merchant_domain, market_country):
@@ -439,7 +483,7 @@ async def _open_a2a_purchase(
                 agent_id=agent_id, agent_user_ref_hash=owner, merchant_domain=merchant_host, checkout_url=cart_url,
                 currency=currency, our_price_minor=unit_minor, quantity=int(req.quantity), product_key=product_key,
                 product_name=facts.get("product_name"), variant_title=facts.get("variant_title"),
-                consent_version=consent_version, buyer_email=buyer_email, shipping_address=shipping_address,
+                consent_version=consent_version, buyer_email=stored_email, shipping_address=stored_address,
             )
             winner = await reap_routes._claim_idempotency_key(
                 agent_id=agent_id, agent_user_ref_hash=owner, idempotency_key=idempotency_key,
