@@ -5,7 +5,7 @@ Agent 管理数据库模型
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Boolean, Numeric
 from sqlalchemy.sql import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 from collections import OrderedDict
 import secrets
@@ -45,6 +45,20 @@ _AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS = max(
 )
 _AGENT_AUTH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _AGENT_AUTH_KEY_TABLE_CACHE: Dict[str, Any] = {"table": None, "expires_at": 0.0}
+
+# A key's "last used" time (api_keys.last_used / agent_api_keys.last_used_at) was read by the
+# developer and employee portals but written by nothing, so every key read "Never". It is now stamped
+# when a key-table lookup admits the key: at most once per this many seconds per key per process
+# (the in-process memo below), and the UPDATE's own WHERE skips a row stamped within the same window
+# by another instance. The auth cache already bounds lookups to one per key per positive TTL, so this
+# is at most one indexed UPDATE per key per instance per window. Precision is therefore "within about
+# this many seconds", which is what a "Last used" column needs.
+_KEY_LAST_USED_STAMP_SECONDS = max(
+    60,
+    min(86400, int(os.getenv("AGENT_KEY_LAST_USED_STAMP_SECONDS", "300") or 300)),
+)
+_KEY_LAST_USED_MEMO_MAX_ENTRIES = 20000
+_KEY_LAST_USED_MEMO: "OrderedDict[str, float]" = OrderedDict()
 
 
 class AgentAuthLookupTransientError(RuntimeError):
@@ -474,6 +488,59 @@ _LEGACY_API_KEY_LOOKUP_SQL = (
 )
 
 
+async def _stamp_key_last_used(*, source: str, api_key: str, key_hash_sha256: str) -> None:
+    """Record that a key-table key was just used. Best effort: never raises, never blocks auth on
+    a failure, and does nothing for a synthetic (CI probe) call or for a legacy agents.api_key match,
+    which has no per-key row."""
+    if source == "api_keys":
+        query = (
+            "UPDATE api_keys SET last_used = :now WHERE key_hash = :key_hash "
+            "AND (last_used IS NULL OR last_used < :cutoff)"
+        )
+        # api_keys.last_used is TIMESTAMP (no zone) and routes/agent_keys.py compares it with
+        # datetime.utcnow(): store naive UTC.
+        now = datetime.utcnow()
+        key_hash = key_hash_sha256
+    elif source in {"agent_api_keys", "agent_api_keys_sha256", "agent_api_keys_md5"}:
+        query = (
+            "UPDATE agent_api_keys SET last_used_at = :now WHERE key_hash = :key_hash "
+            "AND (last_used_at IS NULL OR last_used_at < :cutoff)"
+        )
+        now = datetime.now(timezone.utc)
+        key_hash = (
+            hashlib.md5(str(api_key or "").encode("utf-8")).hexdigest()
+            if source == "agent_api_keys_md5"
+            else key_hash_sha256
+        )
+    else:
+        return
+    if is_synthetic_call():
+        return
+
+    memo_key = f"{source}:{key_hash}"
+    mono = time.monotonic()
+    last = _KEY_LAST_USED_MEMO.get(memo_key)
+    if last is not None and mono - last < _KEY_LAST_USED_STAMP_SECONDS:
+        return
+    # Memo before the write, so a failing UPDATE is retried once per window, not once per lookup.
+    _KEY_LAST_USED_MEMO[memo_key] = mono
+    _KEY_LAST_USED_MEMO.move_to_end(memo_key)
+    while len(_KEY_LAST_USED_MEMO) > _KEY_LAST_USED_MEMO_MAX_ENTRIES:
+        _KEY_LAST_USED_MEMO.popitem(last=False)
+
+    try:
+        await database.execute(
+            query,
+            {
+                "now": now,
+                "key_hash": key_hash,
+                "cutoff": now - timedelta(seconds=_KEY_LAST_USED_STAMP_SECONDS),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - a usage stamp must never fail an authenticated call
+        print(f"agent key last-used stamp skipped: {type(exc).__name__}")
+
+
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
@@ -535,6 +602,7 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
 
         agent = _normalize_agent_row(result)
         _put_cached_agent_auth(key_hash, agent)
+        await _stamp_key_last_used(source=source, api_key=api_key, key_hash_sha256=key_hash)
         if metrics is not None:
             metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
             metrics["auth_cache_hit"] = False
