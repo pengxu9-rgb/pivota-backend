@@ -80,6 +80,7 @@ _NEEDS_HUMAN_SQL = """
      WHERE (state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
             AND substr(COALESCE(last_error_code,''),1,22) = :prefix)
         OR (state = 'quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+        OR (state = 'awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
      ORDER BY state_entered_at ASC, id ASC
      LIMIT :limit
 """
@@ -352,6 +353,10 @@ async def list_needs_human(*, limit: int, db: Any = None) -> List[Dict[str, Any]
         if row["state"] == "quoting":
             cohort = ("parked_create" if row["checkout_dispatch_key"] and row["dispatch_tracking_version"] == 1
                       else "legacy_unknown")
+        elif row["reap_checkout_id"] is None:
+            # A pre-tracking awaiting_approval row with no checkout id: the expire sweep never ends it (no
+            # negative proof that no checkout exists), and in reconciliation-only mode nothing claims it.
+            cohort = "legacy_awaiting_approval"
         else:
             cohort = "checkout_unresolvable"
         out.append({
