@@ -140,7 +140,11 @@ def decision_record(choice: RailChoice, *, market_country: str) -> Dict[str, obj
     parent's `routing_plan`): who decided, every rail not taken with its named reason, the rule set, and
     the buyer's market. The market is here because the A2A rail's own row keeps none, and "which rail,
     for which merchant, in which market" is the question a routing decision is later judged by.
-    The keys are `ensure_reap_parent` / `ensure_a2a_parent`'s keyword arguments."""
+    The keys are `ensure_reap_parent` / `ensure_a2a_parent`'s keyword arguments.
+
+    NOT DURABLE. The parent row is written after the purchase commits, best-effort, and the first write
+    wins: when a heal or the backfill writes it first, the plan says `basis="backfill"` and this record
+    is lost. It is evidence for a report, never a fact a later decision may depend on."""
     return {
         "basis": choice.basis, "dropped": dict(choice.dropped), "policy": POLICY_VERSION,
         "market": str(market_country or "").upper(),

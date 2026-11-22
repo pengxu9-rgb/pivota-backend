@@ -342,8 +342,12 @@ async def create_purchase(
         if choice.rail == "reap":
             # The Reap route writes this purchase's parent row. The decision travels to it on the
             # request's server-side state (nothing a caller sends reaches `request.state`), so the
-            # parent says the router chose Reap and why the other rail was dropped. Set ONLY here:
-            # a replay and a lost key race reach the Reap route without it, and write no parent.
+            # parent says the router chose Reap and why the other rail was dropped. Set ONLY here, for
+            # a request the router decided just now (the two other hand-overs in this function, a
+            # replay and a lost key race, carry none). The Reap route stores it only on a purchase
+            # THIS request opens: if the request then loses its key to an earlier one inside that
+            # route, it answers with that purchase and writes no parent for it. Best-effort, like the
+            # parent row itself (`reap_routes._record_purchase_parent`).
             request.state.purchase_routing = rail_router.decision_record(choice, market_country=market_country)
             return await reap_routes.start_reap_purchase(request, context, agent_user)
         if choice.rail is None:

@@ -1460,6 +1460,51 @@ async def test_anything_else_on_the_request_state_is_ignored_and_never_fails_the
     assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
 
 
+@pytest.mark.parametrize("loser_was_routed", [True, False])
+async def test_a_request_that_lost_its_key_writes_no_parent_for_the_winners_purchase(
+    client, monkeypatch, loser_was_routed
+):
+    """Two requests, one key, one body. The first opened the purchase; the second misses the replay read,
+    opens its own row, loses the key claim and answers with the first one's purchase. How the SECOND came
+    to this rail says nothing about the FIRST: it must write no parent row for it."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+    from services.payment_orchestration import router as rail_router
+
+    await _seed_all()
+    same_body = _body()  # one key, one body, sent twice
+    # The winner: opened while the ledger is off, so its parent is not written yet.
+    monkeypatch.delenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, raising=False)
+    first = await client.post(f"{BASE}/purchases", json=same_body)
+    assert first.status_code == 202, first.text
+    winner = first.json()["purchase_id"]
+    assert await _agent_purchase_parents(winner) == []
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+
+    # The loser: its replay read misses once (the race), so it goes on to the key claim and loses it.
+    real_replay, misses = routes_reap._replayed_purchase_id, []
+
+    async def _miss_once(**kwargs):
+        if not misses:
+            misses.append(1)
+            return None
+        return await real_replay(**kwargs)
+
+    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", _miss_once)
+    if loser_was_routed:
+        choice = rail_router.choose_rail(
+            agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+            currency="USD", worker_alive=True)
+        client._app = _with_request_state(
+            client._app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    second = await client.post(f"{BASE}/purchases", json=same_body)
+    assert second.status_code == 202, second.text
+    assert second.json()["purchase_id"] == winner and misses == [1]
+    loser_rows = await database.fetch_all(
+        "SELECT state, refusal_reason FROM reap_agentic_purchases WHERE id <> :w", {"w": winner})
+    assert [(r["state"], r["refusal_reason"]) for r in loser_rows] == [("refused", "duplicate_idempotency_key")]
+    assert await database.fetch_all("SELECT id FROM agent_purchases") == []
+
+
 def test_only_the_decisions_own_keys_are_taken_from_the_request_state():
     from types import SimpleNamespace
 

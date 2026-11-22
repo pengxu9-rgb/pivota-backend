@@ -2903,8 +2903,16 @@ async def _record_purchase_parent(purchase_id: str, routing: Optional[Mapping[st
     pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
     agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
     or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
-    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
-    never reaches it; both get their parent from the heal or the backfill.
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent
+    replay returns before this hook, and a request that lost its key to an earlier one skips it (the
+    caller's `adopted_winner`): this is called only for the purchase the request itself opened. The
+    others get their parent from the winner's own request, the heal or the backfill.
+
+    `routing` (see `_handed_routing`) IS BEST-EFFORT, LIKE THE ROW. The first parent write wins and is
+    never updated, so the router's decision is stored only when THIS write is the first. When the 1 s
+    bound cuts it, or a concurrent read's heal or the backfill writes the parent before it, the parent
+    says `basis="backfill"` and the decision is not recoverable. A reader must treat `backfill` as
+    "how this purchase was routed is not known", never as a decision.
     """
     if not agent_purchase_ledger.is_enabled():
         return
@@ -3428,6 +3436,8 @@ async def start_reap_purchase(
 
         winning_view = None
         other_rail_winner = None
+        # True when this request lost its key to an earlier one and answers with THAT purchase.
+        adopted_winner = False
         try:
             # start_purchase makes no partner call. This short durable unit hides
             # the purchase from other connections until its immutable key lands.
@@ -3477,6 +3487,7 @@ async def start_reap_purchase(
                 elif winner != purchase_id:
                     await _abandon_duplicate(purchase_id)
                     purchase_id = winner
+                    adopted_winner = True
                     winning_view = await _owner_view(
                         purchase_id=winner, agent_id=agent_id,
                         agent_user_ref_hash=agent_user_ref_hash,
@@ -3509,7 +3520,13 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
-        await _record_purchase_parent(purchase_id, _handed_routing(request))
+        if not adopted_winner:
+            # ONLY FOR THE PURCHASE THIS REQUEST OPENED. A request that lost its key answers with the
+            # winner's purchase, and how THIS request came to this rail says nothing about that one:
+            # the first parent write wins, so writing here could record a purchase an agent opened
+            # itself as router-chosen, or the reverse. The winner's own request writes its parent
+            # (or the heal does).
+            await _record_purchase_parent(purchase_id, _handed_routing(request))
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
