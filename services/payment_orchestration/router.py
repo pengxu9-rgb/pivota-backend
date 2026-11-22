@@ -59,6 +59,9 @@ A2A_RAIL_MERCHANTS_ENV = "A2A_RAIL_MERCHANTS"
 A2A_RAIL_MAX_TOTAL_MINOR_ENV = "A2A_RAIL_MAX_TOTAL_MINOR"
 
 RAILS = ("reap", "a2a")
+#: The name of THE RULES above. It is stored with every decision (`decision_record`), so a decision made
+#: under a later rule set can be told from one made under this one. Change it when a rule changes.
+POLICY_VERSION = "env_v1"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 
@@ -130,6 +133,18 @@ class RailChoice:
     dropped: Dict[str, str] = field(default_factory=dict)
     #: For an explicit choice that cannot be honoured: the reason, and nothing was routed.
     refusal: Optional[str] = None
+
+
+def decision_record(choice: RailChoice, *, market_country: str) -> Dict[str, object]:
+    """What the purchase ledger stores for a decision made here (db/agent_purchase_ledger.py, the
+    parent's `routing_plan`): who decided, every rail not taken with its named reason, the rule set, and
+    the buyer's market. The market is here because the A2A rail's own row keeps none, and "which rail,
+    for which merchant, in which market" is the question a routing decision is later judged by.
+    The keys are `ensure_reap_parent` / `ensure_a2a_parent`'s keyword arguments."""
+    return {
+        "basis": choice.basis, "dropped": dict(choice.dropped), "policy": POLICY_VERSION,
+        "market": str(market_country or "").upper(),
+    }
 
 
 def a2a_create_dials_on() -> bool:

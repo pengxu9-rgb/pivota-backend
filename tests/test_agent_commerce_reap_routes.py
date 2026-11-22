@@ -1393,6 +1393,100 @@ async def test_a_stalled_ledger_write_cannot_hold_the_202(client, monkeypatch):
     assert time.monotonic() - started < 5
 
 
+def _plan(parent: dict) -> dict:
+    raw = parent["routing_plan"]
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
+def _with_request_state(inner, **state):
+    """The app, with `state` already on the request's server-side state when the route runs: what the
+    rail-neutral route leaves there before it hands a request to this one."""
+
+    async def _app(scope, receive, send):
+        if scope["type"] == "http":
+            scope.setdefault("state", {}).update(state)
+        await inner(scope, receive, send)
+
+    return _app
+
+
+async def test_an_agent_that_calls_this_route_itself_is_recorded_as_the_decider(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
+async def test_a_request_the_router_handed_over_records_the_routers_decision(client, monkeypatch):
+    """The value on the request state is the one the router really makes (`decision_record` of a real
+    `choose_rail` answer), not a hand-built look-alike."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+    from services.payment_orchestration import router as rail_router
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    choice = rail_router.choose_rail(
+        agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+        currency="USD", worker_alive=True)
+    assert choice.rail == "reap" and choice.dropped  # the other rail is off here, and says so
+    client._app = _with_request_state(
+        client._app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {
+        "rail": "reap", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
+        "dropped": dict(choice.dropped), "policy": rail_router.POLICY_VERSION, "market": "US",
+    }
+
+
+@pytest.mark.parametrize("left_on_state", [
+    None, "orchestrator_selected_rail", ["basis"], {}, {"dropped": {"a2a": "x"}}, {"basis": 7},
+])
+async def test_anything_else_on_the_request_state_is_ignored_and_never_fails_the_purchase(
+    client, monkeypatch, left_on_state
+):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    client._app = _with_request_state(client._app, purchase_routing=left_on_state)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
+def test_only_the_decisions_own_keys_are_taken_from_the_request_state():
+    from types import SimpleNamespace
+
+    handed = {"basis": "buyer_selected_rail", "dropped": {"a2a": "not_selected"}, "policy": "env_v1",
+              "market": "US", "rail_purchase_id": "rp_other", "id": "pp_other"}
+    request = SimpleNamespace(state=SimpleNamespace(purchase_routing=handed))
+    assert routes_reap._handed_routing(request) == {
+        "basis": "buyer_selected_rail", "dropped": {"a2a": "not_selected"}, "policy": "env_v1", "market": "US"}
+    assert routes_reap._handed_routing(SimpleNamespace()) == {}
+
+
+async def test_a_caller_cannot_put_a_decision_on_the_request_state(client, monkeypatch):
+    """Nothing a caller sends lands on `request.state`: not a header, not a query value, not a body key."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    claim = {"basis": "orchestrator_selected_rail", "dropped": {"a2a": "claimed"}, "policy": "env_v1", "market": "US"}
+    resp = await client.post(
+        f"{BASE}/purchases?purchase_routing=orchestrator_selected_rail",
+        json=_body(), headers={"purchase-routing": json.dumps(claim), "x-purchase-routing": json.dumps(claim)},
+    )
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
 async def test_the_price_is_our_catalogs_and_the_request_cannot_move_it(client):
     """THE CENTRAL GUARD. `verify_quote` compares `quantity * our_price_minor` against Reap's
     subtotal EXACTLY. If the caller could set that number, the comparison would be the caller's

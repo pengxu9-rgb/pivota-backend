@@ -2877,7 +2877,22 @@ async def _owner_public_body(row, *, consents: Any = purchase_consent.LOOKUP):
 _RECORD_PARENT_TIMEOUT_S = 1.0
 
 
-async def _record_purchase_parent(purchase_id: str) -> None:
+_ROUTING_KEYS = frozenset({"basis", "dropped", "policy", "market"})
+
+
+def _handed_routing(request: Request) -> Dict[str, Any]:
+    """The router's decision, when the rail-neutral route (routes/agent_commerce_purchases.py) chose this
+    rail and handed the request here: it leaves `router.decision_record(...)` on `request.state`. Empty
+    for an agent that called this route itself, which is recorded as before (`agent_selected_rail`).
+    `request.state` is this process's own object: no header, query or body value lands on it. Anything
+    that is not the expected mapping is ignored, so a fault here can never fail a purchase."""
+    routing = getattr(getattr(request, "state", None), "purchase_routing", None)
+    if not isinstance(routing, Mapping) or not isinstance(routing.get("basis"), str):
+        return {}
+    return {k: v for k, v in routing.items() if k in _ROUTING_KEYS}
+
+
+async def _record_purchase_parent(purchase_id: str, routing: Optional[Mapping[str, Any]] = None) -> None:
     """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
 
     AFTER this route's own transaction has committed, never inside it, and it never raises: the
@@ -2895,7 +2910,8 @@ async def _record_purchase_parent(purchase_id: str) -> None:
         return
     try:
         await asyncio.wait_for(
-            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+            agent_purchase_ledger.ensure_reap_parent(purchase_id, **dict(routing or {})),
+            timeout=_RECORD_PARENT_TIMEOUT_S
         )
     except Exception as exc:  # noqa: BLE001 (TimeoutError included)
         logger.warning(
@@ -3493,7 +3509,7 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
-        await _record_purchase_parent(purchase_id)
+        await _record_purchase_parent(purchase_id, _handed_routing(request))
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
