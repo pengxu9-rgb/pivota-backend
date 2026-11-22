@@ -1158,6 +1158,35 @@ async def buyer_list_orders(
     return {"orders": items, "next_cursor": next_cursor, "has_more": bool(next_cursor)}
 
 
+# The save_token claim: exactly once, by the browser that holds the challenge's nonce, before it
+# expires. It RETURNS the row it claimed because `databases` 0.7 answers an UPDATE's execute with
+# no row count on Postgres (fetchval: None), which made every redemption read as "already used".
+# Raw SQL rather than `.returning()`: SQLAlchemy 1.4 cannot compile RETURNING for SQLite, while
+# SQLite itself (3.35+) runs it. CURRENT_TIMESTAMP is what func.now() renders on both.
+_REDEEM_SAVE_CHALLENGE_SQL = """
+UPDATE buyer_save_challenges
+   SET redeemed_at = CURRENT_TIMESTAMP,
+       redeemed_buyer_id = :buyer_id
+ WHERE save_token_hash = :save_token_hash
+   AND redeemed_at IS NULL
+   AND expires_at > CURRENT_TIMESTAMP
+   AND client_nonce_hash = :client_nonce_hash
+RETURNING save_token_hash
+"""
+
+
+async def _redeem_save_challenge(*, save_token_hash: str, client_nonce_hash: str, buyer_id: str) -> bool:
+    """Claim the save_token for `buyer_id`: True only for the one call whose UPDATE claimed the row."""
+    try:
+        row = await database.fetch_one(
+            _REDEEM_SAVE_CHALLENGE_SQL,
+            {"save_token_hash": save_token_hash, "client_nonce_hash": client_nonce_hash, "buyer_id": buyer_id},
+        )
+    except Exception:
+        return False
+    return row is not None
+
+
 def _checkout_token_may_claim_order(
     payload: Dict[str, Any], order_id: str, order_row: Optional[Dict[str, Any]]
 ) -> bool:
@@ -1405,19 +1434,12 @@ async def save_from_checkout(
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "Invalid save nonce")
 
         save_token_hash = hashlib.sha256(raw_save_token.encode("utf-8")).hexdigest()
-        updated = 0
-        try:
-            updated = await database.execute(
-                buyer_save_challenges.update()
-                .where(buyer_save_challenges.c.save_token_hash == save_token_hash)
-                .where(buyer_save_challenges.c.redeemed_at.is_(None))
-                .where(buyer_save_challenges.c.expires_at > func.now())
-                .where(buyer_save_challenges.c.client_nonce_hash == _sha256_hex(nonce))
-                .values(redeemed_at=func.now(), redeemed_buyer_id=principal.user_id)
-            )
-        except Exception:
-            updated = 0
-        if int(updated or 0) != 1:
+        redeemed = await _redeem_save_challenge(
+            save_token_hash=save_token_hash,
+            client_nonce_hash=_sha256_hex(nonce),
+            buyer_id=principal.user_id,
+        )
+        if not redeemed:
             raise _error(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "save_token already used or expired")
 
     # Pairwise buyer_ref for this agent.

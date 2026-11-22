@@ -315,6 +315,13 @@ def _watch(world, monkeypatch, prefills: Dict[str, Dict[str, Any]], challenge: O
             return {"prefill": json.dumps({"shipping_address": pre})} if pre else None
         if "from buyer_save_challenges" in text:
             return dict(challenge) if challenge else None
+        if challenge and text.lstrip().startswith("update buyer_save_challenges") and "returning" in text:
+            # The claim, for an unredeemed challenge this browser holds (expiry is not modelled here).
+            v = values or {}
+            if challenge.get("redeemed_at") or v.get("client_nonce_hash") != challenge.get("client_nonce_hash"):
+                return None
+            challenge["redeemed_at"] = "claimed"
+            return {"save_token_hash": v.get("save_token_hash")}
         return await real_fetch_one(query, values)
 
     async def execute(query, values=None):  # noqa: ANN001

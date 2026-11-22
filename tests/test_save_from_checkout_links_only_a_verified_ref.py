@@ -87,7 +87,9 @@ class _World:
                 self.links[(v["agent_id"], v["agent_user_ref_hash"])] = v["buyer_id"]
             elif text.lstrip().startswith("update orders"):
                 self.order_updates.append(dict(v))
-        return 1
+        # As on Postgres: `databases` 0.7 answers execute with fetchval, None for a write without
+        # RETURNING. Code that reads a row count from execute must fail here as it does there.
+        return None
 
 
 @pytest.fixture
