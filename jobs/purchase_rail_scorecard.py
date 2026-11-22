@@ -28,10 +28,12 @@ One group per (rail, merchant_domain, market, buyer), over the purchases CREATED
   routed          purchases in the group
   completed / failed / refused / expired
                   the rail's own terminal state (both rails use these four words)
-  held            not terminal, and waiting for a person: on the token rail a checkout the worker
-                  holds (a2a_rail_worker.held_checkout_codes, state `paying`); on the hosted-approval
-                  rail a purchase its ledger counts as needing a human
-                  (reap_agentic_ledger.count_checkout_needs_human, the same predicate)
+  held            not terminal, and waiting for a person. On the hosted-approval rail: a purchase its
+                  ledger counts as needing a human (reap_agentic_ledger.count_checkout_needs_human,
+                  the same predicate). On the token rail, any of: a checkout the worker holds
+                  (a2a_rail_worker.held_checkout_codes, state `paying`); an order step it holds
+                  (its order-step hold codes); a write a crashed step left pending (`worker_error`
+                  with `pending_write` set), which the worker never clears by itself
   in_flight       not terminal and not held: still moving, so not judged yet
   finished        completed + failed + refused + expired + held
   success_rate    completed / finished, 4 decimals; null when nothing finished. A HELD purchase counts
@@ -39,7 +41,10 @@ One group per (rail, merchant_domain, market, buyer), over the purchases CREATED
   sample_ok       finished >= --min-sample. Below it the rate is shown and should not be acted on.
   priced          the rail returned a total for the exact cart (`quoted_total_minor` is set)
   order_recorded  the rail returned an order reference or a final total
-  ended_by        for finished purchases that did not complete: "<state>:<code>" -> count
+  ended_by        for finished purchases that did not complete: "<state>:<code>" -> count. The code
+                  is a refusal's own reason, else the FIRST segment of the rail's `last_error_code`
+                  (both rails write the kind of failure first, then detail); a held purchase on the
+                  token rail prints its hold code
 
 `buyer` is "returning" when the same owner has an EARLIER completed purchase on the same rail (of any
 age, not only inside the window), else "new". A returning buyer has a card on that rail already.
@@ -51,7 +56,15 @@ A purchase with no parent row yet is counted under basis `unrecorded`.
 ── LIMITS, STATED ───────────────────────────────────────────────────────────────────────────
 
   * TEST TRAFFIC IS NOT REMOVED BY ITSELF. A rail's purchase row carries no test stamp. Pass each test
-    agent as `--exclude-agent-id`; the output says how many rows that removed.
+    agent as `--exclude-agent-id`: those purchases are left out in the SQL, before the row bound, and
+    the output says how many agent ids were given (`agents_excluded`).
+  * A DUPLICATE REQUEST'S OWN ROW IS LEFT OUT. A request that lost its idempotency key to an earlier one
+    leaves a row ended `refused` / `duplicate_idempotency_key` on the hosted-approval rail
+    (routes/agent_commerce_reap._abandon_duplicate). It is the same purchase asked for twice, not a
+    second purchase the rail failed, so it is not read. (The token rail rolls its loser back: no row.)
+  * ONE WINDOW. `since` is computed once and bound to all three reads, so they cover the same instant.
+  * COST. Neither rail's table has an index that starts with `created_at`: each read is a sequential
+    scan and a top-N sort. Fine at today's row counts; check the table sizes before a production run.
   * A request refused before a purchase row exists (a create that answered 4xx) is not here. This is a
     scorecard of purchases, not of requests.
   * The token rail's row keeps no market. Its market comes from the parent's stored decision and is
@@ -68,7 +81,7 @@ import json
 import re
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 EXIT_OK = 0
@@ -113,7 +126,10 @@ _REAP_ROWS_SQL = """
                        AND e.state = 'completed' AND e.created_at < r.created_at)
                 THEN 1 ELSE 0 END AS returning_buyer
       FROM reap_agentic_purchases r
-     WHERE r.created_at >= clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+     WHERE r.created_at >= :since
+       AND NOT (r.state = 'refused' AND COALESCE(r.refusal_reason, '') = 'duplicate_idempotency_key')
+       AND (r.agent_id IS NULL
+            OR r.agent_id NOT IN (SELECT jsonb_array_elements_text(CAST(:excluded_agents AS JSONB))))
      ORDER BY r.created_at DESC
      LIMIT :max_rows
 """
@@ -123,48 +139,56 @@ _A2A_ROWS_SQL = """
            CASE WHEN r.quoted_total_minor IS NOT NULL THEN 1 ELSE 0 END AS priced,
            CASE WHEN r.final_total_minor IS NOT NULL OR r.order_id IS NOT NULL
                      OR r.merchant_order_id IS NOT NULL THEN 1 ELSE 0 END AS order_recorded,
+           CASE WHEN r.pending_write IS NOT NULL THEN 1 ELSE 0 END AS write_pending,
            CASE WHEN EXISTS (
                     SELECT 1 FROM a2a_rail_purchases e
                      WHERE e.agent_id = r.agent_id AND e.agent_user_ref_hash = r.agent_user_ref_hash
                        AND e.state = 'completed' AND e.created_at < r.created_at)
                 THEN 1 ELSE 0 END AS returning_buyer
       FROM a2a_rail_purchases r
-     WHERE r.created_at >= clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+     WHERE r.created_at >= :since
+       AND r.agent_id NOT IN (SELECT jsonb_array_elements_text(CAST(:excluded_agents AS JSONB)))
      ORDER BY r.created_at DESC
      LIMIT :max_rows
 """
 _PARENT_PLANS_SQL = """
     SELECT p.rail, p.rail_purchase_id, p.routing_plan
       FROM agent_purchases p
-     WHERE p.created_at >= clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+     WHERE p.created_at >= :since
      ORDER BY p.created_at DESC
      LIMIT :max_rows
 """
 
-_PG_SINCE = "clock_timestamp() - (:window_seconds * INTERVAL '1 second')"
-_SQLITE_SINCE = "datetime('now', :window)"
-_REAP_ROWS_SQL_SQLITE = _REAP_ROWS_SQL.replace(_PG_SINCE, _SQLITE_SINCE).replace("chr(58)", "char(58)")
-_A2A_ROWS_SQL_SQLITE = _A2A_ROWS_SQL.replace(_PG_SINCE, _SQLITE_SINCE)
-_PARENT_PLANS_SQL_SQLITE = _PARENT_PLANS_SQL.replace(_PG_SINCE, _SQLITE_SINCE)
+# The two dialect differences: how a JSON array parameter becomes rows, and the colon's function name.
+_PG_EXCLUDED = "SELECT jsonb_array_elements_text(CAST(:excluded_agents AS JSONB))"
+_SQLITE_EXCLUDED = "SELECT value FROM json_each(:excluded_agents)"
+_REAP_ROWS_SQL_SQLITE = _REAP_ROWS_SQL.replace(_PG_EXCLUDED, _SQLITE_EXCLUDED).replace("chr(58)", "char(58)")
+_A2A_ROWS_SQL_SQLITE = _A2A_ROWS_SQL.replace(_PG_EXCLUDED, _SQLITE_EXCLUDED)
+#: SQLite stores CURRENT_TIMESTAMP as this text, and compares it as text.
+_SQLITE_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-async def _read(days: int, max_rows: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """(hosted-approval rail rows, token rail rows, parent plans), newest first, each bounded."""
+async def _read(
+    since: datetime, max_rows: int, excluded_agent_ids: Sequence[str] = (),
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(hosted-approval rail rows, token rail rows, parent plans), newest first, each bounded. `since`
+    is ONE instant bound to all three, so the three reads cover the same window; the excluded agents
+    are left out in the SQL, before the bound, so they cannot use it up."""
     from db.database import IS_POSTGRES, database
 
-    seconds = days * 86400
+    excluded = json.dumps(sorted({str(a) for a in excluded_agent_ids if str(a)}))
     # Statement form, not a conditional expression, so the PREPARE gate plans the Postgres literals.
     if IS_POSTGRES:
-        values: Dict[str, Any] = {"window_seconds": seconds, "max_rows": max_rows}
+        values: Dict[str, Any] = {"since": since, "max_rows": max_rows, "excluded_agents": excluded}
         reap = await database.fetch_all(_REAP_ROWS_SQL, values)
         a2a = await database.fetch_all(_A2A_ROWS_SQL, values)
-        plans = await database.fetch_all(_PARENT_PLANS_SQL, {"window_seconds": seconds, "max_rows": 2 * max_rows})
+        plans = await database.fetch_all(_PARENT_PLANS_SQL, {"since": since, "max_rows": 2 * max_rows})
     else:
-        values = {"window": f"-{seconds} seconds", "max_rows": max_rows}
+        text = since.astimezone(timezone.utc).strftime(_SQLITE_TS_FORMAT)
+        values = {"since": text, "max_rows": max_rows, "excluded_agents": excluded}
         reap = await database.fetch_all(_REAP_ROWS_SQL_SQLITE, values)
         a2a = await database.fetch_all(_A2A_ROWS_SQL_SQLITE, values)
-        plans = await database.fetch_all(
-            _PARENT_PLANS_SQL_SQLITE, {"window": f"-{seconds} seconds", "max_rows": 2 * max_rows})
+        plans = await database.fetch_all(_PARENT_PLANS_SQL, {"since": text, "max_rows": 2 * max_rows})
     return [dict(r) for r in reap], [dict(r) for r in a2a], [dict(r) for r in plans]
 
 
@@ -186,21 +210,33 @@ def _token(value: Any) -> Optional[str]:
     return text if _CODE_RE.fullmatch(text) else None
 
 
-def _end_code(rail: str, row: Mapping[str, Any]) -> str:
-    """The named reason a purchase ended as it did, or `other`. `refusal_reason` first (a refusal's
-    own word); else the rail's code: the hosted-approval rail writes `code:detail`, the token rail
-    `detail:code` (a2a_rail_worker._last_code), so the code is the first or the last segment."""
+def _last_segment(row: Mapping[str, Any]) -> str:
+    """The worker's own reading of a code (a2a_rail_worker._last_code): a hold code and `worker_error`
+    are the LAST segment (`<prefix>:worker_error`)."""
+    return str(row.get("last_error_code") or "").split(":")[-1]
+
+
+def _end_code(row: Mapping[str, Any]) -> str:
+    """The named reason a purchase ended as it did, or `other`. `refusal_reason` first (a refusal's own
+    word); else the FIRST segment of the rail's code. Both rails write the kind of failure first and
+    detail after it (`checkout_unresolvable:<detail>`; a2a_rail_worker._code's `prefix:kind:status`), so
+    two different refusals with the same HTTP status stay two codes."""
     reason = _token(row.get("refusal_reason"))
     if reason:
         return reason
-    parts = str(row.get("last_error_code") or "").split(":")
-    return _token(parts[-1] if rail == "a2a" else parts[0]) or "other"
+    return _token(str(row.get("last_error_code") or "").split(":")[0]) or "other"
 
 
-def _a2a_held(row: Mapping[str, Any], held_codes: Iterable[str]) -> bool:
-    """A checkout the worker holds: `paying`, and its code (the last segment, the worker's own reading,
-    a2a_rail_worker._last_code) is a hold code."""
-    return row.get("state") == "paying" and str(row.get("last_error_code") or "").split(":")[-1] in held_codes
+def _a2a_held(row: Mapping[str, Any], checkout_hold_codes: Iterable[str], order_hold_codes: Iterable[str]) -> bool:
+    """Waiting for a person on the token rail (the caller has already ruled out a terminal state):
+      * a checkout the worker holds: `paying`, and the code is a checkout hold code (the operator's list);
+      * an order step it holds: the code is an order-step hold code (the worker parks it unread);
+      * a write a crashed step left pending: `worker_error` with `pending_write` set. The worker's house
+        rule is that a human decides it; nothing clears it."""
+    last = _last_segment(row)
+    if row.get("state") == "paying" and last in checkout_hold_codes:
+        return True
+    return last in order_hold_codes or (last == "worker_error" and bool(row.get("write_pending")))
 
 
 def _market(value: Any) -> Optional[str]:
@@ -218,21 +254,18 @@ def _dropped_key(dropped: Any) -> str:
 def build_scorecard(
     *, reap_rows: Sequence[Mapping[str, Any]], a2a_rows: Sequence[Mapping[str, Any]],
     plans: Sequence[Mapping[str, Any]], a2a_held_codes: Iterable[str], days: int, min_sample: int, max_rows: int,
-    exclude_agent_ids: Iterable[str] = (), generated_at: Optional[datetime] = None,
+    a2a_order_hold_codes: Iterable[str] = (), agents_excluded: int = 0, since: Optional[datetime] = None,
+    generated_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """The report, from rows already read. No I/O: every number in the output is decided here."""
-    held_codes = frozenset(a2a_held_codes)
-    excluded = frozenset(str(a) for a in exclude_agent_ids if str(a))
+    """The report, from rows already read (`_read` has left out the excluded agents and the duplicate
+    requests' rows). No I/O: every number in the output is decided here."""
+    held_codes, order_hold_codes = frozenset(a2a_held_codes), frozenset(a2a_order_hold_codes)
     plan_by_id = {(str(p.get("rail")), str(p.get("rail_purchase_id"))): _plan(p.get("routing_plan")) for p in plans}
 
     groups: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     decisions: Counter = Counter()
-    removed = 0
     for rail, rows in (("reap", reap_rows), ("a2a", a2a_rows)):
         for row in rows:
-            if str(row.get("agent_id") or "") in excluded:
-                removed += 1
-                continue
             plan = plan_by_id.get((rail, str(row.get("rail_purchase_id"))))
             market = _market(row.get("market")) or _market((plan or {}).get("market"))
             buyer = "returning" if row.get("returning_buyer") else "new"
@@ -249,10 +282,12 @@ def build_scorecard(
             if state in TERMINAL_STATES:
                 group[state] += 1
                 if state != "completed":
-                    group["ended_by"][f"{state}:{_end_code(rail, row)}"] += 1
-            elif bool(row.get("held")) if rail == "reap" else _a2a_held(row, held_codes):
+                    group["ended_by"][f"{state}:{_end_code(row)}"] += 1
+            elif bool(row.get("held")) if rail == "reap" else _a2a_held(row, held_codes, order_hold_codes):
                 group["held"] += 1
-                group["ended_by"][f"held:{_end_code(rail, row)}"] += 1
+                # A token-rail hold is named by its hold code (the last segment), not by its prefix.
+                code = _end_code(row) if rail == "reap" else (_token(_last_segment(row)) or "other")
+                group["ended_by"][f"held:{code}"] += 1
             else:
                 group["in_flight"] += 1
             if plan is None:
@@ -274,8 +309,9 @@ def build_scorecard(
         "job": JOB,
         "generated_at": (generated_at or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
         "window_days": days, "min_sample": min_sample,
+        "since": since.astimezone(timezone.utc).isoformat(timespec="seconds") if since else None,
         "rows_read": {"reap": len(reap_rows), "a2a": len(a2a_rows), "parents": len(plans)},
-        "rows_excluded_by_agent": removed,
+        "agents_excluded": int(agents_excluded),
         "truncated": len(reap_rows) >= max_rows or len(a2a_rows) >= max_rows,
         "groups": out_groups,
         "decisions": [
@@ -319,17 +355,23 @@ async def run(argv: List[str], out=sys.stdout) -> int:
     from db.database import database
     from services.payment_orchestration import a2a_rail_worker as worker
 
+    excluded = sorted({str(a) for a in args.exclude_agent_id if str(a)})
+    generated_at = datetime.now(timezone.utc)
+    since = generated_at - timedelta(days=args.days)
     connected_here = not database.is_connected
     if connected_here:
         await database.connect()
     try:
-        reap_rows, a2a_rows, plans = await _read(args.days, args.max_rows)
+        reap_rows, a2a_rows, plans = await _read(since, args.max_rows, excluded)
     finally:
         if connected_here:
             await database.disconnect()
     report = build_scorecard(
         reap_rows=reap_rows, a2a_rows=a2a_rows, plans=plans, a2a_held_codes=worker.held_checkout_codes(),
-        days=args.days, min_sample=args.min_sample, max_rows=args.max_rows, exclude_agent_ids=args.exclude_agent_id)
+        # The worker's order-step hold codes have no public accessor; a rename fails the job's tests.
+        a2a_order_hold_codes=worker._VIC_HOLD_CODES,
+        days=args.days, min_sample=args.min_sample, max_rows=args.max_rows, agents_excluded=len(excluded),
+        since=since, generated_at=generated_at)
     print(json.dumps(report, sort_keys=True), file=out)
     return EXIT_OK
 

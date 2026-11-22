@@ -22,6 +22,7 @@ import db.a2a_rail_ledger as a2a_ledger  # noqa: E402
 import db.agent_purchase_ledger as purchases  # noqa: E402
 import db.reap_agentic_ledger as reap_ledger  # noqa: E402
 import jobs.purchase_rail_scorecard as scorecard  # noqa: E402
+import routes.agent_commerce_reap as reap_routes  # noqa: E402
 from services.payment_orchestration import a2a_rail_worker as worker  # noqa: E402
 
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm")
@@ -35,6 +36,7 @@ STREET = "900 Brannan St"
 SHOP = "brand.example"
 OTHER_SHOP = "other.example"
 HOLD = sorted(worker.held_checkout_codes())[0]
+ORDER_HOLD = sorted(worker._VIC_HOLD_CODES)[0]
 
 
 @pytest.fixture(autouse=True)
@@ -93,14 +95,15 @@ def _group(report: dict, rail: str, buyer: str = "new", shop: str = SHOP) -> dic
 def _row(state, **over):
     row = {"rail_purchase_id": f"id_{state}_{len(over)}", "state": state, "merchant_domain": SHOP, "market": "US",
            "agent_id": AGENT, "refusal_reason": None, "last_error_code": None, "priced": 0, "order_recorded": 0,
-           "held": 0, "returning_buyer": 0}
+           "held": 0, "returning_buyer": 0, "write_pending": 0}
     row.update(over)
     return row
 
 
 def _build(reap=(), a2a=(), plans=(), **over):
-    args = dict(reap_rows=list(reap), a2a_rows=list(a2a), plans=list(plans), a2a_held_codes={HOLD}, days=14,
-                min_sample=3, max_rows=100, generated_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+    args = dict(reap_rows=list(reap), a2a_rows=list(a2a), plans=list(plans), a2a_held_codes={HOLD},
+                a2a_order_hold_codes={ORDER_HOLD}, days=14, min_sample=3, max_rows=100,
+                generated_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
     args.update(over)
     return scorecard.build_scorecard(**args)
 
@@ -128,19 +131,41 @@ def test_nothing_finished_has_no_rate_and_a_small_group_is_marked():
     assert done["ended_by"] == {"expired:buyer_left": 1}
 
 
-def test_each_rails_code_is_read_from_its_own_end_and_a_detail_is_never_echoed():
+def test_a_code_is_named_by_its_first_segment_and_a_detail_is_never_echoed():
+    """Both rails write the kind of failure first. Two refusals with the same HTTP status stay two codes
+    (the worker's own code builder makes the strings, so the shape is the one it really writes)."""
+    from types import SimpleNamespace
+
+    answer = SimpleNamespace(kind="rejected", http_status=422)
+    token_refused, confirm_refused = worker._code("token_refused", answer), worker._code("checkout_confirm_refused", answer)
+    assert token_refused.endswith(":422") and confirm_refused.endswith(":422")
     report = _build(
         reap=[_row("failed", last_error_code="transport_error:ConnectTimeout to 10.0.0.9"),
               _row("failed", last_error_code="Not A Token"), _row("failed")],
-        a2a=[_row("failed", last_error_code=f"step 3 said no:{HOLD}"), _row("paying", last_error_code=f"x:{HOLD}"),
-             _row("paying", last_error_code="quote_pending"), _row("refused", refusal_reason="Has Spaces")])
+        a2a=[_row("failed", last_error_code=token_refused), _row("failed", last_error_code=confirm_refused),
+             _row("failed", last_error_code="step 3 said no:422"), _row("refused", refusal_reason="Has Spaces")])
     assert _group(report, "reap")["ended_by"] == {"failed:other": 2, "failed:transport_error": 1}
-    a2a = _group(report, "a2a")
-    assert a2a["ended_by"] == {f"failed:{HOLD}": 1, f"held:{HOLD}": 1, "refused:other": 1}
-    assert (a2a["held"], a2a["in_flight"]) == (1, 1)
+    assert _group(report, "a2a")["ended_by"] == {
+        "failed:checkout_confirm_refused": 1, "failed:other": 1, "failed:token_refused": 1, "refused:other": 1}
     text = json.dumps(report)
-    for leaked in ("ConnectTimeout", "10.0.0.9", "Not A Token", "step 3", "Has Spaces"):
+    for leaked in ("ConnectTimeout", "10.0.0.9", "Not A Token", "step 3", "Has Spaces", "422"):
         assert leaked not in text
+
+
+def test_what_waits_for_a_person_on_the_token_rail_is_held_and_named_by_its_hold_code():
+    report = _build(a2a=[
+        _row("paying", last_error_code=f"checkout:{HOLD}"),                       # a held checkout
+        _row("paying", last_error_code=ORDER_HOLD),                                # a held order step
+        _row("awaiting_authorization", last_error_code=f"order:{ORDER_HOLD}"),     # ... in any open state
+        _row("paying", last_error_code="token:worker_error", write_pending=1),     # a crashed step's write
+        _row("paying", last_error_code="token:worker_error"),                      # crashed, nothing pending
+        _row("paying", last_error_code="quote_pending", write_pending=1),          # a write in progress
+        _row("failed", last_error_code=HOLD),                                      # ended: not held
+    ])
+    [group] = report["groups"]
+    assert (group["held"], group["in_flight"], group["failed"], group["finished"]) == (4, 2, 1, 5)
+    assert group["ended_by"] == {
+        f"failed:{HOLD}": 1, f"held:{HOLD}": 1, f"held:{ORDER_HOLD}": 2, "held:worker_error": 1}
 
 
 def test_a_hold_code_on_a_token_rail_row_that_is_not_paying_is_not_a_hold():
@@ -176,12 +201,11 @@ def test_groups_split_by_merchant_market_and_buyer_and_the_token_rails_market_is
     ]
 
 
-def test_an_excluded_agents_purchases_are_left_out_and_counted():
-    report = _build(reap=[_row("completed"), _row("failed", agent_id=TEST_AGENT)], a2a=[_row("failed", agent_id=TEST_AGENT)],
-                    exclude_agent_ids=[TEST_AGENT, ""])
-    assert report["rows_excluded_by_agent"] == 2 and report["rows_read"] == {"reap": 2, "a2a": 1, "parents": 0}
-    [group] = report["groups"]
-    assert (group["rail"], group["routed"], group["success_rate"]) == ("reap", 1, 1.0)
+def test_the_report_says_how_many_agents_were_excluded_and_since_when():
+    since = datetime(2025, 12, 19, 3, 4, 5, tzinfo=timezone.utc)
+    report = _build(reap=[_row("completed")], agents_excluded=2, since=since)
+    assert report["agents_excluded"] == 2 and report["since"] == "2025-12-19T03:04:05+00:00"
+    assert _build()["since"] is None and _build()["agents_excluded"] == 0
 
 
 @pytest.mark.parametrize("reap_n,a2a_n,truncated", [(2, 0, False), (3, 0, True), (0, 3, True)])
@@ -223,6 +247,7 @@ async def test_the_job_reads_both_rails_and_the_parents_and_prints_one_object():
     assert reap["ended_by"] == {"refused:quote_mismatch": 1}
     assert (token["market"], token["completed"], token["held"], token["success_rate"]) == (None, 1, 1, 0.5)
     assert token["ended_by"] == {f"held:{HOLD}": 1}
+    assert report["agents_excluded"] == 0 and report["since"] < report["generated_at"]
     assert {(d["rail"], d["basis"], d["dropped"]) for d in report["decisions"]} == {
         ("reap", "agent_selected_rail", None), ("reap", "unrecorded", None),
         ("a2a", "orchestrator_selected_rail", "reap=a2a_preferred"), ("a2a", "unrecorded", None)}
@@ -288,6 +313,72 @@ async def test_held_on_the_hosted_approval_rail_is_its_ledgers_own_count():
         assert squash(theirs.split("WHERE", 1)[1]).strip() in squash(mine)
 
 
+async def test_a_duplicate_requests_own_row_is_not_read_as_a_refused_purchase():
+    """The row is ended by the route's own function, so the state and reason are the ones it writes."""
+    winner = await _reap()
+    await _set("reap_agentic_purchases", winner, state="completed")
+    loser = await _reap()
+    await reap_routes._abandon_duplicate(loser)
+    really_refused = await _reap(owner=BOB)
+    await _set("reap_agentic_purchases", really_refused, state="refused", refusal_reason="quote_mismatch")
+    stored = await database.fetch_one(
+        "SELECT state, refusal_reason FROM reap_agentic_purchases WHERE id = :i", {"i": loser})
+    assert (stored["state"], stored["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
+    report = await _report()
+    assert report["rows_read"]["reap"] == 2
+    [group] = report["groups"]
+    assert (group["routed"], group["completed"], group["refused"], group["success_rate"]) == (2, 1, 1, 0.5)
+    assert group["ended_by"] == {"refused:quote_mismatch": 1}
+
+
+async def test_an_excluded_agents_purchases_are_left_out_before_the_row_bound():
+    kept = await _reap()
+    for owner in ("d" * 64, "e" * 64):
+        await _reap(owner=owner, agent_id=TEST_AGENT)
+        await _a2a(owner=owner, agent_id=TEST_AGENT)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET created_at = datetime('now', '-1 hour') WHERE id = :i", {"i": kept})
+    with_rig = await _report("--max-rows", "2")
+    assert with_rig["rows_read"] == {"reap": 2, "a2a": 2, "parents": 0} and with_rig["truncated"] is True
+    report = await _report("--max-rows", "2", "--exclude-agent-id", TEST_AGENT, "--exclude-agent-id", TEST_AGENT)
+    assert report["rows_read"] == {"reap": 1, "a2a": 0, "parents": 0}
+    assert report["truncated"] is False and report["agents_excluded"] == 1
+    assert [(g["rail"], g["routed"]) for g in report["groups"]] == [("reap", 1)]
+
+
+async def test_a_purchase_with_no_agent_is_kept_when_agents_are_excluded():
+    rp = await _reap()
+    await database.execute("UPDATE reap_agentic_purchases SET agent_id = NULL WHERE id = :i", {"i": rp})
+    assert (await _report("--exclude-agent-id", TEST_AGENT))["rows_read"]["reap"] == 1
+
+
+async def test_the_three_reads_share_one_instant(monkeypatch):
+    seen = []
+    real = database.fetch_all
+
+    async def _spy(query, values=None):
+        seen.append(dict(values or {}))
+        return await real(query, values)
+
+    monkeypatch.setattr(database, "fetch_all", _spy)
+    report = await _report("--days", "3")
+    sinces = [v["since"] for v in seen if "since" in v]
+    assert len(sinces) == 3 and len(set(sinces)) == 1
+    assert sinces[0] == report["since"].replace("T", " ").replace("+00:00", "")
+
+
+async def test_a_token_rail_order_hold_read_from_the_table_is_held():
+    held = await _a2a()
+    await _set("a2a_rail_purchases", held, state="paying", last_error_code=ORDER_HOLD)
+    crashed = await _a2a(owner=BOB)
+    await _set("a2a_rail_purchases", crashed, state="paying", last_error_code="token:worker_error",
+               pending_write="token#submit")
+    moving = await _a2a(owner="c" * 64)
+    await _set("a2a_rail_purchases", moving, state="paying", pending_write="token#submit")
+    report = await _report()
+    assert (sum(g["held"] for g in report["groups"]), sum(g["in_flight"] for g in report["groups"])) == (2, 1)
+
+
 async def test_a_quoting_purchase_the_ledger_tracks_is_in_flight_not_held():
     await _reap()
     row = await database.fetch_one("SELECT state, dispatch_tracking_version FROM reap_agentic_purchases")
@@ -330,14 +421,20 @@ async def test_the_job_writes_nothing(monkeypatch):
     assert after == before == {"reap_agentic_purchases": 1, "a2a_rail_purchases": 1, "agent_purchases": 0}
 
 
-def test_every_statement_is_one_select():
-    for name in ("_REAP_ROWS_SQL", "_A2A_ROWS_SQL", "_PARENT_PLANS_SQL"):
-        for sql in (getattr(scorecard, name), getattr(scorecard, name + "_SQLITE")):
-            assert sql.strip().upper().startswith("SELECT") and ";" not in sql
-            assert not re.search(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|TRUNCATE|GRANT)\b", sql.upper())
-            assert "LIMIT :max_rows" in sql
-    assert "clock_timestamp()" not in scorecard._REAP_ROWS_SQL_SQLITE + scorecard._A2A_ROWS_SQL_SQLITE
+def test_every_statement_is_one_bounded_select_over_one_bound_instant():
+    statements = (scorecard._REAP_ROWS_SQL, scorecard._REAP_ROWS_SQL_SQLITE, scorecard._A2A_ROWS_SQL,
+                  scorecard._A2A_ROWS_SQL_SQLITE, scorecard._PARENT_PLANS_SQL)
+    for sql in statements:
+        assert sql.strip().upper().startswith("SELECT") and ";" not in sql
+        assert not re.search(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|TRUNCATE|GRANT)\b", sql.upper())
+        assert "LIMIT :max_rows" in sql and "created_at >= :since" in sql
+        # No clock function: the window is ONE bound instant, not one evaluated per row or statement.
+        assert not re.search(r"clock_timestamp|now\(\)|current_timestamp|datetime\('now'", sql.lower())
     assert "chr(58)" in scorecard._REAP_ROWS_SQL and "chr(58)" not in scorecard._REAP_ROWS_SQL_SQLITE
+    for pg, sqlite in ((scorecard._REAP_ROWS_SQL, scorecard._REAP_ROWS_SQL_SQLITE),
+                       (scorecard._A2A_ROWS_SQL, scorecard._A2A_ROWS_SQL_SQLITE)):
+        assert "jsonb_array_elements_text" in pg and "json_each" in sqlite and "jsonb" not in sqlite
+    assert "duplicate_idempotency_key" in scorecard._REAP_ROWS_SQL
 
 
 @pytest.mark.parametrize("argv", [["--days", "0"], ["--days", "367"], ["--max-rows", "0"], ["--min-sample", "0"],
