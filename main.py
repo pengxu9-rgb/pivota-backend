@@ -2235,9 +2235,25 @@ async def app_lifespan(_app: FastAPI):
         group_shadow_armer = start_group_shadow_arming()
     except Exception as exc:  # noqa: BLE001
         logger.warning("group shadow arming not started: %s", exc)
+    # API key "last used" stamps, off the auth path: get_agent_by_key only queues them, and this one
+    # drainer writes them (db.agents). Started here, never from a request.
+    key_last_used_drainer = None
+    try:
+        from db.agents import start_key_last_used_drainer
+
+        key_last_used_drainer = start_key_last_used_drainer()
+    except Exception as exc:  # noqa: BLE001 - a usage stamp must never stop the boot
+        logger.warning("agent key last-used drainer not started: %s", exc)
     try:
         yield
     finally:
+        if key_last_used_drainer is not None:
+            from db.agents import stop_key_last_used_drainer
+
+            stop_key_last_used_drainer()
+            key_last_used_drainer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await key_last_used_drainer
         reconnect_supervisor.cancel()
         # Suppress Exception too, not only CancelledError: anything else
         # escaping this await propagates out of the finally and SKIPS

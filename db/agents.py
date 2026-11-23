@@ -5,9 +5,11 @@ Agent 管理数据库模型
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Boolean, Numeric
 from sqlalchemy.sql import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 from collections import OrderedDict
+import asyncio
+import contextvars
 import secrets
 import hashlib
 import json
@@ -45,6 +47,27 @@ _AGENT_AUTH_KEY_TABLE_CACHE_TTL_SECONDS = max(
 )
 _AGENT_AUTH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _AGENT_AUTH_KEY_TABLE_CACHE: Dict[str, Any] = {"table": None, "expires_at": 0.0}
+
+# A key's "last used" time (api_keys.last_used / agent_api_keys.last_used_at) was read by the
+# developer and employee portals but written by nothing, so every key read "Never". It is now stamped
+# when a key-table lookup admits an active agent's key, OFF the request path: get_agent_by_key only
+# drops a (table, hash, time) item into a bounded in-process queue (put_nowait, O(1), never awaits),
+# and one drainer task, started by the app lifespan in a fresh context (its own DB connection, not
+# the lifespan's), writes them under lock_timeout / statement_timeout and an overall deadline. With
+# no drainer (scripts, tests, a process that never started it) nothing is queued or written.
+# At most once per window per key per process (the memo), and the UPDATE's own WHERE skips a row
+# another instance stamped in the window. Precision: "within about this many seconds".
+_KEY_LAST_USED_STAMP_SECONDS = max(
+    60,
+    min(86400, int(os.getenv("AGENT_KEY_LAST_USED_STAMP_SECONDS", "300") or 300)),
+)
+_KEY_LAST_USED_MEMO_MAX_ENTRIES = 20000
+_KEY_LAST_USED_MEMO: "OrderedDict[str, float]" = OrderedDict()
+_KEY_LAST_USED_QUEUE_MAX = 2000
+# A drop (queue full) or a skipped write is retried at the next lookup after the window.
+_KEY_LAST_USED_WRITE_DEADLINE_SECONDS = 5.0
+_key_last_used_queue: "Optional[asyncio.Queue]" = None
+_key_last_used_dropped = 0
 
 
 class AgentAuthLookupTransientError(RuntimeError):
@@ -474,6 +497,111 @@ _LEGACY_API_KEY_LOOKUP_SQL = (
 )
 
 
+# Only an ACTIVE key row is stamped (a revoked key that still resolved through a race is not).
+_KEY_LAST_USED_SQL = {
+    "api_keys": (
+        "UPDATE api_keys SET last_used = :now WHERE key_hash = :key_hash AND status = 'active' "
+        "AND (last_used IS NULL OR last_used < :cutoff)"
+    ),
+    "agent_api_keys": (
+        "UPDATE agent_api_keys SET last_used_at = :now WHERE key_hash = :key_hash "
+        "AND COALESCE(is_active, TRUE) = TRUE AND (last_used_at IS NULL OR last_used_at < :cutoff)"
+    ),
+}
+
+
+def _enqueue_key_last_used(*, source: str, api_key: str, key_hash_sha256: str, agent: Dict[str, Any]) -> None:
+    """Queue a last-used stamp for a key-table key that just admitted an ACTIVE agent. Synchronous and
+    O(1): never awaits, never raises, never touches the DB. Skipped for a synthetic (CI probe) call,
+    an inactive agent (its request 403s next; a refused call is not a use), a legacy agents.api_key
+    match (no per-key row), and a process with no drainer (scripts such as the redaction script)."""
+    try:
+        queue = _key_last_used_queue
+        if queue is None or not agent_is_active(agent) or is_synthetic_call():
+            return
+        if source == "api_keys":
+            table = "api_keys"
+            # api_keys.last_used is TIMESTAMP (no zone) and routes/agent_keys.py compares it with
+            # datetime.utcnow(): store naive UTC.
+            now = datetime.utcnow()
+            key_hash = key_hash_sha256
+        elif source in {"agent_api_keys", "agent_api_keys_sha256", "agent_api_keys_md5"}:
+            table = "agent_api_keys"
+            now = datetime.now(timezone.utc)
+            key_hash = (
+                hashlib.md5(str(api_key or "").encode("utf-8")).hexdigest()
+                if source == "agent_api_keys_md5"
+                else key_hash_sha256
+            )
+        else:
+            return
+
+        memo_key = f"{table}:{key_hash}"
+        mono = time.monotonic()
+        last = _KEY_LAST_USED_MEMO.get(memo_key)
+        if last is not None and mono - last < _KEY_LAST_USED_STAMP_SECONDS:
+            return
+        try:
+            queue.put_nowait((table, key_hash, now))
+        except asyncio.QueueFull:
+            global _key_last_used_dropped
+            _key_last_used_dropped += 1
+            return  # not memoized: the next lookup after a free slot tries again
+        # Memo on enqueue, so a failed write is retried once per window, not once per lookup.
+        _KEY_LAST_USED_MEMO[memo_key] = mono
+        _KEY_LAST_USED_MEMO.move_to_end(memo_key)
+        while len(_KEY_LAST_USED_MEMO) > _KEY_LAST_USED_MEMO_MAX_ENTRIES:
+            _KEY_LAST_USED_MEMO.popitem(last=False)
+    except Exception:  # noqa: BLE001 - a usage stamp must never fail an authenticated call
+        return
+
+
+async def _write_key_last_used(table: str, key_hash: str, now: datetime) -> None:
+    params = {"now": now, "key_hash": key_hash, "cutoff": now - timedelta(seconds=_KEY_LAST_USED_STAMP_SECONDS)}
+    if IS_POSTGRES:
+        # Skip rather than wait: a row locked by a rotation, or a slow DB, is retried next window.
+        async with database.transaction():
+            await database.execute("SET LOCAL lock_timeout = '1s'")
+            await database.execute("SET LOCAL statement_timeout = '2s'")
+            await database.execute(_KEY_LAST_USED_SQL[table], params)
+    else:
+        await database.execute(_KEY_LAST_USED_SQL[table], params)
+
+
+async def _drain_key_last_used(queue: "asyncio.Queue") -> None:
+    while True:
+        table, key_hash, now = await queue.get()
+        try:
+            await asyncio.wait_for(_write_key_last_used(table, key_hash, now), timeout=_KEY_LAST_USED_WRITE_DEADLINE_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one failed stamp must not stop the drainer
+            print(f"agent key last-used stamp skipped: {type(exc).__name__}")
+        finally:
+            queue.task_done()
+
+
+def start_key_last_used_drainer() -> "asyncio.Task":
+    """Start the one drainer for this process (call from the app lifespan, never from a request).
+
+    The task runs in a FRESH contextvars.Context: databases==0.7 keeps its Connection in a ContextVar
+    and a task inherits its creator's, so a task made from the lifespan (or a request) would share
+    that connection. An empty context makes the drainer open its own."""
+    global _key_last_used_queue
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_KEY_LAST_USED_QUEUE_MAX)
+    task = asyncio.get_running_loop().create_task(
+        _drain_key_last_used(queue), name="agent-key-last-used", context=contextvars.Context()
+    )
+    _key_last_used_queue = queue
+    return task
+
+
+def stop_key_last_used_drainer() -> None:
+    """Stop queueing (the lifespan cancels the task). Items still queued are dropped."""
+    global _key_last_used_queue
+    _key_last_used_queue = None
+
+
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """通过 API Key 获取 Agent（用于认证）
 
@@ -535,6 +663,7 @@ async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] =
 
         agent = _normalize_agent_row(result)
         _put_cached_agent_auth(key_hash, agent)
+        _enqueue_key_last_used(source=source, api_key=api_key, key_hash_sha256=key_hash, agent=agent)
         if metrics is not None:
             metrics["auth_lookup_ms"] = int((time.perf_counter() - started) * 1000)
             metrics["auth_cache_hit"] = False
