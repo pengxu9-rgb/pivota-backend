@@ -11,11 +11,12 @@
 -- its file, the server-computed evidence digest, the operator handle, the times, the two attestations and
 -- whether a lookup ran and agreed. Append-only: the trigger refuses UPDATE, DELETE and TRUNCATE.
 --
--- schema-guard-exempt: the self-heal lives in db/a2a_rail_ledger.ensure_manual_resolution_audit_schema (the
--- same CREATE TABLE; the trigger only while the catalog says it is missing, under schema_guard's heal
--- lock_timeout), called from ensure_a2a_rail_schema at every boot on both dialects (a fast-mode boot skips
--- db/migrations/). tests/test_a2a_rail_decline_close_postgres.py proves the two build the same schema.
--- A new, empty table: safe under the boot runner's single transaction.
+-- THIS TABLE HAS NO STARTUP HEAL, ON PURPOSE (schema-guard-exempt: no startup heal; a gated one-off builds it).
+-- Production does not run db/migrations/ at boot, and this file is applied there once, by hand, as a gated
+-- one-off after its PR has merged. Nothing in db/schema_guard or db/a2a_rail_ledger creates the table, its
+-- function or its trigger, so a deploy never builds them ahead of that run. Until it has run,
+-- db/a2a_rail_ledger.manual_resolution_audit_ready answers False and the close refuses
+-- (`manual_resolution_audit_not_ready`). A new, empty table.
 
 CREATE TABLE IF NOT EXISTS a2a_rail_manual_resolution_audit (
     purchase_id VARCHAR(64) PRIMARY KEY,

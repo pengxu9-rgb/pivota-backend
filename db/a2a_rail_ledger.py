@@ -269,7 +269,8 @@ _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchas
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288, 290 and 296. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287, 288 and 290. Idempotent; called at every startup.
+    NOT 296 (a2a_rail_manual_resolution_audit): that table has no startup heal, on purpose (see its section)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -289,7 +290,6 @@ async def ensure_a2a_rail_schema() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("a2a_rail_ledger: checkout columns heal deferred to next boot error_type=%s",
                                type(exc).__name__)
-        await ensure_manual_resolution_audit_schema()
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
@@ -301,7 +301,6 @@ async def ensure_a2a_rail_schema() -> None:
         await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_DUE_INDEX)
-        await ensure_manual_resolution_audit_schema()
 
 
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
@@ -1650,88 +1649,16 @@ async def forget_orphan_token(purchase_id: str, payment_token_id: str) -> Option
 # times and the two attestations.
 MANUAL_RESOLUTION_AUDIT_TABLE = "a2a_rail_manual_resolution_audit"
 MANUAL_RESOLUTION_AUDIT_TRIGGER = "a2a_rail_manual_resolution_audit_immutable"
-#: The columns, in one place: both dialects' CREATE and the insert are built from it.
-_AUDIT_COLUMNS_PG = """
-    purchase_id VARCHAR(64) PRIMARY KEY,
-    from_state VARCHAR(32) NOT NULL CHECK (from_state = 'paying'),
-    from_code VARCHAR(64) NOT NULL
-        CHECK (from_code IN ('checkout_payment_reached_declined', 'checkout_payment_reached_unconfirmed')),
-    from_state_entered_at TIMESTAMPTZ NOT NULL,
-    resolved_state VARCHAR(32) NOT NULL CHECK (resolved_state = 'failed'),
-    resolution_code VARCHAR(64) NOT NULL CHECK (resolution_code = 'operator_confirmed_declined'),
-    provider_status VARCHAR(16) NOT NULL CHECK (provider_status = 'DECLINED'),
-    operator_ref VARCHAR(64) NOT NULL,
-    evidence_source VARCHAR(64) NOT NULL CHECK (evidence_source = 'provider_written_statement'),
-    evidence_reference VARCHAR(128) NOT NULL,
-    evidence_file_sha256 VARCHAR(64) NOT NULL,
-    evidence_observed_at TIMESTAMPTZ NOT NULL,
-    provider_reference_kind VARCHAR(32) NOT NULL
-        CHECK (provider_reference_kind IN ('checkout_task_id', 'external_order_reference')),
-    provider_reference VARCHAR(128) NOT NULL,
-    attests_no_authorization BOOLEAN NOT NULL CHECK (attests_no_authorization = TRUE),
-    attests_no_merchant_order BOOLEAN NOT NULL CHECK (attests_no_merchant_order = TRUE),
-    lookup_ran BOOLEAN NOT NULL,
-    lookup_agreed BOOLEAN NOT NULL CHECK (lookup_agreed = lookup_ran),
-    provider_origin VARCHAR(255) NOT NULL,
-    evidence_sha256 VARCHAR(64) NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-"""
-_CREATE_MANUAL_RESOLUTION_AUDIT_PG = f"CREATE TABLE IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TABLE} ({_AUDIT_COLUMNS_PG})"
-_CREATE_MANUAL_RESOLUTION_AUDIT_SQLITE = _CREATE_MANUAL_RESOLUTION_AUDIT_PG.replace("TIMESTAMPTZ", "TIMESTAMP")
-#: No table lock: run every boot (idempotent).
-_CREATE_MANUAL_RESOLUTION_AUDIT_FUNCTION_PG = """
-    CREATE OR REPLACE FUNCTION prevent_a2a_rail_manual_resolution_audit_mutation() RETURNS trigger
-    LANGUAGE plpgsql AS $fn$
-    BEGIN
-        RAISE EXCEPTION 'a2a_rail_manual_resolution_audit is append-only';
-    END;
-    $fn$
-"""
-_CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGER_PG = f"""
-    CREATE TRIGGER {MANUAL_RESOLUTION_AUDIT_TRIGGER}
-        BEFORE UPDATE OR DELETE OR TRUNCATE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
-        FOR EACH STATEMENT EXECUTE FUNCTION prevent_a2a_rail_manual_resolution_audit_mutation()
-"""
-_MANUAL_RESOLUTION_TRIGGER_MISSING_PG = f"""NOT EXISTS (
-                SELECT 1 FROM pg_trigger
-                WHERE tgrelid = to_regclass('{MANUAL_RESOLUTION_AUDIT_TABLE}')
-                  AND tgname = '{MANUAL_RESOLUTION_AUDIT_TRIGGER}'
-                  AND NOT tgisinternal
-            )"""
-_CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGERS_SQLITE = (
-    f"""CREATE TRIGGER IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_update
-        BEFORE UPDATE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
-        BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
-    f"""CREATE TRIGGER IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_delete
-        BEFORE DELETE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
-        BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
-)
-
-
-async def ensure_manual_resolution_audit_schema() -> None:
-    """The audit table and its append-only trigger (migration 296's parity). On Postgres the trigger is created
-    only while the catalog says it is missing, under schema_guard's heal lock_timeout (a timeout defers it to
-    the next boot: the CLI refuses to close anything until it exists, `manual_resolution_audit_ready`)."""
-    if IS_POSTGRES:
-        from db.schema_guard import guarded_ddl
-
-        await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_PG)
-        await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_FUNCTION_PG)
-        try:
-            await database.execute(guarded_ddl(
-                MANUAL_RESOLUTION_AUDIT_TABLE, _MANUAL_RESOLUTION_TRIGGER_MISSING_PG,
-                _CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGER_PG + ";"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("a2a_rail_ledger: manual resolution audit trigger heal deferred to next boot "
-                           "error_type=%s", type(exc).__name__)
-        return
-    await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_SQLITE)
-    for statement in _CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGERS_SQLITE:
-        await database.execute(statement)
+# NO STARTUP HEAL, ON PURPOSE. Production does not run db/migrations/ at boot, and migration 296 is applied
+# there once, as a gated one-off after its PR has merged: nothing in this module or db/schema_guard creates
+# the table, its function or its trigger, so a deploy never builds them ahead of that run. Until it has run,
+# `manual_resolution_audit_ready` answers False and the close refuses (`manual_resolution_audit_not_ready`).
+# tests/test_a2a_rail_decline_close.py pins that no startup path creates any of the three.
 
 
 async def manual_resolution_audit_ready() -> bool:
-    """The audit table exists AND carries its append-only trigger(s). The close refuses otherwise."""
+    """The audit table exists AND carries its append-only trigger(s) (migration 296 on Postgres; the test
+    arm's own builder on SQLite). The close refuses otherwise."""
     if IS_POSTGRES:
         row = await database.fetch_one(
             "SELECT to_regclass(:t) IS NOT NULL AS has_table, EXISTS (SELECT 1 FROM pg_trigger "

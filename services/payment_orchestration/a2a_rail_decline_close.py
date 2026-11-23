@@ -19,8 +19,8 @@ opaque reference to it, the hash of the file and the facts above are recorded, a
 (db/a2a_rail_ledger.a2a_rail_manual_resolution_audit). Never the statement's text, card data, the buyer's
 contact or the token id.
 
-THE FENCE. The row's code, state_entered_at, a 16-hex sha256 prefix of its token id (the id itself is never
-printed, passed or logged), its checkout task, its pending write: the values the preview printed. Not
+THE FENCE. The row's code, state_entered_at, 16-hex sha256 prefixes of its token id and of its checkout task id
+(neither id is ever printed, passed or logged), its pending write: the values the preview printed. Not
 `updated_at` (the worker claims and releases a held row every POLL_PARKED) and not `claimed_by` (that
 claim never moves the row, and its release writes nothing once the close NULLs it).
 
@@ -77,7 +77,8 @@ def enabled(env: Optional[Mapping[str, str]] = None) -> bool:
 
 
 def token_digest16(token_id: Any) -> Optional[str]:
-    """The fence's stand-in for the token id: the first 16 hex of its sha256. None for no token."""
+    """The fence's stand-in for an id (the token's, or the checkout task's): the first 16 hex of its sha256.
+    None for no id."""
     if not isinstance(token_id, str) or not token_id:
         return None
     return hashlib.sha256(token_id.encode("utf-8")).hexdigest()[:TOKEN_DIGEST_HEX]
@@ -169,6 +170,7 @@ def fence_view(row: Optional[Mapping[str, Any]], now: Optional[datetime] = None)
         "minimum_hold_age_seconds": worker.OPERATOR_MIN_HOLD_AGE_SECONDS,
         "token_digest16": token_digest16(row.get("payment_token_id")),
         "has_task": bool(row.get("checkout_task_id")),
+        "task_digest16": token_digest16(row.get("checkout_task_id")),
         "pending_write": row.get("pending_write"),
     }
 
@@ -179,10 +181,12 @@ class Expected:
     code: str
     state_entered_at: datetime
     token_digest16: str
+    task_digest16: str
     pending_write: Optional[str]
 
 
-def expected_from(*, code: Any, state_entered_at: Any, token_digest16: Any, pending_write: Any) -> Expected:
+def expected_from(*, code: Any, state_entered_at: Any, token_digest16: Any, task_digest16: Any,
+                  pending_write: Any) -> Expected:
     if not isinstance(code, str) or not code:
         raise CloseRefused("expected_code_required")
     entered = state_entered_at if isinstance(state_entered_at, datetime) else None
@@ -194,9 +198,11 @@ def expected_from(*, code: Any, state_entered_at: Any, token_digest16: Any, pend
     entered = _aware(entered)
     if not isinstance(token_digest16, str) or not _DIGEST16_RE.match(token_digest16):
         raise CloseRefused("expected_token_digest16_invalid")
+    if not isinstance(task_digest16, str) or not _DIGEST16_RE.match(task_digest16):
+        raise CloseRefused("expected_task_digest16_invalid")
     if pending_write is not None and not isinstance(pending_write, str):
         raise CloseRefused("expected_pending_write_invalid")
-    return Expected(code, entered, token_digest16, pending_write)
+    return Expected(code, entered, token_digest16, task_digest16, pending_write)
 
 
 def lookup_agrees(lookup: Optional[Mapping[str, Any]]) -> bool:
@@ -238,6 +244,8 @@ def decide(row: Optional[Mapping[str, Any]], *, expected: Expected, evidence: Ev
         raise CloseRefused("token_changed")
     if not row.get("checkout_task_id"):
         raise CloseRefused("checkout_task_missing")
+    if token_digest16(row.get("checkout_task_id")) != expected.task_digest16:
+        raise CloseRefused("checkout_task_changed")
     if row.get("pending_write") != expected.pending_write:
         raise CloseRefused("pending_write_changed")
     if (now - entered).total_seconds() < worker.OPERATOR_MIN_HOLD_AGE_SECONDS:

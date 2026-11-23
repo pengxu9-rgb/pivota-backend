@@ -543,15 +543,17 @@ approved or captured, and no order at the merchant), a human ends it as `failed`
            --attest-no-authorization --attest-no-merchant-order [--lookup]
        # then, with the fence the preview printed:
            ... --apply --operator <handle> --expect-env <PIVOTA_ENV> --expected-code <code> \
-           --expected-state-entered-at <iso> --expected-token-digest16 <hex> --expected-pending-write <w|none>
+           --expected-state-entered-at <iso> --expected-token-digest16 <hex> --expected-task-digest16 <hex> \
+           --expected-pending-write <w|none>
 
 - **Off by default:** `A2A_RAIL_OPERATOR_CLOSE_DECLINED_ENABLED` on the one-off job's env only. When it's off,
   the command refuses before any read. It also refuses while the audit table or its append-only trigger is
-  missing (migration 296, or the boot heal).
+  missing. Migration 296 is their only builder: it has no startup heal, and it's applied once, as a gated
+  one-off after the merge.
 - **Who:** a production one-off, one at a time, with the owner's go for THAT purchase. The go names the
   statement's reference and whether `--lookup` runs. Preview first: it prints the fence (the code,
-  `state_entered_at`, a 16-hex sha256 prefix of the token id, whether a task is recorded, the pending write)
-  and never the token id or the task id. Given the evidence, it also says whether the apply would be accepted.
+  `state_entered_at`, 16-hex sha256 prefixes of the token id and of the task id, whether a task is recorded,
+  the pending write) and never either id. Given the evidence, it also says whether the apply would be accepted.
 - **The evidence:**
   - The statement must name one of OUR ids: the checkout task id, or the external order reference we sent
     with the token. It must equal the purchase's own value.
@@ -560,7 +562,8 @@ approved or captured, and no order at the merchant), a human ends it as `failed`
   - Only the reference, the file's hash and the facts above are recorded, append-only, in
     `a2a_rail_manual_resolution_audit`, with a digest computed on the server. Never the statement's text,
     card data, the buyer's contact or the token id.
-- **The fence:** the code, `state_entered_at`, the token digest, the task and the pending write. Not
+- **The fence:** the code, `state_entered_at`, the token and task digests, and the pending write. Every
+  `--apply` guard runs before anything is read or sent, so a wrong `--expect-env` costs no provider call. Not
   `updated_at`, because the worker claims and releases a held row every `POLL_PARKED`; not `claimed_by`,
   because that claim never moves the row, and its release writes nothing once the close clears it. On
   Postgres the transition and the audit row are ONE statement.

@@ -34,7 +34,50 @@ from tests.test_a2a_rail_checkout import (  # noqa: E402
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
 
 _REPO = Path(__file__).resolve().parents[1]
+_MIGRATION = _REPO / "db/migrations/296_a2a_rail_manual_resolution_audit.sql"
+_DOWN = _REPO / "db/migrations/down/296_a2a_rail_manual_resolution_audit_down.sql"
 TASK = "ckout_abc123"
+
+
+def _split(sql):
+    """Statements of a migration file, keeping a $fn$ function body whole."""
+    lines = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    out, buf, in_body = [], [], False
+    for line in lines:
+        buf.append(line)
+        if line.count("$fn$") == 1:
+            in_body = not in_body
+        if line.rstrip().endswith(";") and not in_body:
+            text = "\n".join(buf).strip()
+            if text:
+                out.append(text)
+            buf = []
+    return out
+
+
+#: The SQLite arm's builder (migration 296 has no startup heal, and its trigger is plpgsql): the migration's own
+#: CREATE TABLE, plus SQLite's two append-only triggers.
+_SQLITE_TRIGGERS = (
+    """CREATE TRIGGER IF NOT EXISTS a2a_rail_manual_resolution_audit_immutable_no_update
+       BEFORE UPDATE ON a2a_rail_manual_resolution_audit
+       BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
+    """CREATE TRIGGER IF NOT EXISTS a2a_rail_manual_resolution_audit_immutable_no_delete
+       BEFORE DELETE ON a2a_rail_manual_resolution_audit
+       BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
+)
+
+
+async def _apply_migration_296():
+    """What the gated one-off does on Postgres (the file itself); on SQLite, the same table and its triggers."""
+    statements = _split(_MIGRATION.read_text("utf-8"))
+    if IS_POSTGRES:
+        for statement in statements:
+            await database.execute(statement)
+        return
+    [create] = [st for st in statements if st.startswith("CREATE TABLE")]
+    await database.execute(create.replace("TIMESTAMPTZ", "TIMESTAMP").rstrip(";"))
+    for statement in _SQLITE_TRIGGERS:
+        await database.execute(statement)
 FILE_SHA = "a" * 64
 OLD = worker.OPERATOR_MIN_HOLD_AGE_SECONDS + 600
 
@@ -50,6 +93,7 @@ async def _db(monkeypatch):
     for table in tables:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
+    await _apply_migration_296()
     monkeypatch.setenv(close.ENABLED_ENV, "1")
     monkeypatch.setenv("A2A_RAIL_BASE_URL", BASE)
     if not IS_POSTGRES:
@@ -104,7 +148,7 @@ async def _fence(pid, *extra, client=None):
 
 def _expected_args(fence):
     return ("--expected-code", fence["code"], "--expected-state-entered-at", fence["state_entered_at"],
-            "--expected-token-digest16", fence["token_digest16"],
+            "--expected-token-digest16", fence["token_digest16"], "--expected-task-digest16", fence["task_digest16"],
             "--expected-pending-write", fence["pending_write"] if fence["pending_write"] else "none")
 
 
@@ -212,6 +256,7 @@ async def test_the_preview_prints_the_fence_never_the_token_or_the_task():
     fence = preview["fence"]
     assert fence["code"] == worker.CHECKOUT_PAYMENT_REACHED_DECLINED and fence["has_task"] is True
     assert fence["token_digest16"] == hashlib.sha256(token.encode()).hexdigest()[:16]
+    assert fence["task_digest16"] == hashlib.sha256(TASK.encode()).hexdigest()[:16]
     text = json.dumps(preview)
     assert token not in text and TASK not in text
     code, preview = await _fence(pid, *_evidence_args())
@@ -277,9 +322,10 @@ async def test_the_close_takes_a_row_a_worker_has_claimed_and_the_workers_releas
     ("UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_other' WHERE id = :i", "token_changed"),
     ("UPDATE a2a_rail_purchases SET pending_write = 'checkout.confirm#confirm' WHERE id = :i", "pending_write_changed"),
     ("UPDATE a2a_rail_purchases SET checkout_task_id = NULL WHERE id = :i", "checkout_task_missing"),
+    ("UPDATE a2a_rail_purchases SET checkout_task_id = 'ckout_other' WHERE id = :i", "checkout_task_changed"),
     ("UPDATE a2a_rail_purchases SET state_entered_at = datetime(state_entered_at, '-1 seconds') WHERE id = :i",
      "state_entered_at_changed"),
-], ids=["code", "token", "pending", "task", "entered"])
+], ids=["code", "token", "pending", "task", "task_changed", "entered"])
 async def test_each_fence_refuses_a_row_that_moved_since_the_preview(change, reason):
     if IS_POSTGRES and "datetime(" in change:
         change = "UPDATE a2a_rail_purchases SET state_entered_at = state_entered_at - INTERVAL '1 second' WHERE id = :i"
@@ -304,6 +350,68 @@ async def test_the_sql_fence_holds_on_its_own_when_the_row_moves_after_the_decis
     code, result, _ = await _apply(pid, fence=preview["fence"])
     assert (code, result["reason"]) == (3, "fence_lost")
     assert (await _row(pid))["state"] == "paying" and await _audit(pid) is None
+
+
+#: Each SQL fence, with the Python decision bypassed: the row moves AFTER the fence values were read.
+_SQL_FENCE_MOVES = {
+    "state": "UPDATE a2a_rail_purchases SET state = 'awaiting_authorization' WHERE id = :i",
+    "code": "UPDATE a2a_rail_purchases SET last_error_code = 'checkout_payment_no_order' WHERE id = :i",
+    "state_entered_at": ("UPDATE a2a_rail_purchases SET state_entered_at = datetime(state_entered_at, '-1 seconds') "
+                         "WHERE id = :i"),
+    "token": "UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_other' WHERE id = :i",
+    "task": "UPDATE a2a_rail_purchases SET checkout_task_id = 'ckout_other' WHERE id = :i",
+    "order_id": "UPDATE a2a_rail_purchases SET order_id = 'ord_other' WHERE id = :i",
+    "pending_write": "UPDATE a2a_rail_purchases SET pending_write = 'x' WHERE id = :i",
+}
+
+
+async def _audit_for(pid):
+    row = await ledger.get_decline_candidate(pid)
+    fence = close.fence_view(row)
+    expected = close.expected_from(code=fence["code"], state_entered_at=fence["state_entered_at"],
+                                   token_digest16=fence["token_digest16"], task_digest16=fence["task_digest16"],
+                                   pending_write=fence["pending_write"])
+    evidence = close.evidence_from(reference="stmt-1", file_sha256=FILE_SHA,
+                                   observed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                                   provider_reference_kind="checkout_task_id", provider_reference=TASK,
+                                   attests_no_authorization=True, attests_no_merchant_order=True)
+    audit = close.decide(row, expected=expected, evidence=evidence, origin=close.provider_origin(), operator="ops-1",
+                         lookup=None, lookup_required=False, legacy=False)
+    return row, audit
+
+
+@pytest.mark.parametrize("field", sorted(_SQL_FENCE_MOVES))
+async def test_every_sql_fence_holds_without_the_python_checks(field):
+    pid = await _declined()
+    row, audit = await _audit_for(pid)
+    move = _SQL_FENCE_MOVES[field]
+    if IS_POSTGRES and "datetime(" in move:
+        move = "UPDATE a2a_rail_purchases SET state_entered_at = state_entered_at - INTERVAL '1 second' WHERE id = :i"
+    await database.execute(move, {"i": pid})
+    written = await ledger.close_declined(pid, expected_code=row["last_error_code"], fence=row["_raw_fence"],
+                                          audit=audit, min_age_seconds=worker.OPERATOR_MIN_HOLD_AGE_SECONDS)
+    assert written is False and await _audit(pid) is None
+    assert (await _row(pid))["state"] != "failed"
+
+
+async def test_the_sql_age_fence_holds_without_the_python_checks():
+    pid = await _declined()
+    row, audit = await _audit_for(pid)
+    await _ago("state_entered_at", 60, pid)  # young now; read the fresh fence so only the age differs
+    fresh = await ledger.get_decline_candidate(pid)
+    written = await ledger.close_declined(pid, expected_code=fresh["last_error_code"], fence=fresh["_raw_fence"],
+                                          audit=audit, min_age_seconds=worker.OPERATOR_MIN_HOLD_AGE_SECONDS)
+    assert written is False and await _audit(pid) is None and (await _row(pid))["state"] == "paying"
+
+
+async def test_apply_guards_run_before_any_provider_lookup():
+    pid = await _declined()
+    _, preview = await _fence(pid)
+    rail = Rail().on("checkout.lookup#submit", DECLINE_LOOKUP)
+    code, [result], _ = await _op("close-declined", "--purchase-id", pid, *_evidence_args(), "--lookup", "--apply",
+                                  "--operator", "ops-1", "--expect-env", "production",
+                                  *_expected_args(preview["fence"]), client=_client(rail))
+    assert code == 2 and result["reason"].startswith("--expect-env") and rail.sent == []
 
 
 async def test_a_row_held_too_recently_refuses():
@@ -436,7 +544,8 @@ async def test_the_close_itself_refuses_while_the_audit_is_not_ready(monkeypatch
     row = await ledger.get_decline_candidate(pid)
     fence = close.fence_view(row)
     expected = close.expected_from(code=fence["code"], state_entered_at=fence["state_entered_at"],
-                                   token_digest16=fence["token_digest16"], pending_write=fence["pending_write"])
+                                   token_digest16=fence["token_digest16"], task_digest16=fence["task_digest16"],
+                                   pending_write=fence["pending_write"])
     result = await close.close(pid, expected=expected, evidence=evidence, operator="ops-1", lookup=None,
                                lookup_required=False, legacy=False)
     assert result == {"outcome": "refused", "reason": "manual_resolution_audit_not_ready"}
@@ -496,7 +605,7 @@ async def test_the_close_refuses_while_the_audit_trigger_is_missing():
         await database.execute("DROP TRIGGER a2a_rail_manual_resolution_audit_immutable_no_update")
     code, [result], _ = await _op("close-declined", "--purchase-id", pid)
     assert (code, result["reason"]) == (3, "manual_resolution_audit_not_ready")
-    await ledger.ensure_manual_resolution_audit_schema()  # the boot heal puts it back
+    await _apply_migration_296()  # the gated one-off puts it back
     assert await ledger.manual_resolution_audit_ready()
 
 
@@ -510,10 +619,42 @@ async def test_the_audit_is_append_only():
     assert (await _audit(pid))["operator_ref"] == "ops-1"
 
 
-async def test_the_heal_is_idempotent():
+async def test_migration_296_applies_twice():
     for _ in range(2):
-        await ledger.ensure_manual_resolution_audit_schema()
+        await _apply_migration_296()
     assert await ledger.manual_resolution_audit_ready()
+
+
+async def test_nothing_at_startup_creates_the_table_its_function_or_its_trigger():
+    await database.execute("DROP TABLE IF EXISTS a2a_rail_manual_resolution_audit")
+    if IS_POSTGRES:
+        await database.execute("DROP FUNCTION IF EXISTS prevent_a2a_rail_manual_resolution_audit_mutation()")
+    await ensure_required_schema_light()
+    await ledger.ensure_a2a_rail_schema()
+    assert not await ledger.manual_resolution_audit_ready()
+    if IS_POSTGRES:
+        row = await database.fetch_one(
+            "SELECT to_regclass('a2a_rail_manual_resolution_audit') IS NULL AS no_table, NOT EXISTS (SELECT 1 FROM "
+            "pg_proc WHERE proname = 'prevent_a2a_rail_manual_resolution_audit_mutation') AS no_function")
+        assert row["no_table"] and row["no_function"]
+    else:
+        names = {r["name"] for r in await database.fetch_all(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'a2a_rail_manual_resolution_audit%'")}
+        assert names == set()
+
+
+def test_no_code_outside_the_migration_creates_the_audit_schema():
+    needles = re.compile(r"CREATE\s+(TABLE\s+IF\s+NOT\s+EXISTS\s+a2a_rail_manual_resolution_audit|"
+                         r"(OR\s+REPLACE\s+)?FUNCTION\s+prevent_a2a_rail_manual_resolution_audit_mutation|"
+                         r"TRIGGER\s+(IF\s+NOT\s+EXISTS\s+)?a2a_rail_manual_resolution_audit)", re.I)
+    hits = []
+    for path in _REPO.rglob("*.py"):
+        rel = path.relative_to(_REPO).as_posix()
+        if rel.startswith(("tests/", ".venv", "venv/")) or "/site-packages/" in rel:
+            continue
+        if needles.search(path.read_text("utf-8", errors="ignore")):
+            hits.append(rel)
+    assert hits == []
 
 
 # ── the orphan pass waits 72 h after a close ─────────────────────────────────────────────────
@@ -525,6 +666,15 @@ async def test_a_closed_decline_stays_off_the_orphan_list_for_72_hours():
     assert pid not in {r["id"] for r in await ledger.list_orphan_tokens(limit=50)}
     assert await ledger.count_orphan_tokens() == 1  # still counted
     await _ago("terminal_at", ledger.ORPHAN_DECLINED_HOLD_SECONDS + 60, pid)
+    assert pid in {r["id"] for r in await ledger.list_orphan_tokens(limit=50)}
+
+
+async def test_a_failed_row_with_no_code_that_ended_just_now_is_still_an_orphan():
+    # The 72 h hold must not drop rows whose code is NULL (NOT (NULL = ... AND ...) is NULL in SQL).
+    pid = await _declined()
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'failed', last_error_code = NULL WHERE id = :i",
+                           {"i": pid})
+    await _ago("terminal_at", 60, pid)
     assert pid in {r["id"] for r in await ledger.list_orphan_tokens(limit=50)}
 
 

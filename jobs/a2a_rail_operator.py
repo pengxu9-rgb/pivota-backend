@@ -5,14 +5,15 @@
         [--lookup | --apply --operator <handle> --expect-env <PIVOTA_ENV> --provider-checked]
     python -m jobs.a2a_rail_operator close-declined --purchase-id ap_... [evidence ...] [--lookup]
         [--legacy-unconfirmed] [--apply --operator <handle> --expect-env <PIVOTA_ENV> --expected-code <code>
-         --expected-state-entered-at <iso> --expected-token-digest16 <hex> --expected-pending-write <w|none>]
+         --expected-state-entered-at <iso> --expected-token-digest16 <hex> --expected-task-digest16 <hex>
+         --expected-pending-write <w|none>]
 
 CLOSE-DECLINED (services/payment_orchestration/a2a_rail_decline_close.py). A held checkout the provider has
 confirmed IN WRITING was declined (no authorization approved or captured, no order at the merchant) ends as
 `failed` / `operator_confirmed_declined`, with an append-only audit row. Off unless
 A2A_RAIL_OPERATOR_CLOSE_DECLINED_ENABLED is on in this process's env; refused before any read otherwise.
-Without --apply it prints the row's fence (code, state_entered_at, a 16-hex token digest, has_task, the
-pending write; never the token id) and, given the evidence, whether the apply would be accepted. Evidence:
+Without --apply it prints the row's fence (code, state_entered_at, 16-hex digests of the token id and the task
+id, has_task, the pending write; never either id) and, given the evidence, whether the apply would be accepted. Evidence:
   --evidence-reference <opaque handle>  --evidence-file-sha256 <64 hex>  --evidence-observed-at <iso+offset>
   --provider-reference-kind checkout_task_id|external_order_reference  --provider-reference <value>
   --attest-no-authorization  --attest-no-merchant-order
@@ -115,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     close.add_argument("--expected-code")
     close.add_argument("--expected-state-entered-at")
     close.add_argument("--expected-token-digest16")
+    close.add_argument("--expected-task-digest16")
     close.add_argument("--expected-pending-write")
     return parser
 
@@ -159,7 +161,8 @@ async def _lookup(worker: Any, ledger: Any, purchase_id: str, row: Any, client: 
 
 _EVIDENCE_ARGS = ("evidence_reference", "evidence_file_sha256", "evidence_observed_at", "provider_reference_kind",
                   "provider_reference")
-_EXPECTED_ARGS = ("expected_code", "expected_state_entered_at", "expected_token_digest16", "expected_pending_write")
+_EXPECTED_ARGS = ("expected_code", "expected_state_entered_at", "expected_token_digest16", "expected_task_digest16",
+                  "expected_pending_write")
 
 
 def _evidence(args: argparse.Namespace) -> Any:
@@ -191,6 +194,24 @@ async def _close_declined(args: argparse.Namespace, out, client: Any) -> int:
             evidence = _evidence(args)
         except close.CloseRefused as refusal:
             return emit({"outcome": "refused", "reason": refusal.reason}, EXIT_BAD_ARGS)
+    expected = None
+    if args.apply:
+        # Every apply guard BEFORE anything is read or sent: a wrong --expect-env never costs a provider call.
+        if not has_evidence or not all(getattr(args, a) for a in _EXPECTED_ARGS):
+            return emit({"outcome": "refused",
+                         "reason": "--apply needs the full evidence and every --expected-* fence"}, EXIT_BAD_ARGS)
+        if not args.operator:
+            return emit({"outcome": "refused", "reason": "--apply needs --operator"}, EXIT_BAD_ARGS)
+        if args.expect_env is None or args.expect_env != os.environ.get("PIVOTA_ENV"):
+            return emit({"outcome": "refused", "reason": "--expect-env must equal this process's PIVOTA_ENV exactly"},
+                        EXIT_BAD_ARGS)
+        try:
+            expected = close.expected_from(
+                code=args.expected_code, state_entered_at=args.expected_state_entered_at,
+                token_digest16=args.expected_token_digest16, task_digest16=args.expected_task_digest16,
+                pending_write=None if args.expected_pending_write == "none" else args.expected_pending_write)
+        except close.CloseRefused as refusal:
+            return emit({"outcome": "refused", "reason": refusal.reason}, EXIT_BAD_ARGS)
     row = await ledger.get_decline_candidate(args.purchase_id)
     lookup = None
     if args.lookup or args.legacy_unconfirmed:
@@ -209,7 +230,10 @@ async def _close_declined(args: argparse.Namespace, out, client: Any) -> int:
             fence = close.fence_view(row)
             close.decide(row, expected=close.expected_from(
                 code=fence.get("code"), state_entered_at=fence.get("state_entered_at"),
-                token_digest16=fence.get("token_digest16") or "", pending_write=fence.get("pending_write")),
+                # A missing id gets a placeholder digest, so the preview names the real refusal (no token, no task).
+                token_digest16=fence.get("token_digest16") or "0" * 16,
+                task_digest16=fence.get("task_digest16") or "0" * 16,
+                pending_write=fence.get("pending_write")),
                 evidence=evidence, origin=close.provider_origin(), operator=args.operator or "preview",
                 lookup=lookup, lookup_required=args.lookup, legacy=args.legacy_unconfirmed)
         except close.CloseRefused as refusal:
@@ -217,21 +241,6 @@ async def _close_declined(args: argparse.Namespace, out, client: Any) -> int:
             return emit(preview, EXIT_REFUSED)
         preview.update(eligible=True, reason="eligible")
         return emit(preview, EXIT_OK)
-    if not has_evidence or not all(getattr(args, a) for a in _EXPECTED_ARGS):
-        return emit({"outcome": "refused", "reason": "--apply needs the full evidence and every --expected-* fence"},
-                    EXIT_BAD_ARGS)
-    if not args.operator:
-        return emit({"outcome": "refused", "reason": "--apply needs --operator"}, EXIT_BAD_ARGS)
-    if args.expect_env is None or args.expect_env != os.environ.get("PIVOTA_ENV"):
-        return emit({"outcome": "refused", "reason": "--expect-env must equal this process's PIVOTA_ENV exactly"},
-                    EXIT_BAD_ARGS)
-    try:
-        expected = close.expected_from(
-            code=args.expected_code, state_entered_at=args.expected_state_entered_at,
-            token_digest16=args.expected_token_digest16,
-            pending_write=None if args.expected_pending_write == "none" else args.expected_pending_write)
-    except close.CloseRefused as refusal:
-        return emit({"outcome": "refused", "reason": refusal.reason}, EXIT_BAD_ARGS)
     result = await close.close(args.purchase_id, expected=expected, evidence=evidence, operator=args.operator,
                                lookup=lookup, lookup_required=args.lookup, legacy=args.legacy_unconfirmed)
     return emit(result, EXIT_OK if result["outcome"] in ("resolved", "already_resolved") else EXIT_REFUSED)

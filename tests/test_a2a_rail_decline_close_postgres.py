@@ -8,7 +8,6 @@ dialect-aware), collected here so the Postgres dialect gate runs them, plus the 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -25,51 +24,19 @@ pytestmark = pytest.mark.skipif(
     reason="needs a throwaway Postgres DATABASE_URL",
 )
 
-_COLUMNS_SQL = """
-    SELECT column_name, data_type, is_nullable FROM information_schema.columns
-     WHERE table_name = 'a2a_rail_manual_resolution_audit' ORDER BY column_name
-"""
-_CHECKS_SQL = """
-    SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
-     WHERE conrelid = to_regclass('a2a_rail_manual_resolution_audit') ORDER BY 1
-"""
 
 
-async def test_migration_296_and_the_boot_heal_build_the_same_table_and_trigger():
+async def test_migration_296_builds_the_table_and_trigger_and_its_down_removes_them():
     from db.database import database
     import db.a2a_rail_ledger as ledger
+    from tests.test_a2a_rail_decline_close import _DOWN, _apply_migration_296, _split
 
-    await database.execute("DROP TABLE IF EXISTS a2a_rail_manual_resolution_audit")
-    await ledger.ensure_manual_resolution_audit_schema()
-    healed = ([dict(r) for r in await database.fetch_all(_COLUMNS_SQL)],
-              [r["def"] for r in await database.fetch_all(_CHECKS_SQL)])
-    assert await ledger.manual_resolution_audit_ready()
-    await database.execute("DROP TABLE a2a_rail_manual_resolution_audit")
-    migration = (Path(__file__).resolve().parents[1] / "db/migrations/296_a2a_rail_manual_resolution_audit.sql")
-    for statement in _split(migration.read_text("utf-8")):
-        await database.execute(statement)
-    migrated = ([dict(r) for r in await database.fetch_all(_COLUMNS_SQL)],
-                [r["def"] for r in await database.fetch_all(_CHECKS_SQL)])
-    assert migrated == healed
-    assert await ledger.manual_resolution_audit_ready()
-    down = (Path(__file__).resolve().parents[1] / "db/migrations/down/296_a2a_rail_manual_resolution_audit_down.sql")
-    for statement in _split(down.read_text("utf-8")):
+    assert await ledger.manual_resolution_audit_ready()  # the fixture applied 296
+    for statement in _split(_DOWN.read_text("utf-8")):
         await database.execute(statement)
     assert not await ledger.manual_resolution_audit_ready()
-    await ledger.ensure_manual_resolution_audit_schema()
-
-
-def _split(sql):
-    """Statements of a migration file, keeping a $fn$ function body whole."""
-    lines = [l for l in sql.splitlines() if not l.strip().startswith("--")]
-    out, buf, in_body = [], [], False
-    for line in lines:
-        buf.append(line)
-        if "$fn$" in line:
-            in_body = not in_body if line.count("$fn$") == 1 else in_body
-        if line.rstrip().endswith(";") and not in_body:
-            text = "\n".join(buf).strip()
-            if text:
-                out.append(text)
-            buf = []
-    return out
+    row = await database.fetch_one("SELECT NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = "
+                                   "'prevent_a2a_rail_manual_resolution_audit_mutation') AS gone")
+    assert row["gone"]
+    await _apply_migration_296()
+    assert await ledger.manual_resolution_audit_ready()
