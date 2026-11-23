@@ -343,3 +343,28 @@ async def test_a_quote_replayed_after_a_not_created_answer_still_never_sends_its
     assert again.last_error_code == svc.CHECKOUT_DISPATCH_UNRESOLVED
     assert len(reap.named('create_checkout')) == 1
     assert (await _get(pid))['checkout_dispatch_key'] and await ledger.count_checkout_needs_human() == 1
+
+
+async def test_a_legacy_awaiting_approval_row_without_a_checkout_id_is_needs_human_and_counting_moves_nothing():
+    # The expire sweep refuses it (no version-1 tracking: its missing checkout id is no proof that no checkout
+    # exists) and reconciliation-only mode never claims it, so the needs-human count and list must show it.
+    import jobs.reap_operator as op
+
+    legacy = await _start(buyer_ref='bref_legacy')
+    legacy_zero = await _start(buyer_ref='bref_legacy_zero')
+    tracked = await _start(buyer_ref='bref_tracked')
+    with_id = await _start(buyer_ref='bref_with_id')
+    for pid, version, checkout in ((legacy, None, None), (legacy_zero, 0, None), (tracked, 1, None),
+                                   (with_id, None, 'chk_legacy_with_id')):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET state='awaiting_approval', dispatch_tracking_version=:v,"
+            " reap_checkout_id=:c, checkout_dispatch_key=NULL WHERE id=:id", {'v': version, 'c': checkout, 'id': pid})
+    before = {pid: await _get(pid) for pid in (legacy, legacy_zero, tracked, with_id)}
+    assert await ledger.count_checkout_needs_human() == 2
+    listed = await op.list_needs_human(limit=10)
+    assert sorted((line['purchase_id'], line['cohort']) for line in listed) == sorted(
+        [(legacy, 'legacy_awaiting_approval'), (legacy_zero, 'legacy_awaiting_approval')])
+    assert all(line['checkout_dispatch_state'] == 'unknown' and line['reap_checkout_id'] is None for line in listed)
+    # Counting and listing are reads: every row is exactly as it was, still waiting.
+    assert {pid: await _get(pid) for pid in before} == before
+    assert {row['state'] for row in before.values()} == {'awaiting_approval'}

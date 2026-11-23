@@ -2271,7 +2271,12 @@ ENROLLMENT_GRACE_SECONDS_MAX = 3600
 #                           until 11:36:43, 9 s past the 11:36:34 expiry). Without the grace
 #                           the sweep expired the purchase before the poller could see the
 #                           card it was waiting for. Checkout-backed awaiting_approval is
-#                           excluded: a local deadline never proves the buyer did not pay.
+#                           excluded: a local deadline never proves the buyer did not pay. So is
+#                           an awaiting_approval row without version-1 dispatch tracking (a legacy
+#                           row's missing checkout id is unknown, never negative proof:
+#                           db/reap_continuation.dispatch_state), so this sweep's codes are only
+#                           ever written where there is no dispatch evidence
+#                           (tests/test_terminal_write_dispatch_invariant.py).
 #   updated_at + max_age  — the ABSOLUTE fallback. Without it a row in 'needs_enrollment' or
 #                           'awaiting_approval' with a NULL hosted_url_expires_at is never
 #                           expired by anything, and keeps the buyer's address and email
@@ -2292,6 +2297,7 @@ _EXPIRE_OVERDUE_SQL = """
            updated_at = clock_timestamp()
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
        AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
+       AND (state = 'needs_enrollment' OR dispatch_tracking_version = 1)
        AND NOT (state = 'needs_enrollment' AND enrollment_id IS NOT NULL)
        AND contact_purged_at IS NULL AND checkout_dispatch_key IS NULL
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
@@ -2299,6 +2305,7 @@ _EXPIRE_OVERDUE_SQL = """
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
            AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
+           AND (state = 'needs_enrollment' OR dispatch_tracking_version = 1)
        AND NOT (state = 'needs_enrollment' AND enrollment_id IS NOT NULL)
        AND contact_purged_at IS NULL AND checkout_dispatch_key IS NULL
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
@@ -2332,6 +2339,7 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
        AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
+       AND (state = 'needs_enrollment' OR dispatch_tracking_version = 1)
        AND NOT (state = 'needs_enrollment' AND enrollment_id IS NOT NULL)
        AND contact_purged_at IS NULL AND checkout_dispatch_key IS NULL
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
@@ -2339,6 +2347,7 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
            AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
+           AND (state = 'needs_enrollment' OR dispatch_tracking_version = 1)
        AND NOT (state = 'needs_enrollment' AND enrollment_id IS NOT NULL)
        AND contact_purged_at IS NULL AND checkout_dispatch_key IS NULL
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
@@ -3011,6 +3020,7 @@ _COUNT_CHECKOUT_NEEDS_HUMAN_SQL = """
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=chr(58))
        OR (state='quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+       OR (state='awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
 """
 _COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
     SELECT count(*) AS n FROM reap_agentic_purchases
@@ -3018,11 +3028,17 @@ _COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=char(58))
        OR (state='quoting' AND (checkout_dispatch_key IS NOT NULL OR COALESCE(dispatch_tracking_version,0) <> 1))
+       OR (state='awaiting_approval' AND reap_checkout_id IS NULL AND COALESCE(dispatch_tracking_version,0) <> 1)
 """
 
 
 async def count_checkout_needs_human() -> int:
-    """Only explicitly classified unresolved reads; never general transport/refusal errors."""
+    """Only explicitly classified unresolved reads; never general transport/refusal errors. Three cohorts:
+    a stored checkout classified `checkout_unresolvable:`; a `quoting` row whose create may have reached Reap
+    (a dispatch fence, or no version-1 tracking); and a LEGACY `awaiting_approval` row with no checkout id and
+    no version-1 tracking. The expire sweep refuses that last one (a legacy row's missing id is unknown, never
+    negative proof), and in reconciliation-only mode nothing claims it, so without this count it would wait
+    for ever, unseen. A read: counting changes nothing."""
     if IS_POSTGRES:
         row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL)
     else:

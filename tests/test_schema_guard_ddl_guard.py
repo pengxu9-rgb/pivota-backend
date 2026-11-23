@@ -29,11 +29,19 @@ def test_the_ddl_runs_verbatim_only_while_needed_and_under_the_lock_timeout():
     """
     statement = _flat(sg.guarded_ddl("t", sg.column_is_not_null("t", "a"), ddl))
 
-    assert statement.startswith("DO $guard$ BEGIN IF to_regclass('t') IS NOT NULL AND (")
+    # The lock_timeout is the block's first statement, BEFORE the catalog check: the check can take a
+    # relation lock of its own (pg_get_constraintdef on a CHECK takes ACCESS SHARE).
+    assert statement.startswith(
+        "DO $guard$ DECLARE guard_lock_timeout_was text := current_setting('lock_timeout'); "
+        "BEGIN PERFORM set_config('lock_timeout', '500ms', true); "
+        "IF to_regclass('t') IS NOT NULL AND (")
+    # ...and the caller's own value comes back as the last statement (a caller's transaction keeps its own).
+    assert statement.endswith(
+        "END IF; PERFORM set_config('lock_timeout', guard_lock_timeout_was, true); END $guard$;")
+    assert statement.index("set_config('lock_timeout'") < statement.index("to_regclass(")
     assert _flat(ddl) in statement
     assert "AND attname = 'a'" in statement and "AND attnotnull" in statement
-    # The lock_timeout is set before, and only inside, the branch that runs the DDL.
-    assert "THEN PERFORM set_config('lock_timeout', '500ms', true); ALTER TABLE" in statement
+    assert "THEN ALTER TABLE" in statement
 
 
 def test_the_catalog_conditions_name_what_they_check():
@@ -168,7 +176,9 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
     guarded = [
         m.group(1)
         for s in db.statements
-        for m in [re.match(r"DO \$guard\$ BEGIN IF to_regclass\('(\w+)'\)", s)]
+        for m in [re.match(r"DO \$guard\$ DECLARE guard_lock_timeout_was text := current_setting\('lock_timeout'\); "
+                           r"BEGIN PERFORM set_config\('lock_timeout', '500ms', true\); "
+                           r"IF to_regclass\('(\w+)'\)", s)]
         if m
     ]
     assert sorted(guarded) == [
@@ -180,3 +190,91 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
         "tierb_cart_link_eligibility",
         "tierb_cart_link_eligibility",
     ]
+
+
+def _transaction_blocks(tree):
+    import ast
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+                isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "transaction" for item in node.items):
+            yield node
+
+
+def test_no_guarded_ddl_runs_inside_a_callers_transaction():
+    """guarded_ddl sets a TRANSACTION-LOCAL lock_timeout as its first statement: run alone, it ends with the
+    statement; run inside a caller's transaction, it would hold 500 ms for the rest of that transaction. So no
+    guarded_ddl call, and no function that runs one (it calls guarded_ddl, or runs a module constant built
+    from it), may sit inside a `transaction()` block anywhere in the non-test code. Enumerated by AST."""
+    import ast
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    modules = []
+    for path in sorted(repo.rglob("*.py")):
+        rel = path.relative_to(repo)
+        if any(p.startswith(".") or p in {"tests", "node_modules", "venv"} for p in rel.parts[:-1]):
+            continue
+        try:
+            modules.append((str(rel), ast.parse(path.read_text(encoding="utf-8"))))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+    def called(node):
+        return {getattr(c.func, "id", getattr(c.func, "attr", None)) for c in ast.walk(node) if isinstance(c, ast.Call)}
+
+    # A builder returns a guarded statement (it calls guarded_ddl): `_recheck`, say.
+    builders = {"guarded_ddl"} | {fn.name for _, tree in modules for fn in ast.walk(tree)
+                                  if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                  and fn.name != "guarded_ddl" and "guarded_ddl" in called(fn)}
+
+    def calls_guarded(node):
+        return bool(called(node) & builders)
+
+    runners, sites = set(), []
+    for path, tree in modules:
+        built = {t.id for n in tree.body if isinstance(n, ast.Assign) and calls_guarded(n.value)
+                 for t in n.targets if isinstance(t, ast.Name)}
+        for fn in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            if fn.name == "guarded_ddl":
+                continue
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            if calls_guarded(fn) or names & built:
+                runners.add(fn.name)
+                sites.append((path, fn.name))
+        for block in _transaction_blocks(tree):
+            assert not calls_guarded(block), f"{path}:{block.lineno}: guarded_ddl inside a transaction"
+        # Transitively WITHIN the module: a function that calls (by bare name) a local runner runs one too,
+        # however many hops down. (Across modules only the direct runners are followed: a closure over bare
+        # names there collides on generic names.)
+        local = {fn.name: {c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+                 for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        mine = {name for name in local if name in runners}
+        while True:
+            more = {name for name, calls in local.items() if calls & mine} - mine
+            if not more:
+                break
+            mine |= more
+            runners |= more
+    # Positive control: the callers this was written against, and one two hops up (schema_guard's light
+    # guard, which runs the guarded heals through _heal_guarded).
+    assert {"_heal_guarded", "ensure_agent_purchase_consents_schema", "_ensure_invoice_generation_schema",
+            "ensure_required_schema_light"} <= runners, runners
+    inside = set()
+    for path, tree in modules:
+        for block in _transaction_blocks(tree):
+            for call in (c for c in ast.walk(block) if isinstance(c, ast.Call)):
+                name = getattr(call.func, "id", getattr(call.func, "attr", None))
+                if name in runners:
+                    inside.add((path, name))
+    assert inside - KNOWN_INSIDE == set(), "a guarded heal runs inside a caller's transaction:\n" + "\n".join(
+        f"{p} {n}" for p, n in sorted(inside - KNOWN_INSIDE))
+    assert KNOWN_INSIDE <= inside, f"fixed, so remove it from KNOWN_INSIDE: {KNOWN_INSIDE - inside}"
+
+
+#: PRE-EXISTING on main, found by the transitive check, NOT fixed here: url_consumer_launch's launch transaction
+#: enqueues the audit run, whose memoized `ensure_merchant_audit_runs_table()` runs the guarded DROP NOT NULL
+#: on a process's first call. guarded_ddl gives the caller's lock_timeout back, so nothing leaks; but that DDL's
+#: locks last until the launch commits. A fix runs the ensure before the transaction.
+KNOWN_INSIDE = {("services/url_consumer_launch.py", "enqueue_audit_run_with_replay")}

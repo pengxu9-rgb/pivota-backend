@@ -213,11 +213,14 @@ def test_every_deploy_spec_parses_as_gcloud_reads_it(mode, armed):
                  "--tasks", "--max-retries", "--task-timeout", "--labels", "--command", "--args", "--set-secrets",
                  "--set-env-vars"):
         parser.add_argument(name)
+    for name in ("--clear-volumes", "--clear-volume-mounts"):
+        parser.add_argument(name, action="store_true")
     args = spec(mode, armed=armed)
     assert args[:4] == ["gcloud", "run", "jobs", "deploy"]
     parsed = parser.parse_args(args[4:])
     assert parsed.job == "reviewed-seed-batch-batch-one" and parsed.command == "python"
     assert parsed.args == f"-m,scripts.ops.reviewed_seed_batch,{mode}"
+    assert parsed.clear_volumes and parsed.clear_volume_mounts          # every deploy, armed or not
     with pytest.raises(ValueError, match="argument --args: expected one argument"):
         parser.parse_args(["j", "--args", parsed.args])
 
@@ -255,7 +258,7 @@ class Gcloud:
     def __init__(self, *, gate=(f"{SUMMARY}\nGATE_OPEN\n", 0), states=("EXECUTION_SUCCEEDED",), describe_errors=0,
                  lock_build=BUILD, log=None, cp_fail=None, execute_fails=False, listed=None, disarm_fails=False,
                  before=(("reviewed-seed-batch-batch-one-old", True),), after=None, foreign_at_release=(),
-                 armed_rows=None, list_fails_at_release=False):
+                 armed_rows=None, list_fails_at_release=False, readback=None, keep_stale_volumes=False):
         self.calls, self.gate, self.states, self.describe_errors = [], gate, list(states), describe_errors
         self.lock_build, self.log, self.cp_fail = lock_build, log, cp_fail
         self.execute_fails, self.disarm_fails = execute_fails, disarm_fails
@@ -266,6 +269,10 @@ class Gcloud:
         self.foreign_at_release, self.executed = list(foreign_at_release), False
         # Shown after the first deploy and before execute (None: the same as before).
         self.armed_rows, self.deployed, self.list_fails_at_release = armed_rows, False, list_fails_at_release
+        # `jobs describe`: a dict / exception given here, else the job as the LAST deploy left it. keep_stale_volumes
+        # models gcloud WITHOUT --clear-volumes: earlier deploys' secret volumes stay, unmounted.
+        self.readback, self.keep_stale_volumes, self.volumes = readback, keep_stale_volumes, {}
+        self.job = None
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
@@ -286,6 +293,11 @@ class Gcloud:
                                   for name, done in rows]))
         if args[:4] == ["gcloud", "run", "jobs", "deploy"]:
             self.deployed = True
+            self.job = applied_job(args, self.volumes, clear=not self.keep_stale_volumes)
+        if args[:4] == ["gcloud", "run", "jobs", "describe"]:
+            if isinstance(self.readback, Exception):
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr=str(self.readback))
+            return ok(json.dumps(self.readback if self.readback is not None else self.job))
         if args[:4] == ["gcloud", "run", "jobs", "deploy"] and self.disarm_fails and \
                 "REVIEWED_SEED_BATCH_GATE" not in args[args.index("--set-env-vars") + 1]:
             return subprocess.CompletedProcess(args, 1, stdout="", stderr="deploy failed")
@@ -306,6 +318,29 @@ class Gcloud:
         if args[:3] == ["gcloud", "storage", "cp"] and self.cp_fail and args[-1].endswith(self.cp_fail):
             return subprocess.CompletedProcess(args, 1, stdout="", stderr="precondition failed")
         return ok()
+
+
+def applied_job(args, volumes, *, clear):
+    """The job document `gcloud run jobs deploy <args>` leaves, cut to what the read-back reads. `volumes` persists
+    across deploys (name -> volume) the way the server's template does; with clear=False old ones are kept."""
+    if clear:
+        assert "--clear-volumes" in args and "--clear-volume-mounts" in args
+        volumes.clear()
+    env, mounts = [], []
+    for item in args[args.index("--set-secrets") + 1].split(","):
+        target, ref = item.split("=", 1)
+        secret, version = ref.rsplit(":", 1)
+        if target.startswith("/"):
+            directory, file = target.rsplit("/", 1)
+            name = f"{secret}-{len(volumes)}"
+            volumes[name] = {"name": name, "secret": {"secretName": secret, "items": [{"key": version, "path": file}]}}
+            mounts.append({"name": name, "mountPath": directory})
+        else:
+            env.append({"name": target, "valueFrom": {"secretKeyRef": {"name": secret, "key": version}}})
+    env += [{"name": k, "value": v} for k, v in _env(args).items()]
+    return {"metadata": {"name": args[4]},
+            "spec": {"template": {"spec": {"template": {"spec": {
+                "volumes": list(volumes.values()), "containers": [{"env": env, "volumeMounts": mounts}]}}}}}}
 
 
 def run_args(mode="apply"):
@@ -339,7 +374,93 @@ def test_run_gates_then_deploys_armed_executes_async_waits_by_name_and_disarms(m
     state = json.loads((tmp_path / "run.json").read_text())
     # The name was kept at once (P1-1); a client error while polling was not taken as a terminal state.
     assert state["execution"] == "reviewed-seed-batch-batch-one-x7k2p" and state["state"] == "EXECUTION_SUCCEEDED"
-    assert state["disarmed"] is True
+    assert state["disarmed"] is True and state["disarm_check"] == []
+    # the disarm deploy is followed by the read-back, by the job's name
+    tail = [" ".join(c[1:5]) for c in fake.calls if c[1:3] == ["run", "jobs"] and c[3] in ("deploy", "describe")]
+    assert tail[-2:] == ["run jobs deploy reviewed-seed-batch-batch-one", "run jobs describe reviewed-seed-batch-batch-one"]
+
+
+@pytest.mark.parametrize("mode", launch.MODES)
+def test_every_deploy_clears_volumes_and_mounts_first(mode):
+    for armed in (True, False):
+        args = spec(mode, armed=armed)
+        assert "--clear-volumes" in args and "--clear-volume-mounts" in args and "--add-volume" not in args
+
+
+def disarm_secrets(mode="apply"):
+    return launch.parse_secrets(mode, raw_secrets(mode), NAMED_SHA)
+
+
+@pytest.mark.parametrize("mode", launch.MODES)
+def test_the_disarmed_job_as_deployed_reads_back_clean_and_the_armed_one_does_not(mode):
+    volumes = {}
+    armed = applied_job(spec(mode), volumes, clear=True)
+    problems = launch.disarmed_spec_problems(armed, disarm_secrets(mode))
+    assert problems and all(p.startswith(("secret volume", "volume mount", "env ")) for p in problems)
+    assert launch.disarmed_spec_problems(applied_job(spec(mode, armed=False), volumes, clear=True),
+                                         disarm_secrets(mode)) == []
+
+
+def test_without_clear_volumes_the_disarm_leaves_the_approval_volume_and_the_read_back_names_it():
+    volumes = {}
+    applied_job(spec("apply"), volumes, clear=False)
+    left = applied_job(spec("apply", armed=False), volumes, clear=False)
+    problems = launch.disarmed_spec_problems(left, disarm_secrets())
+    stale = sorted(p.rsplit("(", 1)[1].rstrip(")") for p in problems if p.startswith("secret volume"))
+    assert stale == ["seed-batch-approval", "seed-batch-plan"]      # the armed apply's, left unmounted
+    assert not [p for p in problems if p.startswith(("volume mount", "env ", "secret env"))]     # mounts were redone
+
+
+def test_the_read_back_checks_versions_mounts_secret_env_arming_env_and_unreadable_docs():
+    secrets = disarm_secrets()
+    clean = applied_job(spec("apply", armed=False), {}, clear=True)
+    tmpl = clean["spec"]["template"]["spec"]["template"]["spec"]
+    other = json.loads(json.dumps(clean))
+    other["spec"]["template"]["spec"]["template"]["spec"]["volumes"][0]["secret"]["items"][0]["key"] = "9"
+    assert [p for p in launch.disarmed_spec_problems(other, secrets) if "at versions ['9']" in p]
+    mounted = json.loads(json.dumps(clean))
+    mounted["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["volumeMounts"].append(
+        {"name": "x", "mountPath": "/var/run/pivota-seed-batch-approval"})
+    assert launch.disarmed_spec_problems(mounted, secrets) == ["volume mount /var/run/pivota-seed-batch-approval"]
+    keyed = json.loads(json.dumps(clean))
+    keyed["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"].append(
+        {"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "1"}}})
+    assert launch.disarmed_spec_problems(keyed, secrets) == ["secret env TOKEN"]
+    for name in sorted(launch.ARMING_ENV):
+        armed_env = json.loads(json.dumps(clean))
+        armed_env["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"].append(
+            {"name": name, "value": "1"})
+        assert launch.disarmed_spec_problems(armed_env, secrets) == [f"env {name}"]
+    scratch = json.loads(json.dumps(clean))
+    scratch["spec"]["template"]["spec"]["template"]["spec"]["volumes"].append({"name": "tmp", "emptyDir": {}})
+    assert launch.disarmed_spec_problems(scratch, secrets) == []
+    assert {v["secret"]["secretName"] for v in tmpl["volumes"]} == {"seed-batch-manifest", launch.NAMED_SECRET}
+    for broken in ({}, {"spec": {}}, []):
+        assert launch.disarmed_spec_problems(broken, secrets) == ["an unreadable job document"]
+
+
+def test_a_disarm_that_reads_back_a_leftover_secret_volume_is_not_disarmed_and_keeps_the_lock(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(keep_stale_volumes=True)
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["state"] == "EXECUTION_SUCCEEDED" and len(deploys(fake.calls)) == 2
+    assert state["disarmed"] is False and any("seed-batch-approval" in p for p in state["disarm_check"])
+    assert "still carries" in state["error"]
+    assert launch.lock_decision(state).startswith("HELD: the job is still ARMED")
+
+
+def test_a_read_back_that_fails_is_not_disarmed(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(readback=RuntimeError("describe denied"))
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    launch.cmd_run(run_args())
+    state = json.loads((tmp_path / "run.json").read_text())
+    assert state["disarmed"] is False and "describe denied" in state["error"]
+    assert launch.lock_decision(state).startswith("HELD")
 
 
 def test_run_with_a_closed_gate_deploys_and_executes_nothing_armed(monkeypatch, tmp_path):
@@ -516,6 +637,81 @@ def test_step_order_and_failure_policy():
     assert [s["id"] for s in steps() if s.get("allowFailure")] == ["run"]
     total = sum(int(s["timeout"].rstrip("s")) for s in steps())
     assert all("timeout" in s for s in steps()) and total < int(yaml.safe_load(CONFIG.read_text())["timeout"].rstrip("s"))
+
+
+def test_the_run_step_fits_the_worst_pre_wait_a_full_task_and_the_disarm():
+    run_step = int(next(s for s in steps() if s["id"] == "run")["timeout"].rstrip("s"))
+    assert run_step == launch.RUN_STEP_SECONDS
+    # Even after the slowest gate, listings, deploy and execute, the wait still covers the task's own timeout plus
+    # one poll, and the disarm + read-back still fit after it.
+    worst_wait = launch.wait_budget(0, launch.PRE_WAIT_WORST_SECONDS)
+    assert worst_wait >= launch.TASK_TIMEOUT_SECONDS + launch.EXECUTION_POLL_SECONDS + launch.DESCRIBE_TIMEOUT_SECONDS
+    assert launch.PRE_WAIT_WORST_SECONDS + worst_wait + launch.DISARM_RESERVE_SECONDS <= run_step
+    assert launch.DISARM_RESERVE_SECONDS >= 300 + launch.READBACK_TIMEOUT_SECONDS
+    assert launch.PRE_WAIT_WORST_SECONDS >= 420 + 120 + 120 + 300 + 120
+    assert f"--task-timeout={launch.TASK_TIMEOUT_SECONDS}s" not in spec("apply")         # two tokens, a plain value
+    assert spec("apply")[spec("apply").index("--task-timeout") + 1] == "1800s"
+
+
+def test_the_wait_budget_counts_from_the_step_start():
+    assert launch.wait_budget(0, 0) == launch.EXECUTION_DEADLINE_SECONDS
+    late = launch.RUN_STEP_SECONDS - launch.DISARM_RESERVE_SECONDS - 100
+    assert launch.wait_budget(0, late) == 100
+    assert launch.wait_budget(0, launch.RUN_STEP_SECONDS) == 0 and launch.wait_budget(50, 50 + late) == 100
+
+
+def test_no_poll_starts_unless_its_describe_fits_and_the_last_one_starts_at_deadline_minus_describe(monkeypatch):
+    calls, sleeps, now = [], [], [0.0]
+
+    def describe_running(args, **kw):
+        calls.append(kw.get("timeout"))
+        assert len(calls) < 50, "the wait keeps polling without the clock moving"      # fail, never hang
+        return json.dumps({"status": {}})
+
+    monkeypatch.setattr(launch, "run", describe_running)
+    poll, describe = launch.EXECUTION_POLL_SECONDS, launch.DESCRIBE_TIMEOUT_SECONDS
+    # deadline 89: polls at 0 and 15 (sleep 15), then the final one at 29 = 89 - 60 (sleep 14), then none (60 left)
+    state = launch.wait_for_execution("x", deadline=poll * 2 + describe - 1,
+                                      sleep=lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s)),
+                                      monotonic=lambda: now[0])
+    assert state is None and len(calls) == 3 and set(calls) == {describe}
+    assert sleeps == [poll, poll - 1] and now[0] == poll * 2 + describe - 1 - describe
+    # exactly describe left after a poll: no further poll (it could not finish by the deadline)
+    calls.clear(); sleeps.clear(); now[0] = 0.0
+    assert launch.wait_for_execution("x", deadline=describe, sleep=lambda s: sleeps.append(s),
+                                     monotonic=lambda: now[0]) is None
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_a_batch_that_ends_in_the_last_minute_before_the_deadline_is_seen_terminal(monkeypatch):
+    now, deadline = [0.0], 1000
+    done_at = deadline - launch.DESCRIBE_TIMEOUT_SECONDS - 1      # inside the old guard's blind ~75 s
+    monkeypatch.setattr(launch, "run", lambda args, **kw: json.dumps(
+        {"status": {"completionTime": "t", "conditions": [{"type": "Completed", "status": "True"}]}}
+        if now[0] >= done_at else {"status": {}}))
+    state = launch.wait_for_execution("x", deadline=deadline, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                                      monotonic=lambda: now[0])
+    assert state == "EXECUTION_SUCCEEDED" and now[0] <= deadline - launch.DESCRIBE_TIMEOUT_SECONDS
+
+
+def test_the_run_waits_only_for_what_is_left_of_the_step(monkeypatch, tmp_path):
+    held(tmp_path)
+    fake = Gcloud(states=("EXECUTION_SUCCEEDED",))
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    monkeypatch.setattr(launch.time, "sleep", lambda s: None)
+    seen = {}
+    real_wait = launch.wait_for_execution
+
+    def spy(name, *, deadline, **kw):
+        seen["deadline"] = deadline
+        return real_wait(name, deadline=deadline, **kw)
+
+    monkeypatch.setattr(launch, "wait_for_execution", spy)
+    clock = iter([0] + [2500] * 50)          # the step started at 0; the wait begins 2500 s in
+    launch.cmd_run(run_args(), monotonic=lambda: next(clock))
+    state = json.loads((tmp_path / "run.json").read_text())
+    left = launch.RUN_STEP_SECONDS - launch.DISARM_RESERVE_SECONDS - 2500
+    assert seen["deadline"] == state["wait_budget_s"] == left and state["disarmed"] is True
 
 
 def test_the_workspace_step_hands_the_directories_to_the_backend_images_runtime_user():

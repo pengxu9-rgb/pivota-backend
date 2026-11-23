@@ -159,10 +159,59 @@ def test_the_issuer_key_is_mounted_only_when_a_selected_case_needs_an_end_user()
         spec(["OR-DE"], user_key_version=2)
 
 
-def test_disarmed_spec_has_no_secret_no_gate_no_cases():
+def test_disarmed_spec_has_no_secret_no_volume_no_gate_no_cases():
     args = spec([], gate=None, armed=False)
     assert "--clear-secrets" in args and "--set-secrets" not in args
-    assert set(env_of(args)) == {"PIVOTA_ENV", "PROD_TEST_TXN_RELEASE_COMMIT"}
+    assert "--clear-volumes" in args and "--clear-volume-mounts" in args and "--add-volume" not in args
+    assert set(env_of(args)) == {"PIVOTA_ENV", "PROD_TEST_TXN_RELEASE_COMMIT"} == set(launch.DISARMED_ENV)
+
+
+def test_the_armed_spec_also_starts_from_no_volume_so_stale_secret_volumes_cannot_pile_up():
+    # gcloud applies --clear-volume-mounts / --clear-volumes BEFORE the secret changes, so the armed job ends with
+    # exactly the mounts --set-secrets names (and fresh volumes for them).
+    for args in (spec(["OR-US", "OR-DE"]), spec(["MCP-K-US"], user_key_version=2)):
+        assert "--clear-volumes" in args and "--clear-volume-mounts" in args and "--set-secrets" in args
+
+
+def job_doc(*, volumes=None, mounts=None, env=None, labels=None):
+    """`gcloud run jobs describe --format json`, cut to what the disarm read-back reads. Default: cleanly disarmed."""
+    env = env if env is not None else [{"name": "PIVOTA_ENV", "value": "production"},
+                                       {"name": "PROD_TEST_TXN_RELEASE_COMMIT", "value": RELEASE}]
+    container = {"image": f"x@{DIGEST}", "env": env}
+    if mounts is not None:
+        container["volumeMounts"] = mounts
+    template = {"containers": [container]}
+    if volumes is not None:
+        template["volumes"] = volumes
+    return {"metadata": {"name": "prod-test-transactions",
+                         "labels": labels if labels is not None else {"armed": "no", "build-id": BUILD}},
+            "spec": {"template": {"spec": {"template": {"spec": template}}}}}
+
+
+def secret_volume(name, secret, version, path):
+    return {"name": name, "secret": {"secretName": secret, "items": [{"key": version, "path": path}]}}
+
+
+def test_the_read_back_names_what_a_disarmed_job_still_carries():
+    assert launch.disarmed_spec_problems(job_doc()) == []
+    assert launch.disarmed_spec_problems(job_doc(volumes=[], mounts=[])) == []
+    # The shape build fc63d22a left behind: --clear-secrets dropped the mounts, not the two secret volumes.
+    left = job_doc(volumes=[secret_volume("k-abc", "test-shopping-agent-api-key", "2", "key"),
+                            secret_volume("t-def", "prod-test-transactions-targets", "1", "targets.json")], mounts=[])
+    assert launch.disarmed_spec_problems(left) == ["secret volume k-abc (test-shopping-agent-api-key)",
+                                                   "secret volume t-def (prod-test-transactions-targets)"]
+    assert launch.disarmed_spec_problems(job_doc(volumes=[{"name": "scratch", "emptyDir": {}}])) == []
+    assert launch.disarmed_spec_problems(job_doc(mounts=[{"name": "k-abc", "mountPath": "/var/run/x"}])) == [
+        "volume mount /var/run/x"]
+    keyed = [{"name": "PIVOTA_ENV", "value": "production"},
+             {"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "1"}}}]
+    assert launch.disarmed_spec_problems(job_doc(env=keyed)) == ["secret env TOKEN"]
+    armed_env = [{"name": "PIVOTA_ENV", "value": "production"}, {"name": "PROD_TEST_TXN_ARMED", "value": "1"}]
+    assert launch.disarmed_spec_problems(job_doc(env=armed_env)) == ["env PROD_TEST_TXN_ARMED"]
+    assert launch.disarmed_spec_problems(job_doc(labels={"armed": "yes"})) == ["label armed=yes"]
+    assert launch.disarmed_spec_problems(job_doc(labels={})) == ["label armed=None"]
+    for broken in ({}, {"spec": {}}, {"metadata": {}, "spec": {"template": {"spec": {"template": {"spec": {}}}}}}, []):
+        assert launch.disarmed_spec_problems(broken) == ["an unreadable job document"]
 
 
 class _GcloudArgs(argparse.ArgumentParser):
@@ -178,7 +227,8 @@ def gcloud_deploy_parse(args):
     for name in ("--project", "--region", "--image", "--service-account", "--tasks", "--max-retries",
                  "--task-timeout", "--labels", "--command", "--args", "--set-secrets", "--set-env-vars"):
         parser.add_argument(name)
-    parser.add_argument("--clear-secrets", action="store_true")
+    for name in ("--clear-secrets", "--clear-volumes", "--clear-volume-mounts"):
+        parser.add_argument(name, action="store_true")
     assert args[:4] == ["gcloud", "run", "jobs", "deploy"]
     return parser.parse_args(args[4:])
 
@@ -197,6 +247,7 @@ def test_every_deploy_spec_parses_as_gcloud_reads_it(over):
     assert parsed.job == "prod-test-transactions" and parsed.command == "python"
     assert parsed.args == "-m,scripts.ops.prod_test_transactions"
     assert parsed.set_env_vars == flag(args, "--set-env-vars") and parsed.clear_secrets == (not over.get("armed", True))
+    assert parsed.clear_volumes and parsed.clear_volume_mounts           # every deploy, armed or not
 
 
 def test_a_refused_deploy_keeps_gclouds_error_line_not_only_its_usage_tail(monkeypatch):
@@ -280,6 +331,8 @@ def test_a_wait_that_runs_out_cancels_the_execution_then_disarms(monkeypatch, tm
         calls.append(args[:5])
         if args[:4] == ["gcloud", "run", "jobs", "execute"]:
             return "prod-test-transactions-abc12\n"
+        if args[:4] == ["gcloud", "run", "jobs", "describe"]:
+            return json.dumps(job_doc())
         return ""
 
     monkeypatch.setattr(launch, "run", fake_run)
@@ -302,7 +355,8 @@ def test_a_wait_that_runs_out_cancels_the_execution_then_disarms(monkeypatch, tm
     assert state["cancel_requested"] is True and state["state"] == "EXECUTION_CANCELLED" and state["disarmed"] is True
     assert ["gcloud", "run", "jobs", "executions", "cancel"] in calls
     assert waits == [launch.EXECUTION_DEADLINE_SECONDS, launch.CANCEL_POLL_SECONDS]
-    assert calls[-1][:4] == ["gcloud", "run", "jobs", "deploy"]               # the disarm came after the cancel
+    # the disarm came after the cancel, and the job was read back after the disarm
+    assert calls[-2][:4] == ["gcloud", "run", "jobs", "deploy"] and calls[-1][:4] == ["gcloud", "run", "jobs", "describe"]
 
 
 def run_args():
@@ -311,8 +365,9 @@ def run_args():
                           "scripts": "/x"})()
 
 
-def armed_run(monkeypatch, tmp_path, *, execute=None, wait=None, find=None):
-    """cmd_run with every gcloud call faked; returns (run.json state, the gcloud calls made)."""
+def armed_run(monkeypatch, tmp_path, *, execute=None, wait=None, find=None, readback=None):
+    """cmd_run with every gcloud call faked; returns (run.json state, the gcloud calls made). `readback` is the job
+    document the disarm read-back gets (a clean disarmed job by default), or an exception it raises."""
     (tmp_path / "lock.held").write_text(BUILD)
     (tmp_path / "gateway.json").write_text("{}")
     calls = []
@@ -323,6 +378,10 @@ def armed_run(monkeypatch, tmp_path, *, execute=None, wait=None, find=None):
             if execute:
                 raise execute
             return "prod-test-transactions-abc12\n"
+        if args[:4] == ["gcloud", "run", "jobs", "describe"]:
+            if isinstance(readback, Exception):
+                raise readback
+            return json.dumps(readback if readback is not None else job_doc())
         return ""
 
     monkeypatch.setattr(launch, "run", fake_run)
@@ -369,6 +428,32 @@ def test_the_disarm_runs_when_the_lookup_or_the_wait_raises(monkeypatch, tmp_pat
 
     state, calls = armed_run(monkeypatch, tmp_path, wait=raising_wait)
     assert state["disarmed"] is True and disarmed(calls) and "describe exploded" in state["error"]
+
+
+def test_a_disarm_whose_read_back_still_finds_a_secret_volume_is_not_disarmed_and_keeps_the_lock(monkeypatch, tmp_path):
+    left = job_doc(volumes=[secret_volume("k-abc", "test-shopping-agent-api-key", "2", "key")], mounts=[])
+    state, calls = armed_run(monkeypatch, tmp_path, readback=left)
+    assert state["state"] == "EXECUTION_SUCCEEDED" and disarmed(calls)
+    assert state["disarmed"] is False and state["disarm_check"] == ["secret volume k-abc (test-shopping-agent-api-key)"]
+    assert "still carries: secret volume k-abc" in state["error"]
+    assert launch.sbl.lock_decision(state).startswith("HELD: the job is still ARMED")
+
+
+def test_a_read_back_that_fails_or_is_unreadable_is_not_disarmed(monkeypatch, tmp_path):
+    state, _ = armed_run(monkeypatch, tmp_path, readback=launch.LaunchRefused("describe refused"))
+    assert state["disarmed"] is False and "describe refused" in state["error"]
+    assert launch.sbl.lock_decision(state).startswith("HELD")
+    state, _ = armed_run(monkeypatch, tmp_path, readback={"metadata": {}})
+    assert state["disarmed"] is False and state["disarm_check"] == ["an unreadable job document"]
+
+
+def test_a_clean_read_back_is_disarmed_and_the_read_back_fits_the_reserve(monkeypatch, tmp_path):
+    state, calls = armed_run(monkeypatch, tmp_path)
+    assert state["disarmed"] is True and state["disarm_check"] == []
+    assert [c[:4] for c in calls[-2:]] == [["gcloud", "run", "jobs", "deploy"], ["gcloud", "run", "jobs", "describe"]]
+    assert launch.DISARM_RESERVE_SECONDS >= (60 + launch.CANCEL_POLL_SECONDS + launch.EXECUTION_POLL_SECONDS + 300
+                                             + launch.READBACK_TIMEOUT_SECONDS)
+
 
 
 def test_a_poll_never_starts_when_its_describe_would_overrun_the_deadline():
