@@ -1,6 +1,6 @@
 # ADR-032: The same product at another seller: matching at variant grain when listings share no identifier
 
-**Status:** Proposed (draft 3), 2026-11-22. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 and 3 answer two passes of an independent review: the ADR describes today's matcher correctly, names two existing attach paths, says which fields may create a match and which must be known, and ties the new stores to ADR-010, ADR-011 and ADR-012.
+**Status:** Proposed (draft 4), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 and 3 answered two passes of an independent review. Draft 4 answers the controller's review: one storage rule shared with ADR-031 (nothing derived from a door's or a catalog's content is kept until the source allows it); the beauty-first spec and the handling of unsure labels are put to the owner instead of being stated as decided; the intake's exact GTIN attach is named as family-grain only.
 
 **Decision owner:** Founder. **Runtime owners:** the backend owner (identity engine, records, evaluation), the gateway owner (lane field mapping, request-time lookup).
 
@@ -18,15 +18,17 @@
 - **ADR-010 (accepted in principle).** The tiered resolver, the two-grain model, reversibility and hysteresis, and its safety invariants, all of which stand:
   - money and attribution stay keyed on merchant-scoped ids;
   - public signature ids are write-once;
-  - a cross-merchant card needs resolution at or above the automatic threshold;
+  - a cross-merchant card needs resolution at or above the automatic threshold and `pdp_scope='multi_merchant_canonical'`; mis-merge is worse than fragmentation;
   - mis-merge rate is a neutrality metric.
 
   This ADR writes the pieces ADR-010 named and left unbuilt: the attribute spec (Tier 1), candidate retrieval (Tier 2), adjudication (Tier 3), and the gold labels.
-  - **Amended:** ADR-010's committed increment names electronics as the pilot vertical for the spec. The owner's 2026-10-16 direction made beauty the first. As ADR-010 says of beauty, its fields come from its lexicon and from structured options first, not from model-extracted attributes.
+  - **Proposed amendment (question 4):** ADR-010's committed increment names electronics as the pilot vertical for the spec. This ADR proposes beauty first, because the owner's 2026-10-16 matching direction was given for beauty.
+  - **Proposed amendment (question 4):** ADR-010 says beauty's fields come "via its lexicon graph, not `llm_attributes`". This ADR keeps the lexicon and structured options as the sources that count, and adds model-filled fields only as weak evidence: they can veto or hold, and never create agreement (M3).
   - **Amended:** ADR-010 defers Tiers 2 and 3 "until the measurement justifies them". The measurements below are that justification: retailers share no hard key, and exact titles alone leave most multi-seller brands unmatched. Tiers 2 and 3 start here in shadow and propose mode only. Neither may accept automatically under this ADR.
 - **ADR-011.** Attach before mint (R1), one namespace (R2), offers stay beneath identity (R6), no existing key is re-minted (R7). M1 and M8 say how a listing pointer meets each.
-- **ADR-012.** Every derived store has a reconciler and a drift metric (M12).
-- **ADR-007.** Mis-merge is worse than fragmentation.
+- **ADR-012 (catalog convergence).** Every derived store has a reconciler and a drift metric (M12).
+- **ADR-007.** The no-GTIN mis-merge gate: GTIN or resolved identity before any cross-merchant capture. Ranking stays on merit.
+- **ADR-031 D1.** What may be kept from each lane. This ADR adds no storage rule of its own.
 - **ADR-026.** Cross-border offers are served, ranked below domestic ones, and labelled.
 
 ## Scope
@@ -126,7 +128,7 @@
 - A listing attaches to a hub variant. Two retailers are the same variant because each attached to the same hub variant, never because they resemble each other.
 - **No hub:** a provisional anchor may be formed from retailers only through the exact tiers and a person's approval.
 - **When the brand's listing appears later,** a move to it is proposed. No member moves without a proposal (ADR-010 hysteresis).
-- The hub's variant list is the attribute record (M3) of the brand's own listing. Most hubs are listings Pivota already stores. Where one is read through the brand's door, what is kept is the derived typed fields, under M3's rule for that lane.
+- The hub's variant list is the attribute record (M3) of the brand's own listing. It is built from a source Pivota may store: its own crawl of a permitted page, a feed, a connected merchant, or brand-supplied data. Most hubs are such listings already.
 
 ### M3. Evidence is a typed record per listing version
 
@@ -148,7 +150,9 @@
 - **Not stated means unknown.** A field is never inferred from the fact that a listing shows a single option.
 - **Extraction:** the existing deterministic parsers first, then the lexicon. A vision-language model fills what they cannot, as a weak source, in two calls: one extracts, a second checks the first against the inputs. Units are converted in a separate deterministic step.
 - **An identifier is evidence, never a requirement.** It is collected wherever a lane or a feed gives one and attached to the cross-merchant variant. No stage needs one to exist.
-- **From a lane that allows only a cache window,** what is kept is the pointer, the derived typed fields, a fingerprint of the inputs, and the field-by-field outcome of a decision. Not the listing's text or images. This waits on ADR-031's open dependency 1 (question 5).
+- **What is kept follows ADR-031 D1.**
+  - For a listing Pivota may store (its own crawl of a permitted page, a feed, a connected merchant, brand-supplied data), the attribute record is stored.
+  - For a listing known only through a store's door or a platform catalog, the record is built in memory from a fresh read when the cascade runs. What is kept is the pointer, the verdict, which fields agreed, and a fingerprint of the inputs. The field values are not kept until the source allows it in writing (question 5).
 - The record is tied to a fingerprint of its inputs. When the listing changes, the record is rebuilt and the membership is re-checked (M7).
 
 ### M4. Candidates come from several channels, and recall is measured apart
@@ -214,7 +218,8 @@ Never substring, never "contains". The implementation starts from this table as 
 ### M8. At request time: look up only
 
 - **A request reads stored memberships.** It makes no model call and accepts nothing.
-- **A listing a lane returns that Pivota has not seen** gets a pointer and an attribute record, and is queued for the cascade. Demand sets the order: listings for products that partners ask about are matched first.
+- **A listing a lane returns that Pivota has not seen** gets a pointer and is queued for the cascade. Demand sets the order: listings for products that partners ask about are matched first.
+- **The intake's exact attach is family grain only.** `services/intake_identity.py` attaches a catalog row to an existing identity on an exact GTIN or other exact key, automatically, today. That stays. It never creates a `same_variant` membership; only the cascade does.
 - **Until it is resolved, it is not another seller of that product.** Whether it may appear at all is ADR-031 D8's rule.
 - Once matched, the answer is a lookup for every later request, on every lane.
 
@@ -225,7 +230,7 @@ Never substring, never "contains". The implementation starts from this table as 
 - **The gate for automatic acceptance** is the owner's: at least 600 randomly sampled accepted pairs with no error.
   - It is taken per tier for stage A (T0a, T0b, T0c separately), per stage for B, and separately for each vertical and language pair.
   - No error in 600 gives a one-sided 95% upper bound of about 0.5% on the error rate, for that slice only.
-  - A pair labelled unsure does not count toward the 600 and is replaced by a new draw. The bound therefore describes the pairs a person could judge. The unsure share is reported, and an unsure pair is never accepted automatically.
+  - **Proposed, pending question 3:** a pair labelled unsure does not count toward the 600 and is replaced by a new draw, so the bound describes the pairs a person could judge. The unsure share is reported, and an unsure pair is never accepted automatically. The owner's gate as given does not say how unsure labels are handled.
   - A gate that finds an error fails. It is taken again, on a new sample, only after the cause is fixed and the rule version has changed.
 - **After a gate passes:** a weekly random audit of automatic acceptances. One confirmed error suspends automatic acceptance for that slice until it is understood.
 - **Monitors that need no label:** a price far from the others inside a cross-merchant variant; an image that disagrees with the hub's; a live title that no longer matches the record's fingerprint.
@@ -249,11 +254,11 @@ A wider matcher would amplify these. Each is fixed before a new stage is switche
 4. The two other attach paths (the seed matcher and the official-catalogue judge) take the variant vetoes, and accept automatically only through M5 and M9.
 5. The existing judge is given the variant fields and the images, or is retired in favour of stage D.
 
-### M12. Reconcilers and drift metrics (ADR-012)
+### M12. Reconcilers and drift metrics (ADR-012, catalog convergence)
 
 | New stored thing | Upstream truth | Reconciler | Drift metric |
 |---|---|---|---|
-| Attribute records | the listing version | rebuilt when the input fingerprint changes; a periodic pass, stalest first | records whose fingerprint differs from the current listing |
+| Attribute records (stored listings only) | the listing version | rebuilt when the input fingerprint changes; a periodic pass, stalest first | records whose fingerprint differs from the current listing |
 | Cross-merchant variants and memberships | applied decisions | the engine's apply and revert; a periodic check that every member's record still agrees with the hub's tuple | members in `needs_recheck` beyond a set age; members whose record now conflicts |
 | Listing pointers | the lane's answers | ADR-031 D11 | ADR-031 D11 |
 
@@ -275,10 +280,10 @@ Moving `OFFERS_RESOLVE_GROUP_SEED_SIBLINGS` from shadow to on is a separate owne
 
 ## Phases
 
-1. **Fix first, and measure.** M11. The gold table, seeded from the labels the owner has already given. Attribute records built offline for stored listings. Exit: a measured baseline for today's tiers on the gold set.
+1. **Fix first, and measure.** M11. The gold table, seeded from the labels the owner has already given. Attribute records built offline for the listings Pivota may store. Exit: a measured baseline for today's tiers on the gold set.
 2. **Stage B for listings with a hub.** Same size first, then shade (question 1). Propose, audit, then the gate. Exit: the gate passes for one vertical in one market.
 3. **Retrieval, score and adjudication in shadow.** Each measured against the gold set before it proposes anything. Exit: retrieval recall and stage precision are known numbers.
-4. **Lane intake.** M8, with store-door search as the source (ADR-031 phase 4). The platform catalog is added once ADR-031's open dependency 1 is answered. Exit: the share of asked-for products with a second resolved seller.
+4. **Lane intake.** M8, with store-door search as the source (ADR-031 phase 3): pointers, a queue, and decisions made from a fresh read. The platform catalog is added once ADR-031's open dependency 1 is answered. Exit: the share of asked-for products with a second resolved seller.
 5. **A second language pair.** Its own gold slice and gate.
 
 ## Risks
@@ -286,7 +291,7 @@ Moving `OFFERS_RESOLVE_GROUP_SEED_SIBLINGS` from shadow to on is a separate owne
 - **A wrong merge shows a buyer the wrong price for the wrong item.** Every rule here trades recall for precision. A missed match leaves a listing standing alone, which is the safe failure.
 - **Labelling load.** The owner has been the labeller. Gates of 600 per slice need more labellers and a written guideline (question 2).
 - **Unknowns dominate where a lane gives few fields.** Comparison coverage will be low at first on the platform catalog lane.
-- **Derived fields may count as stored content** under a source's rules (ADR-031, open dependency 1).
+- **A match on a door-only listing cannot be re-examined offline.** Its field values are not kept (ADR-031 D1), only the verdict and which fields agreed. A person reviewing it later needs a fresh read. That changes if question 5 is answered with an allowance.
 - **The hub can be wrong.** A brand's own listing may be mis-titled or regional. A hub variant is itself a record with evidence and can be corrected.
 - **Model drift.** A model change re-runs the gold set before it serves, and never moves an attached member on its own.
 
@@ -294,9 +299,9 @@ Moving `OFFERS_RESOLVE_GROUP_SEED_SIBLINGS` from shadow to on is a separate owne
 
 1. **Shade grain.** Phase 1 was same size, with equal shade tokens. Open shade-level matching in phase 2 for listings with a hub, or wait until same-size has passed its gate?
 2. **Labellers.** Who labels beyond the owner, and may a second trained person's labels count toward a gate?
-3. **The bar.** Keep "no error in 600" for every slice, or accept a stated error rate for stages that only propose to a person?
-4. **The beauty-first spec.** Confirm that the first attribute spec is beauty, amending ADR-010's electronics pilot.
-5. **Derived records from cache-window lanes (M3).** Wait for the source's written answer before storing them (this draft), or store derived fields now?
+3. **The bar.** Keep "no error in 600" for every slice, or accept a stated error rate for stages that only propose to a person? And how are unsure labels counted: excluded and redrawn (this draft, M9), or counted as errors?
+4. **The beauty-first spec.** Confirm both proposed amendments to ADR-010: the first attribute spec is beauty, not electronics; and model-filled fields are admitted for beauty as weak evidence only.
+5. **Field values derived from a door's or a catalog's content (M3; ADR-031 D1).** Not kept until the source allows it in writing (this draft), or ask the sources for that allowance now as part of the same request as ADR-031's open dependencies 1 and 5?
 6. **The content key rule (M11 item 2).** GTIN out of the key and in its own column, as the intake code does, or in the key, as ADR-011 R3's text says?
 
 ## Consequences
