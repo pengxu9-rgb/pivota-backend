@@ -142,6 +142,94 @@
      "agent-internal-commerce-purchases"
     ]
    }
+  },
+  "/agent/internal/commerce/purchases/{purchase_id}/shipping-address": {
+   "post": {
+    "operationId": "submit_shipping_address_for_gateway_agent_internal_commerce_purchases__purchase_id__shipping_address_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "purchase_id",
+      "required": true,
+      "schema": {
+       "title": "Purchase Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Agenpas-Agent-Id",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Agenpas-Agent-Id"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Agenpas-Agent-User-Ref",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Agenpas-Agent-User-Ref"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-Internal-Key",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Internal-Key"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Submit Shipping Address For Gateway",
+    "tags": [
+     "agent-internal-commerce-purchases"
+    ]
+   }
   }
  }
 }

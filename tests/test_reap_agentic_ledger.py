@@ -1267,6 +1267,29 @@ async def test_expire_leaves_a_live_page_and_a_wrong_state_alone():
         assert (await ledger.get_purchase_internal(row_id))["state"] != "expired"
 
 
+@pytest.mark.parametrize("version", [None, 0, 2])
+async def test_expire_never_takes_an_awaiting_approval_row_without_version_1_dispatch_tracking(version):
+    """A legacy row's missing checkout id is unknown, never negative proof (db/reap_continuation.dispatch_state):
+    only a version-1 row's NULL checkout id and dispatch key prove no checkout exists. The sweep's codes are
+    then only ever written where there is no dispatch evidence (tests/test_terminal_write_dispatch_invariant.py).
+    A 'needs_enrollment' row cannot have dispatched (no edge back to it), so it expires whatever its version."""
+    legacy = await _mk(state="awaiting_approval")
+    tracked = await _mk(state="awaiting_approval", buyer_ref="bref_t")
+    enrolling = await _mk(state="needs_enrollment", buyer_ref="bref_e")
+    await database.execute("UPDATE reap_agentic_purchases SET dispatch_tracking_version = :v WHERE id IN (:a, :e)",
+                           {"v": version, "a": legacy["id"], "e": enrolling["id"]})
+    for row in (legacy, tracked):
+        await _set_clock_column(row["id"], "hosted_url_expires_at", _PAST)
+    await _set_clock_column(enrolling["id"], "hosted_url_expires_at", _PAST_GRACE)
+
+    assert sorted(await ledger.expire_overdue_purchases()) == sorted([tracked["id"], enrolling["id"]])
+    assert await _state_of(legacy["id"]) == "awaiting_approval"
+    # The absolute-age fallback is bounded by the same predicate.
+    await _set_clock_column(legacy["id"], "state_entered_at", "datetime('now', '-99999 seconds')")
+    assert await ledger.expire_overdue_purchases(max_age_seconds=60) == []
+    assert await _state_of(legacy["id"]) == "awaiting_approval"
+
+
 async def test_expire_is_idempotent_and_races_cleanly_with_a_transition():
     """A purchase that reached a terminal state by the ordinary path must not be re-expired, and
     two sweeps must not both claim the same row."""
