@@ -51,6 +51,18 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
         # The AgenPas consent gate withheld the page (services/payment_orchestration/purchase_consent.py):
         # the buyer still has a step to take, on the AgenPas page first. No url, by construction.
         body["next_action"] = {"kind": kind, "expires_at": marker.get("expires_at"), "consent_required": True}
+    # The A2A rail asks the buyer for the shipping address / email the agent did not send: a form the
+    # gateway shows, no URL. Field NAMES only (services/payment_orchestration/a2a_purchase_view).
+    required = detail.get("shipping_address_required")
+    if "next_action" not in body and isinstance(required, Mapping) and required.get("fields_missing"):
+        body["next_action"] = {"kind": "shipping_address", "fields_missing": list(required["fields_missing"])}
+        if required.get("expires_at") is not None:
+            body["next_action"]["expires_at"] = required["expires_at"]
+    if ("next_action" not in body and isinstance(marker, Mapping) and marker.get("kind") == "shipping_address"
+            and marker.get("consent_required") is True):
+        # The consent gate withheld the shipping-address form: the step is there, the form is not (no
+        # fields_missing until the consent; services/payment_orchestration/purchase_consent.py).
+        body["next_action"] = {"kind": "shipping_address", "consent_required": True, "expires_at": marker.get("expires_at")}
     if state == "completed" and detail.get("order_reference"):
         body["order_reference"] = detail["order_reference"]
     body["detail"] = dict(detail)
