@@ -1,6 +1,6 @@
 # ADR-031: Supply is read through lanes; a price is read from its source when a buyer acts, not crawled in advance
 
-**Status:** Proposed (draft 5), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 to 4 answered three passes of an independent review and recorded the owner's answer on list prices. Draft 5 answers the controller's review: a kept price lives only in the gateway's price cache and never reaches public or bulk surfaces; the ADR no longer amends the `has_price` gate; request-time reads get an egress rule; one storage rule serves this ADR and ADR-032.
+**Status:** Proposed (draft 6), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 to 4 answered three passes of an independent review and recorded the owner's answer on list prices. Draft 5 answers the controller's review: a kept price lives only in the gateway's price cache and never reaches public or bulk surfaces; the ADR no longer amends the `has_price` gate; request-time reads get an egress rule; one storage rule serves this ADR and ADR-032. Draft 6 records the owner's answer to question 1 and changes nothing else.
 
 **Decision owner:** Founder. **Runtime owners:** the gateway owner (request-time lanes, the price cache), the backend owner (identity, seller facts, records, scheduled lanes).
 
@@ -9,7 +9,7 @@
 **Direction already decided by the owner:**
 - **2026-10-14.** Pivota is a cross-platform merchant decision and recommendation layer, not a product index. The flow is: discover the product, compare merchants' offers across platforms, fill in the order, send an agent to complete it at the merchant, confirm, and leave service to the merchant.
 - **2026-11-22.** Supply comes from store platforms connected directly and from affiliate networks, not from a wider crawl. Four conditions hold on every source: same-product matching, a live comparison of a short list, a path to a paid order for every offer, and Pivota's credit on the order on every path.
-- **2026-11-23.** Asked how lists keep a recent price once the page crawl stops for a store with a door, the owner chose to keep a dated copy of the door's price and availability, with a paced re-read. D9 says what that is today and what it waits on. What happens meanwhile on stores whose platform limits a kept price to minutes is back with the owner (question 1).
+- **2026-11-23.** Asked how lists keep a recent price once the page crawl stops for a store with a door, the owner chose to keep a dated copy of the door's price and availability, with a paced re-read. D9 says what that is today and what it waits on. Asked the same day what applies meanwhile on stores whose platform limits a kept price to minutes, the owner chose to keep the page refresh there (question 1, answered).
 
 **Decisions this ADR follows and does not reopen:**
 - **The list-price rule** (gateway `src/services/listPriceTiers.js`). Lists use a recent price and never block on live reads. The live check runs where the buyer acts on one product. The merchant's own cart price is final. A list row says where its price came from with one of three tokens: `live`, `cache`, `stored`.
@@ -32,7 +32,7 @@
 
 **Amends** (each restated where it bites):
 - **The live-read rule** (gateway `src/services/ucpLiveOfferRead.js`, citing the owner's 2026-10-14 direction): "nothing is written back". D9 keeps a door's price and availability in the gateway's shared price cache. Inside the source's window that is what the cache was built for. Beyond it, it is new and waits on the source (owner, 2026-11-23).
-- **ADR-026, section 4.6** (the scheduled refresh as the recurring price read). It changes only for a store where the page refresh is stopped, which D9 allows only after open dependency 5 and owner questions 1 and 7.
+- **ADR-026, section 4.6** (the scheduled refresh as the recurring price read). It changes only for a store where the page refresh is stopped, which D9 allows only after open dependency 5 and owner question 7. Until then the page refresh keeps running (owner, 2026-11-23, question 1).
 - **ADR-025 D2**, the carrier table. D7 adds one row, and names what that row cannot do.
 - **ADR-012 (catalog convergence), rule 1** ("full coverage over time"). Listing pointers and cached prices are refreshed only when a buyer asks (D11). Their staleness is made visible, not reconciled.
 
@@ -275,7 +275,7 @@ This ADR adds no price vocabulary and changes no served field.
 
 | Reader | After this ADR |
 |---|---|
-| Price refresh (one page per listing) | Unchanged. It is the only writer of the stored price that public surfaces, the stored-price gates and stale list rows read. It stops for a store only after open dependency 5 and owner questions 1 and 7 |
+| Price refresh (one page per listing) | Unchanged. It is the only writer of the stored price that public surfaces, the stored-price gates and stale list rows read. The owner kept it for stores whose platform limits a kept price to minutes (2026-11-23, question 1). It stops for a store only after open dependency 5 and owner question 7 |
 | Destination sweep | Unchanged. A `variant_gone` door answer is one observation for its rule, at variant grain; one gone variant never marks a product gone |
 | Purchasability sweep; cart-link eligibility | Unchanged. ADR-029 D6 needs their facts |
 | Retailer ingest; affiliate feed reader | Unchanged. The feed reader gets a terms record per network (D3) |
@@ -351,7 +351,7 @@ Each phase ships alone, behind its switch. None depends on the payment work, and
 2. **Top search cards read live.** The search read is enforced with a top-K, under D10's egress rule. The storefront page reader is retired for stores with a door. Exit: the share of top cards answered `live`; list latency inside the budget; reads per minute under the ceiling.
 3. **Finding other sellers.** Store-door `search` at sellers we already serve queues listings for ADR-032. Catalog `search` and `lookup` run in shadow and are counted only. Under D10's egress rule. Exit: for products partners asked about, how many more sellers each source would add.
 4. **The ticket.** D7. Exit: the share of tickets whose quoted cart total equals the merchant's total at checkout.
-5. **A days-long copy, and the crawl stops for a store.** Only after open dependency 5 and owner questions 1 and 7. Exit: scheduled page reads per day fall by a number predicted beforehand, and no list row loses a price it had.
+5. **A days-long copy, and the crawl stops for a store.** Only after open dependency 5 and owner question 7. Exit: scheduled page reads per day fall by a number predicted beforehand, and no list row loses a price it had.
 6. **More lanes.** A second store platform, a marketplace's affiliate interface, affiliate feeds for retailers outside the platforms. Each needs its own terms record and its own market proof. Own crawl shrinks to sellers that partners ask for and no lane reaches.
 
 ## What we count
@@ -366,7 +366,7 @@ Each phase ships alone, behind its switch. None depends on the payment work, and
 
 ## Risks
 
-- **The owner's answer cannot replace the crawl on the largest lane yet.** Stores on a platform whose rule is a window of minutes keep the page refresh until that platform allows a days-long copy. The crawl's exposure on those stores is unchanged until then.
+- **The dated copy cannot replace the crawl on the largest lane yet.** Stores on a platform whose rule is a window of minutes keep the page refresh until that platform allows a days-long copy (owner, 2026-11-23, question 1). The crawl's exposure on those stores is unchanged until then; the question was put to the owner with that stated.
 - **A source changes its rules.** A seller reachable by two lanes survives one change, and the terms record makes a rule change one edit. Many sellers will have one lane.
 - **Request-time reads share the payment address.** A block of that address would affect payments. D10 bounds the volume; only a separate egress removes the coupling.
 - **Latency.** A live read adds one to three seconds on product and offers. Lists do not wait.
@@ -387,9 +387,7 @@ Each phase ships alone, behind its switch. None depends on the payment work, and
 
 ## Questions for the owner
 
-1. **Stores whose platform limits a kept price to minutes (D9).** The 2026-11-23 answer was given on a recommendation that read: a dated copy for a seller's own door once the source confirms; no stored price where a lane does not allow one; the page refresh only where no lane exists. It then turned out that the largest platform's rule is minutes. Until that platform allows more, which applies there:
-   - keep the page refresh for those stores (this draft; nothing changes), or
-   - stop it there, and accept list rows with no recent price beyond the cache window, and whatever question 7 decides for public pages?
+1. **Answered 2026-11-23: keep the page refresh.** The question was: on stores whose platform limits a kept price to minutes (D9), until that platform allows more, keep the page refresh, or stop it there and accept list rows with no recent price beyond the cache window. The owner chose to keep it. The answer covers the time before the platform's allowance only. What public pages and feeds show once a store's refresh does stop is still question 7.
 2. **Catalog-attributed hand-offs (D7).** No order joins their click row, so no agent share accrues under ADR-025 D5. Accept that for this lane, or hold the lane's attribution at shadow until the source offers a per-partner unit?
 3. **Comparing totals by cart (D5).** This draft prices a cart for the selected offer only, as ADR-029 D6 implies. The 2026-11-22 "live comparison of a short list" is met by live price reads, without shipping or tax. Is that enough, or should carts at a short list of sellers be designed as an amendment to ADR-029?
 4. **First sight (D8).** A listing first seen through a lane, at a seller we already serve: show it in the same answer as its own product, or only after it is queued and stored, as this draft does?
@@ -398,7 +396,7 @@ Each phase ships alone, behind its switch. None depends on the payment work, and
 7. **Public pages and feeds, once the page refresh stops for a store.** They read stored prices only. Show no price there (the page stays citable under ADR-007), or keep a slow page refresh for them?
 8. **Egress (D10).** Accept request-time lane reads on the shared payment address up to a stated ceiling, or require their own egress before phases 2 and 3?
 
-**Answered (owner, 2026-11-23): how lists keep a recent price.** Three options were put: (a) keep the page refresh for list prices; (b) keep a dated copy of the door's price and availability, with a paced re-read; (c) keep no stored price for these listings. The owner chose (b). This draft implements (b) as the gateway's price cache (D9). What applies on a platform whose rule is minutes was not part of that answer and is question 1.
+**Answered (owner, 2026-11-23): how lists keep a recent price.** Three options were put: (a) keep the page refresh for list prices; (b) keep a dated copy of the door's price and availability, with a paced re-read; (c) keep no stored price for these listings. The owner chose (b). This draft implements (b) as the gateway's price cache (D9). What applies on a platform whose rule is minutes was not part of that answer; it was asked separately and answered the same day (question 1).
 
 ## Consequences
 
@@ -413,7 +411,7 @@ Each phase ships alone, behind its switch. None depends on the payment work, and
 - **Keep widening the crawl.** Rejected by the owner on 2026-11-22: it duplicates what platforms serve live, its cost grows with products, markets and refresh rate, and it is the access most easily blocked.
 - **Write the dated copy through the page refresh's write path.** Draft 4 proposed it. Rejected: that path ends in the offer table, which feeds public pages, feeds and the stored-price gates, so a copy allowed for list display would be republished.
 - **Let a lane pointer stand in for a stored price** (`has_price`). Drafts 1 to 4 proposed it. Rejected: recall, trust and the public invariant all read the stored offer, the public surface is out of scope, and the built live-verification path already serves a stale listing.
-- **Keep the page refresh for list prices where a door exists** (option (a)), and **no stored price where a door exists** (option (c)). Not chosen by the owner on 2026-11-23. Which of them applies in the interim on a platform whose rule is minutes is question 1.
+- **Keep the page refresh for list prices where a door exists** (option (a)), and **no stored price where a door exists** (option (c)). Not chosen by the owner on 2026-11-23 as the standing design. For the interim on a platform whose rule is minutes, the owner chose (a) the same day (question 1); (c) is not adopted anywhere.
 - **No stored identity; search every source on every request.** Rejected: no public system works this way, no source outside one platform offers cross-merchant search, and a seller cannot be served before its facts are stored (ADR-030 D8).
 - **Copy the platform catalog into our tables.** Rejected: as read, its rules do not allow a standing index or bulk collection.
 - **A new price vocabulary and a new rank order.** Draft 1 proposed both. Rejected: the three-token contract and the ranking decisions already exist.
