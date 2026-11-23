@@ -269,7 +269,7 @@ _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchas
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288 and 290. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287, 288, 290 and 296. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -289,6 +289,7 @@ async def ensure_a2a_rail_schema() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("a2a_rail_ledger: checkout columns heal deferred to next boot error_type=%s",
                                type(exc).__name__)
+        await ensure_manual_resolution_audit_schema()
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
@@ -300,6 +301,7 @@ async def ensure_a2a_rail_schema() -> None:
         await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_DUE_INDEX)
+        await ensure_manual_resolution_audit_schema()
 
 
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
@@ -1563,6 +1565,8 @@ _LIST_ORPHAN_TOKENS_SQL = """
      WHERE state IN ('failed', 'refused', 'expired')
        AND payment_token_id IS NOT NULL
        AND terminal_at > clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+       AND NOT (COALESCE(last_error_code, '') = 'operator_confirmed_declined'
+                AND terminal_at > clock_timestamp() - (:declined_hold_seconds * INTERVAL '1 second'))
      ORDER BY terminal_at, id
      LIMIT :limit
 """
@@ -1571,6 +1575,8 @@ _LIST_ORPHAN_TOKENS_SQL_SQLITE = """
      WHERE state IN ('failed', 'refused', 'expired')
        AND payment_token_id IS NOT NULL
        AND terminal_at > datetime('now', '-' || :max_age_seconds || ' seconds')
+       AND NOT (COALESCE(last_error_code, '') = 'operator_confirmed_declined'
+                AND terminal_at > datetime('now', '-' || :declined_hold_seconds || ' seconds'))
      ORDER BY terminal_at, id
      LIMIT :limit
 """
@@ -1587,6 +1593,10 @@ _COUNT_ORPHAN_TOKENS_SQL_SQLITE = """
        AND terminal_at > datetime('now', '-' || :max_age_seconds || ' seconds')
 """
 ORPHAN_MAX_AGE_SECONDS = 31 * 86400
+#: A purchase a human closed as a provider-confirmed decline (`operator_confirmed_declined`) keeps its token
+#: OFF the orphan list (so never voided or forgotten) for this long after it ended: a late authorisation or a
+#: dispute can still be matched to a live token record first. The count below still counts it.
+ORPHAN_DECLINED_HOLD_SECONDS = 72 * 3600
 #: Fenced on the token it names and on the row having ended: a voided token is forgotten only where it
 #: was an orphan. `last_error_code` is left alone (it is what the agent was told about the purchase).
 _FORGET_ORPHAN_TOKEN_SQL = """
@@ -1602,7 +1612,8 @@ ORPHAN_TOKEN_STATES = _states_in(_LIST_ORPHAN_TOKENS_SQL, "WHERE state IN (")
 
 async def list_orphan_tokens(*, limit: int = 10) -> List[Dict[str, Any]]:
     """Ended purchases that still name a token, oldest end first. Worker-only (carries the member id)."""
-    values = {"limit": _limit(limit, 500), "max_age_seconds": ORPHAN_MAX_AGE_SECONDS}
+    values = {"limit": _limit(limit, 500), "max_age_seconds": ORPHAN_MAX_AGE_SECONDS,
+              "declined_hold_seconds": ORPHAN_DECLINED_HOLD_SECONDS}
     if IS_POSTGRES:
         rows = await database.fetch_all(_LIST_ORPHAN_TOKENS_SQL, values)
     else:
@@ -1626,3 +1637,237 @@ async def forget_orphan_token(purchase_id: str, payment_token_id: str) -> Option
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_FORGET_ORPHAN_TOKEN_SQL, values))
     return _purchase(await database.fetch_one(_FORGET_ORPHAN_TOKEN_SQL_SQLITE, values))
+
+
+# ── a human's close of a provider-confirmed decline (append-only audit; migration 296) ─────────
+#
+# ONE caller: services/payment_orchestration/a2a_rail_decline_close.py (jobs/a2a_rail_operator.py
+# `close-declined`). It ends ONE `paying` row held as `checkout_payment_reached_declined` (or, with a bound
+# lookup that agrees, the legacy `checkout_payment_reached_unconfirmed`) as `failed` /
+# `operator_confirmed_declined`, and records why in `a2a_rail_manual_resolution_audit`, in ONE statement on Postgres.
+# The audit row is append-only in the database (a trigger refuses UPDATE, DELETE and TRUNCATE). It holds no
+# statement text, no card data, no contact, no token id: an opaque reference, hashes, the operator handle,
+# times and the two attestations.
+MANUAL_RESOLUTION_AUDIT_TABLE = "a2a_rail_manual_resolution_audit"
+MANUAL_RESOLUTION_AUDIT_TRIGGER = "a2a_rail_manual_resolution_audit_immutable"
+#: The columns, in one place: both dialects' CREATE and the insert are built from it.
+_AUDIT_COLUMNS_PG = """
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    from_state VARCHAR(32) NOT NULL CHECK (from_state = 'paying'),
+    from_code VARCHAR(64) NOT NULL
+        CHECK (from_code IN ('checkout_payment_reached_declined', 'checkout_payment_reached_unconfirmed')),
+    from_state_entered_at TIMESTAMPTZ NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL CHECK (resolved_state = 'failed'),
+    resolution_code VARCHAR(64) NOT NULL CHECK (resolution_code = 'operator_confirmed_declined'),
+    provider_status VARCHAR(16) NOT NULL CHECK (provider_status = 'DECLINED'),
+    operator_ref VARCHAR(64) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL CHECK (evidence_source = 'provider_written_statement'),
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_file_sha256 VARCHAR(64) NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_reference_kind VARCHAR(32) NOT NULL
+        CHECK (provider_reference_kind IN ('checkout_task_id', 'external_order_reference')),
+    provider_reference VARCHAR(128) NOT NULL,
+    attests_no_authorization BOOLEAN NOT NULL CHECK (attests_no_authorization = TRUE),
+    attests_no_merchant_order BOOLEAN NOT NULL CHECK (attests_no_merchant_order = TRUE),
+    lookup_ran BOOLEAN NOT NULL,
+    lookup_agreed BOOLEAN NOT NULL CHECK (lookup_agreed = lookup_ran),
+    provider_origin VARCHAR(255) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+"""
+_CREATE_MANUAL_RESOLUTION_AUDIT_PG = f"CREATE TABLE IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TABLE} ({_AUDIT_COLUMNS_PG})"
+_CREATE_MANUAL_RESOLUTION_AUDIT_SQLITE = _CREATE_MANUAL_RESOLUTION_AUDIT_PG.replace("TIMESTAMPTZ", "TIMESTAMP")
+#: No table lock: run every boot (idempotent).
+_CREATE_MANUAL_RESOLUTION_AUDIT_FUNCTION_PG = """
+    CREATE OR REPLACE FUNCTION prevent_a2a_rail_manual_resolution_audit_mutation() RETURNS trigger
+    LANGUAGE plpgsql AS $fn$
+    BEGIN
+        RAISE EXCEPTION 'a2a_rail_manual_resolution_audit is append-only';
+    END;
+    $fn$
+"""
+_CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGER_PG = f"""
+    CREATE TRIGGER {MANUAL_RESOLUTION_AUDIT_TRIGGER}
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
+        FOR EACH STATEMENT EXECUTE FUNCTION prevent_a2a_rail_manual_resolution_audit_mutation()
+"""
+_MANUAL_RESOLUTION_TRIGGER_MISSING_PG = f"""NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgrelid = to_regclass('{MANUAL_RESOLUTION_AUDIT_TABLE}')
+                  AND tgname = '{MANUAL_RESOLUTION_AUDIT_TRIGGER}'
+                  AND NOT tgisinternal
+            )"""
+_CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGERS_SQLITE = (
+    f"""CREATE TRIGGER IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_update
+        BEFORE UPDATE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
+        BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
+    f"""CREATE TRIGGER IF NOT EXISTS {MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_delete
+        BEFORE DELETE ON {MANUAL_RESOLUTION_AUDIT_TABLE}
+        BEGIN SELECT RAISE(ABORT, 'a2a_rail_manual_resolution_audit is append-only'); END""",
+)
+
+
+async def ensure_manual_resolution_audit_schema() -> None:
+    """The audit table and its append-only trigger (migration 296's parity). On Postgres the trigger is created
+    only while the catalog says it is missing, under schema_guard's heal lock_timeout (a timeout defers it to
+    the next boot: the CLI refuses to close anything until it exists, `manual_resolution_audit_ready`)."""
+    if IS_POSTGRES:
+        from db.schema_guard import guarded_ddl
+
+        await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_PG)
+        await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_FUNCTION_PG)
+        try:
+            await database.execute(guarded_ddl(
+                MANUAL_RESOLUTION_AUDIT_TABLE, _MANUAL_RESOLUTION_TRIGGER_MISSING_PG,
+                _CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGER_PG + ";"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("a2a_rail_ledger: manual resolution audit trigger heal deferred to next boot "
+                           "error_type=%s", type(exc).__name__)
+        return
+    await database.execute(_CREATE_MANUAL_RESOLUTION_AUDIT_SQLITE)
+    for statement in _CREATE_MANUAL_RESOLUTION_AUDIT_TRIGGERS_SQLITE:
+        await database.execute(statement)
+
+
+async def manual_resolution_audit_ready() -> bool:
+    """The audit table exists AND carries its append-only trigger(s). The close refuses otherwise."""
+    if IS_POSTGRES:
+        row = await database.fetch_one(
+            "SELECT to_regclass(:t) IS NOT NULL AS has_table, EXISTS (SELECT 1 FROM pg_trigger "
+            "WHERE tgrelid = to_regclass(:t) AND tgname = :g AND NOT tgisinternal) AS has_trigger",
+            {"t": MANUAL_RESOLUTION_AUDIT_TABLE, "g": MANUAL_RESOLUTION_AUDIT_TRIGGER})
+        return bool(row and row["has_table"] and row["has_trigger"])
+    names = {r["name"] for r in await database.fetch_all(
+        "SELECT name FROM sqlite_master WHERE (type = 'table' AND name = :t) OR (type = 'trigger' AND tbl_name = :t)",
+        {"t": MANUAL_RESOLUTION_AUDIT_TABLE})}
+    return {MANUAL_RESOLUTION_AUDIT_TABLE, f"{MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_update",
+            f"{MANUAL_RESOLUTION_AUDIT_TRIGGER}_no_delete"} <= names
+
+
+_AUDIT_INSERT_COLUMNS = (
+    "purchase_id", "from_state", "from_code", "from_state_entered_at", "resolved_state", "resolution_code",
+    "provider_status", "operator_ref", "evidence_source", "evidence_reference", "evidence_file_sha256",
+    "evidence_observed_at", "provider_reference_kind", "provider_reference", "attests_no_authorization",
+    "attests_no_merchant_order", "lookup_ran", "lookup_agreed", "provider_origin", "evidence_sha256",
+)
+
+#: The candidate, by id (no lock). The decision (a2a_rail_decline_close.decide) runs on what this returns; the
+#: write then fences on the SAME stored values (`_raw_fence`), so a row that moved in between is not touched.
+_GET_DECLINE_CANDIDATE_SQL = """
+    SELECT id, state, last_error_code, state_entered_at, payment_token_id, checkout_task_id, order_id,
+           pending_write, claimed_by, terminal_at
+      FROM a2a_rail_purchases WHERE id = :id
+"""
+#: The fenced terminal write. NO `claimed_by` fence: a held payment-reached row is claimed and released every
+#: POLL_PARKED by the worker, which only ever releases it (its release is fenced `claimed_by = :worker_id`, so
+#: it writes nothing once this NULLs the claim). Fenced on what only a real transition changes.
+_CLOSE_DECLINED_SET_AND_FENCE = """
+       SET state = 'failed',
+           last_error_code = 'operator_confirmed_declined',
+           pending_write = NULL,
+           pending_write_at = NULL,
+           buyer_action_kind = NULL,
+           buyer_action_url = NULL,
+           buyer_action_expires_at = NULL,
+           buyer_email = NULL,
+           shipping_address = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = clock_timestamp(),
+           state_entered_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'paying'
+       AND last_error_code = :expected_code
+       AND state_entered_at = CAST(:fence_state_entered_at AS TIMESTAMPTZ)
+       AND payment_token_id = :fence_payment_token_id
+       AND checkout_task_id = :fence_checkout_task_id
+       AND order_id IS NOT DISTINCT FROM CAST(:fence_order_id AS VARCHAR)
+       AND pending_write IS NOT DISTINCT FROM CAST(:fence_pending_write AS VARCHAR)
+       AND state_entered_at < clock_timestamp() - (:min_age_seconds * INTERVAL '1 second')
+"""
+_AUDIT_CASTS = {
+    "from_state_entered_at": "TIMESTAMPTZ", "evidence_observed_at": "TIMESTAMPTZ",
+    "attests_no_authorization": "BOOLEAN", "attests_no_merchant_order": "BOOLEAN",
+    "lookup_ran": "BOOLEAN", "lookup_agreed": "BOOLEAN",
+}
+#: Postgres: ONE statement, so the transition and its audit row land together or not at all (a moved row
+#: returns nothing from `moved`, and the INSERT then inserts nothing).
+_CLOSE_DECLINED_SQL = (
+    "WITH moved AS (UPDATE a2a_rail_purchases" + _CLOSE_DECLINED_SET_AND_FENCE + " RETURNING id) "
+    f"INSERT INTO {MANUAL_RESOLUTION_AUDIT_TABLE} ({', '.join(_AUDIT_INSERT_COLUMNS)}) SELECT moved.id, "
+    + ", ".join(f"CAST(:a_{c} AS {_AUDIT_CASTS.get(c, 'VARCHAR')})" for c in _AUDIT_INSERT_COLUMNS[1:])
+    + " FROM moved RETURNING purchase_id"
+)
+#: SQLite (the test arm only; production is Postgres) has no data-modifying CTE: the fenced UPDATE, then the
+#: INSERT, in sequence.
+_CLOSE_DECLINED_UPDATE_SQL_SQLITE = (
+    ("UPDATE a2a_rail_purchases" + _CLOSE_DECLINED_SET_AND_FENCE + " RETURNING id")
+    .replace("clock_timestamp() - (:min_age_seconds * INTERVAL '1 second')",
+             "datetime('now', '-' || :min_age_seconds || ' seconds')")
+    .replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:fence_state_entered_at AS TIMESTAMPTZ)", ":fence_state_entered_at")
+    .replace("CAST(:fence_order_id AS VARCHAR)", ":fence_order_id")
+    .replace("CAST(:fence_pending_write AS VARCHAR)", ":fence_pending_write")
+    .replace("IS NOT DISTINCT FROM", "IS")
+)
+_INSERT_MANUAL_RESOLUTION_AUDIT_SQL_SQLITE = (
+    f"INSERT INTO {MANUAL_RESOLUTION_AUDIT_TABLE} ({', '.join(_AUDIT_INSERT_COLUMNS)}) "
+    f"VALUES ({', '.join(':a_' + c for c in _AUDIT_INSERT_COLUMNS)})"
+)
+_GET_MANUAL_RESOLUTION_SQL = f"SELECT * FROM {MANUAL_RESOLUTION_AUDIT_TABLE} WHERE purchase_id = :id"
+
+
+async def get_manual_resolution(purchase_id: str) -> Optional[Dict[str, Any]]:
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    row = await database.fetch_one(_GET_MANUAL_RESOLUTION_SQL, {"id": purchase_id})
+    return dict(row) if row is not None else None
+
+
+async def get_decline_candidate(purchase_id: str) -> Optional[Dict[str, Any]]:
+    """The close's read of ONE row by id. Decoded columns for the decision, plus `_raw_fence`: the STORED
+    values the write fences on (exact on both dialects). Carries the token id and the task id for the
+    CALLER'S comparisons only; the caller never prints either."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    row = await database.fetch_one(_GET_DECLINE_CANDIDATE_SQL, {"id": purchase_id})
+    if row is None:
+        return None
+    raw = dict(row)
+    out = _purchase(dict(raw))
+    out["_raw_fence"] = {k: raw[k] for k in ("state_entered_at", "payment_token_id", "checkout_task_id",
+                                             "order_id", "pending_write")}
+    return out
+
+
+async def close_declined(purchase_id: str, *, expected_code: str, fence: Mapping[str, Any],
+                         audit: Mapping[str, Any], min_age_seconds: int) -> bool:
+    """End ONE held row as `failed` / `operator_confirmed_declined` and record `audit`, fenced on `fence`
+    (get_decline_candidate's `_raw_fence`). True when written; False when the row moved (nothing written).
+    One caller: a2a_rail_decline_close.close, after its decision."""
+    if isinstance(min_age_seconds, bool) or not isinstance(min_age_seconds, int) or min_age_seconds < 1800:
+        raise ValueError("min_age_seconds must be at least 1800")
+    values: Dict[str, Any] = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "expected_code": _require(_CODE_RE, expected_code, "expected_code"),
+        "min_age_seconds": min_age_seconds,
+    }
+    for key in ("state_entered_at", "payment_token_id", "checkout_task_id", "order_id", "pending_write"):
+        values[f"fence_{key}"] = fence[key]
+    if not values["fence_payment_token_id"] or not values["fence_checkout_task_id"]:
+        raise ValueError("fence_incomplete")
+    record = {c: audit[c] for c in _AUDIT_INSERT_COLUMNS}
+    if record["purchase_id"] != values["id"]:
+        raise ValueError("audit_purchase_mismatch")
+    for column in ("from_state_entered_at", "evidence_observed_at"):
+        record[column] = _bind_dt(record[column])
+    if IS_POSTGRES:
+        values.update({f"a_{c}": record[c] for c in _AUDIT_INSERT_COLUMNS[1:]})
+        return await database.fetch_one(_CLOSE_DECLINED_SQL, values) is not None
+    moved = await database.fetch_one(_CLOSE_DECLINED_UPDATE_SQL_SQLITE, values)
+    if moved is None:
+        return False
+    await database.execute(_INSERT_MANUAL_RESOLUTION_AUDIT_SQL_SQLITE, {f"a_{c}": record[c] for c in _AUDIT_INSERT_COLUMNS})
+    return True
