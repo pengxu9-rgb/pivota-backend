@@ -398,6 +398,11 @@ def _address_row_to_checkout_shipping(addr: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+#: Checkout-token claim, set (True) only when the token's agent_user_ref came from a verified
+#: X-Agent-User-JWT at mint. GET /prefill reads the identity-linked buyer's vault only when it is True.
+_AGENT_USER_REF_VERIFIED_CLAIM = "agent_user_ref_verified"
+
+
 async def _buyer_prefill_from_identity_link(*, agent_id: str, agent_user_ref: str) -> Optional[Dict[str, Any]]:
     ref = str(agent_user_ref or "").strip()
     if not ref:
@@ -885,6 +890,10 @@ async def create_checkout_intent(
             },
         )
     agent_user_ref = verified_agent_user_ref or requested_agent_user_ref or None
+    # Only a ref that came from a verified X-Agent-User-JWT may unlock the buyer's identity-link
+    # prefill (GET /prefill). A body ref with no JWT is the caller's word: it is kept as attribution,
+    # never as identity.
+    agent_user_ref_verified = bool(verified_agent_user_ref) and agent_user_ref == verified_agent_user_ref
     brief_id = (req.brief_id or "").strip() or None
     brief_schema_version = (req.brief_schema_version or "").strip() or None
     job_id = (req.job_id or "").strip() or None
@@ -990,6 +999,8 @@ async def create_checkout_intent(
         token_payload["order_id"] = bound_order_id
     if agent_user_ref:
         token_payload["agent_user_ref"] = agent_user_ref
+        if agent_user_ref_verified:
+            token_payload[_AGENT_USER_REF_VERIFIED_CLAIM] = True
     if brief_id:
         token_payload["brief_id"] = brief_id
         token_payload["brief_schema_version"] = brief_schema_version
@@ -1302,7 +1313,9 @@ async def get_checkout_prefill(
             pass
     else:
         token_agent_user_ref = str(payload.get("agent_user_ref") or "").strip() or None
-        if token_agent_user_ref:
+        # A token whose ref was not verified at mint (a body ref with no JWT, or a token minted
+        # before this claim existed) does not unlock another buyer's saved email and address.
+        if token_agent_user_ref and payload.get(_AGENT_USER_REF_VERIFIED_CLAIM) is True:
             buyer_prefill = await _buyer_prefill_from_identity_link(
                 agent_id=context.agent_id,
                 agent_user_ref=token_agent_user_ref,
