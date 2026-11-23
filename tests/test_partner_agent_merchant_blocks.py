@@ -202,6 +202,9 @@ async def test_operator_events_carry_a_name_and_are_never_merged(_blocks_db):
     dict(source="operator", recorded_by="   "),
     dict(purchase_id="ap test"), dict(purchase_id="x" * 65), dict(purchase_id=""), dict(purchase_id=7),
     dict(source="operator", recorded_by="line one\nline two"), dict(source="operator", recorded_by="n" * 201),
+    # A part that does not fit refuses the whole event. It is never dropped to let the rest through.
+    dict(source="operator", recorded_by=STAFF, purchase_id="ap test"),
+    dict(source="worker", recorded_by="line one\nline two"),
 ], ids=lambda k: ",".join(f"{a}={str(b)[:12]!r}" for a, b in k.items()))
 async def test_an_event_that_does_not_fit_is_refused_and_nothing_is_written(_blocks_db, kwargs):
     args = dict(rail="a2a", domain=SHOP, kind="captcha", source="worker", purchase_id="ap_test_0001", recorded_by=None)
@@ -411,6 +414,11 @@ async def test_clear_is_a_dry_run_until_apply_and_shows_what_it_would_clear(_blo
     assert await blocks.is_clear("reap", SHOP) is True and await _count() == 2
     nothing = await _tool(*_CLEAR, "--apply")
     assert nothing.code == tool.EXIT_OK and nothing.payloads(tool.CLEARED_PREFIX)[0]["cleared"] == 0
+    # A dry run shows only what is OPEN: the two cleared events are not offered again.
+    await _tool(*_RECORD, "--apply")
+    again = await _tool(*_CLEAR)
+    assert len(again.payloads(tool.ROW_PREFIX)) == 1 and again.payloads(tool.DRY_RUN_PREFIX)[0]["would_clear"] == 1
+    assert again.payloads(tool.ROW_PREFIX)[0]["cleared_at"] is None
 
 
 async def test_the_tool_prints_every_column_of_an_event_as_json(_blocks_db):
