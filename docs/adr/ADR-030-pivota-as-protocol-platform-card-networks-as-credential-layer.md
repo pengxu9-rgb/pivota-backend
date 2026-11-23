@@ -51,14 +51,16 @@
 
 D7 makes the entry link a required field of the partner contract, and the agreed partner flow of 2026-11-10 says the order enters the merchant through it. One of the two payment partners cannot meet that as its interface stands. The decision owner decided on 2026-11-23 how that partner's orders are treated. This amendment builds nothing and switches nothing on.
 
+*Owner decision of 2026-11-23, to be confirmed by the owner when this amendment is merged.*
+
 **The limit.** Reap's external-checkout request takes a merchant domain and a checkout URL, and the domain must be the URL's own host. A request where they differ is refused. A network tracking link sits on the network's host, so it cannot be the checkout URL, and the request has no other field for a link the partner's agent loads first. Our own check of that URL (`services/reap_cart_link.py`) accepts one shape only: the cart line, our click id as a cart attribute, and the market.
 
 **The decision.** A payment partner that cannot load the entry link may complete orders without it. This is an exception to D7 for a named partner. D7 itself is unchanged.
 - **The exception is recorded per partner.** The partner's path declaration (ADR-029 D2, `attribution`) says that its orders do not enter through the entry link. Today that is Reap only.
 - **The entry link stays required for every other payment partner,** and it is a condition for admitting a new one. A partner that can load it must.
 - **What still rides on such an order.** The cart link carries our click id as a cart attribute, unchanged. That attributes the order wherever Pivota can read the merchant's orders. It earns no network commission: a network credits a click through its own link, and this order has none.
-- **How the order is treated.** For D7's commission fact it counts as **none** on the network, whatever the merchant's stored fact says for other paths. It follows ADR-028 D4: the order first, then a task to fix the loop. It never changes an offer's rank (ADR-025).
-- **The cost is accepted for now.** An order this partner completes can earn nothing where the handoff link on the same offer would have earned commission. ADR-029 decides which partner takes a purchase, so that choice may land on a partner whose order earns none.
+- **How the order is treated.** For D7's commission fact it counts as **none** on the network, whatever the merchant's stored fact says for other paths. It follows ADR-028 D4: the order first, then the loop is fixed. That is one standing task for this partner, the "To be revisited" item below, not a task per order. It never changes an offer's rank (ADR-025).
+- **The cost is accepted for now.** An order this partner completes can earn nothing where the handoff link on the same offer would have earned commission. ADR-029 decides which partner takes a purchase. Its amendment 1, point 1, puts the buyer's existing credential and the agent's partner before attribution among payment partners, so that choice may land on a partner whose order earns none.
 
 **To be revisited** once the partner has answered whether its agent can start from a tracking link that lands on the merchant. Two other ways to earn on such an order are open and undecided:
 - a code that the merchant's programme issues to us, sent in the partner's offer-code field. A code usually changes the buyer's price, so the price check has to expect it;
@@ -178,6 +180,8 @@ The buyer pays on the merchant's own checkout.
 - **Start.** The purchase starts at the existing rail-neutral purchase door (ADR-029). Pivota checks the price and the cap, picks the payment partner, and records the purchase.
 - **Card.** First time only, the buyer binds a card on the partner's hosted page.
 - **Quote.** Pivota sends the partner: our reference, the entry link, the cart link, the items, the currency of the buyer's market and the ship-to. The partner's agent opens the merchant's checkout through the entry link, then the cart link byte for byte, keeping cookies. It returns the merchant's items, discount, shipping, tax and total. Nothing is charged.
+
+  > **Amended 2026-11-23 (amendment 1).** For the one named partner that cannot load the entry link, the quote carries no entry link: its agent opens the cart link only.
 - **Approval.** The buyer approves **every** purchase, on the partner's page that shows the merchant and the quoted total.
 - **Payment.** In the same checkout session as the quote, payment is for exactly the approved total.
   - If the session cannot be held, the partner re-opens it. A lower total is then paid without re-asking only when the seller of record, the items and the currency are unchanged. Any other change re-asks the buyer.
