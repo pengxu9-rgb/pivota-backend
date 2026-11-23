@@ -530,6 +530,17 @@ async def test_apply_clears_what_the_dry_run_listed_and_not_what_arrived_since(_
     assert len(await _rows(open_only=True)) == 1 and await blocks.is_clear("reap", SHOP) is False
 
 
+async def test_a_dry_run_with_ids_previews_exactly_those_events(_blocks_db):
+    await _tool(*_RECORD, "--apply")
+    await _tool(*_RECORD, "--apply")
+    first, second = _ids_of(await _tool(*_CLEAR)).split(",")
+    preview = await _tool(*_CLEAR, "--ids", first)
+    assert [row["id"] for row in preview.payloads(tool.ROW_PREFIX)] == [first]
+    assert preview.payloads(tool.DRY_RUN_PREFIX)[0]["would_clear"] == 1 and _ids_of(preview) == first
+    assert (await _tool(*_CLEAR, "--ids", first, "--apply")).payloads(tool.CLEARED_PREFIX)[0]["cleared"] == 1
+    assert [row["id"] for row in await _rows(open_only=True)] == [second]
+
+
 async def test_apply_refuses_a_list_that_holds_an_id_that_is_not_open(_blocks_db):
     await _tool(*_RECORD, "--apply")
     reviewed = _ids_of(await _tool(*_CLEAR))
