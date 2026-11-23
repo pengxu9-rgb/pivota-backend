@@ -20,6 +20,21 @@ THREE OUTCOMES, AND "CANNOT TELL" IS NOT A NEGATIVE:
                        `last_code` change: an unreadable check neither revokes a positive nor
                        renews one, so a merchant that cannot be read for long enough ages out.
 
+THE DELIBERATE RULES (the challenge record and the filter that reads this fact inherit them):
+
+  1. A CLEAN NEGATIVE REVOKES AT ONCE. There is no two-strikes rule here, unlike the
+     purchasability fact.
+  2. A CLEAN NEGATIVE NEEDS BOTH PATHS TO ANSWER CLEANLY. One path that could not be read (a bot
+     wall on `/.well-known/ucp` beside a clean 404 on ACP) makes the whole check unreadable.
+  3. A NEGATIVE NEVER AGES OUT. Only a later positive clears it. A positive does age out.
+  4. A ROW THE RUN'S DEADLINE KEPT FROM BEING ASKED is stored as unreadable.
+  5. AN ACP POSITIVE needs a readable discovery document that LISTS the `checkout` service. A
+     readable document without it is a clean "no" for that path.
+
+Rules 2, 4 and 5 are applied by the writer's classifier
+(`jobs.merchant_protocol_profile_census.checkout_check`); rules 1 and 3 by the upsert and the read
+below.
+
 THE READ. `meets_run_condition(domain)` is True only while `negative_at` is NULL and one of the two
 `*_checkout_at` is younger than `max_age_days()` (30 by default). It answers False for a missing
 row, an old positive, a negative, an unusable domain, a slow or failed read, and a table that
