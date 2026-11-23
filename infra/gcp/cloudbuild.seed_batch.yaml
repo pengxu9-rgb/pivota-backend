@@ -40,7 +40,7 @@ options:
   dynamicSubstitutions: false
   env:
     - BUILD_ID=$BUILD_ID
-timeout: 4260s
+timeout: 4860s
 steps:
   - id: workspace
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
@@ -96,7 +96,7 @@ steps:
   - id: run
     name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd
     entrypoint: /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3
-    timeout: 2700s
+    timeout: 3300s
     allowFailure: true
     args: [/workspace/release/scripts/ops/seed_batch_launch.py, run, --mode, "${_MODE}", --batch-id, "${_BATCH_ID}",
            --release, "${_RELEASE}", --digest, "${_DIGEST}", --named-sha256, "${_NAMED_SHA256}",
