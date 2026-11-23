@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List
 from collections import OrderedDict
 import asyncio
 import contextvars
+import logging
 import secrets
 import hashlib
 import json
@@ -68,6 +69,17 @@ _KEY_LAST_USED_QUEUE_MAX = 2000
 _KEY_LAST_USED_WRITE_DEADLINE_SECONDS = 5.0
 _key_last_used_queue: "Optional[asyncio.Queue]" = None
 _key_last_used_dropped = 0
+# Drops are logged at most once per this many seconds, with the running total.
+_KEY_LAST_USED_DROP_LOG_SECONDS = 60.0
+_key_last_used_drop_logged_at: Optional[float] = None
+# The drainer is restarted if it ever ends without a shutdown, at most this many times per window;
+# past that, stamping stops (queue None) with one ERROR rather than restarting in a tight loop.
+_KEY_LAST_USED_MAX_RESTARTS = 5
+_KEY_LAST_USED_RESTART_WINDOW_SECONDS = 600.0
+_key_last_used_restarts: List[float] = []
+_key_last_used_task: "Optional[asyncio.Task]" = None
+# WARNING and above: prod's root logger is at WARNING, so INFO from a module logger is dropped.
+_key_last_used_logger = logging.getLogger("db.agents.key_last_used")
 
 
 class AgentAuthLookupTransientError(RuntimeError):
@@ -544,8 +556,15 @@ def _enqueue_key_last_used(*, source: str, api_key: str, key_hash_sha256: str, a
         try:
             queue.put_nowait((table, key_hash, now))
         except asyncio.QueueFull:
-            global _key_last_used_dropped
+            global _key_last_used_dropped, _key_last_used_drop_logged_at
             _key_last_used_dropped += 1
+            if _key_last_used_drop_logged_at is None or mono - _key_last_used_drop_logged_at >= _KEY_LAST_USED_DROP_LOG_SECONDS:
+                _key_last_used_drop_logged_at = mono
+                _key_last_used_logger.warning(
+                    "agent key last-used queue full: %d stamps dropped since start (queue max %d)",
+                    _key_last_used_dropped,
+                    _KEY_LAST_USED_QUEUE_MAX,
+                )
             return  # not memoized: the next lookup after a free slot tries again
         # Memo on enqueue, so a failed write is retried once per window, not once per lookup.
         _KEY_LAST_USED_MEMO[memo_key] = mono
@@ -574,11 +593,54 @@ async def _drain_key_last_used(queue: "asyncio.Queue") -> None:
         try:
             await asyncio.wait_for(_write_key_last_used(table, key_hash, now), timeout=_KEY_LAST_USED_WRITE_DEADLINE_SECONDS)
         except asyncio.CancelledError:
-            raise
+            # Only a cancel of THIS task (shutdown) stops the drainer. A CancelledError raised from
+            # inside the write (a driver or pool cancelling its own work) is one failed stamp: before,
+            # it ended the drainer for good, silently.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            _key_last_used_logger.warning("agent key last-used stamp skipped: cancelled inside the write")
         except Exception as exc:  # noqa: BLE001 - one failed stamp must not stop the drainer
-            print(f"agent key last-used stamp skipped: {type(exc).__name__}")
+            _key_last_used_logger.warning("agent key last-used stamp skipped: %s", type(exc).__name__)
         finally:
             queue.task_done()
+
+
+def _spawn_key_last_used_drainer(queue: "asyncio.Queue") -> "asyncio.Task":
+    global _key_last_used_task
+    task = asyncio.get_running_loop().create_task(
+        _drain_key_last_used(queue), name="agent-key-last-used", context=contextvars.Context()
+    )
+    _key_last_used_task = task
+    task.add_done_callback(_on_key_last_used_drainer_done)
+    return task
+
+
+def _on_key_last_used_drainer_done(task: "asyncio.Task") -> None:
+    """Restart a drainer that ended without a shutdown, and say so."""
+    global _key_last_used_queue
+    # A stopped drainer (queue None: shutdown, or the restart cap) and a superseded task stay down.
+    if task is not _key_last_used_task or _key_last_used_queue is None:
+        return
+    reason = "cancelled" if task.cancelled() else repr(task.exception())
+    now = time.monotonic()
+    _key_last_used_restarts[:] = [t for t in _key_last_used_restarts if now - t < _KEY_LAST_USED_RESTART_WINDOW_SECONDS]
+    if len(_key_last_used_restarts) >= _KEY_LAST_USED_MAX_RESTARTS:
+        _key_last_used_logger.error(
+            "agent key last-used drainer ended again (%s) after %d restarts in %.0fs; stamping stopped",
+            reason,
+            len(_key_last_used_restarts),
+            _KEY_LAST_USED_RESTART_WINDOW_SECONDS,
+        )
+        _key_last_used_queue = None
+        return
+    _key_last_used_restarts.append(now)
+    _key_last_used_logger.error("agent key last-used drainer ended unexpectedly (%s); restarting", reason)
+    try:
+        _spawn_key_last_used_drainer(_key_last_used_queue)
+    except Exception as exc:  # noqa: BLE001 - e.g. the loop is closing
+        _key_last_used_logger.error("agent key last-used drainer not restarted: %s", type(exc).__name__)
+        _key_last_used_queue = None
 
 
 def start_key_last_used_drainer() -> "asyncio.Task":
@@ -586,20 +648,32 @@ def start_key_last_used_drainer() -> "asyncio.Task":
 
     The task runs in a FRESH contextvars.Context: databases==0.7 keeps its Connection in a ContextVar
     and a task inherits its creator's, so a task made from the lifespan (or a request) would share
-    that connection. An empty context makes the drainer open its own."""
+    that connection. An empty context makes the drainer open its own. If it ever ends without a
+    shutdown, a done-callback logs it and starts a new one (bounded, see _KEY_LAST_USED_MAX_RESTARTS)."""
     global _key_last_used_queue
+    _key_last_used_restarts.clear()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_KEY_LAST_USED_QUEUE_MAX)
-    task = asyncio.get_running_loop().create_task(
-        _drain_key_last_used(queue), name="agent-key-last-used", context=contextvars.Context()
-    )
     _key_last_used_queue = queue
-    return task
+    return _spawn_key_last_used_drainer(queue)
 
 
 def stop_key_last_used_drainer() -> None:
-    """Stop queueing (the lifespan cancels the task). Items still queued are dropped."""
+    """Stop queueing and restarting (the caller cancels the task). Items still queued are dropped."""
     global _key_last_used_queue
     _key_last_used_queue = None
+
+
+async def shutdown_key_last_used_drainer(timeout: float = 3.0) -> None:
+    """For the lifespan: stop, cancel the live drainer (a restarted one included), and wait for it
+    at most `timeout` seconds, so a stuck write can't hold up shutdown."""
+    stop_key_last_used_drainer()
+    task = _key_last_used_task
+    if task is None or task.done():
+        return
+    task.cancel()
+    # asyncio.wait, not wait_for: on timeout wait_for cancels and then WAITS for the cancel to land,
+    # which a task stuck in a write that ignores it would never do. wait returns at the deadline.
+    await asyncio.wait({task}, timeout=timeout)
 
 
 async def get_agent_by_key(api_key: str, metrics_out: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
