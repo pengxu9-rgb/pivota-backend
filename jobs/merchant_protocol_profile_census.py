@@ -110,7 +110,9 @@ is written to `merchant_agent_checkout_facts` (migration 294) through
 
 Each path also carries its own answer. A path that answered cleanly without checkout loses its own
 stored positive at once, even when the other path could not be read and the outcome is therefore
-unreadable. A path that could not be read neither loses its positive nor renews it. BEFORE THE FIRST REQUEST the job checks that the table exists and answers. If it does not
+unreadable. A path that could not be read neither loses its positive nor renews it.
+
+BEFORE THE FIRST REQUEST the job checks that the table exists and answers. If it does not
 (migration 294 has not been applied, or the database is unreachable) it prints
 `UCPPROF_REFUSED store_unavailable` and exits 2 without reading any merchant. A write that fails
 later is counted and the run goes on; the run then exits 3. One more line is printed after the

@@ -182,6 +182,17 @@ async def test_acp_checkout_alone_meets_it(_facts_db):
     assert await facts.meets_run_condition("brand-a.example") is True
 
 
+async def test_a_version_is_stored_only_with_a_ucp_profile_that_was_read(_facts_db):
+    """On a first row as well: a check that did not read the UCP path stores no UCP version,
+    whatever version the caller passed."""
+    acp_only = facts.Check(facts.PUBLISHES, "ok", None, True, "2026-08-25")
+    assert await facts.record_check("brand-a.example", acp_only) is True
+    assert (await facts.get_fact("brand-a.example"))["ucp_version"] is None
+    await facts.record_check("brand-b.example", POSITIVE_UCP)
+    await facts.record_check("brand-b.example", acp_only._replace(ucp_version="2026-01-23"))
+    assert (await facts.get_fact("brand-b.example"))["ucp_version"] == "2026-08-25", "kept, not replaced"
+
+
 async def test_a_clean_negative_revokes_at_once(_facts_db):
     await facts.record_check("brand-a.example", POSITIVE_UCP)
     await facts.record_check("brand-a.example", POSITIVE_ACP)

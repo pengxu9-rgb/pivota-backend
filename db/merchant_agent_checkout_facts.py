@@ -267,7 +267,9 @@ async def record_check(domain: Any, check: Check, *, source: str = "census") -> 
         logger.warning("merchant_agent_checkout_facts: refusing a write with an unusable key, check or source")
         return False
     code = check.code if isinstance(check.code, str) and _CODE_RE.fullmatch(check.code) else CODE_OTHER
-    version = check.ucp_version if isinstance(check.ucp_version, str) and _VERSION_RE.fullmatch(check.ucp_version) else None
+    version = check.ucp_version
+    if not (isinstance(version, str) and _VERSION_RE.fullmatch(version)):
+        version = None
     if check.ucp_checkout is None:
         version = None  # no readable profile, no version: the row keeps the one it had
     values = {
