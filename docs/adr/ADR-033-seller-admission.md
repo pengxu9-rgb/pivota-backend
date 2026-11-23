@@ -1,6 +1,6 @@
 # ADR-033: A seller is shown for a brand only after it is admitted; matching says what an item is, admission says who may sell it
 
-**Status:** Proposed (draft 4), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 answered a first independent review. Draft 3 answers a second: the owner's 2026-07-27 direction that crawled merchants are real is now followed, so sellers already served stay served and the default-deny applies to sellers nobody chose; admission is enforced where a seller enters and exclusion where a seller is emitted or used; the brand key is one named function; the existing official-domain tables are reused; and a person can exclude a seller from the first phase. Draft 4 answers a third: one cut-off and one meaning of "first seen"; entry is enforced where a seller record is minted and an offer is written; a job a person queued admits its seller once the checks pass; a marketplace host never gets a blanket admission; and an exclusion is stored with its own reason on seeds and offers.
+**Status:** Proposed (draft 5), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 answered a first independent review. Draft 3 answers a second: the owner's 2026-07-27 direction that crawled merchants are real is now followed, so sellers already served stay served and the default-deny applies to sellers nobody chose; admission is enforced where a seller enters and exclusion where a seller is emitted or used; the brand key is one named function; the existing official-domain tables are reused; and a person can exclude a seller from the first phase. Draft 4 answers a third: one cut-off and one meaning of "first seen"; entry is enforced where a seller record is minted and an offer is written; a job a person queued admits its seller once the checks pass; a marketplace host never gets a blanket admission; and an exclusion is stored with its own reason on seeds and offers. Draft 5 answers a fourth: entry and exclusion are enforced in the database, because dozens of writers in two repositories touch these tables; a queued job counts as a person's choice only when the job records who queued it and where the domain came from; and the exclusion mark is its own column.
 
 **Decision owner:** Founder. **Runtime owners:** the backend owner (the admission record, review queue, signals, reconciler), the gateway owner (reading admissions on the request path, lane filters).
 
@@ -80,6 +80,9 @@ The 2026-09-24 direction named a way to find retailers that ADR-031's later stan
 - No way to exclude a seller for one brand or one market. The quarantine is all or nothing and takes public rows with it.
 - No marketplace notion, and no field anywhere that names the actual seller of a marketplace listing.
 - No serving gate on a seller's conduct.
+- No record of who queued an ingest job or where its domain came from. A job stores only a free-text source; the scheduler queues jobs itself; the admin route and the enqueue script accept any key holder, automated sessions included.
+- No column that could hold an exclusion beside another reason. The seed table has a status and no reason; the offer table has one suppression reason.
+- No single writer. About thirty backend files write the offer table and about thirty write the seed table; gateway scripts and one gateway service write them too. A connected merchant's products are served from a third table, the products cache.
 - No single brand key. Two functions share one name: the one seller ids use keeps non-ASCII letters but treats an accented and an unaccented spelling as two brands; the one the seller-type rule uses reduces every brand written in a non-Latin script to an empty string.
 - No join between a platform catalog's shop identifier and the storefront domain our records use. The gateway's own notes record that the two differ.
 
@@ -158,7 +161,9 @@ Only these create an admission. Each is stored with its source and the date it w
   - the storefront readable under our rules, with prices servable in the market's currency;
   - the brand present in the store's own listings and in stock;
   - for a merchant that installed our app, staff verification under the 2026-11-08 rule in place of the first check.
-  - **The person's choice is the queued job or the staff approval.** A retailer ingest job a person queues, whose dry run passes these checks, admits its seller, with the person who queued it recorded. A failed check holds the job for a person, as the ingest pipeline already holds a flagged cohort. This keeps ADR-018: a seller someone chose is not default-denied.
+  - **The person's choice is the queued job or the staff approval.** A retailer ingest job a person queues, whose dry run passes these checks, admits its seller. A failed check holds the job for a person, as the ingest pipeline already holds a flagged cohort. This keeps ADR-018: a seller someone chose is not default-denied.
+  - **A job counts as a person's choice only when it says so.** A migration adds to the job the named person who queued it and where the domain came from (a brand's page we read, a feed, a partner's request, the brand's own submission). A job with no named person, a job the scheduler queued, and a job queued by an automated session admit nothing for a domain with no record: they are held. A domain whose stated origin is search-grounded model output is refused (ADR-031's standing rule).
+  - **The identity and policy checks are new.** The ingest pipeline does not run them today. They are built as detectors beside the existing ones; until they exist, a person records each check by hand on the admission.
 - **For `established`:** the seller was served at the cut-off (S1). Nothing else, and nothing after it.
 - **Never evidence:** a commission or affiliate relationship; a platform's eligibility for its catalog; a product match; a rating; a store's description of itself, outside the queued-job case above; anything a model inferred; anything from search-grounded model results.
 
@@ -181,31 +186,35 @@ Only these create an admission. Each is stored with its source and the date it w
 
 ### S5. A marketplace is not a seller
 
-- The admission data holds a list of marketplace hosts. It must be a subset of the known-retailer list, and a test pins that. The three copies of the known-retailer list, and the seller-type rule, are not changed, so no seller id moves and no existing label changes.
+- **The marketplace list is a code constant,** beside the known-retailer list in each of its three copies, and a test pins it as a subset of that list in each. Marking a host that is already a known retailer as a marketplace moves no seller id and changes no existing label.
+- **Adding a marketplace that is not a known retailer today is a known-retailer change.** It goes into all three copies, and it changes how seller ids on that host are keyed, from brand and domain to domain alone. That is the known-retailer list's own review, not a data edit.
 - **Nothing we hold names the actual seller of a marketplace listing,** and the seller key is a domain, so it cannot name one storefront inside a marketplace. Until a lane carries the listing's seller and the key can hold it, no seller on a marketplace host is newly admitted. That includes a brand's own storefront there.
-- **Offers on a marketplace host that are served at the cut-off stay served.** Their `established` record is per brand, never the wildcard, and it covers those offers only: after the cut-off the offer writers add no new offer on a marketplace host. These are first in the review order (question 2).
+- **Offers on a marketplace host that are served at the cut-off stay served.** Their `established` record is per brand, never the wildcard, and it covers those offers only: after the cut-off no new offer is written on a marketplace host (S6). These are first in the review order (question 2).
 
 ### S6. Admission is enforced where a seller enters; exclusion where a seller is stored, emitted or used
 
 There is no single place where every seller passes. So the two halves of the rule are enforced at different points.
 
-**Admission, at entry.** Sellers enter by more than one door: a lane, a retailer ingest job, a connected merchant's catalog sync, the seed batch writer, and operator scripts that write offers directly. Two points sit behind all of them.
-- **Where a seller record is minted** (the observed-seller functions of `services/seller_identity.py`). After the cut-off no seller record is minted for a selling domain without a served tier.
-- **Where an offer or a seed is written.** The writers check the admission record. They write nothing for an `unverified` or `excluded` seller, and nothing new on a marketplace host (S5).
-- The lane module of ADR-031 D2 serves nothing from a seller without a served tier, before either point is reached.
+**Admission, at entry: enforced in the database.** Sellers enter by many doors: a lane, a retailer ingest job, the seed batch writer, operator scripts in both repositories, and a gateway service that updates seeds at run time. No code path sits behind all of them, so the rule is a database rule.
+- **The seed table and the offer table refuse a new row** for a selling domain that has no served tier, once the cut-off is set. The same rule refuses a new offer on a marketplace host (S5). It is a trigger keyed on the admission record; the repository already keeps invariants this way.
+- **Every writer is listed.** A ratchet test in each repository holds the list of files that write these tables and fails when a new one appears, as the existing writer ratchets do. It is how a writer that would trip the rule is found before production.
+- **A connected merchant enters by staff approval at onboarding,** not by these tables. Its seller id is issued there and its products are served from the products cache. The approval writes the admission. A merchant with no admission is not served from the products cache; that check is an emit point below.
+- The lane module of ADR-031 D2 serves nothing from a seller without a served tier, before the database is reached.
 - This is the whole of `enforce_new`.
 
-**Exclusion, in stored state.** An excluded seller must disappear from what is already stored.
-- **An exclusion has its own reason value,** on the seller's seed rows and on its offer rows, for the excluded brand and market. External offers are served from seed rows, so marking offers alone would not hide them.
-- **Writers respect it.** A crawl refresh, an ingest or a projection never re-writes or clears a row marked for exclusion; each checks the admission record first.
-- **Lifting an exclusion clears only that reason.** A row suppressed for another reason stays suppressed.
-- The stored product views are rebuilt, and the nightly relationship graph that `get_alternatives` serves from leaves excluded sellers out at its next build.
+**Exclusion, in stored state: its own column, enforced in the database.** An excluded seller must disappear from what is already stored.
+- **A migration adds an exclusion reference** to seed rows, offer rows and catalog product rows. It points at the admission record that excludes the seller for that brand and market. It is separate from the offer table's single suppression reason, which cannot hold two reasons at once.
+- **External offers are served from seed rows,** so the mark is on seeds as well as offers.
+- **The database keeps it.** A row of an excluded seller cannot be inserted or updated without the mark, and the mark cannot be cleared while the excluding record stands. So a crawl refresh, an ingest or a projection cannot quietly bring an excluded seller back, whichever of the writers runs.
+- **Lifting an exclusion clears only that mark.** A row suppressed for another reason stays suppressed.
+- **The products cache** has no such column in this ADR. An excluded connected merchant is removed by the operator's existing disable in the merchant directory, and by the emit check.
+- The stored product views are rebuilt, and the nightly relationship graph that `get_alternatives` serves from leaves excluded sellers out at its next build. The graph build reads these tables; it writes none of them.
 
 **Exclusion, at emit.** Every point that emits a seller or its address checks the record, before any cut to a top few, any cap, and any collapse of sellers into one. Known points, from review of both repositories; report mode completes the list:
 
 | Where | Points |
 |---|---|
-| Backend offers resolution | the connected-merchant, external-seed and sibling paths; the plain destination returned when a link cannot be minted |
+| Backend offers resolution | the connected-merchant path and its reads of the products cache; the external-seed and sibling paths; the plain destination returned when a link cannot be minted |
 | Backend search and product | the search handler's link attachment, the connected-product redirect attachment, the prefetched seed wrappers, the product read's offers, the product-by-id loader |
 | Backend link issue | caller-supplied seed link minting; the two legacy product search routes; the rule-based outbound link resolver |
 | Stored views | the agent product view's stored offers and its canonical pick; the relationship graph's stored candidates |
@@ -215,7 +224,7 @@ There is no single place where every seller passes. So the two halves of the rul
 
 **Exclusion, at use.** A link or an answer issued before an exclusion must not work after it:
 - link redemption re-checks the record. A link is valid for seven days and is not re-checked today;
-- checkout creation re-checks it on every path: the agent-to-agent purchase, the card-rail purchase, the gateway's checkout hand-off, the storefront cart escalation, the card-rail agentic lane, and the warm hand-off;
+- checkout creation re-checks it on every path: the agent-to-agent purchase, the Reap purchase, the gateway's checkout hand-off, the storefront cart escalation, the Reap agentic lane, and the warm hand-off (named as ADR-026 and ADR-031 name them);
 - the shared search cache's lifetime, and the one night between graph builds, bound how long an excluded seller can still appear. The emit check covers the graph meanwhile. Both bounds are stated in the change.
 
 **What this changes besides the offer list:** which offers survive a cap, the canonical pick, and ADR-032's hub. None is a new ordering input; all are effects of removing a seller, and they are measured in report mode.
@@ -259,7 +268,7 @@ There is no single place where every seller passes. So the two halves of the rul
 |---|---|---|---|
 | Official domains | the brand's own site | the existing official-domain liveness job, which is dormant by default and is turned on for this; a `dead` domain moves its admissions to review | domains `dead` or unchecked past a set age |
 | Operator attestations | the sources the operator reviewed | an attestation carries an expiry under this ADR and is re-reviewed by a person when it lapses; a revoked one moves its admissions to review. The liveness job does not cover these | attestations past expiry; admissions resting on a revoked attestation (zero) |
-| Exclusion marks on seeds and offers, and the relationship graph | admission records | a daily check that every row of an excluded seller carries the exclusion reason, that no row carries it without a record, and that the latest graph holds no excluded seller | rows of an excluded seller without the mark (zero); marks without a record (zero); excluded sellers in the graph (zero after one build) |
+| Exclusion marks on seeds and offers, and the relationship graph | admission records | the database rule keeps the mark; a daily check confirms that every row of an excluded seller carries it, that no row carries it without a record, that the latest graph holds no excluded seller, and that no excluded connected merchant is still enabled in the directory | rows of an excluded seller without the mark (zero); marks without a record (zero); excluded sellers in the graph (zero after one build); excluded merchants still enabled (zero) |
 | Admission records | the evidence each cites | each brand list is re-read on a schedule, by our own read of the brand's page; an admission whose evidence has gone moves to review | admissions past expiry; admissions whose evidence no longer reads; time in review |
 | Served sellers, including the stored offers in the agent product view | admission records | a daily check that no offer served, and no stored offer, came from an excluded seller or from a seller with no record | offers from an excluded seller (zero from phase 1); offers from a seller with no record (zero once enforced); sellers reaching an answer with no evaluation |
 
@@ -268,13 +277,13 @@ There is no single place where every seller passes. So the two halves of the rul
 | Switch | Where | What it does |
 |---|---|---|
 | `SELLER_EXCLUSION` (off, on) | every point of S6 | honours a person's `excluded` record. On from phase 1 and independent of the switch below |
-| `SELLER_ADMISSION` (off, report, enforce_new, enforce) | the lane module and ingest; the S6 points | report computes and logs with no serving change. enforce_new sets the cut-off (S1) and refuses, at the two entry points of S6, any selling domain first seen after it without a served tier. enforce also requires every served seller to have a record |
+| `SELLER_ADMISSION` (off, report, enforce_new, enforce) | the lane module and ingest; the S6 points | report computes and logs with no serving change. enforce_new sets the cut-off (S1) and turns on the database rule of S6, which refuses any selling domain first seen after it without a served tier. enforce also requires every served seller to have a record |
 | `SELLER_ADMISSION_SIGNALS` (off, report, on) | backend | S4 and S10 |
 | `SELLER_BRAND_CHANNEL` (off, on) | backend | S9 |
 
 ## Phases
 
-1. **Record, exclusion and report.** The admission record and the brand key. A person's exclusion honoured at the S6 points, with the quarantine as the interim tool where a point is not yet covered. The S8 report. Exit: the owner has the counts by tier and the products that depend on one seller; an exclusion written by a person removes that seller's offers and its issued links stop working.
+1. **Record, exclusion and report.** The admission record and the brand key. The migrations: the exclusion reference on seeds, offers and catalog products with its database rule, and the named person and domain origin on ingest jobs. The writer ratchets in both repositories. A person's exclusion honoured at the S6 points, with the quarantine as the interim tool where a point is not yet covered. The S8 report. Exit: the owner has the counts by tier and the products that depend on one seller; an exclusion written by a person removes that seller's offers and its issued links stop working.
 2. **Records for served sellers.** S8's first run, with the marketplace list of S5. Exit: every seller that serves today has a record.
 3. **Enforce for new sellers.** S8's second run, then `enforce_new` in the same step, before any ADR-031 phase serves or stores a seller a person did not choose. In ADR-031 as drafted that is its phase 6, which brings both the catalog as a serving lane and affiliate feeds; this phase must be done before either. Exit: nothing is served or stored from a selling domain first seen after the switch without a served tier.
 4. **Enforce for all.** Exit: the S11 drift for sellers with no record is zero.
@@ -293,7 +302,8 @@ There is no single place where every seller passes. So the two halves of the rul
 ## Risks
 
 - **New coverage grows slowly.** Sellers already served stay. A seller a lane returns is not shown until someone reviews it, so the catalog lane adds few sellers at first. Question 1 is where the owner accepts or relaxes that.
-- **Entry has several doors.** Catalog sync, the seed batch writer and operator scripts also bring sellers in. The mint and write points are meant to sit behind all of them; a writer that skips both would bypass the rule, and S11's daily check is what would show it.
+- **A database rule on busy tables.** Dozens of writers in two repositories write the seed and offer tables. A trigger that rejects a row can break a writer nobody thought of; the writer ratchets and a report-mode period, in which the rule logs and does not reject, come first. The trigger also adds a lookup to every write.
+- **The products cache is outside the database rule.** A connected merchant is kept out by onboarding approval and removed by the operator's disable. That is two controls owned by people, not one rule.
 - **`established` is not a check.** It carries ADR-018's direction forward; it says nothing about a seller's relationship to a brand. A fake seller already in the crawl stays until a signal or a person finds it.
 - **Exclusion has many readers.** A missed emit point, a seven-day link or a cached answer can still show an excluded seller. S6 lists what is known; report mode and the time-of-use checks cover the rest.
 - **The work is manual.** A stockist list read as prose, an approval per retailer, and an attestation where a brand has not proved its domain. No standard format was found. A model may help read a page we fetched; a person confirms what is stored.
@@ -335,6 +345,8 @@ There is no single place where every seller passes. So the two halves of the rul
 - **Write exclusions to the source quarantine as the standing design.** Draft 1 proposed it. Rejected: no brand or market key, public rows go down with it, and readers must opt in. It stays as the interim tool (S4).
 - **Default-deny for sellers already served.** Draft 2 implied it. Rejected: the owner's 2026-07-27 direction is that crawled merchants are real, and it would have removed an unmeasured share of offers.
 - **A second official-domain record.** Draft 2 proposed one. Rejected: the store and its liveness job exist.
+- **Enforcing entry in code, at the seller-record functions and the writers.** Draft 4 proposed it. Rejected: about sixty files in two repositories write these tables, and connected merchants do not pass through those functions.
+- **Treating any queued job as a person's choice.** Draft 4 implied it. Rejected: a job records no person, the scheduler queues jobs, and an automated session could queue a list that came from a model.
 - **A second approval for a seller a person queued.** Draft 3 implied it. Rejected as the default: it would default-deny a chosen seller, against ADR-018. It is question 3.
 - **A blanket `established` record for a marketplace host.** Draft 3 allowed it. Rejected: it would admit every third-party seller and every future listing there.
 - **Hiding an excluded seller by offer suppression alone.** Draft 3 proposed it. Rejected: external offers are served from seed rows, a refresh can re-write a row, and a shared reason could be cleared by an unrelated revert.
