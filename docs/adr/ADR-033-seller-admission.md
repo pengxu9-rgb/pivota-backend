@@ -1,6 +1,6 @@
 # ADR-033: A seller is shown for a brand only after it is admitted; matching says what an item is, admission says who may sell it
 
-**Status:** Proposed (draft 6), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 answered a first independent review. Draft 3 answers a second: the owner's 2026-07-27 direction that crawled merchants are real is now followed, so sellers already served stay served and the default-deny applies to sellers nobody chose; admission is enforced where a seller enters and exclusion where a seller is emitted or used; the brand key is one named function; the existing official-domain tables are reused; and a person can exclude a seller from the first phase. Draft 4 answers a third: one cut-off and one meaning of "first seen"; entry is enforced where a seller record is minted and an offer is written; a job a person queued admits its seller once the checks pass; a marketplace host never gets a blanket admission; and an exclusion is stored with its own reason on seeds and offers. Draft 5 answers a fourth: entry and exclusion are enforced in the database, because dozens of writers in two repositories touch these tables; a queued job counts as a person's choice only when the job records who queued it and where the domain came from; and the exclusion mark is its own column. Draft 6 defines that database rule: when it fires, what it looks up, which tables it guards, and where its mode is held.
+**Status:** Proposed (draft 7), 2026-11-23. Nothing here is built or switched on by this ADR. The owner answered the questions at the end on 2026-11-23. It stays Proposed until the owner accepts it. Draft 2 answered a first independent review. Draft 3 answers a second: the owner's 2026-07-27 direction that crawled merchants are real is now followed, so sellers already served stay served and the default-deny applies to sellers nobody chose; admission is enforced where a seller enters and exclusion where a seller is emitted or used; the brand key is one named function; the existing official-domain tables are reused; and a person can exclude a seller from the first phase. Draft 4 answers a third: one cut-off and one meaning of "first seen"; entry is enforced where a seller record is minted and an offer is written; a job a person queued admits its seller once the checks pass; a marketplace host never gets a blanket admission; and an exclusion is stored with its own reason on seeds and offers. Draft 5 answers a fourth: entry and exclusion are enforced in the database, because dozens of writers in two repositories touch these tables; a queued job counts as a person's choice only when the job records who queued it and where the domain came from; and the exclusion mark is its own column. Draft 6 defines that database rule: when it fires, what it looks up, which tables it guards, and where its mode is held. Draft 7 records the owner's answers to all eight questions.
 
 **Decision owner:** Founder. **Runtime owners:** the backend owner (the admission record, review queue, signals, reconciler), the gateway owner (reading admissions on the request path, lane filters).
 
@@ -13,7 +13,9 @@
 - **2026-09-26.** For an ingest job a person queued, a store may be accepted automatically as a brand's own when its published name starts with the brand, it ships to the job's market, and it prices in that market's currency, all together and among other conditions on the name (Tier B).
 - **2026-11-08.** Managed onboarding for now: no merchant signup is approved automatically.
 
-The 2026-09-24 direction named a way to find retailers that ADR-031's later standing rule no longer allows as a stored source. What "verify" means, and what is done about grey-market sellers and marketplaces, are this draft's proposals and are put to the owner (questions 2 and 3).
+- **2026-11-23.** The owner answered this ADR's eight questions, listed at the end. Among them: a seller nobody chose is not shown until verified; no new offer is admitted on a marketplace host; a retailer a brand names as not authorised stops for that brand; and a product stays findable when its only seller is excluded.
+
+The 2026-09-24 direction named a way to find retailers that ADR-031's later standing rule no longer allows as a stored source. What "verify" means, and what is done about grey-market sellers and marketplaces, were this draft's proposals; the owner decided them on 2026-11-23 (questions 2 and 3).
 
 **Decisions this ADR follows and does not reopen:**
 - **ADR-018.** A merchant we already serve, on any of its three connection layers, is a real merchant. It stays served under this ADR without waiting for a review (S8). A merchant a person chooses to add is admitted once the checks pass, without a second approval (S3). The default-deny of this ADR is for sellers nobody chose: those a lane returns.
@@ -34,7 +36,7 @@ The 2026-09-24 direction named a way to find retailers that ADR-031's later stan
 - **The stated contract of `merchant_domain_attestations`.** Its own description says it is read only by seller-type labelling and never widens a tier. Under S3 an attestation in force also counts toward `brand_own`. That is a new reader and a wider effect, decided here.
 - **ADR-001's precedence, as built.** The canonical pick prefers a brand-store row. An exclusion can remove that row, so the pick can change. The same holds for ADR-032 M2's hub.
 - **ADR-031 D8**, "Who may appear does not change". Who may appear does change, by S2.
-- **ADR-007 D2,** only if question 4 turns the offer-free lane on.
+- **ADR-007 D2.** The offer-free lane, built and off by default, is to be turned on so that a product whose only seller is excluded stays findable (owner, 2026-11-23, question 4). Turning it on is its own change, with its own review.
 
 ## Scope
 
@@ -45,7 +47,7 @@ The 2026-09-24 direction named a way to find retailers that ADR-031's later stan
 
 **In scope:** which sellers' offers are served on the agent tools (`search_catalog`, `recommend_products`, `get_alternatives`, `get_product`, `get_offers`, `create_checkout_session`) and on hand-off links; what evidence admits a seller; what holds or excludes one; how the decision is reviewed, measured and undone.
 
-**Also touched:** the gateway's other reads of the same offers (the public read tier and the first-party shopping interface) are covered by S6. Public product pages, sitemaps and the product feed are touched by an exclusion only, through the stored offers (S6; question 6).
+**Also touched:** the gateway's other reads of the same offers (the public read tier and the first-party shopping interface) are covered by S6. Public product pages, sitemaps and the product feed are touched by an exclusion only, through the stored offers (S6; confirmed by the owner, 2026-11-23, question 6).
 
 **Out of scope:**
 - **Whether a given item is genuine.** Pivota never inspects goods. It can check a seller's relationship to a brand and a seller's conduct, and nothing more. No field may claim otherwise.
@@ -90,7 +92,7 @@ The 2026-09-24 direction named a way to find retailers that ADR-031's later stan
 
 - **Sellers already served are not removed by this ADR.** Under ADR-018 they are real merchants. They receive a record that says so (S8) and stay served unless a person excludes one.
 - **How many have no seller type is not known today.** ADR-019 measured, on 2026-07-27, that of 2,646 external-referral offers not marked first-party, 2,166 had no seller type. That is one slice on one day. S8 measures all of it.
-- **A seller a person excludes may be a product's only seller.** Recall today requires a stored offer; the offer-free citable lane exists and is off by default. So an exclusion can remove a product from search.
+- **A seller a person excludes may be a product's only seller.** Recall today requires a stored offer; the offer-free citable lane exists and is off by default. So an exclusion can remove a product from search. The owner decided such a product stays findable, by turning that lane on (owner, 2026-11-23, question 4). Until it is on, the person writing an exclusion is shown the products that would lose their only seller.
 - **Exclusion changes more than the offer list.** It can change the canonical pick, which prefers a brand-store row, and the hub ADR-032 attaches other sellers to.
 
 ### Why this becomes urgent with lanes
@@ -133,11 +135,11 @@ Today's protection is implicit: sellers are brand sites and retailers a person c
 | `authorised` | a seller the brand itself names for that market (S3) | yes |
 | `verified_retailer` | a retailer, or a merchant that installed our app, that a person chose and that passed the S3 checks | yes |
 | `established` | a seller already served at the cut-off, on any connection layer of ADR-018 | yes; reviewed over time, in order of demand |
-| `unverified` | any other seller: in practice one a lane returned that nobody chose | no; counted only (question 1) |
+| `unverified` | any other seller: in practice one a lane returned that nobody chose | no; counted only (owner, 2026-11-23, question 1) |
 | `excluded` | a seller a person has excluded, for a brand and market or everywhere | no; no link is issued to it and none already issued is honoured |
 
 - **`verified_retailer` is decided per seller and market,** and applies to a brand only while that brand is in the retailer's own listings.
-- **Where a brand publishes a list of authorised sellers for a market,** a seller not on it is not newly admitted for that brand as a `verified_retailer`; it goes to review. An `established` seller not on the list stays served and is reviewed (question 2).
+- **Where a brand publishes a list of authorised sellers for a market,** a seller not on it is not newly admitted for that brand as a `verified_retailer`; it goes to review. An `established` seller not on the list stays served and is reviewed. Where a brand publishes no list, a `verified_retailer` is enough (owner, 2026-11-23, question 2).
 - **The order of tiers is not an input to how offers are ordered** (ADR-031 D6).
 
 ### S3. What admits a seller
@@ -156,7 +158,7 @@ Only these create an admission. Each is stored with its source and the date it w
 - **For `authorised`:**
   - the brand's own published list of authorised sellers or stockists for that market, read by us from the brand's official domain;
   - a statement through a brand account whose claim is on the official domain by DNS record or domain email (S9).
-- **For `verified_retailer`,** a person's choice and these checks, taken by us (question 3):
+- **For `verified_retailer`,** a person's choice and these checks, taken by us (owner, 2026-11-23, question 3):
   - a published legal identity, contact details, and shipping and returns policies;
   - the storefront readable under our rules, with prices servable in the market's currency;
   - the brand present in the store's own listings and in stock;
@@ -170,9 +172,9 @@ Only these create an admission. Each is stored with its source and the date it w
 ### S4. Signals hold; only a person excludes
 
 - **Signals that stop serving at once, pending a person's review:**
-  - the brand's official domain names the seller as not authorised, or the brand reports it under S9;
+  - the brand's official domain names the seller as not authorised, or the brand reports it under S9. The seller stops for that brand; it may still be shown for others (owner, 2026-11-23, question 2). This signal is switched on only after counsel has read the points in Risks (owner, 2026-11-23, question 8);
   - a confirmed complaint that an item bought through Pivota was not genuine;
-  - a dispute or return rate above a set threshold on orders through Pivota, once the seller has the minimum sample the outcome service already requires (question 7).
+  - a dispute or return rate above a set threshold on orders through Pivota, once the seller has the minimum sample the outcome service already requires. The threshold is set by the owner after the signals have run in report mode; until then no seller is stopped by this signal (owner, 2026-11-23, question 7).
 - **Signals that open a review without stopping serving:**
   - the matcher vetoes a set share of the seller's listings for a brand on price ratio against the brand's own listing. The matcher already computes that veto; this counts it per seller. Price is weak evidence both ways: a counterfeit may be priced just under the genuine item, and a legitimate sale may be deep;
   - an `established` seller is absent from a list its brand publishes;
@@ -181,7 +183,7 @@ Only these create an admission. Each is stored with its source and the date it w
 - **A stopped seller is not yet excluded.** Its admission moves to review and it contributes no offer meanwhile. Only a person writes `excluded`, with evidence, and the write is reversible.
 - **The exclusion lives on the admission record.** It is scoped to a brand and market, or to the seller everywhere (S1's wildcard).
 - **A person's exclusion works from the first phase, in every mode of the switch.** It does not wait for `enforce`. Until every reader of S6 honours the record, the source quarantine remains the tool for taking a seller down everywhere: it exists, it works for the readers that opt in, and its bluntness (no brand or market, public rows too) is accepted for that interim.
-- **Pivota never tells an agent that a seller is fake or unauthorised.** An unadmitted seller is simply not offered. The only tier facts an answer may carry are positive ones (question 5).
+- **Pivota never tells an agent that a seller is fake or unauthorised.** An unadmitted seller is simply not offered. The tier is not exposed to agents; `official_source` remains the only such fact an answer carries (owner, 2026-11-23, question 5).
 - Signals on a seller's domain age and on copied images are not adopted here. Nothing we hold measures them today.
 
 ### S5. A marketplace is not a seller
@@ -189,7 +191,7 @@ Only these create an admission. Each is stored with its source and the date it w
 - **The marketplace list is a code constant,** beside the known-retailer list in each of its three copies, and a test pins it as a subset of that list in each. Marking a host that is already a known retailer as a marketplace moves no seller id and changes no existing label.
 - **Adding a marketplace that is not a known retailer today is a known-retailer change.** It goes into all three copies, and it changes how seller ids on that host are keyed, from brand and domain to domain alone. That is the known-retailer list's own review, not a data edit.
 - **Nothing we hold names the actual seller of a marketplace listing,** and the seller key is a domain, so it cannot name one storefront inside a marketplace. Until a lane carries the listing's seller and the key can hold it, no seller on a marketplace host is newly admitted. That includes a brand's own storefront there.
-- **Offers on a marketplace host that are served at the cut-off stay served.** Their `established` record is per brand, never the wildcard, and it covers those offers only: after the cut-off no new offer is written on a marketplace host (S6). These are first in the review order (question 2).
+- **Offers on a marketplace host that are served at the cut-off stay served.** Their `established` record is per brand, never the wildcard, and it covers those offers only: after the cut-off no new offer is written on a marketplace host (S6). These are first in the review order (owner, 2026-11-23, question 2).
 
 ### S6. Admission is enforced where a seller enters; exclusion where a seller is stored, emitted or used
 
@@ -238,7 +240,7 @@ There is no single place where every seller passes. So the two halves of the rul
 
 **What this changes besides the offer list:** which offers survive a cap, the canonical pick, and ADR-032's hub. None is a new ordering input; all are effects of removing a seller, and they are measured in report mode.
 
-**Bulk and public surfaces** (the product feed for agent checkout, public pages, sitemaps): an exclusion reaches them through the marked rows. Whether `unverified` matters there does not arise, since an unverified seller is never stored (question 6).
+**Bulk and public surfaces** (the product feed for agent checkout, public pages, sitemaps): an exclusion reaches them through the marked rows. Whether `unverified` matters there does not arise, since an unverified seller is never stored (owner, 2026-11-23, question 6).
 
 **Report mode logs any seller that reaches an answer without an evaluation.** `enforce` waits until that log is empty for a stated period.
 
@@ -258,7 +260,7 @@ There is no single place where every seller passes. So the two halves of the rul
 - **Then every served seller gets a record.** A brand store whose domain counts by S3 is `brand_own`. A retailer whose S3 checks are on record is `verified_retailer`. Every other served seller is `established`: with the wildcard brand, except on a marketplace host, where it is per brand (S5).
 - **The record-writing runs twice:** once in phase 2, and again at the cut-off, so a seller first served between the two is not left without a record.
 - **`established` is a fact about the past.** It cannot be given to a seller after the cut-off.
-- **Review of `established` sellers runs in order of demand.** Marketplace hosts and sellers with S4 signals go first. This draft sets no deadline after which an unreviewed seller stops (question 4).
+- **Review of `established` sellers runs in order of demand.** Marketplace hosts and sellers with S4 signals go first. There is no deadline after which an unreviewed seller stops (owner, 2026-11-23, question 4).
 
 ### S9. The brand can speak, from its official domain
 
@@ -293,11 +295,12 @@ There is no single place where every seller passes. So the two halves of the rul
 ## Phases
 
 1. **Record, exclusion and report.** The admission record and the brand key, with their database copies. The migrations: the exclusion reference on seeds, offers and catalog products with its database rule; the entry rule on the same three tables in `report` mode; and the authenticated person and domain origin on ingest jobs. The writer ratchets in both repositories. A person's exclusion honoured at the S6 points, with the quarantine as the interim tool where a point is not yet covered. The S8 report. Exit: the owner has the counts by tier and the products that depend on one seller; an exclusion written by a person removes that seller's offers and its issued links stop working.
+   Alongside it, as its own change: the offer-free lane of ADR-007 is turned on, so that an exclusion does not remove a product from search (question 4).
 2. **Records for served sellers.** S8's first run, with the marketplace list of S5. Exit: every seller that serves today has a record.
 3. **Enforce for new sellers.** S8's second run, then `enforce_new` in the same step, before any ADR-031 phase serves or stores a seller a person did not choose. In ADR-031 as drafted that is its phase 6, which brings both the catalog as a serving lane and affiliate feeds; this phase must be done before either. Exit: nothing is served or stored from a selling domain first seen after the switch without a served tier.
 4. **Enforce for all.** Exit: the S11 drift for sellers with no record is zero.
-5. **Signals and outcomes.** S4 and S10, in report mode first. Exit: the review queue's volume and its false-alarm rate are known.
-6. **The brand channel.** S9.
+5. **Signals and outcomes.** S4 and S10, in report mode first. The owner sets the thresholds from that data (question 7). The brand-statement signal waits on counsel (question 8). Exit: the review queue's volume and its false-alarm rate are known.
+6. **The brand channel.** S9, after counsel's read (question 8).
 
 ## What we count
 
@@ -310,7 +313,7 @@ There is no single place where every seller passes. So the two halves of the rul
 
 ## Risks
 
-- **New coverage grows slowly.** Sellers already served stay. A seller a lane returns is not shown until someone reviews it, so the catalog lane adds few sellers at first. Question 1 is where the owner accepts or relaxes that.
+- **New coverage grows slowly.** Sellers already served stay. A seller a lane returns is not shown until someone reviews it, so the catalog lane adds few sellers at first. The owner accepted that (2026-11-23, question 1).
 - **A database rule on busy tables.** Dozens of writers in two repositories write the seed and offer tables. A trigger that rejects a row can break a writer nobody thought of; the writer ratchets and a report-mode period, in which the rule logs and does not reject, come first. The trigger also adds a lookup to every write.
 - **The products cache is outside the database rule.** A connected merchant is kept out by onboarding approval and removed by the operator's disable. That is two controls owned by people, not one rule, and a brand-scoped exclusion there has only the emit check.
 - **Two copies of two functions.** The domain rule and the brand key each exist in code, in the gateway and in the database. A drift between them would admit or refuse the wrong rows; the shared test names are the only guard.
@@ -321,24 +324,26 @@ There is no single place where every seller passes. So the two halves of the rul
 - **A `verified_retailer` may still sell grey-market goods.** Our checks see the storefront, not the supply chain. The brand's own statement outranks them.
 - **A price signal misfires.** Legitimate sales trip it and careful counterfeiters do not. It opens a review and decides nothing.
 - **Outcome signals are thin.** They exist only for orders through Pivota, and only past a minimum sample.
-- **Excluding a seller has legal weight.** Declining to show a seller is a product decision; calling one fake is not something we do (S4). Competition rules on selective distribution, and the regional differences on grey-market goods, should be read by counsel before `enforce` (question 8). Nothing here is a legal conclusion.
+- **Excluding a seller has legal weight.** Declining to show a seller is a product decision; calling one fake is not something we do (S4). Competition rules on selective distribution, and the regional differences on grey-market goods, are read by counsel before any seller is stopped or excluded at a brand's request (owner, 2026-11-23, question 8). The report, the records, and exclusions for other reasons do not wait on that. Nothing here is a legal conclusion.
 - **Brand reports can be abused** to remove a lawful competitor. A report counts only from the brand's official domain, and every exclusion has a person and evidence behind it.
 - **Admission does not prove an item is genuine.** An admitted seller can still ship a bad unit.
 
 ## Questions for the owner
 
-1. **A seller a lane returns that we cannot verify.** Not shown as an offer (this draft), or shown with a label? Ordering them lower would be a new ordering input and an amendment to ADR-031 D6.
-2. **Marketplaces and grey-market sellers.** Four choices this draft makes and you have not:
-   - no new seller or offer on a marketplace host is admitted, a brand's own storefront there included, until we can tell who the seller of a listing is;
+All eight were answered by the owner on 2026-11-23.
+
+1. **A seller a lane returns that we cannot verify: not shown.** Its offers are left out and counted. Showing them with a label was the alternative.
+2. **Marketplaces and grey-market sellers,** in four parts:
+   - no new offer on a marketplace host is admitted, a brand's own storefront there included, until we can tell who the seller of a listing is;
    - marketplace offers already served stay, per brand, and are reviewed first;
-   - a retailer the brand names as unauthorised stops serving for that brand;
-   - where a brand publishes a list, a new retailer not on it is not admitted for that brand; where a brand publishes none, a `verified_retailer` is enough.
-3. **What "verify" means for a retailer.** A person queues the job and the S3 checks pass (this draft, which follows how retailer ingest already works), or a second person's approval on top, or different checks?
-4. **Sellers already served.** This draft reads your 2026-07-27 direction as: they stay served, with no deadline for review. Confirm, or set a date after which an unreviewed seller stops. And when an exclusion removes a product's only seller, should the product stay findable without an offer, which means turning on ADR-007's offer-free lane?
-5. **Telling the agent.** Expose the tier of an admitted seller on an offer, beside `official_source`, or keep it internal?
-6. **Public pages and feeds.** An exclusion reaches them through the stored offers (this draft). Confirm, or keep an excluded seller's offers on public pages?
-7. **Thresholds.** The dispute and return rate that stops serving, and the share of price-ratio vetoes that opens a review. This draft sets neither.
-8. **Counsel.** Read the grey-market and selective-distribution points before a seller is excluded at a brand's request?
+   - a retailer the brand's own site names as not authorised stops being shown for that brand;
+   - where a brand publishes a list, a new retailer not on it is not admitted for that brand and goes to review. That a `verified_retailer` is enough where a brand publishes no list was stated in the question as the draft's rule and stands.
+3. **"Verified" for a retailer: a named person queues it and the S3 checks pass.** No second approval. The checks were not changed.
+4. **Sellers already served: no review deadline.** And when an exclusion removes a product's only seller, **the product stays findable**: ADR-007's offer-free lane is turned on, as its own change.
+5. **The tier is kept internal.** It is not exposed to agents.
+6. **An exclusion applies everywhere:** public pages, sitemaps and the product feed as well as agent answers.
+7. **Thresholds are set after report-mode data.** The dispute and return rate that stops a seller, and the share of price-ratio vetoes that opens a review, are set by the owner then. No seller is stopped by those signals before.
+8. **Counsel reads the grey-market and selective-distribution points before any seller is stopped or excluded at a brand's request.** Nothing else waits on it.
 
 ## Consequences
 
@@ -357,7 +362,7 @@ There is no single place where every seller passes. So the two halves of the rul
 - **A second official-domain record.** Draft 2 proposed one. Rejected: the store and its liveness job exist.
 - **Enforcing entry in code, at the seller-record functions and the writers.** Draft 4 proposed it. Rejected: about sixty files in two repositories write these tables, and connected merchants do not pass through those functions.
 - **Treating any queued job as a person's choice.** Draft 4 implied it. Rejected: a job records no person, the scheduler queues jobs, and an automated session could queue a list that came from a model.
-- **A second approval for a seller a person queued.** Draft 3 implied it. Rejected as the default: it would default-deny a chosen seller, against ADR-018. It is question 3.
+- **A second approval for a seller a person queued.** Draft 3 implied it. Rejected as the default: it would default-deny a chosen seller, against ADR-018. The owner chose no second approval (2026-11-23, question 3).
 - **A blanket `established` record for a marketplace host.** Draft 3 allowed it. Rejected: it would admit every third-party seller and every future listing there.
 - **Hiding an excluded seller by offer suppression alone.** Draft 3 proposed it. Rejected: external offers are served from seed rows, a refresh can re-write a row, and a shared reason could be cleared by an unrelated revert.
 - **One gate "before a link is minted".** Draft 2 proposed it. Rejected: some paths emit a seller's address with no mint, and links and cached answers outlive the check.
