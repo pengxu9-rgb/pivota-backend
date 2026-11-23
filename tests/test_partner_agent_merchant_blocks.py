@@ -333,8 +333,12 @@ async def test_a_clearance_of_several_events_clears_each_of_them(_blocks_db):
     # string, a key=value pair or a credential.
     dict(evidence="https://files.example/letter.pdf?token=abc123&sig=def456"),
     dict(evidence="https://files.example/letter.pdf?download"), dict(evidence="ref=OPS-0001"),
-    dict(evidence="letter a & b"), dict(evidence="portal password hunter2"), dict(evidence="Bearer abc.def"),
-    dict(evidence="api-key in vault"), dict(evidence="session_id 9f"),
+    # ... nor a labelled credential, nor text shaped like a secret.
+    dict(evidence="Bearer abc.def"), dict(evidence="token: abc123"), dict(evidence="portal password: hunter2"),
+    dict(evidence="sig : deadbeef"), dict(evidence="API_KEY:x1"),
+    dict(evidence="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"),
+    dict(evidence="ghp_" + "a1B2c3D4e5" * 4), dict(evidence="key AKIAIOSFODNN7EXAMPLE in vault"),
+    dict(evidence="ref 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"), dict(evidence="xoxb-123456789012-abcdef"),
     # No format or control character: a direction override hides what a reader sees.
     dict(by="Ops \u202eenO nosreP"), dict(by="Ops\u0085Person"), dict(by="Ops\u200bPerson"),
     dict(evidence="ticket OPS-0001\u202e"), dict(evidence="line\u2028two"),
@@ -357,11 +361,84 @@ async def test_a_clearance_without_a_d11_basis_a_name_and_evidence_is_refused(_b
 @pytest.mark.parametrize("evidence", [
     EVIDENCE, "https://docs.example/letters/brand-a-2026-11", "Drive: Merchant letters / brand-a (signed 2026-11-20)",
     "card network programme listing, checked by Ops Person One", "e" * 500, "工单 OPS-0001",
+    # Ordinary prose that happens to use a word a credential also uses, or an ampersand.
+    "e-signature on file", "SIG-1234", "cookie policy page", "password reset ticket IT-33",
+    "letters a & b, folder 2026-11", "api-key rotation note in the vault runbook", "session_id column, ticket DATA-9",
+    "token rail incident INC-2026-0042", "1" * 40, "abcdefghijklmnopqrstuvwxyz-abcdefghij",
 ])
 async def test_a_plain_reference_to_where_the_evidence_is_kept_is_accepted(_blocks_db, evidence):
     await _worker_event()
     assert await _clear(evidence=evidence) == 1
     assert (await _rows())[0]["cleared_evidence"] == evidence
+
+
+@pytest.mark.parametrize("change,part", [
+    (dict(rail="rail_x"), "rail"), (dict(domain="not a domain"), "domain"), (dict(ids=[]), "ids"),
+    (dict(basis="later_order"), "basis"),
+    (dict(cleared_by="  "), "by_missing"), (dict(cleared_by=None), "by_missing"),
+    (dict(cleared_by="n" * 201), "by_too_long"), (dict(cleared_by="Ops\u202ePerson"), "by_hidden_character"),
+    (dict(evidence=""), "evidence_missing"), (dict(evidence="e" * 501), "evidence_too_long"),
+    (dict(evidence="ticket\u200b1"), "evidence_hidden_character"),
+    (dict(evidence="https://files.example/a?token=abc"), "evidence_query_string"),
+    (dict(evidence="token: abc123"), "evidence_credential_label"),
+    (dict(evidence="ghp_" + "a1B2c3D4e5" * 4), "evidence_looks_like_a_secret"),
+    (dict(), None),
+])
+def test_a_refused_clearance_names_the_part_that_failed(change, part):
+    args = dict(ids=[NO_SUCH_EVENT], basis="written_permission", cleared_by=STAFF, evidence=EVIDENCE)
+    rail, domain = change.pop("rail", "a2a"), change.pop("domain", SHOP)
+    args.update(change)
+    assert blocks.clearance_problem(rail, domain, **args) == part
+    assert (blocks.clearance_values(rail, domain, **args) is None) == (part is not None)
+
+
+@pytest.mark.parametrize("change,part", [
+    (dict(rail=None), "rail"), (dict(domain="a.example,b.example"), "domain"), (dict(kind="issuer_step_up"), "kind"),
+    (dict(source="request"), "source"), (dict(purchase_id="ap test"), "purchase_id"),
+    (dict(recorded_by="a\nb"), "by_hidden_character"), (dict(purchase_id=None), "purchase_id_required"),
+    (dict(source="operator", purchase_id=None), "by_required"), (dict(), None),
+])
+def test_a_refused_event_names_the_part_that_failed(change, part):
+    args = dict(source="worker", purchase_id="ap_test_0001", recorded_by=None)
+    rail, domain, kind = change.pop("rail", "a2a"), change.pop("domain", SHOP), change.pop("kind", "captcha")
+    args.update(change)
+    assert blocks.event_problem(rail, domain, kind, **args) == part
+    assert (blocks.event_values(rail, domain, kind, **args) is None) == (part is not None)
+
+
+async def test_a_clearance_that_matches_only_part_of_its_list_is_rolled_back(_blocks_db, monkeypatch):
+    """Two overlapping clearances at once: the statement's own count comes from its snapshot, so
+    a concurrent clearance of one listed event can leave it matching fewer rows than were listed.
+    Stood in for here by a statement without the count: the transaction must undo the part."""
+    await _worker_event()
+    await _worker_event(purchase="ap_test_0002")
+    first, second = await _open_ids()
+    name = "_CLEAR_SQL" if IS_POSTGRES else "_CLEAR_SQL_SQLITE"
+    whole = getattr(blocks, name)
+    # Same statement minus the count conjunct (the bound `:expected` stays in use).
+    without_count = (whole[:whole.index("   AND (SELECT COUNT(*)")]
+                     + "   AND CAST(:expected AS INTEGER) = CAST(:expected AS INTEGER)\nRETURNING id\n")
+    monkeypatch.setattr(blocks, name, without_count)
+    assert await _clear(ids=[first, NO_SUCH_EVENT]) == 0
+    assert sorted(await _open_ids()) == sorted([first, second]), "the one row it matched is open again"
+    assert await _clear(ids=[first, second]) == 2, "a clearance that matches its whole list is kept"
+
+
+async def test_only_a_purchase_id_collision_is_a_duplicate(_blocks_db, monkeypatch):
+    """The conflict rule is targeted at the purchase-id index. Any other unique violation (here
+    the primary key) is an error and never reads as "this purchase already has its event"."""
+    await _worker_event()
+    (stored,) = await _rows()
+    values = blocks.event_values("a2a", OTHER, "block", source="worker", purchase_id="ap_test_0002")
+    with pytest.raises(Exception):
+        await database.fetch_one(blocks._INSERT_SQL, {**values, "id": stored["id"]})
+
+    class _SameId:
+        hex = stored["id"][len("pab_"):]
+
+    monkeypatch.setattr(blocks.uuid, "uuid4", lambda: _SameId())
+    assert await _worker_event(domain=OTHER, purchase="ap_test_0002", kind="block") is None
+    assert await _count() == 1 and await blocks.is_clear("a2a", OTHER) is True
 
 
 def test_only_the_two_bases_d11_names_exist():
@@ -574,9 +651,13 @@ async def test_a_dry_run_refuses_exactly_what_apply_refuses(_blocks_db, apply):
                  "--by", STAFF, "--evidence", "   ", "--ids", listed, *apply)
     leaky_clear = ("clear", "--rail", "reap", "--domain", SHOP, "--basis", "written_permission", "--by", STAFF,
                    "--evidence", "https://files.example/letter.pdf?token=abc123", "--ids", listed, *apply)
-    for argv in (bad_record, worse_record, bad_clear, leaky_clear):
+    expected = {bad_record: "record_refused part=domain", worse_record: "record_refused part=domain",
+                bad_clear: "clear_refused part=evidence_missing", leaky_clear: "clear_refused part=evidence_query_string"}
+    for argv, said in expected.items():
         got = await _tool(*argv)
         assert got.code == tool.EXIT_REFUSED and len(got.refusals()) == 1 and len(got.lines) == 1
+        assert got.lines[0].startswith(f"PABLOCK_REFUSED {said};")
+        assert "abc123" not in got.lines[0] and "files.example" not in got.lines[0], "a refusal never repeats what was typed"
     assert await _count() == 1 and await blocks.is_clear("reap", SHOP) is False
 
 

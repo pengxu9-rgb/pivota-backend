@@ -26,7 +26,9 @@ WHAT `clear` DOES AND DOES NOT DO. It sets when, on which basis, by whom and whe
 kept on the listed events. It deletes nothing and rewrites nothing: the events stay in the table,
 and one that was already cleared keeps its first clearance. Only the two bases D11 names are
 accepted. `--evidence` says where the evidence is kept (a ticket or a document reference), never
-the evidence itself: a query string, or a word that names a credential, is refused.
+the evidence itself: a query string, a labelled credential and text shaped like a secret are
+refused. A refusal names the part that failed (`part=evidence_query_string`, `part=by_missing`,
+`part=domain`, ...) and never repeats what was typed.
 
 BEFORE ANYTHING ELSE the tool checks that the table exists and answers. If it does not (migration
 295 has not been applied, or the database is unreachable) it prints
@@ -95,17 +97,20 @@ async def _record(args: Any, out: Callable[[str], None]) -> int:
     domain = normalize_domain(args.domain)
     said = {"rail": args.rail, "domain": domain, "kind": args.kind}
     if not args.apply:
-        would = blocks.event_values(
-            args.rail, args.domain, args.kind,
-            source=blocks.SOURCE_OPERATOR, purchase_id=args.purchase_id, recorded_by=args.by)  # fmt: skip
-        if would is None:
-            out(f"{REFUSED_PREFIX}record_refused the event does not fit; nothing would be written")
+        event = dict(source=blocks.SOURCE_OPERATOR, purchase_id=args.purchase_id, recorded_by=args.by)
+        problem = blocks.event_problem(args.rail, args.domain, args.kind, **event)
+        if problem is not None:
+            out(f"{REFUSED_PREFIX}record_refused part={problem}; nothing would be written")
             return EXIT_REFUSED
+        would = blocks.event_values(args.rail, args.domain, args.kind, **event)
         out(_line(DRY_RUN_PREFIX, {"action": "record", **said, "purchase_id": would["purchase_id"], "by": would["recorded_by"]}))
         return EXIT_OK
-    result = await blocks.record_block(
-        args.rail, args.domain, args.kind,
-        source=blocks.SOURCE_OPERATOR, purchase_id=args.purchase_id, recorded_by=args.by)  # fmt: skip
+    event = dict(source=blocks.SOURCE_OPERATOR, purchase_id=args.purchase_id, recorded_by=args.by)
+    problem = blocks.event_problem(args.rail, args.domain, args.kind, **event)
+    if problem is not None:
+        out(f"{REFUSED_PREFIX}record_refused part={problem}; nothing was written")
+        return EXIT_REFUSED
+    result = await blocks.record_block(args.rail, args.domain, args.kind, **event)
     if result is None:
         out(f"{REFUSED_PREFIX}record_failed nothing was written")
         return EXIT_REFUSED
@@ -127,10 +132,11 @@ async def _clear(args: Any, out: Callable[[str], None]) -> int:
     said = {"rail": args.rail, "domain": domain, "basis": args.basis}
     ids = _listed_ids(args.ids)
     if not args.apply:
-        if blocks.clearance_values(
-                args.rail, args.domain, ids=ids or [_NO_EVENT_ID],
-                basis=args.basis, cleared_by=args.by, evidence=args.evidence) is None:
-            out(f"{REFUSED_PREFIX}clear_refused the clearance does not fit; nothing would be cleared")
+        problem = blocks.clearance_problem(
+            args.rail, args.domain, ids=ids or [_NO_EVENT_ID],
+            basis=args.basis, cleared_by=args.by, evidence=args.evidence)
+        if problem is not None:
+            out(f"{REFUSED_PREFIX}clear_refused part={problem}; nothing would be cleared")
             return EXIT_REFUSED
         rows = await blocks.list_blocks(rail=args.rail, domain=args.domain, open_only=True)
         if rows is None:
@@ -151,6 +157,11 @@ async def _clear(args: Any, out: Callable[[str], None]) -> int:
         return EXIT_OK
     if not ids:
         out(f"{REFUSED_PREFIX}ids_required run without --apply first, then pass the ids it printed with --ids")
+        return EXIT_REFUSED
+    problem = blocks.clearance_problem(
+        args.rail, args.domain, ids=ids, basis=args.basis, cleared_by=args.by, evidence=args.evidence)
+    if problem is not None:
+        out(f"{REFUSED_PREFIX}clear_refused part={problem}; nothing was cleared")
         return EXIT_REFUSED
     cleared = await blocks.clear_blocks(
         args.rail, args.domain, ids=ids, basis=args.basis, cleared_by=args.by, evidence=args.evidence)

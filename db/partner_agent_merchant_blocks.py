@@ -18,7 +18,10 @@ db/merchant_agent_checkout_facts):
   2a. A CLEARANCE NAMES THE EVENTS IT CLEARS, BY ID, AND IS ALL OR NOTHING. It clears the events
      a person reviewed, never "whatever is open now": an event recorded after the review is not
      in the list and stays open. If any listed id is not an open event of that rail and domain,
-     nothing is cleared.
+     nothing is cleared. That holds under two overlapping clearances at once as well: the
+     statement runs in a transaction that is rolled back when it cleared fewer rows than were
+     listed (the statement's own count is taken from its snapshot, so on Postgres a concurrent
+     clearance of one listed event would otherwise leave the rest cleared).
   3. ONLY THE TWO BASES D11 NAMES CLEAR AN EVENT: `verified_recognition` and
      `written_permission`. A later order, a later census and time do not.
   4. CLEAR IS A POSITIVE ANSWER. `is_clear` is True only when the read worked and found no open
@@ -31,7 +34,11 @@ db/merchant_agent_checkout_facts):
      reported as recorded.
   7. A NAME AND AN EVIDENCE REFERENCE ARE PLAIN TEXT. No control or format character (a
      right-to-left override hides what a reader sees). `cleared_evidence` says WHERE the evidence
-     is kept and never carries it: a query string, or a word that names a credential, is refused.
+     is kept and never carries it: a query string, a labelled credential (`token: ...`) and text
+     shaped like a secret are refused. This is a guard against a pasted link or key, not a
+     detector of every secret: prose that mentions a password is not refused.
+  8. A REFUSAL NAMES THE PART THAT FAILED AND NEVER ECHOES ITS VALUE (`event_problem`,
+     `clearance_problem`).
 
 WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run as a gated one-off.
 A partner's worker will, for the purchase that met the event, in a later change. No request
@@ -75,7 +82,9 @@ __all__ = [
     "PERSON_MAX_CHARS",
     "EVIDENCE_MAX_CHARS",
     "table_is_readable",
+    "event_problem",
     "event_values",
+    "clearance_problem",
     "clearance_values",
     "record_block",
     "clear_blocks",
@@ -110,11 +119,19 @@ EVIDENCE_MAX_CHARS = 500
 #: Unicode categories a name or a reference may not contain: control, format (zero-width and
 #: direction overrides), surrogate, private use, and the line and paragraph separators.
 _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
-#: A reference says where the evidence is kept. These mark text that carries something else: a
-#: query string or a key=value pair, and a word that names a credential.
-_EVIDENCE_FORBIDDEN_CHARS = frozenset("?&=")
-_EVIDENCE_CREDENTIAL_WORD_RE = re.compile(
-    r"(?i)\b(token|secret|password|passwd|signature|sig|apikey|api[_-]?key|bearer|session[_-]?id|cookie)\b")
+#: A reference says where the evidence is kept. These mark text that carries something else.
+#: A query string or a key=value pair:
+_EVIDENCE_QUERY_CHARS = frozenset("?=")
+#: A LABELLED credential (`token: abc`, `Bearer abc.def`). The bare words are ordinary prose
+#: ("e-signature on file", "password reset ticket") and are not refused.
+_EVIDENCE_CREDENTIAL_LABEL_RE = re.compile(
+    r"(?i)\b(token|secret|password|passwd|signature|sig|apikey|api[_-]?key|session[_-]?id|cookie)\s*:\s*\S"
+    r"|\bbearer\s+[A-Za-z0-9._~+/-]{6,}")
+#: Text shaped like a secret: well-known key prefixes, and any unbroken run of 24 or more
+#: letters, digits, `_` or `-` that mixes letters and digits (a token, a signed id, a hash).
+_EVIDENCE_SECRET_PREFIX_RE = re.compile(
+    r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.")
+_EVIDENCE_RUN_RE = re.compile(r"[A-Za-z0-9_-]{24,}")
 
 
 # ── statements (module-level literals, passed by name) ───────────────────────────────────────
@@ -239,26 +256,35 @@ def _text(value: Any, pattern: "re.Pattern[str]") -> Optional[str]:
     return trimmed if pattern.fullmatch(trimmed) else None
 
 
-def _plain(value: Any, max_chars: int) -> Optional[str]:
-    """Trimmed plain text of 1 to `max_chars` characters, else None. No control, format,
-    surrogate or private-use character, and no line or paragraph separator."""
-    if not isinstance(value, str):
-        return None
+def _plain_problem(value: Any, max_chars: int) -> Optional[str]:
+    """Why a value is not trimmed plain text of 1 to `max_chars` characters, or None when it is:
+    `missing`, `too_long`, or `hidden_character` (a control, format, surrogate or private-use
+    character, or a line or paragraph separator)."""
+    if not isinstance(value, str) or not value.strip():
+        return "missing"
     trimmed = value.strip()
-    if not 1 <= len(trimmed) <= max_chars:
-        return None
+    if len(trimmed) > max_chars:
+        return "too_long"
     if any(unicodedata.category(char) in _FORBIDDEN_CATEGORIES for char in trimmed):
-        return None
-    return trimmed
+        return "hidden_character"
+    return None
 
 
-def _reference(value: Any) -> Optional[str]:
-    """Where the evidence is kept, or None. Plain text that carries no query string, no
-    key=value pair and no word that names a credential."""
-    text = _plain(value, EVIDENCE_MAX_CHARS)
-    if text is None or _EVIDENCE_FORBIDDEN_CHARS.intersection(text) or _EVIDENCE_CREDENTIAL_WORD_RE.search(text):
-        return None
-    return text
+def _reference_problem(value: Any) -> Optional[str]:
+    """Why a value is not a reference to where evidence is kept, or None when it is. Besides
+    `_plain_problem`'s answers: `query_string`, `credential_label`, `looks_like_a_secret`."""
+    problem = _plain_problem(value, EVIDENCE_MAX_CHARS)
+    if problem is not None:
+        return problem
+    text = value.strip()
+    if _EVIDENCE_QUERY_CHARS.intersection(text):
+        return "query_string"
+    if _EVIDENCE_CREDENTIAL_LABEL_RE.search(text):
+        return "credential_label"
+    if _EVIDENCE_SECRET_PREFIX_RE.search(text) or any(
+            re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run) for run in _EVIDENCE_RUN_RE.findall(text)):
+        return "looks_like_a_secret"
+    return None
 
 
 def _ids(value: Any) -> Optional[List[str]]:
@@ -282,41 +308,80 @@ async def table_is_readable() -> bool:
 # ── writes ───────────────────────────────────────────────────────────────────────────────────
 
 
+def event_problem(
+    rail: Any, domain: Any, kind: Any, *, source: Any, purchase_id: Any = None, recorded_by: Any = None
+) -> Optional[str]:
+    """The first part of an event that does not fit, by name, or None when the event fits. The
+    value itself is never part of the answer. Pure: no I/O."""
+    if not isinstance(rail, str) or rail not in RAILS:
+        return "rail"
+    if _domain(domain) is None:
+        return "domain"
+    if kind not in KINDS:
+        return "kind"
+    if source not in SOURCES:
+        return "source"
+    if purchase_id is not None and _text(purchase_id, _PURCHASE_ID_RE) is None:
+        return "purchase_id"
+    if recorded_by is not None and _plain_problem(recorded_by, PERSON_MAX_CHARS) is not None:
+        return f"by_{_plain_problem(recorded_by, PERSON_MAX_CHARS)}"
+    if source == SOURCE_WORKER and purchase_id is None:
+        return "purchase_id_required"
+    if source == SOURCE_OPERATOR and recorded_by is None:
+        return "by_required"
+    return None
+
+
 def event_values(
     rail: Any, domain: Any, kind: Any, *, source: Any, purchase_id: Any = None, recorded_by: Any = None
 ) -> Optional[Dict[str, Any]]:
-    """The row an event would be written as (without its id), or None when it would be refused.
+    """The row an event would be written as (without its id), or None when `event_problem`
+    names a part that does not fit. Pure: no I/O."""
+    if event_problem(rail, domain, kind, source=source, purchase_id=purchase_id, recorded_by=recorded_by) is not None:
+        return None
+    return {
+        **_key(rail, domain), "kind": kind, "source": source,
+        "purchase_id": None if purchase_id is None else purchase_id.strip(),
+        "recorded_by": None if recorded_by is None else recorded_by.strip(),
+    }  # fmt: skip
 
-    Refused: an unusable rail, domain, kind or source; a purchase id or a name that does not fit;
-    a worker event without a purchase id; an operator event without a name. Pure: no I/O."""
-    key = _key(rail, domain)
-    if key is None or kind not in KINDS or source not in SOURCES:
-        return None
-    purchase = None if purchase_id is None else _text(purchase_id, _PURCHASE_ID_RE)
-    person = None if recorded_by is None else _plain(recorded_by, PERSON_MAX_CHARS)
-    if (purchase_id is not None and purchase is None) or (recorded_by is not None and person is None):
-        return None
-    if (source == SOURCE_WORKER and purchase is None) or (source == SOURCE_OPERATOR and person is None):
-        return None
-    return {**key, "kind": kind, "source": source, "purchase_id": purchase, "recorded_by": person}
+
+def clearance_problem(
+    rail: Any, domain: Any, *, ids: Any, basis: Any, cleared_by: Any, evidence: Any
+) -> Optional[str]:
+    """The first part of a clearance that does not fit, by name, or None when it fits. The value
+    itself is never part of the answer. Pure: no I/O."""
+    if not isinstance(rail, str) or rail not in RAILS:
+        return "rail"
+    if _domain(domain) is None:
+        return "domain"
+    if _ids(ids) is None:
+        return "ids"
+    if basis not in BASES:
+        return "basis"
+    if _plain_problem(cleared_by, PERSON_MAX_CHARS) is not None:
+        return f"by_{_plain_problem(cleared_by, PERSON_MAX_CHARS)}"
+    if _reference_problem(evidence) is not None:
+        return f"evidence_{_reference_problem(evidence)}"
+    return None
 
 
 def clearance_values(
     rail: Any, domain: Any, *, ids: Any, basis: Any, cleared_by: Any, evidence: Any
 ) -> Optional[Dict[str, Any]]:
-    """What a clearance would write, or None when it would be refused: no list of event ids, a
-    basis outside D11's two, a missing name or evidence reference, an unusable rail or domain.
-    Pure: no I/O."""
-    key = _key(rail, domain)
-    listed = _ids(ids)
-    person = _plain(cleared_by, PERSON_MAX_CHARS)
-    reference = _reference(evidence)
-    if key is None or listed is None or basis not in BASES or person is None or reference is None:
+    """What a clearance would write, or None when `clearance_problem` names a part that does not
+    fit. Pure: no I/O."""
+    if clearance_problem(rail, domain, ids=ids, basis=basis, cleared_by=cleared_by, evidence=evidence) is not None:
         return None
+    listed = _ids(ids)
     return {
-        **key, "ids": json.dumps(listed), "expected": len(listed),
-        "basis": basis, "cleared_by": person, "evidence": reference,
+        **_key(rail, domain), "ids": json.dumps(listed), "expected": len(listed),
+        "basis": basis, "cleared_by": cleared_by.strip(), "evidence": evidence.strip(),
     }  # fmt: skip
+
+
+class _PartialClearance(Exception):
+    """Raised inside the clearance's transaction to roll it back."""
 
 
 async def record_block(
@@ -335,7 +400,9 @@ async def record_block(
     which is a conflict to look at and never a duplicate. Never raises."""
     values = event_values(rail, domain, kind, source=source, purchase_id=purchase_id, recorded_by=recorded_by)
     if values is None:
-        logger.warning("partner_agent_merchant_blocks: refusing an event that does not fit (see event_values)")
+        logger.warning(
+            "partner_agent_merchant_blocks: refusing an event, part=%s",
+            event_problem(rail, domain, kind, source=source, purchase_id=purchase_id, recorded_by=recorded_by))
         return None
     values["id"] = f"pab_{uuid.uuid4().hex}"
     try:
@@ -361,18 +428,35 @@ async def clear_blocks(
     """Clear exactly the listed events of one rail and domain, all or nothing.
 
     The number cleared, which is `len(ids)` on success and 0 when any listed id is not an open
-    event of that rail and domain (then nothing was cleared). None when `clearance_values`
-    refused it or the write failed. The event rows stay. Never raises."""
+    event of that rail and domain (then nothing was cleared, also when another clearance took
+    one of the listed events while this one ran). None when `clearance_problem` names a part
+    that does not fit or the write failed. The event rows stay. Never raises.
+
+    It opens its own transaction, so it is for an operator's tool, never a request path."""
     values = clearance_values(rail, domain, ids=ids, basis=basis, cleared_by=cleared_by, evidence=evidence)
     if values is None:
-        logger.warning("partner_agent_merchant_blocks: refusing a clearance (see clearance_values)")
+        logger.warning(
+            "partner_agent_merchant_blocks: refusing a clearance, part=%s",
+            clearance_problem(rail, domain, ids=ids, basis=basis, cleared_by=cleared_by, evidence=evidence))
         return None
-    statement = _CLEAR_SQL if IS_POSTGRES else _CLEAR_SQL_SQLITE
     try:
-        records = await asyncio.wait_for(database.fetch_all(statement, values), WRITE_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(_clear_all_or_nothing(values), WRITE_TIMEOUT_SECONDS)
+    except _PartialClearance:
+        logger.warning("partner_agent_merchant_blocks: a clearance matched only part of its list; rolled back")
+        return 0
     except Exception:  # noqa: BLE001 - timeouts included
         logger.exception("partner_agent_merchant_blocks: clearing failed")
         return None
+
+
+async def _clear_all_or_nothing(values: Dict[str, Any]) -> int:
+    """The clearance in one transaction. Fewer rows than were listed (and more than none) means
+    a concurrent clearance took one of them after this statement's snapshot: roll back."""
+    statement = _CLEAR_SQL if IS_POSTGRES else _CLEAR_SQL_SQLITE
+    async with database.transaction():
+        records = await database.fetch_all(statement, values)
+        if records and len(records) != values["expected"]:
+            raise _PartialClearance()
     return len(records)
 
 
