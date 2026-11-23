@@ -1,7 +1,8 @@
-"""The buyer's acceptance of Pivota's terms and privacy policy on an AgenPas page (migration 289).
+"""The buyer's acceptance of Pivota's terms and privacy policy on an AgenPas page (migrations 289, 293).
 
 One row per (rail, rail purchase id, step, approval epoch): the link holder ticked "I agree" on Pivota's
-own page before the rail's card page (`card_binding`) or approval page (`approval`) was opened to them.
+own page before the rail's card page (`card_binding`) or approval page (`approval`) was opened to them, or
+(A2A only) before the buyer's shipping-address form was shown (`shipping_address`, migration 293).
 services/payment_orchestration/purchase_consent.py decides when a row is needed and whether a request may
 write one; routes/agent_internal_commerce_purchases.py is the one writer.
 
@@ -12,7 +13,7 @@ no user agent, no email; `rail_buyer_ref` is the rail's opaque enrollment / memb
 
 KEYED ON THE RAIL ID, not the `pp_` parent: the write does not need the parent row (it is healed best
 effort), and `purchase_id` is filled when the parent is known. `approval_epoch` is 0 for `card_binding`
-and the purchase's approval number for `approval` (purchase_consent.approval_epoch).
+and `shipping_address`, and the purchase's approval number for `approval` (purchase_consent.approval_epoch).
 
 A double click is one row: the INSERT is ON CONFLICT DO NOTHING on the unique key, and the row that exists
 afterwards is SELECTed back (on Postgres an `ON CONFLICT DO NOTHING ... RETURNING` returns nothing for the
@@ -32,8 +33,14 @@ from typing import Any, Dict, FrozenSet, Iterable, Optional, Tuple
 from db.database import IS_POSTGRES, database
 from db.reap_agentic_ledger import _bind_dt, _normalize_row
 
-#: The two buyer steps a consent unlocks. The CHECK below holds the same strings; a test parses them back.
-STEPS = ("card_binding", "approval")
+#: The buyer steps a consent unlocks. The CHECK below holds the same strings; a test parses them back. A step
+#: is at most 16 characters (the column): "shipping_address" is exactly 16.
+STEPS = ("card_binding", "approval", "shipping_address")
+#: The step CHECK, as migration 289 built it and as it is now (migration 293 widened it, adding
+#: `shipping_address`). `_CREATE_TABLE_PG` carries the current one; `_WIDEN_STEP_CHECK_DDL` widens a table
+#: built with the 289 one.
+_STEP_CHECK_289 = "step IN ('card_binding', 'approval')"
+_STEP_CHECK = "step IN ('card_binding', 'approval', 'shipping_address')"
 #: What the record is evidence of: the holder of the AgenPas link accepted on Pivota's page. The agent
 #: holds the link too; the record does not claim more than that (docs/agent_purchases_routes.md).
 EVIDENCE = ("link_holder_on_pivota_page",)
@@ -46,7 +53,7 @@ CREATE TABLE IF NOT EXISTS agent_purchase_consents (
     rail VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchase_consents_rail CHECK (rail IN ('reap', 'a2a')),
     rail_purchase_id VARCHAR(64) NOT NULL,
     agent_id VARCHAR(128) NOT NULL,
-    step VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchase_consents_step CHECK (step IN ('card_binding', 'approval')),
+    step VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchase_consents_step CHECK (step IN ('card_binding', 'approval', 'shipping_address')),
     approval_epoch INTEGER NOT NULL DEFAULT 0 CONSTRAINT ck_agent_purchase_consents_epoch CHECK (approval_epoch >= 0),
     terms_version VARCHAR(32) NOT NULL,
     privacy_version VARCHAR(32) NOT NULL,
@@ -60,6 +67,21 @@ CREATE TABLE IF NOT EXISTS agent_purchase_consents (
 """
 _CREATE_TABLE_SQLITE = _CREATE_TABLE_PG.replace("TIMESTAMPTZ", "TIMESTAMP").replace("now()", "CURRENT_TIMESTAMP")
 
+#: Migration 293's widening, for a table an earlier boot built with the 289 CHECK (prod: the boot heal built
+#: it). WIDEN ONLY, idempotent: it runs only while the step CHECK does not yet admit `shipping_address`, and
+#: then as one DROP + ADD pair (never seen half-done) under the heal lock_timeout (db/schema_guard.guarded_ddl).
+_WIDEN_STEP_CHECK_DDL = """
+    ALTER TABLE agent_purchase_consents DROP CONSTRAINT IF EXISTS ck_agent_purchase_consents_step;
+    ALTER TABLE agent_purchase_consents ADD CONSTRAINT ck_agent_purchase_consents_step
+        CHECK (step IN ('card_binding', 'approval', 'shipping_address'));
+"""
+_STEP_CHECK_WIDENED = """NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = to_regclass('agent_purchase_consents')
+                  AND conname = 'ck_agent_purchase_consents_step'
+                  AND pg_get_constraintdef(oid) LIKE '%''shipping_address''%'
+            )"""
+
 #: One consent per (rail purchase, step, approval). The rail id leads, so the reads below use it.
 _CREATE_UNIQUE_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_purchase_consents_step
@@ -68,14 +90,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_purchase_consents_step
 
 
 async def ensure_agent_purchase_consents_schema() -> None:
-    """Self-heal parity with migration 289. Idempotent; called at every startup. A new, empty table:
-    it locks nothing that exists."""
+    """Self-heal parity with migrations 289 and 293. Idempotent; called at every startup
+    (db/schema_guard.ensure_required_schema_light, which a fast-mode boot runs although it skips
+    db/migrations/). Creating the table locks nothing that exists. A table an earlier boot built with the 289
+    step CHECK is widened here (migration 293's DROP + ADD), only while still needed and under the heal
+    lock_timeout; on a lock timeout it is left for the next boot (a `shipping_address` consent is then refused
+    by the CHECK: fail closed, the form stays withheld)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_TABLE_PG)
         # Built only while missing, under the heal lock_timeout (see db/agent_purchase_ledger).
-        from db.schema_guard import _ensure_index
+        from db.schema_guard import _ensure_index, guarded_ddl, is_lock_timeout
 
         await _ensure_index(_CREATE_UNIQUE_INDEX)
+        try:
+            await database.execute(guarded_ddl("agent_purchase_consents", _STEP_CHECK_WIDENED, _WIDEN_STEP_CHECK_DDL))
+        except Exception as exc:
+            if not is_lock_timeout(exc):
+                raise
+            import logging
+
+            logging.getLogger(__name__).warning("agent_purchase_consents: step CHECK widening deferred to next boot")
     else:
         await database.execute(_CREATE_TABLE_SQLITE)
         await database.execute(_CREATE_UNIQUE_INDEX)
@@ -186,15 +220,20 @@ _SELECT_REAP_FOR_AGENT_SQL = """
       FROM reap_agentic_purchases
      WHERE id = :id AND agent_id = :agent_id
 """
+#: The contact columns and the deadline are read ONLY for the shared waiting-for-contact rule
+#: (a2a_shipping_address.awaits_contact, the same one the read applies); the write never returns or logs them.
 _SELECT_A2A_FOR_AGENT_SQL = """
-    SELECT id, state, member_id AS rail_buyer_ref FROM a2a_rail_purchases
+    SELECT id, state, member_id AS rail_buyer_ref, contact_purged_at, buyer_email, shipping_address,
+           buyer_action_kind, buyer_action_expires_at
+      FROM a2a_rail_purchases
      WHERE id = :id AND agent_id = :agent_id
 """
 
 
 async def rail_purchase_for_agent(rail: str, rail_purchase_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
-    """{id, state, rail_buyer_ref[, contact_purged_at, last_error_code (Reap)]} of this agent's rail purchase, or None ("not this agent's" and "does not
-    exist" are the same None)."""
+    """{id, state, rail_buyer_ref, contact_purged_at[, last_error_code (Reap) | buyer_email, shipping_address,
+    buyer_action_kind, buyer_action_expires_at (A2A: for the waiting-for-contact rule only; never returned, never
+    logged)]} of this agent's rail purchase, or None ("not this agent's" and "does not exist" are the same None)."""
     params = {"id": rail_purchase_id, "agent_id": agent_id}
     if rail == "reap":
         row = await database.fetch_one(_SELECT_REAP_FOR_AGENT_SQL, params)
