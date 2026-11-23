@@ -175,7 +175,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `variant_id` | no | **cart-link lane only, never with `variant_key`** (else `400 invalid_request`): the buyer's chosen variant as the storefront numbers it (`get_product`'s `variants[].variant_id`, a string of digits). We resolve it to our own sku, with `/purchases/prepare`'s guards: every live sku naming that id must be this listing's own (the product's merchant and platform), else `409 row_variant_unverified`; none naming it ⇒ `409 row_variant_unverified`. When it is the product's only variant (or the product has only its `::canonical` placeholder) it is bought exactly as with no key. Several spellings of it (one variant written by two catalog writers; more than 4 ⇒ `409 row_variant_ambiguous`) ⇒ each is priced as a named sku, a spelling this merchant has no usable offer on is passed over, any other refusal stands, and the priced ones must agree (`409 row_price_ambiguous`). Whatever path is taken, the variant bought must BE the selected one, else `409 row_variant_unverified`. **Prefer it to `variant_key`**: never spell a sku key yourself (`::sku_<hash>`, `::v:<n>`, `::v::<n>` and `::v:retailer-<hash>` all occur). The idempotency hash holds the id as sent, so a `variant_id` body and a `variant_key` body for the same variant are different purchases. Also accepted by `/recover` and `/resume` (the same body). |
 | `quantity` | no (default 1) | 1..10 (`MAX_QUANTITY`). |
 | `buyer.email` | yes | the contact for **this purchase**. It is **not** an identity: nothing about the buyer we resolve or create is derived from it. See "The buyer identity" below. |
-| `buyer.consent_version` | **yes** | the version tag of the terms your user accepted, ≤ 32 printable characters. Missing, blank, over-long or unprintable ⇒ `400 consent_required`. Stored against the buyer and **overwritten on every purchase**, so it is always the latest version they accepted. Not an enum — we record the tag, we do not adjudicate it — and not part of the idempotency hash, so re-consenting mid-retry still replays. |
+| `buyer.consent_version` | **yes** | the version tag of the terms your user accepted, ≤ 32 printable characters. Missing, blank, over-long or unprintable ⇒ `400 consent_required`. Stored against the buyer and **overwritten on every purchase** (a replay included, while create is on; a replay while create is off is read-only and writes nothing), so it is the latest version they accepted. Not an enum — we record the tag, we do not adjudicate it — and not part of the idempotency hash, so re-consenting mid-retry still replays. |
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
@@ -318,7 +318,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 
 | status | `detail.error` | meaning | what the door should do |
 |---|---|---|---|
-| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured, and this key names no purchase of yours (a retry of one still replays, above) | show unavailable; preserve the selected route and original attempt |
+| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured, and this key names no purchase of yours (a retry of one still replays, above). While create is off a retry the route cannot read is this 404 too, before the key is looked up: one with no `buyer.consent_version`, or any other malformed body | show unavailable; preserve the selected route and original attempt; a retry resends the original body exactly as first sent |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session; do not switch routes |
 | 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | show blocked; do not retry through cart-link |
 | 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | show blocked; do not try another Reap lane |
@@ -886,8 +886,9 @@ request that uses it.
   an unrecognised tag would reject the newest consent the moment the door shipped it.
 * **Latest wins *on the buyer row*.** `reap_agentic_buyer_refs.consent_version` is rewritten on
   **every** `POST` that succeeds, alongside a `consented_at` timestamp — **including an idempotent
-  replay**. Send a newer tag with a retried `idempotency_key` and the stored tag moves, even
-  though the response is the original purchase.
+  replay while create is on**. Send a newer tag with a retried `idempotency_key` and the stored tag
+  moves, even though the response is the original purchase. While create is off a replay is
+  read-only: the original purchase comes back and the stored tag stays as it was.
 * **The purchase row keeps the tag it was opened under, for ever.** Migration **233** stores the
   same validated string on `reap_agentic_purchases` in the same request, and nothing rewrites it:
   it is absent from the transition statement, so no poller step can revise it, and the terminal
@@ -903,13 +904,15 @@ request that uses it.
   url. Consent is not one of those: folding it in would turn a door that upgraded its consent
   version mid-retry into `409 idempotency_conflict`, which is the opposite of what you want from
   a client that just collected a *stronger* consent. So a retry carrying a new tag replays to the
-  same purchase **and** records the new tag.
+  same purchase **and**, while create is on, records the new tag.
 * **A non-string is `invalid_request`, not `consent_required`.** `123`, `true`, `{}` and `[]` are
   refused as a malformed body; they never reach the consent check. `consent_required` means "go
   and ask your user", `invalid_request` means "fix your JSON".
 
-The dial is still checked **first**: a dark rail answers `404` to a request with no consent, the
-same as to every other request, so this field cannot be used to probe whether the rail is armed.
+The dial still wins over this check: while create is off (or the rail is dark), a request with
+no consent answers the same `404` as every other request that names no purchase of yours, so this
+field cannot be used to probe whether the rail is armed. (The dials are read first; their refusal
+is answered after the key lookup, so a retry of an existing purchase still replays.)
 
 ---
 
@@ -1073,8 +1076,11 @@ byte-for-byte. On **create** it only replays: if its key names an attempt keyed
 that way, the answer is that attempt's (`202` with the same purchase, its
 remembered refusal, `attempt_retired`, or `idempotency_conflict`), and nothing is
 written -- not even the consent tag a money-bearing replay rewrites. If the key
-names nothing, it is `400 invalid_request` and nothing is written. **Recovery**
-accepts it as before. Old client attempts—including attempts whose client retained a selection witness
+names nothing, it is `400 invalid_request` and nothing is written. While create is
+off, only the `202` replay (and an `idempotency_conflict` naming a purchase) is
+answered as such; a remembered refusal, `attempt_retired`, a conflict naming no
+purchase and a key naming nothing are all `404 not_available_on_this_rail`.
+**Recovery** accepts it as before. Old client attempts—including attempts whose client retained a selection witness
 without putting a money pair on the original backend body—must recover with that
 original body. Do not infer or add money fields from a retained witness, do not
 remint the attempt, and do not switch checkout routes after any refusal.

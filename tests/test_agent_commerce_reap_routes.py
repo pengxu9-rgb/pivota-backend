@@ -4827,11 +4827,40 @@ async def test_a_changed_body_under_an_existing_key_while_create_is_off_is_the_c
 #: parse, or a request with no end user, answers as it always has with only that dial off.
 _BEFORE_THE_LANE_IS_KNOWN = ("not_json", "no_agent_user")
 
+#: The caller's OWN key, mapped to no purchase: a refusal tombstone, an operator's retirement marker,
+#: and a changed body under a tombstoned key (a conflict that names no purchase). With create on each
+#: answers its 409 (`test_an_own_key_naming_no_purchase_answers_its_409_with_create_on`); with create
+#: off each is the dark 404, because none of them is a purchase a client could lose track of.
+_OWN_KEY_NAMING_NO_PURCHASE = {
+    "own_tombstone": ("merchant_not_eligible", "merchant_not_eligible"),
+    "own_retired_attempt": ("attempt_retired:" + "a" * 32, "attempt_retired"),
+    "changed_body_on_own_tombstone": ("merchant_not_eligible", "idempotency_conflict"),
+}
+
+
+async def _own_key_naming_no_purchase(kind: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Plant the caller's own key for `kind` and return the retry body that reaches it."""
+    marker, _ = _OWN_KEY_NAMING_NO_PURCHASE[kind]
+    await _plant_legacy_tombstone(body, reason=marker)
+    # A tombstone is keyed under the money-less fingerprint; the body WITH money is a different
+    # request under the same key.
+    return body if kind == "changed_body_on_own_tombstone" else _legacy(body)
+
+
+@pytest.mark.parametrize("kind", sorted(_OWN_KEY_NAMING_NO_PURCHASE))
+async def test_an_own_key_naming_no_purchase_answers_its_409_with_create_on(client, monkeypatch, kind):
+    """The control for the dark-404 cases below: these setups are real, and create on answers them."""
+    await _seed_atomic_request_lane(monkeypatch, "cart_link")
+    retry = await _own_key_naming_no_purchase(kind, _body(item_source="cart_link"))
+    resp = await client.post(f"{BASE}/purchases", json=retry)
+    assert resp.status_code == 409 and _error(resp) == _OWN_KEY_NAMING_NO_PURCHASE[kind][1], resp.text
+    assert "purchase_id" not in resp.json()["detail"]
+
 
 @pytest.mark.parametrize("how,kind", [
     (how, kind) for how in sorted(_CREATE_OFF)
     for kind in ("new_key", "no_consent", "blank_key", "money_less_new", "key_of_another_buyer",
-                 "key_without_its_purchase")
+                 "key_without_its_purchase") + tuple(sorted(_OWN_KEY_NAMING_NO_PURCHASE))
     + _BEFORE_THE_LANE_IS_KNOWN
     if how != "cart_link_off" or kind not in _BEFORE_THE_LANE_IS_KNOWN
 ])
@@ -4851,6 +4880,8 @@ async def test_while_create_is_off_a_request_naming_no_existing_purchase_is_the_
         orphan = await client.post(f"{BASE}/purchases", json=body)
         assert orphan.status_code == 202, orphan.text
         await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": orphan.json()["purchase_id"]})
+    own_retry = (await _own_key_naming_no_purchase(kind, body)
+                 if kind in _OWN_KEY_NAMING_NO_PURCHASE else None)
     _turn_create_off(monkeypatch, how)
     before = await _rail_rows()
     _forbid_create_writes(monkeypatch)
@@ -4867,6 +4898,8 @@ async def test_while_create_is_off_a_request_naming_no_existing_purchase_is_the_
         CALLER.agent_user_ref = None
     elif kind == "key_of_another_buyer":
         kwargs["json"] = existing
+    elif own_retry is not None:
+        kwargs["json"] = own_retry
 
     resp = await client.post(f"{BASE}/purchases", **kwargs)
 
