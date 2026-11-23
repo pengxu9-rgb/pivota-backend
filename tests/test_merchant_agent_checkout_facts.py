@@ -232,6 +232,16 @@ async def test_a_positive_on_one_path_clears_the_other_paths_stale_positive(_fac
     assert row["acp_checkout_at"] is None and row["ucp_checkout_at"] is not None
 
 
+async def test_a_negative_on_the_row_wins_over_any_positive_beside_it(_facts_db):
+    """The writer never leaves a negative beside a positive (a negative clears both paths). The
+    read does not rely on that: a row that holds both, however it came to, is not met."""
+    await facts.record_check("brand-a.example", POSITIVE_UCP)
+    await _age("brand-a.example", "negative_at", 0)
+    row = await facts.get_fact("brand-a.example")
+    assert row["negative_at"] is not None and row["ucp_checkout_at"] is not None
+    assert await facts.meets_run_condition("brand-a.example") is False
+
+
 async def test_a_later_positive_clears_the_negative(_facts_db):
     await facts.record_check("brand-a.example", NEGATIVE)
     assert await facts.meets_run_condition("brand-a.example") is False
