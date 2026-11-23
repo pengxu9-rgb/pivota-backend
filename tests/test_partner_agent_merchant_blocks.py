@@ -139,9 +139,21 @@ async def _worker_event(domain: str = SHOP, rail: str = "a2a", purchase: str = "
     return await blocks.record_block(rail, domain, kind, source="worker", purchase_id=purchase)
 
 
-async def _clear(domain: str = SHOP, rail: str = "a2a", basis: str = "written_permission",
-                 by: Any = STAFF, evidence: Any = EVIDENCE) -> Optional[int]:
-    return await blocks.clear_blocks(rail, domain, basis=basis, cleared_by=by, evidence=evidence)
+NO_SUCH_EVENT = "pab_" + "f" * 32
+_OPEN = object()
+
+
+async def _open_ids(domain: str = SHOP, rail: str = "a2a") -> List[str]:
+    return [row["id"] for row in await _rows(rail=rail, domain=domain, open_only=True)]
+
+
+async def _clear(domain: Any = SHOP, rail: Any = "a2a", basis: Any = "written_permission",
+                 by: Any = STAFF, evidence: Any = EVIDENCE, ids: Any = _OPEN) -> Optional[int]:
+    """Clear the listed events; by default the ones open for that rail and domain right now."""
+    if ids is _OPEN:
+        ids = await _open_ids(SHOP if not isinstance(domain, str) or not domain.strip() else domain,
+                              "a2a" if rail not in router.RAILS else rail)
+    return await blocks.clear_blocks(rail, domain, ids=ids, basis=basis, cleared_by=by, evidence=evidence)
 
 
 _EVENT_COLUMNS = ("id", "rail", "merchant_domain", "kind", "source", "purchase_id", "recorded_by", "observed_at")
@@ -184,6 +196,17 @@ async def test_one_purchase_records_one_event(_blocks_db):
     assert await _worker_event(purchase="ap_test_0002") == blocks.RECORDED and await _count() == 2
 
 
+@pytest.mark.parametrize("rail,domain", [("a2a", OTHER), ("reap", SHOP), ("reap", OTHER)])
+async def test_a_purchase_id_recorded_for_another_merchant_or_rail_is_a_conflict_not_a_duplicate(_blocks_db, rail, domain):
+    """Answering "duplicate" here would tell the caller the event is on record for a merchant that
+    has none, and that merchant would stay clear."""
+    assert await _worker_event() == blocks.RECORDED
+    assert await blocks.record_block(rail, domain, "captcha", source="worker", purchase_id="ap_test_0001") is None
+    assert await _count() == 1
+    assert await blocks.is_clear(rail, domain) is True, "nothing was recorded for it, and nothing said it was"
+    assert await _worker_event() == blocks.DUPLICATE
+
+
 async def test_operator_events_carry_a_name_and_are_never_merged(_blocks_db):
     for _ in range(2):
         assert await blocks.record_block("reap", SHOP, "bot_challenge", source="operator", recorded_by=f"  {STAFF} ") == blocks.RECORDED
@@ -193,8 +216,10 @@ async def test_operator_events_carry_a_name_and_are_never_merged(_blocks_db):
 
 
 @pytest.mark.parametrize("kwargs", [
-    dict(rail="stripe"), dict(rail=""), dict(rail=None), dict(rail="A2A"),
+    dict(rail="rail_x"), dict(rail=""), dict(rail=None), dict(rail="A2A"),
     dict(domain=""), dict(domain=None), dict(domain="   "),
+    dict(domain="not a domain"), dict(domain="a.example,b.example"), dict(domain="localhost"),
+    dict(domain="10.0.0.1"), dict(domain="brand_a.example"),
     dict(kind="issuer_step_up"), dict(kind=""), dict(kind=None), dict(kind="CAPTCHA"),
     dict(source="request"), dict(source=None),
     dict(source="worker", purchase_id=None),                    # a worker event needs its purchase
@@ -202,10 +227,11 @@ async def test_operator_events_carry_a_name_and_are_never_merged(_blocks_db):
     dict(source="operator", recorded_by="   "),
     dict(purchase_id="ap test"), dict(purchase_id="x" * 65), dict(purchase_id=""), dict(purchase_id=7),
     dict(source="operator", recorded_by="line one\nline two"), dict(source="operator", recorded_by="n" * 201),
+    dict(source="operator", recorded_by="Ops \u202eenO nosreP"), dict(source="operator", recorded_by="Ops\u0085One"),
     # A part that does not fit refuses the whole event. It is never dropped to let the rest through.
     dict(source="operator", recorded_by=STAFF, purchase_id="ap test"),
     dict(source="worker", recorded_by="line one\nline two"),
-], ids=lambda k: ",".join(f"{a}={str(b)[:12]!r}" for a, b in k.items()))
+], ids=lambda k: ",".join(f"{a}={ascii(b)[:14]}" for a, b in k.items()))
 async def test_an_event_that_does_not_fit_is_refused_and_nothing_is_written(_blocks_db, kwargs):
     args = dict(rail="a2a", domain=SHOP, kind="captcha", source="worker", purchase_id="ap_test_0001", recorded_by=None)
     args.update(kwargs)
@@ -229,9 +255,11 @@ async def test_clearing_reopens_the_merchant_and_keeps_the_event(_blocks_db):
 
 async def test_the_first_clearance_of_an_event_stands(_blocks_db):
     await _worker_event()
+    (event_id,) = await _open_ids()
     await _clear(basis="written_permission")
     (first,) = await _rows()
-    assert await _clear(basis="verified_recognition", by="Ops Person Two", evidence="another reference") == 0
+    assert await _clear(basis="verified_recognition", by="Ops Person Two", evidence="another reference",
+                        ids=[event_id]) == 0
     (again,) = await _rows()
     assert [again[c] for c in _CLEARED_COLUMNS] == [first[c] for c in _CLEARED_COLUMNS]
 
@@ -258,8 +286,41 @@ async def test_a_clearance_touches_only_its_own_rail_and_domain(_blocks_db):
         True, False, False]
 
 
-async def test_clearing_a_merchant_with_nothing_open_clears_nothing(_blocks_db):
-    assert await _clear() == 0 and await _count() == 0
+async def test_clearing_an_id_that_is_no_event_clears_nothing(_blocks_db):
+    assert await _clear(ids=[NO_SUCH_EVENT]) == 0 and await _count() == 0
+
+
+async def test_a_clearance_clears_the_events_that_were_reviewed_and_no_later_one(_blocks_db):
+    """The race the review reproduced: evidence looked at on Monday must not clear a challenge
+    that arrives on Tuesday, between the review and the apply."""
+    await _worker_event()
+    reviewed = await _open_ids()
+    await _worker_event(purchase="ap_test_0002", kind="block")       # arrives after the review
+    assert await _clear(ids=reviewed) == 1
+    still_open = await _rows(open_only=True)
+    assert [row["purchase_id"] for row in still_open] == ["ap_test_0002"]
+    assert await blocks.is_clear("a2a", SHOP) is False
+
+
+async def test_a_clearance_is_all_or_nothing(_blocks_db):
+    await _worker_event()
+    await _worker_event(domain=OTHER, purchase="ap_test_0002")
+    await _worker_event(rail="reap", purchase="ap_test_0003")
+    (mine,), (others,), (other_rail,) = await _open_ids(), await _open_ids(OTHER), await _open_ids(SHOP, "reap")
+    for listed in ([mine, others], [mine, other_rail], [mine, NO_SUCH_EVENT]):
+        assert await _clear(ids=listed) == 0, listed
+        assert len(await _rows(open_only=True)) == 3, "one id that is not this merchant's open event stops all of it"
+    await _clear(ids=[mine])
+    assert await _clear(ids=[mine]) == 0, "an event that is already cleared is not an open event"
+    assert await _clear(domain=OTHER, ids=[others]) == 1
+
+
+async def test_a_clearance_of_several_events_clears_each_of_them(_blocks_db):
+    for n in range(3):
+        await _worker_event(purchase=f"ap_test_000{n}")
+    listed = await _open_ids()
+    assert await _clear(ids=listed[:2]) == 2
+    assert await _open_ids() == [i for i in listed if i not in listed[:2]]
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -267,16 +328,40 @@ async def test_clearing_a_merchant_with_nothing_open_clears_nothing(_blocks_db):
     dict(basis="WRITTEN_PERMISSION"),
     dict(by=""), dict(by="   "), dict(by=None), dict(by="a\tb"), dict(by="n" * 201),
     dict(evidence=""), dict(evidence="  "), dict(evidence=None), dict(evidence="e" * 501), dict(evidence="x\x00y"),
-    dict(rail="stripe"), dict(domain=""),
-], ids=lambda k: ",".join(f"{a}={str(b)[:12]!r}" for a, b in k.items()))
+    dict(rail="rail_x"), dict(domain=""), dict(domain="not a domain"), dict(domain="a.example,b.example"),
+    # The evidence field says where the evidence is kept. It never carries a link with a query
+    # string, a key=value pair or a credential.
+    dict(evidence="https://files.example/letter.pdf?token=abc123&sig=def456"),
+    dict(evidence="https://files.example/letter.pdf?download"), dict(evidence="ref=OPS-0001"),
+    dict(evidence="letter a & b"), dict(evidence="portal password hunter2"), dict(evidence="Bearer abc.def"),
+    dict(evidence="api-key in vault"), dict(evidence="session_id 9f"),
+    # No format or control character: a direction override hides what a reader sees.
+    dict(by="Ops \u202eenO nosreP"), dict(by="Ops\u0085Person"), dict(by="Ops\u200bPerson"),
+    dict(evidence="ticket OPS-0001\u202e"), dict(evidence="line\u2028two"),
+    dict(ids=[]), dict(ids=None), dict(ids="pab_" + "a" * 32), dict(ids=["pab_short"]),
+    dict(ids=["PAB_" + "a" * 32]), dict(ids=[NO_SUCH_EVENT, NO_SUCH_EVENT]), dict(ids=[7]),
+    dict(ids=[f"pab_{n:032x}" for n in range(blocks.LIST_MAX + 1)]),
+], ids=lambda k: ",".join(f"{a}={ascii(b)[:14]}" for a, b in k.items()))
 async def test_a_clearance_without_a_d11_basis_a_name_and_evidence_is_refused(_blocks_db, kwargs):
     await _worker_event()
+    (open_id,) = await _open_ids()
     assert blocks.clearance_values(
-        kwargs.get("rail", "a2a"), kwargs.get("domain", SHOP), basis=kwargs.get("basis", "written_permission"),
+        kwargs.get("rail", "a2a"), kwargs.get("domain", SHOP), ids=kwargs.get("ids", [open_id]),
+        basis=kwargs.get("basis", "written_permission"),
         cleared_by=kwargs.get("by", STAFF), evidence=kwargs.get("evidence", EVIDENCE)) is None
-    assert await _clear(**kwargs) is None
+    assert await _clear(**{"ids": [open_id], **kwargs}) is None
     (row,) = await _rows()
     assert [row[c] for c in _CLEARED_COLUMNS] == [None] * 4 and await blocks.is_clear("a2a", SHOP) is False
+
+
+@pytest.mark.parametrize("evidence", [
+    EVIDENCE, "https://docs.example/letters/brand-a-2026-11", "Drive: Merchant letters / brand-a (signed 2026-11-20)",
+    "card network programme listing, checked by Ops Person One", "e" * 500, "工单 OPS-0001",
+])
+async def test_a_plain_reference_to_where_the_evidence_is_kept_is_accepted(_blocks_db, evidence):
+    await _worker_event()
+    assert await _clear(evidence=evidence) == 1
+    assert (await _rows())[0]["cleared_evidence"] == evidence
 
 
 def test_only_the_two_bases_d11_names_exist():
@@ -284,7 +369,8 @@ def test_only_the_two_bases_d11_names_exist():
     assert blocks.KINDS == {"captcha", "bot_challenge", "block"}
 
 
-@pytest.mark.parametrize("rail,domain", [("stripe", SHOP), ("", SHOP), (None, SHOP), ("a2a", ""), ("a2a", None), ("A2A", SHOP)])
+@pytest.mark.parametrize("rail,domain", [("rail_x", SHOP), ("", SHOP), (None, SHOP), ("a2a", ""), ("a2a", None), ("A2A", SHOP),
+                                         ("a2a", "not a domain"), ("a2a", "a.example,b.example"), ("a2a", "localhost")])
 async def test_an_unusable_key_is_never_clear(_blocks_db, rail, domain):
     assert await blocks.is_clear(rail, domain) is False
 
@@ -293,7 +379,7 @@ async def test_a_missing_table_is_never_clear_and_never_an_error(_blocks_db):
     await database.execute(f"DROP TABLE {TABLE}")
     assert await blocks.table_is_readable() is False
     assert await blocks.is_clear("a2a", SHOP) is False
-    assert await _worker_event() is None and await _clear() is None
+    assert await _worker_event() is None and await _clear(ids=[NO_SUCH_EVENT]) is None
     assert await blocks.list_blocks() is None
 
 
@@ -312,6 +398,7 @@ async def test_a_slow_read_is_not_clear(_blocks_db, monkeypatch):
 
 async def test_a_failed_write_is_none_and_does_not_raise(_blocks_db, monkeypatch):
     await _worker_event()
+    listed = await _open_ids()
 
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise OSError("connection lost")
@@ -319,7 +406,7 @@ async def test_a_failed_write_is_none_and_does_not_raise(_blocks_db, monkeypatch
     monkeypatch.setattr(database, "fetch_one", broken)
     monkeypatch.setattr(database, "fetch_all", broken)
     assert await _worker_event(purchase="ap_test_0002") is None
-    assert await _clear() is None
+    assert await _clear(ids=listed) is None
     assert await blocks.list_blocks() is None
 
 
@@ -334,8 +421,9 @@ async def test_the_list_filters_and_an_unusable_filter_is_not_no_filter(_blocks_
     assert {r["purchase_id"] for r in await _rows(open_only=True)} == {"ap_test_0002", "ap_test_0003"}
     assert {r["purchase_id"] for r in await _rows(rail="a2a", domain=SHOP, open_only=True)} == set()
     assert len(await _rows(limit=1)) == 1
-    assert await blocks.list_blocks(rail="stripe") is None
+    assert await blocks.list_blocks(rail="rail_x") is None
     assert await blocks.list_blocks(domain="   ") is None
+    assert await blocks.list_blocks(domain="not a domain") is None
 
 
 async def test_the_database_itself_refuses_a_half_clearance(_blocks_db):
@@ -400,20 +488,25 @@ async def test_record_says_duplicate_for_a_purchase_that_has_its_event(_blocks_d
     assert await _count() == 1
 
 
+def _ids_of(run: "Ran") -> str:
+    return run.payloads(tool.DRY_RUN_PREFIX)[0]["ids"]
+
+
 async def test_clear_is_a_dry_run_until_apply_and_shows_what_it_would_clear(_blocks_db):
     await _tool(*_RECORD, "--apply")
     await _tool(*_RECORD, "--apply")
     dry = await _tool(*_CLEAR)
     assert dry.code == tool.EXIT_OK and len(dry.payloads(tool.ROW_PREFIX)) == 2
+    listed = sorted(row["id"] for row in dry.payloads(tool.ROW_PREFIX))
     assert dry.payloads(tool.DRY_RUN_PREFIX) == [
-        {"action": "clear", "rail": "reap", "domain": SHOP, "basis": "written_permission", "by": STAFF, "would_clear": 2}]
+        {"action": "clear", "rail": "reap", "domain": SHOP, "basis": "written_permission", "by": STAFF,
+         "would_clear": 2, "ids": _ids_of(dry)}]
+    assert sorted(_ids_of(dry).split(",")) == listed
     assert await blocks.is_clear("reap", SHOP) is False, "a dry run clears nothing"
-    done = await _tool(*_CLEAR, "--apply")
-    assert done.payloads(tool.CLEARED_PREFIX) == [
+    done = await _tool(*_CLEAR, "--ids", _ids_of(dry), "--apply")
+    assert done.code == tool.EXIT_OK and done.payloads(tool.CLEARED_PREFIX) == [
         {"rail": "reap", "domain": SHOP, "basis": "written_permission", "cleared": 2}]
     assert await blocks.is_clear("reap", SHOP) is True and await _count() == 2
-    nothing = await _tool(*_CLEAR, "--apply")
-    assert nothing.code == tool.EXIT_OK and nothing.payloads(tool.CLEARED_PREFIX)[0]["cleared"] == 0
     # A dry run shows only what is OPEN: the two cleared events are not offered again.
     await _tool(*_RECORD, "--apply")
     again = await _tool(*_CLEAR)
@@ -421,9 +514,39 @@ async def test_clear_is_a_dry_run_until_apply_and_shows_what_it_would_clear(_blo
     assert again.payloads(tool.ROW_PREFIX)[0]["cleared_at"] is None
 
 
+async def test_apply_clears_what_the_dry_run_listed_and_not_what_arrived_since(_blocks_db):
+    """The review's reproduction, at the tool: a dry run, then a new event, then --apply."""
+    nothing_yet = await _tool(*_CLEAR)
+    assert nothing_yet.code == tool.EXIT_OK and nothing_yet.payloads(tool.DRY_RUN_PREFIX)[0]["would_clear"] == 0
+    await _tool(*_RECORD, "--apply")                                    # arrives after that dry run
+    blind = await _tool(*_CLEAR, "--apply")
+    assert blind.code == tool.EXIT_REFUSED and blind.refusals()[0].startswith("PABLOCK_REFUSED ids_required")
+    assert await blocks.is_clear("reap", SHOP) is False, "--apply without the reviewed ids clears nothing"
+
+    reviewed = _ids_of(await _tool(*_CLEAR))
+    await _tool(*_RECORD, "--apply")                                    # arrives after the review
+    done = await _tool(*_CLEAR, "--ids", reviewed, "--apply")
+    assert done.payloads(tool.CLEARED_PREFIX)[0]["cleared"] == 1
+    assert len(await _rows(open_only=True)) == 1 and await blocks.is_clear("reap", SHOP) is False
+
+
+async def test_apply_refuses_a_list_that_holds_an_id_that_is_not_open(_blocks_db):
+    await _tool(*_RECORD, "--apply")
+    reviewed = _ids_of(await _tool(*_CLEAR))
+    for listed in (f"{reviewed},{NO_SUCH_EVENT}", NO_SUCH_EVENT):
+        for apply in ((), ("--apply",)):
+            got = await _tool(*_CLEAR, "--ids", listed, *apply)
+            assert got.code == tool.EXIT_REFUSED and got.refusals()[0].startswith("PABLOCK_REFUSED ids_not_open")
+    assert await blocks.is_clear("reap", SHOP) is False
+    assert (await _tool(*_CLEAR, "--ids", reviewed)).payloads(tool.DRY_RUN_PREFIX)[0]["would_clear"] == 1
+    assert (await _tool(*_CLEAR, "--ids", f" {reviewed} ,", "--apply")).code == tool.EXIT_OK
+    again = await _tool(*_CLEAR, "--ids", reviewed, "--apply")
+    assert again.code == tool.EXIT_REFUSED, "an event that is already cleared is not open"
+
+
 async def test_the_tool_prints_every_column_of_an_event_as_json(_blocks_db):
     await _tool(*_RECORD, "--apply")
-    await _tool(*_CLEAR, "--apply")
+    await _tool(*_CLEAR, "--ids", _ids_of(await _tool(*_CLEAR)), "--apply")
     (row,) = (await _tool("list", "--rail", "reap", "--domain", f"www.{SHOP}")).payloads(tool.ROW_PREFIX)
     assert set(row) == set(_EVENT_COLUMNS) | set(_CLEARED_COLUMNS)
     assert row["cleared_evidence"] == EVIDENCE and isinstance(row["observed_at"], str)
@@ -433,17 +556,21 @@ async def test_the_tool_prints_every_column_of_an_event_as_json(_blocks_db):
 @pytest.mark.parametrize("apply", [(), ("--apply",)], ids=["dry-run", "apply"])
 async def test_a_dry_run_refuses_exactly_what_apply_refuses(_blocks_db, apply):
     await _tool(*_RECORD, "--apply")
+    listed = _ids_of(await _tool(*_CLEAR))
     bad_record = ("record", "--rail", "reap", "--domain", "   ", "--kind", "block", "--by", STAFF, *apply)
+    worse_record = ("record", "--rail", "reap", "--domain", "not a domain", "--kind", "block", "--by", STAFF, *apply)
     bad_clear = ("clear", "--rail", "reap", "--domain", SHOP, "--basis", "written_permission",
-                 "--by", STAFF, "--evidence", "   ", *apply)
-    for argv in (bad_record, bad_clear):
+                 "--by", STAFF, "--evidence", "   ", "--ids", listed, *apply)
+    leaky_clear = ("clear", "--rail", "reap", "--domain", SHOP, "--basis", "written_permission", "--by", STAFF,
+                   "--evidence", "https://files.example/letter.pdf?token=abc123", "--ids", listed, *apply)
+    for argv in (bad_record, worse_record, bad_clear, leaky_clear):
         got = await _tool(*argv)
         assert got.code == tool.EXIT_REFUSED and len(got.refusals()) == 1 and len(got.lines) == 1
     assert await _count() == 1 and await blocks.is_clear("reap", SHOP) is False
 
 
 @pytest.mark.parametrize("argv", [
-    ("record", "--rail", "stripe", "--domain", SHOP, "--kind", "block", "--by", STAFF),
+    ("record", "--rail", "rail_x", "--domain", SHOP, "--kind", "block", "--by", STAFF),
     ("record", "--rail", "reap", "--domain", SHOP, "--kind", "issuer_step_up", "--by", STAFF),
     ("clear", "--rail", "reap", "--domain", SHOP, "--basis", "later_order", "--by", STAFF, "--evidence", EVIDENCE),
     ("clear", "--rail", "reap", "--domain", SHOP, "--basis", "written_permission", "--by", STAFF),
@@ -460,7 +587,7 @@ def test_the_parser_itself_refuses_what_d11_does_not_allow(argv, capsys):
 
 async def test_the_tool_refuses_before_anything_when_the_table_is_missing(_blocks_db):
     await database.execute(f"DROP TABLE {TABLE}")
-    for argv in (("list",), (*_RECORD, "--apply"), (*_CLEAR, "--apply")):
+    for argv in (("list",), (*_RECORD, "--apply"), (*_CLEAR, "--ids", NO_SUCH_EVENT, "--apply")):
         got = await _tool(*argv)
         assert got.code == tool.EXIT_REFUSED and got.lines == [f"PABLOCK_REFUSED store_unavailable table={TABLE}"]
 
@@ -553,9 +680,10 @@ def test_the_migration_only_creates_and_its_down_only_drops():
 
 
 def test_no_statement_in_the_application_can_delete_or_rewrite_an_event():
-    """Rule 1 and rule 2, read off the source: one UPDATE in the whole application names this
-    table, it sets the four `cleared_*` columns and nothing else, and it matches open rows only.
-    Nothing deletes from the table."""
+    """Rules 1, 2 and 2a, read off the source: the only UPDATE in the whole application that
+    names this table is the clearance (once per dialect); it sets the four `cleared_*` columns
+    and nothing else, on open rows among the listed ids, all or nothing. Nothing deletes from the
+    table."""
     updates, deletes = [], []
     for path in _REPO.glob("**/*.py"):
         parts = path.relative_to(_REPO).parts
@@ -564,11 +692,13 @@ def test_no_statement_in_the_application_can_delete_or_rewrite_an_event():
         text = path.read_text("utf-8", errors="ignore")
         updates += re.findall(rf"UPDATE\s+{TABLE}\b.*?(?=\"\"\")", text, flags=re.S)
         deletes += re.findall(rf"DELETE\s+FROM\s+{TABLE}\b", text)
-    assert deletes == [] and len(updates) == 1
-    (update,) = updates
-    set_clause = update[update.index("SET") + 3:update.index("WHERE")]
-    assert sorted(re.findall(r"([a-z_]+)\s*=", set_clause)) == sorted(_CLEARED_COLUMNS)
-    assert "cleared_at IS NULL" in update[update.index("WHERE"):]
+    assert deletes == [] and len(updates) == 2, "one per dialect"
+    for update in updates:
+        set_clause = update[update.index("SET") + 3:update.index("WHERE")]
+        assert sorted(re.findall(r"([a-z_]+)\s*=", set_clause)) == sorted(_CLEARED_COLUMNS)
+        where = update[update.index("WHERE"):]
+        assert "   AND cleared_at IS NULL\n   AND id IN (" in where, "open rows only, and only the listed ids"
+        assert "AND listed.cleared_at IS NULL" in where and ") = CAST(:expected AS INTEGER)" in where
 
 
 def test_nothing_reads_or_writes_the_record_on_a_request_path_yet():

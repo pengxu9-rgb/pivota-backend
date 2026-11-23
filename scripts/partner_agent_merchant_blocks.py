@@ -9,16 +9,24 @@ about, and clears a merchant once the evidence exists. It is run as a gated one-
     python -m scripts.partner_agent_merchant_blocks record --rail R --domain D \
         --kind captcha|bot_challenge|block --by "name" [--purchase-id ap_...] [--apply]
     python -m scripts.partner_agent_merchant_blocks clear --rail R --domain D \
-        --basis verified_recognition|written_permission --by "name" --evidence "where it is kept" [--apply]
+        --basis verified_recognition|written_permission --by "name" --evidence "where it is kept" \
+        [--ids pab_...,pab_... --apply]
 
 DRY-RUN BY DEFAULT. `record` and `clear` write only with `--apply`. Without it they print what
-they would do (for `clear`, the open events it would clear) and write nothing.
+they would do and write nothing.
+
+CLEARING IS TWO STEPS, AND THE SECOND NAMES WHAT THE FIRST SHOWED. A dry run prints the open
+events of that rail and domain and their ids. `--apply` needs `--ids` and clears exactly those
+events, all or nothing: an event recorded after the dry run is not in the list and stays open,
+and if any listed id is no longer an open event of that rail and domain, nothing is cleared.
+So the evidence a person looked at clears the events that person looked at, and no others. A dry
+run lists at most 500 events, and one `--apply` clears at most 500.
 
 WHAT `clear` DOES AND DOES NOT DO. It sets when, on which basis, by whom and where the evidence is
-kept on every OPEN event for that rail and domain. It deletes nothing and rewrites nothing: the
-events stay in the table, and one that was already cleared keeps its first clearance. Only the
-two bases D11 names are accepted, and `--evidence` says where the evidence is kept (a ticket or a
-document reference), never the evidence itself.
+kept on the listed events. It deletes nothing and rewrites nothing: the events stay in the table,
+and one that was already cleared keeps its first clearance. Only the two bases D11 names are
+accepted. `--evidence` says where the evidence is kept (a ticket or a document reference), never
+the evidence itself: a query string, or a word that names a credential, is refused.
 
 BEFORE ANYTHING ELSE the tool checks that the table exists and answers. If it does not (migration
 295 has not been applied, or the database is unreachable) it prints
@@ -28,13 +36,14 @@ OUTPUT (stdout, one JSON object per line after the prefix):
 
     PABLOCK_ROW {...}                         one event (`list`, and `clear` without --apply)
     PABLOCK_LIST {"rows":n}
-    PABLOCK_DRY_RUN {"action":..,...}         what `record` / `clear` would do
+    PABLOCK_DRY_RUN {"action":..,...}         what `record` / `clear` would do; for `clear` it
+                                              carries "would_clear":n and "ids":"a,b" for --ids
     PABLOCK_RECORDED {"rail":..,"domain":..,"kind":..,"result":"recorded"|"duplicate"}
     PABLOCK_CLEARED {"rail":..,"domain":..,"basis":..,"cleared":n}
     PABLOCK_REFUSED <reason>
 
-Exit 0 when the command did what it said (a `clear` that found nothing open is 0 with
-`"cleared":0`); 2 for a refusal or a failed read or write.
+Exit 0 when the command did what it said (a `clear` dry run that finds nothing open is 0 with
+`"would_clear":0`); 2 for a refusal or a failed read or write.
 """
 
 from __future__ import annotations
@@ -104,26 +113,53 @@ async def _record(args: Any, out: Callable[[str], None]) -> int:
     return EXIT_OK
 
 
+#: A well-formed id that names no event: lets a dry run check the name, basis and evidence when
+#: nothing is open to list.
+_NO_EVENT_ID = "pab_" + "0" * 32
+
+
+def _listed_ids(raw: Optional[str]) -> List[str]:
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
 async def _clear(args: Any, out: Callable[[str], None]) -> int:
     domain = normalize_domain(args.domain)
     said = {"rail": args.rail, "domain": domain, "basis": args.basis}
+    ids = _listed_ids(args.ids)
     if not args.apply:
         if blocks.clearance_values(
-                args.rail, args.domain, basis=args.basis, cleared_by=args.by, evidence=args.evidence) is None:
+                args.rail, args.domain, ids=ids or [_NO_EVENT_ID],
+                basis=args.basis, cleared_by=args.by, evidence=args.evidence) is None:
             out(f"{REFUSED_PREFIX}clear_refused the clearance does not fit; nothing would be cleared")
             return EXIT_REFUSED
         rows = await blocks.list_blocks(rail=args.rail, domain=args.domain, open_only=True)
         if rows is None:
             out(f"{REFUSED_PREFIX}list_failed an unusable filter, or the read failed")
             return EXIT_REFUSED
+        if ids:
+            if not set(ids) <= {row["id"] for row in rows}:
+                out(f"{REFUSED_PREFIX}ids_not_open a listed id is not an open event of this rail and domain; "
+                    "nothing would be cleared")
+                return EXIT_REFUSED
+            rows = [row for row in rows if row["id"] in set(ids)]
         for row in rows:
             out(_line(ROW_PREFIX, row))
-        out(_line(DRY_RUN_PREFIX, {"action": "clear", **said, "by": args.by, "would_clear": len(rows)}))
+        out(_line(DRY_RUN_PREFIX, {
+            "action": "clear", **said, "by": args.by, "would_clear": len(rows),
+            "ids": ",".join(row["id"] for row in rows),
+        }))  # fmt: skip
         return EXIT_OK
+    if not ids:
+        out(f"{REFUSED_PREFIX}ids_required run without --apply first, then pass the ids it printed with --ids")
+        return EXIT_REFUSED
     cleared = await blocks.clear_blocks(
-        args.rail, args.domain, basis=args.basis, cleared_by=args.by, evidence=args.evidence)
+        args.rail, args.domain, ids=ids, basis=args.basis, cleared_by=args.by, evidence=args.evidence)
     if cleared is None:
         out(f"{REFUSED_PREFIX}clear_failed nothing was cleared")
+        return EXIT_REFUSED
+    if cleared == 0:
+        out(f"{REFUSED_PREFIX}ids_not_open a listed id is not an open event of this rail and domain; "
+            "nothing was cleared")
         return EXIT_REFUSED
     out(_line(CLEARED_PREFIX, {**said, "cleared": cleared}))
     return EXIT_OK
@@ -179,6 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     clear.add_argument("--basis", choices=sorted(blocks.BASES), required=True)
     clear.add_argument("--by", required=True, help="the member of staff clearing it")
     clear.add_argument("--evidence", required=True, help="where the evidence is kept (a reference, not the evidence)")
+    clear.add_argument("--ids", default=None,
+                       help="comma-separated event ids to clear, as the dry run printed them (required with --apply)")
     clear.add_argument("--apply", action="store_true", help="clear the events (default: dry run)")
     return parser
 

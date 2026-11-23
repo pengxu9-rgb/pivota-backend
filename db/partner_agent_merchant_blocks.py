@@ -15,13 +15,23 @@ db/merchant_agent_checkout_facts):
   2. CLEARING SETS FOUR COLUMNS ONCE AND KEEPS THE ROW: when, on which basis, by whom, and where
      the evidence is kept. A row that is already cleared is never cleared again, so the first
      clearance of an event stands.
+  2a. A CLEARANCE NAMES THE EVENTS IT CLEARS, BY ID, AND IS ALL OR NOTHING. It clears the events
+     a person reviewed, never "whatever is open now": an event recorded after the review is not
+     in the list and stays open. If any listed id is not an open event of that rail and domain,
+     nothing is cleared.
   3. ONLY THE TWO BASES D11 NAMES CLEAR AN EVENT: `verified_recognition` and
      `written_permission`. A later order, a later census and time do not.
   4. CLEAR IS A POSITIVE ANSWER. `is_clear` is True only when the read worked and found no open
      event. A failed or slow read, a missing table and an unusable key all answer False.
   5. THE KEY IS THE RAIL AND THE DOMAIN, NOT THE MARKET. The merchant challenged the agent,
      wherever the buyer was. An event on one rail says nothing about the other.
-  6. ONE PURCHASE RECORDS ONE EVENT. A worker that retries after a crash writes nothing new.
+  6. ONE PURCHASE RECORDS ONE EVENT. A worker that retries after a crash writes nothing new. The
+     retry is a duplicate only when it names the same rail and domain as the stored event; a
+     purchase id that is already recorded against another rail or domain is refused, not
+     reported as recorded.
+  7. A NAME AND AN EVIDENCE REFERENCE ARE PLAIN TEXT. No control or format character (a
+     right-to-left override hides what a reader sees). `cleared_evidence` says WHERE the evidence
+     is kept and never carries it: a query string, or a word that names a credential, is refused.
 
 WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run as a gated one-off.
 A partner's worker will, for the purchase that met the event, in a later change. No request
@@ -43,13 +53,16 @@ migration's CHECK as well.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import unicodedata
 import uuid
 from typing import Any, Dict, List, Optional
 
-from db.database import database
+from db.database import IS_POSTGRES, database
 from db.merchant_purchasability import normalize_domain
+from services.agent_card_issuance import validate_merchant_domain
 from services.payment_orchestration.router import RAILS
 
 __all__ = [
@@ -59,6 +72,8 @@ __all__ = [
     "BASES",
     "RECORDED",
     "DUPLICATE",
+    "PERSON_MAX_CHARS",
+    "EVIDENCE_MAX_CHARS",
     "table_is_readable",
     "event_values",
     "clearance_values",
@@ -89,9 +104,17 @@ WRITE_TIMEOUT_SECONDS = 10.0
 LIST_MAX = 500
 
 _PURCHASE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-#: Printable text with no control character, trimmed by the caller before it is matched.
-_PERSON_RE = re.compile(r"[^\x00-\x1f\x7f]{1,200}")
-_EVIDENCE_RE = re.compile(r"[^\x00-\x1f\x7f]{1,500}")
+_EVENT_ID_RE = re.compile(r"pab_[0-9a-f]{32}")
+PERSON_MAX_CHARS = 200
+EVIDENCE_MAX_CHARS = 500
+#: Unicode categories a name or a reference may not contain: control, format (zero-width and
+#: direction overrides), surrogate, private use, and the line and paragraph separators.
+_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+#: A reference says where the evidence is kept. These mark text that carries something else: a
+#: query string or a key=value pair, and a word that names a credential.
+_EVIDENCE_FORBIDDEN_CHARS = frozenset("?&=")
+_EVIDENCE_CREDENTIAL_WORD_RE = re.compile(
+    r"(?i)\b(token|secret|password|passwd|signature|sig|apikey|api[_-]?key|bearer|session[_-]?id|cookie)\b")
 
 
 # ── statements (module-level literals, passed by name) ───────────────────────────────────────
@@ -101,11 +124,21 @@ INSERT INTO partner_agent_merchant_blocks
     (id, rail, merchant_domain, kind, source, purchase_id, recorded_by, observed_at)
 VALUES
     (:id, :rail, :merchant_domain, :kind, :source, :purchase_id, :recorded_by, CURRENT_TIMESTAMP)
-ON CONFLICT DO NOTHING
+ON CONFLICT (purchase_id) WHERE purchase_id IS NOT NULL DO NOTHING
 RETURNING id
 """
 
-# `cleared_at IS NULL` is the whole of "the first clearance stands": a cleared row never matches.
+# The stored event of a purchase, read when the insert above wrote nothing.
+_BY_PURCHASE_SQL = """
+SELECT rail, merchant_domain
+  FROM partner_agent_merchant_blocks
+ WHERE purchase_id = :purchase_id
+"""
+
+# ONE STATEMENT, ALL OR NOTHING. It clears exactly the listed ids, and only when every one of
+# them is an OPEN event of this rail and domain: the count in the last conjunct is taken in the
+# same statement, so a listed id that is cleared, unknown or another merchant's makes the whole
+# clearance match nothing. `cleared_at IS NULL` is also the whole of "the first clearance stands".
 _CLEAR_SQL = """
 UPDATE partner_agent_merchant_blocks
    SET cleared_at = CURRENT_TIMESTAMP,
@@ -115,6 +148,34 @@ UPDATE partner_agent_merchant_blocks
  WHERE rail = :rail
    AND merchant_domain = :merchant_domain
    AND cleared_at IS NULL
+   AND id IN (SELECT jsonb_array_elements_text(CAST(:ids AS JSONB)))
+   AND (SELECT COUNT(*)
+          FROM partner_agent_merchant_blocks AS listed
+         WHERE listed.rail = :rail
+           AND listed.merchant_domain = :merchant_domain
+           AND listed.cleared_at IS NULL
+           AND listed.id IN (SELECT jsonb_array_elements_text(CAST(:ids AS JSONB)))
+       ) = CAST(:expected AS INTEGER)
+RETURNING id
+"""
+
+_CLEAR_SQL_SQLITE = """
+UPDATE partner_agent_merchant_blocks
+   SET cleared_at = CURRENT_TIMESTAMP,
+       cleared_basis = :basis,
+       cleared_by = :cleared_by,
+       cleared_evidence = :evidence
+ WHERE rail = :rail
+   AND merchant_domain = :merchant_domain
+   AND cleared_at IS NULL
+   AND id IN (SELECT value FROM json_each(:ids))
+   AND (SELECT COUNT(*)
+          FROM partner_agent_merchant_blocks AS listed
+         WHERE listed.rail = :rail
+           AND listed.merchant_domain = :merchant_domain
+           AND listed.cleared_at IS NULL
+           AND listed.id IN (SELECT value FROM json_each(:ids))
+       ) = CAST(:expected AS INTEGER)
 RETURNING id
 """
 
@@ -151,12 +212,21 @@ _COLUMNS = (
 # ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 
+def _domain(value: Any) -> Optional[str]:
+    """The domain key, or None for anything that is not one merchant host name: the folded value
+    must pass the same check the merchant-document reader applies before it asks a host."""
+    folded = normalize_domain(value)
+    if not folded or validate_merchant_domain(folded) != folded:
+        return None
+    return folded
+
+
 def _key(rail: Any, domain: Any) -> Optional[Dict[str, str]]:
     """The (rail, domain) key, or None when either part is unusable."""
     if not isinstance(rail, str) or rail not in RAILS:
         return None
-    folded = normalize_domain(domain)
-    if not folded:
+    folded = _domain(domain)
+    if folded is None:
         return None
     return {"rail": rail, "merchant_domain": folded}
 
@@ -167,6 +237,37 @@ def _text(value: Any, pattern: "re.Pattern[str]") -> Optional[str]:
         return None
     trimmed = value.strip()
     return trimmed if pattern.fullmatch(trimmed) else None
+
+
+def _plain(value: Any, max_chars: int) -> Optional[str]:
+    """Trimmed plain text of 1 to `max_chars` characters, else None. No control, format,
+    surrogate or private-use character, and no line or paragraph separator."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    if not 1 <= len(trimmed) <= max_chars:
+        return None
+    if any(unicodedata.category(char) in _FORBIDDEN_CATEGORIES for char in trimmed):
+        return None
+    return trimmed
+
+
+def _reference(value: Any) -> Optional[str]:
+    """Where the evidence is kept, or None. Plain text that carries no query string, no
+    key=value pair and no word that names a credential."""
+    text = _plain(value, EVIDENCE_MAX_CHARS)
+    if text is None or _EVIDENCE_FORBIDDEN_CHARS.intersection(text) or _EVIDENCE_CREDENTIAL_WORD_RE.search(text):
+        return None
+    return text
+
+
+def _ids(value: Any) -> Optional[List[str]]:
+    """1 to LIST_MAX distinct event ids, in the order given, or None."""
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= LIST_MAX:
+        return None
+    if any(not isinstance(item, str) or not _EVENT_ID_RE.fullmatch(item) for item in value):
+        return None
+    return list(value) if len(set(value)) == len(value) else None
 
 
 async def table_is_readable() -> bool:
@@ -192,7 +293,7 @@ def event_values(
     if key is None or kind not in KINDS or source not in SOURCES:
         return None
     purchase = None if purchase_id is None else _text(purchase_id, _PURCHASE_ID_RE)
-    person = None if recorded_by is None else _text(recorded_by, _PERSON_RE)
+    person = None if recorded_by is None else _plain(recorded_by, PERSON_MAX_CHARS)
     if (purchase_id is not None and purchase is None) or (recorded_by is not None and person is None):
         return None
     if (source == SOURCE_WORKER and purchase is None) or (source == SOURCE_OPERATOR and person is None):
@@ -200,15 +301,22 @@ def event_values(
     return {**key, "kind": kind, "source": source, "purchase_id": purchase, "recorded_by": person}
 
 
-def clearance_values(rail: Any, domain: Any, *, basis: Any, cleared_by: Any, evidence: Any) -> Optional[Dict[str, Any]]:
-    """What a clearance would write, or None when it would be refused: a basis outside D11's two,
-    a missing name or a missing evidence reference, an unusable rail or domain. Pure: no I/O."""
+def clearance_values(
+    rail: Any, domain: Any, *, ids: Any, basis: Any, cleared_by: Any, evidence: Any
+) -> Optional[Dict[str, Any]]:
+    """What a clearance would write, or None when it would be refused: no list of event ids, a
+    basis outside D11's two, a missing name or evidence reference, an unusable rail or domain.
+    Pure: no I/O."""
     key = _key(rail, domain)
-    person = _text(cleared_by, _PERSON_RE)
-    reference = _text(evidence, _EVIDENCE_RE)
-    if key is None or basis not in BASES or person is None or reference is None:
+    listed = _ids(ids)
+    person = _plain(cleared_by, PERSON_MAX_CHARS)
+    reference = _reference(evidence)
+    if key is None or listed is None or basis not in BASES or person is None or reference is None:
         return None
-    return {**key, "basis": basis, "cleared_by": person, "evidence": reference}
+    return {
+        **key, "ids": json.dumps(listed), "expected": len(listed),
+        "basis": basis, "cleared_by": person, "evidence": reference,
+    }  # fmt: skip
 
 
 async def record_block(
@@ -220,10 +328,11 @@ async def record_block(
     purchase_id: Any = None,
     recorded_by: Any = None,
 ) -> Optional[str]:
-    """Record one event. `RECORDED`, `DUPLICATE` (this purchase already has its event), or None.
+    """Record one event. `RECORDED`, `DUPLICATE` (this purchase already has THIS event), or None.
 
-    None means nothing was written: `event_values` refused it, or the write failed or was slow.
-    Never raises."""
+    None means this call recorded nothing it can vouch for: `event_values` refused it; the write
+    failed or was slow; or the purchase id is already recorded against ANOTHER rail or domain,
+    which is a conflict to look at and never a duplicate. Never raises."""
     values = event_values(rail, domain, kind, source=source, purchase_id=purchase_id, recorded_by=recorded_by)
     if values is None:
         logger.warning("partner_agent_merchant_blocks: refusing an event that does not fit (see event_values)")
@@ -231,24 +340,36 @@ async def record_block(
     values["id"] = f"pab_{uuid.uuid4().hex}"
     try:
         record = await asyncio.wait_for(database.fetch_one(_INSERT_SQL, values), WRITE_TIMEOUT_SECONDS)
+        if record is not None:
+            return RECORDED
+        if values["purchase_id"] is None:
+            return None  # nothing was written and there is no purchase to have collided on
+        stored = await asyncio.wait_for(
+            database.fetch_one(_BY_PURCHASE_SQL, {"purchase_id": values["purchase_id"]}), READ_TIMEOUT_SECONDS)
     except Exception:  # noqa: BLE001 - timeouts included
         logger.exception("partner_agent_merchant_blocks: recording an event failed")
         return None
-    return RECORDED if record is not None else DUPLICATE
+    if stored is not None and (stored["rail"], stored["merchant_domain"]) == (values["rail"], values["merchant_domain"]):
+        return DUPLICATE
+    logger.error("partner_agent_merchant_blocks: a purchase id is already recorded against another rail or domain")
+    return None
 
 
-async def clear_blocks(rail: Any, domain: Any, *, basis: Any, cleared_by: Any, evidence: Any) -> Optional[int]:
-    """Clear every OPEN event for one rail and domain. The number cleared (0 when none was
-    open), or None when `clearance_values` refused it or the write failed.
+async def clear_blocks(
+    rail: Any, domain: Any, *, ids: Any, basis: Any, cleared_by: Any, evidence: Any
+) -> Optional[int]:
+    """Clear exactly the listed events of one rail and domain, all or nothing.
 
-    The event rows stay; an event that was already cleared keeps its first clearance. Never
-    raises."""
-    values = clearance_values(rail, domain, basis=basis, cleared_by=cleared_by, evidence=evidence)
+    The number cleared, which is `len(ids)` on success and 0 when any listed id is not an open
+    event of that rail and domain (then nothing was cleared). None when `clearance_values`
+    refused it or the write failed. The event rows stay. Never raises."""
+    values = clearance_values(rail, domain, ids=ids, basis=basis, cleared_by=cleared_by, evidence=evidence)
     if values is None:
-        logger.warning("partner_agent_merchant_blocks: refusing a clearance without a key, a D11 basis, a name and evidence")
+        logger.warning("partner_agent_merchant_blocks: refusing a clearance (see clearance_values)")
         return None
+    statement = _CLEAR_SQL if IS_POSTGRES else _CLEAR_SQL_SQLITE
     try:
-        records = await asyncio.wait_for(database.fetch_all(_CLEAR_SQL, values), WRITE_TIMEOUT_SECONDS)
+        records = await asyncio.wait_for(database.fetch_all(statement, values), WRITE_TIMEOUT_SECONDS)
     except Exception:  # noqa: BLE001 - timeouts included
         logger.exception("partner_agent_merchant_blocks: clearing failed")
         return None
@@ -282,8 +403,8 @@ async def list_blocks(
     folds to nothing, is an unusable filter and never "no filter"."""
     if rail is not None and (not isinstance(rail, str) or rail not in RAILS):
         return None
-    folded = "" if domain is None else normalize_domain(domain)
-    if domain is not None and not folded:
+    folded = "" if domain is None else _domain(domain)
+    if folded is None:
         return None
     bounded = limit if type(limit) is int and 1 <= limit <= LIST_MAX else LIST_MAX
     values = {"rail": rail or "", "merchant_domain": folded, "open_only": 1 if open_only is True else 0, "limit": bounded}

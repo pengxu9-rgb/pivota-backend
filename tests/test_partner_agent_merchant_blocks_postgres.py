@@ -61,7 +61,7 @@ async def test_every_statement_prepares(_blocks_db):
 
     statements = _statements()
     assert set(statements) == {
-        "_INSERT_SQL", "_CLEAR_SQL", "_OPEN_SQL", "_LIST_SQL", "_TABLE_READABLE_SQL",
+        "_INSERT_SQL", "_BY_PURCHASE_SQL", "_CLEAR_SQL", "_OPEN_SQL", "_LIST_SQL", "_TABLE_READABLE_SQL",
     }, sorted(statements)
     conn = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
     failures = []
@@ -131,7 +131,7 @@ async def test_each_check_refuses_a_value_outside_its_vocabulary(_blocks_db):
 
     base = "INSERT INTO {t} (id, rail, merchant_domain, kind, source, observed_at) VALUES ('pab_x', {v}, CURRENT_TIMESTAMP)"
     for values, constraint in [
-        ("'stripe', 'brand-a.example', 'captcha', 'worker'", "ck_partner_agent_merchant_blocks_rail"),
+        ("'rail_x', 'brand-a.example', 'captcha', 'worker'", "ck_partner_agent_merchant_blocks_rail"),
         ("'a2a', 'brand-a.example', 'issuer_step_up', 'worker'", "ck_partner_agent_merchant_blocks_kind"),
         ("'a2a', 'brand-a.example', 'captcha', 'request'", "ck_partner_agent_merchant_blocks_source"),
     ]:
