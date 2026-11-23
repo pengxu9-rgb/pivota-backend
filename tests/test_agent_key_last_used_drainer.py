@@ -187,3 +187,56 @@ async def test_the_app_lifespan_starts_the_drainer_and_shuts_it_down(monkeypatch
     assert agents_db._key_last_used_queue is None
     await asyncio.sleep(0)
     assert task.done(), "the lifespan cancelled it on the way out"
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_in_the_middle_of_a_write_ends_the_drainer_without_a_restart(monkeypatch, agents_db, caplog):
+    # The reviewer's probe, as a test: the cancel lands while a write is awaiting the DB. That is a
+    # real cancel of the task (cancelling() is set), so it must end the drainer, release the item,
+    # and not be "restarted" as if it had crashed.
+    entered = asyncio.Event()
+    finished = []
+
+    async def slow_execute(query, values=None):
+        entered.set()
+        await asyncio.sleep(3600)  # a write in flight
+        finished.append(values["key_hash"])
+
+    monkeypatch.setattr(agents_db.database, "execute", slow_execute)
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    task = agents_db.start_key_last_used_drainer()
+    queue = agents_db._key_last_used_queue
+    queue.put_nowait(_item("mid-write"))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    started = asyncio.get_running_loop().time()
+
+    await agents_db.shutdown_key_last_used_drainer(timeout=2.0)
+
+    assert asyncio.get_running_loop().time() - started < 1.0, "the cancel ended the write promptly"
+    assert task.done() and task.cancelled(), "a real cancel ends the task as cancelled"
+    assert agents_db._key_last_used_task is task, "not restarted"
+    assert finished == [], "the write did not complete after the shutdown"
+    await asyncio.wait_for(queue.join(), timeout=1)  # task_done ran for the in-flight item
+    assert "restarting" not in caplog.text and "skipped" not in caplog.text, caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_drainer_ending_does_not_start_another(monkeypatch, agents_db, caplog):
+    # Only the CURRENT drainer is restarted. An older task that ends (e.g. one already replaced by a
+    # restart) must not spawn a second drainer next to the live one.
+    caplog.set_level(logging.ERROR, logger=LOGGER)
+    old = agents_db.start_key_last_used_drainer()
+    current = agents_db._spawn_key_last_used_drainer(agents_db._key_last_used_queue)  # what a restart does
+    assert agents_db._key_last_used_task is current and current is not old
+
+    old.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await old
+    await asyncio.sleep(0.05)
+
+    assert agents_db._key_last_used_task is current, "the live drainer is unchanged"
+    assert agents_db._key_last_used_restarts == [], "no restart was counted"
+    assert not current.done()
+    live = [t for t in asyncio.all_tasks() if t.get_name() == "agent-key-last-used" and not t.done()]
+    assert live == [current], "exactly one drainer is running"
+    assert "restarting" not in caplog.text
