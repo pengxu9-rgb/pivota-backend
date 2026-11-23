@@ -9,44 +9,66 @@ WHO WRITES. `jobs/merchant_protocol_profile_census`, and only when it is run wit
 reads each domain's robots.txt, `/.well-known/ucp` and `/.well-known/acp.json` from the crawl
 egress and hands this module one `Check` per domain. Nothing a request sends ever writes here.
 
-THREE OUTCOMES, AND "CANNOT TELL" IS NOT A NEGATIVE:
+EACH PATH IS READ ON ITS OWN, AND "CANNOT TELL" IS NOT A NEGATIVE. A check carries one answer per
+path (`ucp_checkout`, `acp_checkout`):
 
-    publishes          a readable document offers checkout. The matching `*_checkout_at` is set to
-                       the database's clock and `negative_at` is cleared.
-    does_not_publish   both documents answered cleanly and neither offers checkout. `negative_at`
-                       is set. The earlier `*_checkout_at` values stay as history.
-    unreadable         robots.txt disallowed or unavailable, a refused redirect, a timeout, a 403
-                       or 5xx, a body that does not parse. Only `checked_at`, `last_outcome` and
-                       `last_code` change: an unreadable check neither revokes a positive nor
-                       renews one, so a merchant that cannot be read for long enough ages out.
+    True    a readable document offers checkout: that path's `*_checkout_at` is set to the
+            database's clock
+    False   the path answered cleanly without checkout (a readable document that does not list
+            it, or a 404 / 410): that path's `*_checkout_at` is CLEARED, at once
+    None    the path could not be read (robots.txt, a refused redirect, a timeout, a 403 or 5xx,
+            a body that does not parse): that path's column is left exactly as it was, so a path
+            that cannot be read neither loses its positive nor renews it, and ages out
+
+and one outcome for the whole check, which must agree with the two answers:
+
+    publishes          at least one True. `negative_at` is cleared.
+    does_not_publish   both False. `negative_at` is set.
+    unreadable         no True and at least one None. `negative_at` is left as it was.
 
 THE DELIBERATE RULES (the challenge record and the filter that reads this fact inherit them):
 
   1. A CLEAN NEGATIVE REVOKES AT ONCE. There is no two-strikes rule here, unlike the
      purchasability fact.
   2. A CLEAN NEGATIVE NEEDS BOTH PATHS TO ANSWER CLEANLY. One path that could not be read (a bot
-     wall on `/.well-known/ucp` beside a clean 404 on ACP) makes the whole check unreadable.
+     wall on `/.well-known/ucp` beside a clean 404 on ACP) makes the whole check unreadable, and
+     `negative_at` is not set.
   3. A NEGATIVE NEVER AGES OUT. Only a later positive clears it. A positive does age out.
   4. A ROW THE RUN'S DEADLINE KEPT FROM BEING ASKED is stored as unreadable.
-  5. AN ACP POSITIVE needs a readable discovery document that LISTS the `checkout` service. A
-     readable document without it is a clean "no" for that path.
+  5. AN ACP POSITIVE needs a readable discovery document that lists `checkout` among its
+     SERVICES. An extension of that name does not count, and a readable document without the
+     service is a clean "no" for that path.
+  6. A PATH THAT ANSWERS CLEANLY WITHOUT CHECKOUT LOSES ITS OWN POSITIVE AT ONCE, whatever the
+     other path did. A profile that stopped listing checkout beside an ACP path behind a bot wall
+     is an unreadable check, and the merchant still stops meeting the run condition unless its
+     ACP positive is fresh.
 
 Rules 2, 4 and 5 are applied by the writer's classifier
-(`jobs.merchant_protocol_profile_census.checkout_check`); rules 1 and 3 by the upsert and the read
-below.
+(`jobs.merchant_protocol_profile_census.checkout_check`); rules 1, 3 and 6 by the upsert and the
+read below.
 
 THE READ. `meets_run_condition(domain)` is True only while `negative_at` is NULL and one of the two
 `*_checkout_at` is younger than `max_age_days()` (30 by default). It answers False for a missing
 row, an old positive, a negative, an unusable domain, a slow or failed read, and a table that
 does not exist. It never raises.
 
+FOR A CALLER ON A REQUEST PATH (none exists yet; the filter is its own change). "Never raises" has
+two side effects on Postgres that such a caller must plan for:
+
+  * INSIDE `database.transaction()`, a statement that fails (the table does not exist) aborts the
+    surrounding transaction even though the error is swallowed here. Read the fact OUTSIDE any
+    transaction, or under a savepoint.
+  * THE READ'S TIMEOUT CANCELS A QUERY IN FLIGHT. With databases 0.7 a request's tasks can share
+    one connection, so a cancelled read can disturb a sibling query on it. Read it before the
+    request fans out, as the worker-heartbeat read is done.
+
 NOTHING READS THIS YET. No route, router or worker calls `meets_run_condition` in this change; the
 filter that will is its own change behind its own flag.
 
 NO STARTUP HEAL. Migration 294 is applied in production once, by hand, as a gated one-off. Nothing
 in db/schema_guard creates the table, so the code can be deployed before the table exists; that
-is why every function here treats a missing table as "no fact". `_CREATE_SQL_SQLITE` exists for
-the SQLite tests only.
+is why every function here treats a missing table as "no fact". The SQLite tests build their own
+copy of the table (tests/test_merchant_agent_checkout_facts.py).
 
 THE KEY is `db.merchant_purchasability.normalize_domain`'s form (lower case, one leading `www.`
 removed), applied on every read and every write, so the row the census wrote under
@@ -107,13 +129,14 @@ CODE_OTHER = "other"
 class Check(NamedTuple):
     """One domain's check, as the reader of its documents classified it.
 
-    `ucp_checkout` / `acp_checkout` are True only for a READABLE document that offers checkout.
-    `outcome` must agree with them: `publishes` exactly when one is True."""
+    `ucp_checkout` / `acp_checkout`: True = a readable document offers checkout, False = the path
+    answered cleanly without it, None = the path could not be read. `outcome` must agree with
+    them (see the module header). `ucp_version` is the readable UCP profile's own, else None."""
 
     outcome: str
     code: str
-    ucp_checkout: bool = False
-    acp_checkout: bool = False
+    ucp_checkout: Optional[bool] = None
+    acp_checkout: Optional[bool] = None
     ucp_version: Optional[str] = None
 
 
@@ -129,10 +152,10 @@ def max_age_days() -> int:
 
 # ── statements (module-level literals, passed by name) ───────────────────────────────────────
 #
-# ONE UPSERT, evaluated server-side: the three booleans the caller derived pick which columns move,
-# and every timestamp is the database's own clock. A positive clears `negative_at`; a negative
-# sets it and keeps the earlier positives as history; an unreadable check (all three false) falls
-# through every CASE to "keep what the row had".
+# ONE UPSERT, evaluated server-side: the booleans the caller derived pick which columns move, and
+# every timestamp is the database's own clock. Per path: yes sets its `*_checkout_at`, a clean no
+# clears it, cannot-tell keeps what the row had. For the whole check: a positive clears
+# `negative_at`, a both-clean negative sets it, anything else keeps it.
 
 _UPSERT_SQL = """
 INSERT INTO merchant_agent_checkout_facts
@@ -140,21 +163,32 @@ INSERT INTO merchant_agent_checkout_facts
      ucp_checkout_at, acp_checkout_at, negative_at, ucp_version, source)
 VALUES
     (:merchant_domain, CURRENT_TIMESTAMP, :outcome, :code,
-     CASE WHEN CAST(:ucp_checkout AS BOOLEAN) THEN CURRENT_TIMESTAMP END,
-     CASE WHEN CAST(:acp_checkout AS BOOLEAN) THEN CURRENT_TIMESTAMP END,
+     CASE WHEN CAST(:ucp_yes AS BOOLEAN) THEN CURRENT_TIMESTAMP END,
+     CASE WHEN CAST(:acp_yes AS BOOLEAN) THEN CURRENT_TIMESTAMP END,
      CASE WHEN CAST(:negative AS BOOLEAN) THEN CURRENT_TIMESTAMP END,
      :ucp_version, :source)
 ON CONFLICT (merchant_domain) DO UPDATE SET
     checked_at = EXCLUDED.checked_at,
     last_outcome = EXCLUDED.last_outcome,
     last_code = EXCLUDED.last_code,
-    ucp_checkout_at = COALESCE(EXCLUDED.ucp_checkout_at, merchant_agent_checkout_facts.ucp_checkout_at),
-    acp_checkout_at = COALESCE(EXCLUDED.acp_checkout_at, merchant_agent_checkout_facts.acp_checkout_at),
+    ucp_checkout_at = CASE
+        WHEN CAST(:ucp_yes AS BOOLEAN) THEN EXCLUDED.ucp_checkout_at
+        WHEN CAST(:ucp_no AS BOOLEAN) THEN NULL
+        ELSE merchant_agent_checkout_facts.ucp_checkout_at
+    END,
+    acp_checkout_at = CASE
+        WHEN CAST(:acp_yes AS BOOLEAN) THEN EXCLUDED.acp_checkout_at
+        WHEN CAST(:acp_no AS BOOLEAN) THEN NULL
+        ELSE merchant_agent_checkout_facts.acp_checkout_at
+    END,
     negative_at = CASE
         WHEN CAST(:positive AS BOOLEAN) THEN NULL
         ELSE COALESCE(EXCLUDED.negative_at, merchant_agent_checkout_facts.negative_at)
     END,
-    ucp_version = COALESCE(EXCLUDED.ucp_version, merchant_agent_checkout_facts.ucp_version),
+    ucp_version = CASE
+        WHEN CAST(:ucp_yes AS BOOLEAN) OR CAST(:ucp_no AS BOOLEAN) THEN EXCLUDED.ucp_version
+        ELSE merchant_agent_checkout_facts.ucp_version
+    END,
     source = EXCLUDED.source
 RETURNING merchant_domain
 """
@@ -193,34 +227,23 @@ _TABLE_READABLE_SQL = """
 SELECT 1 AS present FROM merchant_agent_checkout_facts LIMIT 1
 """
 
-#: The SQLite tests' table. Production's is migration 294; nothing at startup runs either.
-_CREATE_SQL_SQLITE = """
-CREATE TABLE IF NOT EXISTS merchant_agent_checkout_facts (
-    merchant_domain VARCHAR(255) PRIMARY KEY,
-    checked_at TIMESTAMP NOT NULL,
-    last_outcome VARCHAR(20) NOT NULL
-        CONSTRAINT ck_merchant_agent_checkout_facts_outcome
-        CHECK (last_outcome IN ('publishes', 'does_not_publish', 'unreadable')),
-    last_code VARCHAR(64) NOT NULL,
-    ucp_checkout_at TIMESTAMP,
-    acp_checkout_at TIMESTAMP,
-    negative_at TIMESTAMP,
-    ucp_version VARCHAR(10),
-    source VARCHAR(32) NOT NULL
-)
-"""
-
-
 # ── writes ───────────────────────────────────────────────────────────────────────────────────
 
 
 def _usable(check: Any) -> bool:
-    """A check this module will store: a known outcome that agrees with its two booleans."""
+    """A check this module will store: a known outcome that agrees with its two path answers."""
     if not isinstance(check, Check) or check.outcome not in OUTCOMES:
         return False
-    if type(check.ucp_checkout) is not bool or type(check.acp_checkout) is not bool:
+    answers = (check.ucp_checkout, check.acp_checkout)
+    if any(answer is not None and type(answer) is not bool for answer in answers):
         return False
-    return (check.outcome == PUBLISHES) == (check.ucp_checkout or check.acp_checkout)
+    if any(answer is True for answer in answers):
+        expected = PUBLISHES
+    elif all(answer is False for answer in answers):
+        expected = DOES_NOT_PUBLISH
+    else:
+        expected = UNREADABLE
+    return check.outcome == expected
 
 
 async def table_is_readable() -> bool:
@@ -245,12 +268,16 @@ async def record_check(domain: Any, check: Check, *, source: str = "census") -> 
         return False
     code = check.code if isinstance(check.code, str) and _CODE_RE.fullmatch(check.code) else CODE_OTHER
     version = check.ucp_version if isinstance(check.ucp_version, str) and _VERSION_RE.fullmatch(check.ucp_version) else None
+    if check.ucp_checkout is None:
+        version = None  # no readable profile, no version: the row keeps the one it had
     values = {
         "merchant_domain": key,
         "outcome": check.outcome,
         "code": code,
-        "ucp_checkout": check.ucp_checkout,
-        "acp_checkout": check.acp_checkout,
+        "ucp_yes": check.ucp_checkout is True,
+        "ucp_no": check.ucp_checkout is False,
+        "acp_yes": check.acp_checkout is True,
+        "acp_no": check.acp_checkout is False,
         "negative": check.outcome == DOES_NOT_PUBLISH,
         "positive": check.outcome == PUBLISHES,
         "ucp_version": version,

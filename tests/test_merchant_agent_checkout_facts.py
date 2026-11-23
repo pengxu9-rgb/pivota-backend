@@ -28,6 +28,7 @@ import pytest
 from db import merchant_agent_checkout_facts as facts
 from db.database import IS_POSTGRES, database
 from jobs import merchant_protocol_profile_census as census
+from utils import database_readiness
 from tests.test_merchant_protocol_profile_census import (
     ACP_FULL,
     ACP_MIN,
@@ -47,10 +48,30 @@ _MIGRATION = _REPO / "db/migrations/294_merchant_agent_checkout_facts.sql"
 _DOWN = _REPO / "db/migrations/down/294_merchant_agent_checkout_facts_down.sql"
 TABLE = facts.TABLE
 
-POSITIVE_UCP = facts.Check(facts.PUBLISHES, "ok", True, False, "2026-08-25")
-POSITIVE_ACP = facts.Check(facts.PUBLISHES, "ok", False, True, None)
-NEGATIVE = facts.Check(facts.DOES_NOT_PUBLISH, "ok")
+# A path answer is True (offers checkout), False (answered cleanly without it) or None (could not
+# be read). These four leave the other path unread, so each test moves one thing at a time.
+POSITIVE_UCP = facts.Check(facts.PUBLISHES, "ok", True, None, "2026-08-25")
+POSITIVE_ACP = facts.Check(facts.PUBLISHES, "ok", None, True, None)
+NEGATIVE = facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, False)
 UNREADABLE = facts.Check(facts.UNREADABLE, "ucp_timeout")
+
+#: The SQLite copy of migration 294's table, for this suite only. Production's table is the
+#: migration; nothing in the application builds one.
+_CREATE_SQL_SQLITE = """
+CREATE TABLE IF NOT EXISTS merchant_agent_checkout_facts (
+    merchant_domain VARCHAR(255) PRIMARY KEY,
+    checked_at TIMESTAMP NOT NULL,
+    last_outcome VARCHAR(20) NOT NULL
+        CONSTRAINT ck_merchant_agent_checkout_facts_outcome
+        CHECK (last_outcome IN ('publishes', 'does_not_publish', 'unreadable')),
+    last_code VARCHAR(64) NOT NULL,
+    ucp_checkout_at TIMESTAMP,
+    acp_checkout_at TIMESTAMP,
+    negative_at TIMESTAMP,
+    ucp_version VARCHAR(10),
+    source VARCHAR(32) NOT NULL
+)
+"""
 
 
 def _migration_statements() -> List[str]:
@@ -82,7 +103,7 @@ async def _create_table() -> None:
         for statement in split_statements(_MIGRATION.read_text("utf-8")):
             await database.execute(statement)
     else:
-        await database.execute(facts._CREATE_SQL_SQLITE)
+        await database.execute(_CREATE_SQL_SQLITE)
 
 
 @pytest.fixture
@@ -161,13 +182,54 @@ async def test_acp_checkout_alone_meets_it(_facts_db):
     assert await facts.meets_run_condition("brand-a.example") is True
 
 
-async def test_a_clean_negative_revokes_and_keeps_the_history(_facts_db):
+async def test_a_clean_negative_revokes_at_once(_facts_db):
     await facts.record_check("brand-a.example", POSITIVE_UCP)
+    await facts.record_check("brand-a.example", POSITIVE_ACP)
     await facts.record_check("brand-a.example", NEGATIVE)
     row = await facts.get_fact("brand-a.example")
     assert row["last_outcome"] == "does_not_publish" and row["negative_at"] is not None
-    assert row["ucp_checkout_at"] is not None, "the earlier positive stays as history"
+    assert (row["ucp_checkout_at"], row["acp_checkout_at"], row["ucp_version"]) == (None, None, None)
     assert await facts.meets_run_condition("brand-a.example") is False
+
+
+async def test_a_profile_that_stopped_listing_checkout_loses_its_positive_though_acp_is_walled(_facts_db):
+    """Review case A. UCP listed checkout; a later run reads the profile WITHOUT it while the ACP
+    path sits behind a bot wall. The check is unreadable overall (no negative), but the UCP
+    positive must not stay fresh-looking for thirty days."""
+    await facts.record_check("brand-a.example", POSITIVE_UCP)
+    walled = facts.Check(facts.UNREADABLE, "acp_403", False, None, "2026-11-01")
+    assert await facts.record_check("brand-a.example", walled) is True
+    row = await facts.get_fact("brand-a.example")
+    assert (row["last_outcome"], row["ucp_checkout_at"], row["negative_at"]) == ("unreadable", None, None)
+    assert row["ucp_version"] == "2026-11-01", "the readable profile's own version"
+    assert await facts.meets_run_condition("brand-a.example") is False
+
+
+async def test_one_paths_clean_no_leaves_the_other_paths_fresh_positive(_facts_db):
+    await facts.record_check("brand-a.example", POSITIVE_UCP)
+    await facts.record_check("brand-a.example", POSITIVE_ACP)
+    await facts.record_check("brand-a.example", facts.Check(facts.UNREADABLE, "acp_403", False, None))
+    row = await facts.get_fact("brand-a.example")
+    assert row["ucp_checkout_at"] is None and row["acp_checkout_at"] is not None
+    assert await facts.meets_run_condition("brand-a.example") is True
+    await facts.record_check("brand-a.example", facts.Check(facts.UNREADABLE, "ucp_403", None, False))
+    assert (await facts.get_fact("brand-a.example"))["acp_checkout_at"] is None
+    assert await facts.meets_run_condition("brand-a.example") is False
+
+
+async def test_a_positive_on_one_path_clears_the_other_paths_stale_positive(_facts_db):
+    """Review case B. UCP positive, then both gone, then only ACP publishes: no UCP timestamp or
+    version may survive to look fresh."""
+    await facts.record_check("brand-a.example", POSITIVE_UCP)
+    await facts.record_check("brand-a.example", NEGATIVE)
+    await facts.record_check("brand-a.example", facts.Check(facts.PUBLISHES, "ok", False, True))
+    row = await facts.get_fact("brand-a.example")
+    assert (row["ucp_checkout_at"], row["ucp_version"], row["negative_at"]) == (None, None, None)
+    assert row["acp_checkout_at"] is not None and await facts.meets_run_condition("brand-a.example") is True
+    await facts.record_check("brand-b.example", POSITIVE_ACP)
+    await facts.record_check("brand-b.example", facts.Check(facts.PUBLISHES, "ok", True, False, "2026-08-25"))
+    row = await facts.get_fact("brand-b.example")
+    assert row["acp_checkout_at"] is None and row["ucp_checkout_at"] is not None
 
 
 async def test_a_later_positive_clears_the_negative(_facts_db):
@@ -198,7 +260,7 @@ async def test_an_unreadable_check_keeps_an_acp_positive_too(_facts_db):
     assert await facts.meets_run_condition("brand-a.example") is True
 
 
-async def test_a_positive_on_one_protocol_keeps_the_others_history(_facts_db):
+async def test_a_positive_on_one_path_keeps_a_positive_the_other_path_could_not_recheck(_facts_db):
     await facts.record_check("brand-a.example", POSITIVE_ACP)
     await facts.record_check("brand-a.example", POSITIVE_UCP)
     row = await facts.get_fact("brand-a.example")
@@ -264,14 +326,20 @@ async def test_the_env_window_is_the_one_the_read_uses(_facts_db, monkeypatch):
 
 @pytest.mark.parametrize("check", [
     facts.Check(facts.PUBLISHES, "ok"),                          # says publishes, shows no document that does
+    facts.Check(facts.PUBLISHES, "ok", False, None),
     facts.Check(facts.DOES_NOT_PUBLISH, "ok", True, False),      # says no, shows a document that does
+    facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, None),      # a negative needs BOTH paths clean
+    facts.Check(facts.DOES_NOT_PUBLISH, "ok"),
     facts.Check(facts.UNREADABLE, "ok", False, True),
+    facts.Check(facts.UNREADABLE, "ok", False, False),           # both clean is a negative, not "cannot tell"
     facts.Check("maybe", "ok"),
-    facts.Check(facts.PUBLISHES, "ok", 1, False),                # a truthy non-bool is not a True
-    ("publishes", "ok", True, False, None),                      # a bare tuple is not a Check
+    facts.Check(facts.PUBLISHES, "ok", 1, None),                 # a truthy non-bool is not a True
+    facts.Check(facts.UNREADABLE, "ok", 0, None),                # nor a falsy one a False
+    ("publishes", "ok", True, None, None),                       # a bare tuple is not a Check
     None,
-], ids=["no-evidence", "negative-with-evidence", "unreadable-with-evidence", "unknown-outcome",
-        "non-bool", "bare-tuple", "none"])
+], ids=["no-evidence", "publishes-on-a-no", "negative-with-evidence", "negative-with-one-path",
+        "negative-with-no-path", "unreadable-with-evidence", "unreadable-with-both-clean",
+        "unknown-outcome", "truthy-non-bool", "falsy-non-bool", "bare-tuple", "none"])
 async def test_a_check_that_contradicts_itself_is_refused(_facts_db, check):
     assert await facts.record_check("brand-a.example", check) is False
     assert await _count() == 0
@@ -284,7 +352,7 @@ async def test_a_source_that_is_not_a_short_token_is_refused(_facts_db, source):
 
 
 async def test_nothing_a_server_sent_is_stored_verbatim(_facts_db):
-    hostile = facts.Check(facts.UNREADABLE, "<script>alert(1)</script>", False, False, "2026-08-25'; DROP")
+    hostile = facts.Check(facts.UNREADABLE, "<script>alert(1)</script>", False, None, "2026-08-25'; DROP")
     assert await facts.record_check("brand-a.example", hostile) is True
     row = await facts.get_fact("brand-a.example")
     assert (row["last_code"], row["ucp_version"]) == ("other", None)
@@ -354,8 +422,8 @@ GONE = (404, None)
     (OK_UCP, GONE, "publishes", (True, False)),
     (GONE, OK_ACP, "publishes", (False, True)),
     (OK_UCP, (200, _body(ACP_FULL)), "publishes", (True, True)),
-    (OK_UCP, ("timeout", None), "publishes", (True, False)),          # one readable yes is enough
-    ((403, None), OK_ACP, "publishes", (False, True)),
+    (OK_UCP, ("timeout", None), "publishes", (True, None)),           # one readable yes is enough
+    ((403, None), OK_ACP, "publishes", (None, True)),
     (GONE, GONE, "does_not_publish", (False, False)),
     ((410, None), GONE, "does_not_publish", (False, False)),
     ((200, _body(UCP_NO_CHECKOUT)), GONE, "does_not_publish", (False, False)),
@@ -369,25 +437,54 @@ def test_a_clean_answer_is_classified_by_what_the_documents_offer(ucp, acp, outc
     assert facts._usable(check)
 
 
-@pytest.mark.parametrize("ucp,acp,code", [
-    ((403, None), GONE, "ucp_403"),
-    ((500, None), GONE, "ucp_500"),
-    ((429, None), (503, None), "ucp_429"),
-    (GONE, (500, None), "acp_500"),
-    (GONE, (301, None), "acp_301"),
-    (("timeout", None), GONE, "ucp_timeout"),
-    (GONE, ("redirect_refused", None), "acp_redirect_refused"),
-    ((200, b"<html>not json</html>"), GONE, "ucp_not_json"),
-    ((200, _body({"ucp": {"services": {}}})), GONE, "ucp_version_missing"),
-    ((200, _body(UCP_NO_CHECKOUT)), (200, b"[]"), "acp_not_an_object"),
-    ((census.CODE_DEADLINE, None), (census.CODE_DEADLINE, None), "deadline"),
-    ((200, _body(UCP_NO_CHECKOUT)), (census.CODE_DEADLINE, None), "deadline"),
+@pytest.mark.parametrize("ucp,acp,code,paths", [
+    ((403, None), GONE, "ucp_403", (None, False)),
+    ((500, None), GONE, "ucp_500", (None, False)),
+    ((429, None), (503, None), "ucp_429", (None, None)),
+    (GONE, (500, None), "acp_500", (False, None)),
+    (GONE, (301, None), "acp_301", (False, None)),
+    (("timeout", None), GONE, "ucp_timeout", (None, False)),
+    (GONE, ("redirect_refused", None), "acp_redirect_refused", (False, None)),
+    ((200, b"<html>not json</html>"), GONE, "ucp_not_json", (None, False)),
+    ((200, _body({"ucp": {"services": {}}})), GONE, "ucp_version_missing", (None, False)),
+    ((200, _body(UCP_NO_CHECKOUT)), (200, b"[]"), "acp_not_an_object", (False, None)),
+    ((census.CODE_DEADLINE, None), (census.CODE_DEADLINE, None), "deadline", (None, None)),
+    ((200, _body(UCP_NO_CHECKOUT)), (census.CODE_DEADLINE, None), "deadline", (False, None)),
 ], ids=["403", "500", "429-and-503", "acp-500", "acp-301", "timeout", "acp-redirect", "not-json",
         "no-version", "acp-not-object", "deadline", "half-deadline"])
-def test_anything_that_is_not_a_clean_answer_is_unreadable(ucp, acp, code):
+def test_anything_that_is_not_a_clean_answer_is_unreadable(ucp, acp, code, paths):
+    """Unreadable overall, with each path's own answer kept: the path that answered cleanly
+    without checkout says False (and so loses its stored positive), the other says None."""
     check = census.checkout_check(_built(ucp, acp))
-    assert (check.outcome, check.ucp_checkout, check.acp_checkout, check.ucp_version) == ("unreadable", False, False, None)
+    assert (check.outcome, (check.ucp_checkout, check.acp_checkout)) == ("unreadable", paths)
     assert check.code == code and facts._usable(check)
+
+
+def test_the_version_of_an_unreadable_check_is_a_readable_profiles_or_none():
+    readable_without = census.checkout_check(_built((200, _body(UCP_NO_CHECKOUT)), (403, None)))
+    assert (readable_without.outcome, readable_without.ucp_version) == ("unreadable", "2026-08-25")
+    assert census.checkout_check(_built(GONE, (403, None))).ucp_version is None
+    assert census.checkout_check(_built((403, None), GONE)).ucp_version is None
+
+
+def test_an_acp_extension_named_checkout_is_not_the_checkout_service():
+    """`acp_cap` in a printed row merges services and extensions. The fact reads services only."""
+    extension_only = copy.deepcopy(ACP_FULL)
+    extension_only["capabilities"]["services"] = ["orders", "carts"]
+    extension_only["capabilities"]["extensions"] = [{"name": "checkout"}, "checkout"]
+    row = _built(GONE, (200, _body(extension_only)))
+    assert "checkout" in row["acp_cap"], "the merged list does name it"
+    check = census.checkout_check(row)
+    assert (check.outcome, check.acp_checkout) == ("does_not_publish", False)
+    assert census.checkout_check(_built(GONE, (200, _body(ACP_FULL)))).acp_checkout is True
+
+
+def test_the_services_key_is_never_printed():
+    row = _built(OK_UCP, (200, _body(ACP_FULL)))
+    assert row[census._ACP_SERVICES] == ["checkout", "orders", "delegate_payment", "carts"]
+    printed = census.printable_row(row)
+    assert not [key for key in printed if key.startswith("_")]
+    assert set(printed) == set(census.empty_row("brand-a.example"))
 
 
 def test_a_403_on_one_path_is_never_read_as_publishes_nothing():
@@ -458,6 +555,17 @@ async def test_a_second_run_that_cannot_read_a_merchant_keeps_its_fact(_facts_db
     assert await facts.meets_run_condition("shop-a.example") is True
 
 
+async def test_a_second_run_that_reads_the_profile_without_checkout_ends_the_fact(_facts_db):
+    """Review case A, end to end: the profile stops listing checkout while ACP answers 403."""
+    await _amain(Net(ROUTES), "shop-a.example")
+    later = Net({("shop-a.example", U): _json(UCP_NO_CHECKOUT), ("shop-a.example", A): _raw(403)})
+    got = await _amain(later, "shop-a.example")
+    assert _store_line(got)["unreadable"] == 1
+    row = await facts.get_fact("shop-a.example")
+    assert (row["ucp_checkout_at"], row["negative_at"], row["last_code"]) == (None, None, "acp_403")
+    assert await facts.meets_run_condition("shop-a.example") is False
+
+
 async def test_a_second_run_that_finds_the_profile_gone_revokes_it(_facts_db):
     await _amain(Net(ROUTES), "shop-a.example")
     got = await _amain(Net({}), "shop-a.example")
@@ -509,8 +617,11 @@ async def test_a_storing_run_refuses_when_the_database_cannot_be_reached(monkeyp
     async def refuse(*args: Any, **kwargs: Any) -> None:
         raise OSError("no database")
 
+    # Both doors: on Postgres the bounded connect builds its own pool and never calls
+    # `database.connect`, so patching that alone leaves a database that really connects.
     monkeypatch.setattr(database, "is_connected", False)
     monkeypatch.setattr(database, "connect", refuse)
+    monkeypatch.setattr(database_readiness, "connect_database_with_timeout", refuse)
     net = Net(ROUTES)
     got = await _amain(net, "shop-a.example")
     assert got.code == census.EXIT_REFUSED and net.requests == []
@@ -608,11 +719,11 @@ def _columns(ddl: str) -> List[str]:
 
 def test_the_sqlite_table_has_the_migrations_columns_and_check():
     migration = "\n".join(_migration_statements())
-    assert _columns(migration) == _columns(facts._CREATE_SQL_SQLITE) == [
+    assert _columns(migration) == _columns(_CREATE_SQL_SQLITE) == [
         "merchant_domain", "checked_at", "last_outcome", "last_code",
         "ucp_checkout_at", "acp_checkout_at", "negative_at", "ucp_version", "source"]
     check = "CHECK (last_outcome IN ('publishes', 'does_not_publish', 'unreadable'))"
-    assert check in migration and check in facts._CREATE_SQL_SQLITE
+    assert check in migration and check in _CREATE_SQL_SQLITE
     assert {f"'{o}'" for o in facts.OUTCOMES} == set(re.findall(r"'[a-z_]+'", check))
 
 
@@ -623,9 +734,9 @@ def test_nothing_at_startup_creates_the_table():
         assert TABLE not in (_REPO / path).read_text("utf-8"), path
     creators = sorted(
         str(p.relative_to(_REPO)) for p in _REPO.glob("**/*.py")
-        if ".venv" not in p.parts and "node_modules" not in p.parts
+        if ".venv" not in p.parts and "node_modules" not in p.parts and p.relative_to(_REPO).parts[0] != "tests"
         and f"CREATE TABLE IF NOT EXISTS {TABLE}" in p.read_text("utf-8", errors="ignore"))
-    assert creators == ["db/merchant_agent_checkout_facts.py"]
+    assert creators == [], "only migration 294 (and this suite's SQLite copy) may create the table"
 
 
 def test_the_migration_is_one_plain_create_and_its_down_one_drop():

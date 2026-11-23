@@ -8,16 +8,17 @@
 -- ONE ROW PER MERCHANT DOMAIN (the key is db.merchant_purchasability.normalize_domain's form:
 -- lower case, one leading `www.` removed). The fact is about the domain, not a market.
 --
--- THREE OUTCOMES PER CHECK, AND ONLY TWO OF THEM MOVE THE FACT:
---   publishes          a readable UCP profile lists the checkout capability, or a readable ACP
---                      discovery document lists the checkout service. Sets the matching
---                      `*_checkout_at` and clears `negative_at`.
---   does_not_publish   both documents answered cleanly and neither offers checkout (a 404 or 410
---                      is a clean "publishes nothing"). Sets `negative_at`.
---   unreadable         anything else: robots.txt disallows or could not be read, a refused
---                      redirect, a timeout, a 403 or 5xx, a body that does not parse. Changes
---                      `checked_at`, `last_outcome` and `last_code` ONLY. "Cannot tell" is never
---                      turned into a negative, and never renews a positive.
+-- EACH PATH IS READ ON ITS OWN. A readable document that offers checkout sets that path's
+-- `*_checkout_at`; a path that answers cleanly without it (a readable document that does not list
+-- checkout, or a 404 / 410) clears that path's `*_checkout_at`; a path that could not be read
+-- (robots.txt, a refused redirect, a timeout, a 403 or 5xx, a body that does not parse) leaves its
+-- column as it was. "Cannot tell" is never turned into a negative and never renews a positive.
+--
+-- ONE OUTCOME FOR THE WHOLE CHECK:
+--   publishes          at least one path offers checkout. Clears `negative_at`.
+--   does_not_publish   both paths answered cleanly and neither offers checkout. Sets
+--                      `negative_at`.
+--   unreadable         neither of the above. `negative_at` is left as it was.
 --
 -- THE READ (db/merchant_agent_checkout_facts.meets_run_condition) is true only while
 -- `negative_at` is NULL and one of the two `*_checkout_at` is inside the freshness window. A

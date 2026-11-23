@@ -101,14 +101,16 @@ is written to `merchant_agent_checkout_facts` (migration 294) through
 `checkout_check` turns the row into one of three outcomes:
 
     publishes          a readable UCP profile lists `dev.ucp.shopping.checkout`, or a readable ACP
-                       discovery document lists the `checkout` service
+                       discovery document lists `checkout` among its services (an extension of
+                       that name does not count)
     does_not_publish   both paths answered cleanly and neither offers checkout (404 and 410 are a
                        clean "publishes nothing")
     unreadable         anything else (robots, a refused redirect, a timeout, 403, 5xx, a body
                        that does not parse, a path the deadline kept from being asked)
 
-Only the first two move the fact; an unreadable check never revokes a positive and never renews
-one. BEFORE THE FIRST REQUEST the job checks that the table exists and answers. If it does not
+Each path also carries its own answer. A path that answered cleanly without checkout loses its own
+stored positive at once, even when the other path could not be read and the outcome is therefore
+unreadable. A path that could not be read neither loses its positive nor renews it. BEFORE THE FIRST REQUEST the job checks that the table exists and answers. If it does not
 (migration 294 has not been applied, or the database is unreachable) it prints
 `UCPPROF_REFUSED store_unavailable` and exits 2 without reading any merchant. A write that fails
 later is counted and the run goes on; the run then exits 3. One more line is printed after the
@@ -225,6 +227,8 @@ NETWORK_TOKEN = "network_token"
 ACP_SERVICE_CHECKOUT = "checkout"
 #: Statuses that are a clean "this merchant publishes nothing here".
 _PUBLISHES_NOTHING = frozenset({404, 410})
+#: A row key that is never printed: the ACP document's SERVICES, without its extensions.
+_ACP_SERVICES = "_acp_services"
 
 _VERSION_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -513,11 +517,12 @@ def _read_acp_discovery(doc: Any) -> Dict[str, Any]:
     for value in _bounded_list(_get(capabilities, "services")):
         if _name(value) and value not in names:
             names.append(value)
+    services = list(names)
     for extension in _bounded_list(_get(capabilities, "extensions")):
         value = extension if isinstance(extension, str) else _get(extension, "name")
         if _name(value) and value not in names:
             names.append(value)
-    return {"ok": True, "ver": version, "cap": names}
+    return {"ok": True, "ver": version, "cap": names, "services": services}
 
 
 def parse_acp_discovery(doc: Any) -> Dict[str, Any]:
@@ -826,6 +831,8 @@ def build_row(
         facts = parse_acp_discovery(acp_body)
         if facts["ok"]:
             row["acp_ver"], row["acp_cap"] = facts["ver"], facts["cap"]
+            # Not printed (see `printable_row`): the services alone, which the stored fact reads.
+            row[_ACP_SERVICES] = facts["services"]
         else:
             errors.append(f"acp_{facts['reason']}")
     row["err"] = CODE_DEADLINE if out_of_time else (errors[0] if errors else None)
@@ -836,7 +843,7 @@ def printable_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """The row as printed: every list cut at MAX_ROW_LIST entries, with `truncated` set when a cut
     was made. The totals are counted on the uncut row."""
     cut = False
-    printed = dict(row)
+    printed = {key: value for key, value in row.items() if not key.startswith("_")}
     for key in ("supported", "svc", "cap", "acp_cap"):
         if len(row[key]) > MAX_ROW_LIST:
             printed[key], cut = row[key][:MAX_ROW_LIST], True
@@ -901,13 +908,15 @@ def checkout_check(row: Dict[str, Any]) -> Any:
 
     ucp = _path_offers_checkout(row["ucp"], row["ucp"] == 200 and bool(row["ver"]), CAP_CHECKOUT in row["cap"])
     acp = _path_offers_checkout(
-        row["acp"], row["acp"] == 200 and bool(row["acp_ver"]), ACP_SERVICE_CHECKOUT in row["acp_cap"])
+        row["acp"], row["acp"] == 200 and bool(row["acp_ver"]), ACP_SERVICE_CHECKOUT in row.get(_ACP_SERVICES, ()))
+    # The version of a readable profile, whether or not it lists checkout. A 404 has none.
+    version = row["ver"] if ucp is not None and row["ucp"] == 200 else None
     if ucp is True or acp is True:
-        return facts.Check(facts.PUBLISHES, "ok", ucp is True, acp is True, row["ver"] if ucp is True else None)
+        return facts.Check(facts.PUBLISHES, "ok", ucp, acp, version)
     if ucp is False and acp is False:
-        return facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, False, row["ver"] if row["ucp"] == 200 else None)
+        return facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, False, version)
     code = row["err"] or (f"ucp_{row['ucp']}" if ucp is None else f"acp_{row['acp']}")
-    return facts.Check(facts.UNREADABLE, str(code).lower(), False, False, None)
+    return facts.Check(facts.UNREADABLE, str(code).lower(), ucp, acp, version)
 
 
 class RowStore:
