@@ -11,7 +11,8 @@ Subcommands, in build order:
   lock      gs://pivota-prod-ops-locks/prod-test-transactions.lock, create-only (the gate is not a lock)
   run       gate -> ARM the job (the key, the private targets and, only for checkout cases, the test issuer key, each
             mounted by numbered version; the gate, the cases, the run id) -> execute --async -> poll BY NAME to a
-            terminal state or EXECUTION_DEADLINE_SECONDS -> DISARM (--clear-secrets, no gate, no cases) -> run.json
+            terminal state or EXECUTION_DEADLINE_SECONDS -> DISARM (no secret, no volume, no mount, no gate, no cases)
+            -> READ THE JOB BACK (any secret volume, mount, secret env or arming env = not disarmed) -> run.json
   publish   always: log.txt, rows.json, result.json (create-only) under
             gs://pivota-prod-ops-receipts/prod-test-transactions/<build id>/; releases the lock only when nothing can
             still run and the job is disarmed. Fails the build when anything was LEFT OPEN.
@@ -64,14 +65,16 @@ WORK = Path(os.getenv("PROD_TEST_TXN_WORKDIR", "/workspace/prod-test-transaction
 TASK_TIMEOUT_SECONDS = 600
 # The run step has RUN_STEP_SECONDS (the yaml's `run` timeout). The wait is budgeted FROM THE STEP'S START, leaving
 # DISARM_RESERVE_SECONDS for the cancel call (60) + its terminal poll (CANCEL_POLL_SECONDS + one poll interval) + the
-# disarm deploy (300), so a slow gate or deploy can never push the disarm past the step's end and leave keys mounted.
+# disarm deploy (300) + the disarm read-back (READBACK_TIMEOUT_SECONDS), so a slow gate or deploy can never push the
+# disarm past the step's end and leave keys mounted.
 # A poll never starts unless its sleep AND its describe (DESCRIBE_TIMEOUT_SECONDS) still fit before its deadline.
 RUN_STEP_SECONDS = 2100
 EXECUTION_DEADLINE_SECONDS = 840          # the task itself times out at 600 s
 EXECUTION_POLL_SECONDS = 15
 DESCRIBE_TIMEOUT_SECONDS = 60
+READBACK_TIMEOUT_SECONDS = 30
 CANCEL_POLL_SECONDS = 120
-DISARM_RESERVE_SECONDS = 60 + CANCEL_POLL_SECONDS + EXECUTION_POLL_SECONDS + 300
+DISARM_RESERVE_SECONDS = 60 + CANCEL_POLL_SECONDS + EXECUTION_POLL_SECONDS + 300 + READBACK_TIMEOUT_SECONDS
 
 LaunchRefused = sbl.LaunchRefused
 require = sbl.require
@@ -139,7 +142,12 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
                   gate: dict | None, armed: bool, user_key_version: int | None = None) -> list[str]:
     """`gcloud run jobs deploy` args. Armed: the key, the private targets and (ONLY when a selected case needs an end
     user) the test issuer key, each by numbered version; the gate, the case ids and the run id. Disarmed: the same job
-    with NO secret mount (--clear-secrets), no gate, no cases: a re-execution refuses at once."""
+    with NO secret, NO volume and NO mount, no gate, no cases: a re-execution refuses at once.
+
+    EVERY deploy, armed or not, first clears the job's volume mounts and volumes (gcloud applies those before the
+    secret changes). `--clear-secrets` / `--set-secrets` alone drop the secret MOUNTS but leave the secret VOLUME
+    definitions on the template (build fc63d22a, 2026-11-22: the disarmed job still listed the key and the targets
+    as unmounted volumes), and `--set-secrets` adds fresh volume names each time, so stale ones would pile up."""
     require(re.fullmatch(r"[0-9a-f]{40}", release) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest),
             "release must be a commit and digest a sha256 digest")
     require((gate is not None) == armed, "an armed job takes the gate; a disarmed one none")
@@ -167,7 +175,7 @@ def job_spec_args(*, release: str, digest: str, cases: list[str], key_version: i
             # --args=VALUE in ONE token: the value starts with a dash, so `--args -m,...` is read as a second flag
             # (gcloud exits 2, "argument --args: expected one argument"; build 798b8dd8, 2026-11-21; #2367).
             "--command", "python", "--args=-m,scripts.ops.prod_test_transactions",
-            *secrets,
+            "--clear-volume-mounts", "--clear-volumes", *secrets,
             # ^@^ makes gcloud split on @ (the gate JSON contains commas). --set-env-vars REPLACES every env var.
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
 
@@ -368,11 +376,42 @@ def cmd_run(args, *, monotonic=None) -> None:
         if state["armed"]:
             try:
                 run(job_spec_args(**common, cases=[], key_version=1, targets_version=1, gate=None, armed=False))
+                # Disarmed only when the job READ BACK carries nothing: a deploy that exits 0 is not proof.
+                problems = disarmed_spec_problems(json.loads(run(
+                    ["gcloud", "run", "jobs", "describe", JOB_NAME, "--project", PROJECT, "--region", REGION,
+                     "--format", "json"], timeout=READBACK_TIMEOUT_SECONDS)))
+                state["disarm_check"] = problems
+                require(not problems, f"the disarmed job still carries: {'; '.join(problems)}")
                 state["disarmed"] = True
             except Exception as error:  # noqa: BLE001
                 state["disarmed"] = False
                 state["error"] = (state.get("error") or "") + f"; disarm failed: {error}"[:300]
             path.write_text(json.dumps(state))
+
+
+DISARMED_ENV = frozenset({"PIVOTA_ENV", job.ENV + "RELEASE_COMMIT"})
+
+
+def disarmed_spec_problems(doc: dict) -> list[str]:
+    """What a disarmed job must NOT carry, read from `gcloud run jobs describe --format json`: any volume that names a
+    secret, any volume mount, any secret env, any env beyond PIVOTA_ENV + the release commit (ARMED / CASES / GATE /
+    RUN_ID), or a label other than armed=no. Names only, never values. An unreadable document is itself a problem."""
+    try:
+        template = doc["spec"]["template"]["spec"]["template"]["spec"]
+        containers = template["containers"]
+        labels = doc["metadata"].get("labels") or {}
+    except (KeyError, TypeError):
+        return ["an unreadable job document"]
+    problems = [f"secret volume {v.get('name')} ({v['secret'].get('secretName')})"
+                for v in template.get("volumes") or [] if v.get("secret")]
+    for container in containers:
+        problems += [f"volume mount {m.get('mountPath')}" for m in container.get("volumeMounts") or []]
+        env = container.get("env") or []
+        problems += [f"secret env {e.get('name')}" for e in env if "valueFrom" in e]
+        problems += [f"env {e.get('name')}" for e in env if "valueFrom" not in e and e.get("name") not in DISARMED_ENV]
+    if labels.get("armed") != "no":
+        problems.append(f"label armed={labels.get('armed')}")
+    return problems
 
 
 def read_view(filter_text: str, *, fmt: str, limit: int, view: str = LOG_VIEW) -> str:
