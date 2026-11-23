@@ -1,6 +1,6 @@
 # ADR-032: The same product at another seller: matching at variant grain when listings share no identifier
 
-**Status:** Proposed (draft 4), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 and 3 answered two passes of an independent review. Draft 4 answers the controller's review: one storage rule shared with ADR-031 (nothing derived from a door's or a catalog's content is kept until the source allows it); the beauty-first spec and the handling of unsure labels are put to the owner instead of being stated as decided; the intake's exact GTIN attach is named as family-grain only.
+**Status:** Proposed (draft 5), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 and 3 answered two passes of an independent review. Draft 4 answers a further review: one storage rule shared with ADR-031 (nothing derived from a door's or a catalog's content is kept until the source allows it); the beauty-first spec and the handling of unsure labels are put to the owner instead of being stated as decided; the intake's exact GTIN attach is named as family-grain only. Draft 5 applies that storage rule to identifiers, the retrieval indexes, membership evidence, adjudication records and the gold table.
 
 **Decision owner:** Founder. **Runtime owners:** the backend owner (identity engine, records, evaluation), the gateway owner (lane field mapping, request-time lookup).
 
@@ -149,10 +149,12 @@
   - **conditional:** pack count, form, stated strength, edition, market version. A listing rarely states "single" or "full size", so absent on both sides is agreement. Stated on both sides, they are compared. Stated on one side only is a hold, as today's conflict-token rule treats a refill, mini or set word.
 - **Not stated means unknown.** A field is never inferred from the fact that a listing shows a single option.
 - **Extraction:** the existing deterministic parsers first, then the lexicon. A vision-language model fills what they cannot, as a weak source, in two calls: one extracts, a second checks the first against the inputs. Units are converted in a separate deterministic step.
-- **An identifier is evidence, never a requirement.** It is collected wherever a lane or a feed gives one and attached to the cross-merchant variant. No stage needs one to exist.
+- **An identifier is evidence, never a requirement.** It is collected wherever a storable source gives one (a feed, our own crawl of a permitted page, a connected merchant, brand-supplied data) and attached to the cross-merchant variant. A barcode, SKU or part number read from a door or a catalog is a field value from that content: it is used in memory when the cascade runs and is not kept (ADR-031 D1; question 5). No stage needs an identifier to exist.
 - **What is kept follows ADR-031 D1.**
   - For a listing Pivota may store (its own crawl of a permitted page, a feed, a connected merchant, brand-supplied data), the attribute record is stored.
   - For a listing known only through a store's door or a platform catalog, the record is built in memory from a fresh read when the cascade runs. What is kept is the pointer, the verdict, which fields agreed, and a fingerprint of the inputs. The field values are not kept until the source allows it in writing (question 5).
+  - **The same rule binds every store this ADR names.** The retrieval indexes of M4 (identifier tokens, text embedding, image similarity, image fingerprint) hold only listings Pivota may store; a door-only or catalog-only listing is matched in memory against them and is never indexed. For such a listing, the membership evidence of M7, the adjudication record of stage D and the gold table of M9 keep the pointer, field names, outcomes and fingerprints, never the values, text or images that were read. A person labelling or reviewing such a pair sees a fresh read.
+  - **A fingerprint here is a one-way hash of the inputs,** kept to detect change. The image fingerprint of M4 is a different thing, a value derived from the image, and is not kept for such a listing.
 - The record is tied to a fingerprint of its inputs. When the listing changes, the record is rebuilt and the membership is re-checked (M7).
 
 ### M4. Candidates come from several channels, and recall is measured apart
@@ -165,6 +167,7 @@
   - image similarity, and an exact match on the image fingerprint;
   - a platform's own cluster id, as a list of candidates.
 - A platform's cluster id is a candidate source and one feature. **It never decides a match.** It is product-level, rebuilt by its owner, and blind to other platforms.
+- The indexes hold only listings Pivota may store (M3's storage rule).
 - Retrieval recall is measured against the gold set separately from the decision.
 
 ### M5. The decision cascade

@@ -1,6 +1,6 @@
 # ADR-031: Supply is read through lanes; a price is read from its source when a buyer acts, not crawled in advance
 
-**Status:** Proposed (draft 6), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 to 4 answered three passes of an independent review and recorded the owner's answer on list prices. Draft 5 answers the controller's review: a kept price lives only in the gateway's price cache and never reaches public or bulk surfaces; the ADR no longer amends the `has_price` gate; request-time reads get an egress rule; one storage rule serves this ADR and ADR-032. Draft 6 records the owner's answer to question 1 and changes nothing else.
+**Status:** Proposed (draft 7), 2026-11-23. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Drafts 2 to 4 answered three passes of an independent review and recorded the owner's answer on list prices. Draft 5 answers a further review: a kept price lives only in the gateway's price cache and never reaches public or bulk surfaces; the ADR no longer amends the `has_price` gate; request-time reads get an egress rule; one storage rule serves this ADR and ADR-032. Draft 6 records the owner's answer to question 1. Draft 7 names the amendment to ADR-026 on checkout preflight, separates the catalog's caching pages from the store rule the price cache runs under, and says who can see a cached price.
 
 **Decision owner:** Founder. **Runtime owners:** the gateway owner (request-time lanes, the price cache), the backend owner (identity, seller facts, records, scheduled lanes).
 
@@ -33,6 +33,11 @@
 **Amends** (each restated where it bites):
 - **The live-read rule** (gateway `src/services/ucpLiveOfferRead.js`, citing the owner's 2026-10-14 direction): "nothing is written back". D9 keeps a door's price and availability in the gateway's shared price cache. Inside the source's window that is what the cache was built for. Beyond it, it is new and waits on the source (owner, 2026-11-23).
 - **ADR-026, section 4.6** (the scheduled refresh as the recurring price read). It changes only for a store where the page refresh is stopped, which D9 allows only after open dependency 5 and owner question 7. Until then the page refresh keeps running (owner, 2026-11-23, question 1).
+- **ADR-026, section 6, and its phases P0 and P3 where they repeat it** (checkout preflight: "preflight recording is switched on"; "Reap enrichment and checkout preflight must pick the offer for the buyer's market through the one selection module"). D9 retires the backend checkout preflight, so those lines change:
+  - **stored-versus-landed drift at checkout** is recorded by the gateway at `quote` instead (D5): the cart total against the stored price and against the price read, per offer and market. That covers sellers with a door;
+  - **for a seller without a door,** no check runs at checkout time after this. The preflight there ran in shadow only and never verified a price. The purchasability sweep, with its expected price and currency (the first half of the same section, unchanged), stays the drift record;
+  - **the selection rule stands.** The offer handed to `quote`, and the one Reap enrichment picks, is the buyer market's sibling, chosen through the one selection module;
+  - the preflight is deleted only after the `quote` drift record is on (D13).
 - **ADR-025 D2**, the carrier table. D7 adds one row, and names what that row cannot do.
 - **ADR-012 (catalog convergence), rule 1** ("full coverage over time"). Listing pointers and cached prices are refreshed only when a buyer asks (D11). Their staleness is made visible, not reconciled.
 
@@ -49,7 +54,7 @@
 - who completes the payment (ADR-028, ADR-029, ADR-030);
 - the matching rules (ADR-032);
 - **public and bulk surfaces:** public product pages, sitemaps, feeds, and the stored view behind them. They read stored prices under their own rules, and nothing here feeds them (D8);
-- **connected merchants:** the backend's product sync, webhooks and order poller for merchants that installed our app. They are not lanes under this ADR and stay where they are.
+- **connected merchants:** the backend's product sync, webhooks and order poller for merchants that installed our app. They are not lanes under this ADR and stay where they are. The difference from a platform-app lane is direction: a connected merchant's catalog is pushed into our database and is stored supply; a platform-app lane would be read when a partner asks, under the merchant's grant on that platform. No platform-app lane exists yet (D13).
 
 ## Context
 
@@ -101,14 +106,14 @@ Three more things that are built:
 These were read through a summarising reader. Each is re-read directly before a lane's terms record is written (D3). Nothing here is a legal conclusion.
 
 - **The Shopify cross-merchant catalog.**
-  - One page gives cache limits: product data and images up to 24 hours, price and availability up to 10 minutes, commission values never. Another of its pages says not to cache results. Our code holds 15 minutes. The strictest applies until confirmed.
+  - One page gives cache limits: product data and images up to 24 hours, price and availability up to 10 minutes, commission values never. Another of its pages says not to cache results. Both pages govern the catalog lane. This ADR keeps nothing from that lane (D1), so the strict reading, no caching, costs nothing there.
   - As read, it does not allow a standing product database or commerce index built from it, bulk or systematic collection, or syndication.
   - Tracked ids and links are to be used exactly as returned. Our client's notes add: a tracked id identifies one buyer's click and is never reused.
   - Five requests a second per client.
   - Results are grouped by the platform's own product id across sellers on that platform. The grouping is product-level, not variant-level.
   - Availability is yes or no. No barcode, brand field or SKU is documented in the response.
   - Not stated either way: whether bare ids may be kept as join keys, and whether its offers may be shown beside offers from other sources.
-- **A store's own UCP door.** The spec says catalog responses are not transactional commitments, checkout is authoritative, and results should not be reused across sessions without re-validation.
+- **A store's own UCP door.** The spec says catalog responses are not transactional commitments, checkout is authoritative, and results should not be reused across sessions without re-validation. The window the price cache runs under is a separate, store-level rule: the 15 minutes the gateway's cache cites as the platform's limit for keeping a store's price or stock answer. It is not taken from the catalog's pages. Like every rule here it is re-read directly before the door lane's terms record is written (open dependency 2), and the cache is not turned on before that record exists (D3, D9).
 - **Other store platforms.** None was found to offer a cross-merchant catalog. Each offers an app a merchant installs, with catalog, inventory and order scopes. Several have announced UCP support; a shipped endpoint was confirmed for few.
 - **Marketplaces.** Affiliate interfaces: offers and tracked links, no order creation.
 - **Affiliate network feeds.** Bulk files, refreshed up to a few times a day, often carrying GTIN, brand and part number, storable under each network's terms.
@@ -125,7 +130,7 @@ One rule, for this ADR and for ADR-032.
 
 | From | May be kept |
 |---|---|
-| A store's door | the pointer (bare ids); price and availability, in the gateway's price cache, for the lane's window (D9); Pivota's own decision records: a verdict, which fields agreed, a fingerprint of the inputs |
+| A store's door | the pointer (bare ids); price and availability, as D9 lists them, in the gateway's price cache, for the lane's window; Pivota's own decision records: a verdict, which fields agreed, a fingerprint of the inputs |
 | A platform catalog | nothing until open dependency 1 is answered. Then the same as a door |
 | A platform app the merchant installed | what the merchant's grant allows |
 | A feed, our own crawl of a permitted page, a connected merchant, brand-supplied data | content and prices, as today |
@@ -206,11 +211,11 @@ This ADR adds no price vocabulary and changes no served field.
 
 - **Which lane answers a `lookup`:**
   - the seller's own door where the seller has one. It is the seller's answer, and its request limit is counted per store, not shared across sellers;
-  - the platform catalog where a door is absent or has failed, and only once open dependency 1 is answered.
+  - the platform catalog where a door is absent or has failed, and only once open dependency 1 is answered. No phase before phase 6 turns this on, and it adds reads, so D10's egress rule applies to it.
 - **A cart is created for the selected offer only.** Carts at several sellers to compare totals are not adopted (ADR-029 D6; owner question 3).
 - **No buyer contact or delivery detail goes to a seller before the buyer's consent for that order** (ADR-028 D7). A `quote` carries the line items and the market's country, and, where their flags are on, the seller's discount code and our cart attribution. It carries no buyer data.
 - **A request that names no market** gets no cart and no quote, and is answered as today, labelled as assumed (ADR-030 D3). The reader makes no live read without a declared market, as today.
-- **When the cart total differs from the price read earlier,** the cart total is shown and the difference is recorded as drift for that lane and seller.
+- **When the cart total differs from the price read earlier,** the cart total is shown and the difference is recorded as drift for that lane and seller. The same record compares the cart total with the stored price, per offer and market. That is the stored-versus-landed record ADR-026 section 6 asked of the checkout preflight.
 - **A seller with no door and no app** is served from its stored price, with a link hand-off, as today.
 - **Failure never invents a value.** A failed read leaves the stored fields untouched, as today. A failing lane opens its breaker.
 - Partner isolation is applied before any lane call (ADR-030 D6).
@@ -261,7 +266,8 @@ This ADR adds no price vocabulary and changes no served field.
 
 - **What it holds,** as built: amount, compare-at amount, availability, the product handle (so a reader can refuse another product's answer), the source, the writer and the read time. No title, image or description.
 - **Its market rule,** as built: it writes and reads only for a declared market, in that market's currency. A list served under no declared market gets nothing from it.
-- **Inside the source's window (minutes today):** the cache is turned on, first writing only, then read. A list row served from it is `cache`, with the original read time.
+- **Inside the source's window (minutes today):** once the door lane's terms record is written from a direct re-read of the store rule (D3; open dependency 2), the cache is turned on, first writing only, then read. A list row served from it is `cache`, with the original read time.
+- **Who can see it,** as built: the search overlay is the cache's only reader, and it answers every caller of the gateway's search operation. The first-party shopping UI calls that operation, so a cached price can show in that UI's search lists too: for that request, with its read time, never stored. That is still a list. No public page, sitemap or feed reads the cache, and the backend has no client for it.
 - **Beyond the window (days):** this is what could replace the page refresh for list prices. It needs the source's written allowance (open dependency 5). Then the lane's terms record sets the window (D3), and the seven-day list rule still labels an old price.
 - **The paced re-read** keeps a days-long copy recent for what lists serve. The owner chose it; it is not built or run, in any mode, until open dependency 5 is settled. When it is built:
   - it reads only listings that a list served, under a declared market, in the last 14 days, and whose copy is older than five days. It reads them for that market. Both numbers are starting values;
@@ -279,7 +285,7 @@ This ADR adds no price vocabulary and changes no served field.
 | Destination sweep | Unchanged. A `variant_gone` door answer is one observation for its rule, at variant grain; one gone variant never marks a product gone |
 | Purchasability sweep; cart-link eligibility | Unchanged. ADR-029 D6 needs their facts |
 | Retailer ingest; affiliate feed reader | Unchanged. The feed reader gets a terms record per network (D3) |
-| Backend page read for stock; backend checkout preflight | Retired. The backend's request path makes no outbound read |
+| Backend page read for stock; backend checkout preflight | Retired. The backend's request path makes no outbound read. Drift at checkout is recorded by the gateway at `quote` (D5); this amends ADR-026 section 6, as the Amends list says |
 | Gateway storefront page read for list prices | Retired for stores with a door once the top-card read is enforced. For stores without a door: owner question 5 |
 
 ### D10. Identity, conduct and egress on every lane
@@ -335,7 +341,7 @@ A days-long cache window is not a flag. It is a value in a lane's terms record. 
 | Shared price cache | off | the dated copy of a door's answer (D9) | on, write then read; its window moves into the terms record |
 | List-price contract (`listPriceTiers.js`) | flags not read for this ADR | the D4 contract | on in phase 1 |
 | `priceHostBudget`, scattered windows | off | D3 and D10 | consolidate; set each window from the source's published one |
-| Backend page read; backend checkout preflight | off; shadow | retired | delete after the door read covers them |
+| Backend page read; backend checkout preflight | off; shadow | retired | delete after the door read covers them and, for the preflight, after the `quote` drift record is on |
 | Gateway storefront page read | on | retired where a door exists | D9 |
 | Backend `services/merchant_ucp_checkout.py` | one caller | none | goes with its caller (ADR-030 D2) |
 | Price refresh; destination, purchasability and cart-link sweeps; ingest | on | unchanged | the refresh stops per store only under D9's conditions |
@@ -347,12 +353,12 @@ A days-long cache window is not a flag. It is a value in a lane's terms record. 
 
 Each phase ships alone, behind its switch. None depends on the payment work, and none changes the partner contract.
 
-1. **Contract.** The D2 result and the D3 terms module in report mode, around the readers that are already on. The list-price flags on. The per-host budget on. The price cache on: write, then read. The buyer client negotiates the spec version. The two backend readers retired. Exit: every live read passes through the terms module; report mode shows no refusal that is not understood; the cache's hit rate and disagreement rate are known.
+1. **Contract.** The D2 result and the D3 terms module in report mode, around the readers that are already on. The list-price flags on. The per-host budget on. The price cache on, after the door lane's terms record is written: write, then read. The buyer client negotiates the spec version. The two backend readers retired; the preflight only once the `quote` drift record is on. Exit: every live read passes through the terms module; report mode shows no refusal that is not understood; the cache's hit rate and disagreement rate are known.
 2. **Top search cards read live.** The search read is enforced with a top-K, under D10's egress rule. The storefront page reader is retired for stores with a door. Exit: the share of top cards answered `live`; list latency inside the budget; reads per minute under the ceiling.
 3. **Finding other sellers.** Store-door `search` at sellers we already serve queues listings for ADR-032. Catalog `search` and `lookup` run in shadow and are counted only. Under D10's egress rule. Exit: for products partners asked about, how many more sellers each source would add.
 4. **The ticket.** D7. Exit: the share of tickets whose quoted cart total equals the merchant's total at checkout.
 5. **A days-long copy, and the crawl stops for a store.** Only after open dependency 5 and owner question 7. Exit: scheduled page reads per day fall by a number predicted beforehand, and no list row loses a price it had.
-6. **More lanes.** A second store platform, a marketplace's affiliate interface, affiliate feeds for retailers outside the platforms. Each needs its own terms record and its own market proof. Own crawl shrinks to sellers that partners ask for and no lane reaches.
+6. **More lanes.** The platform catalog as a `lookup` fallback, once open dependency 1 is answered and under D10's egress rule. A second store platform, a marketplace's affiliate interface, affiliate feeds for retailers outside the platforms. Each needs its own terms record and its own market proof. Own crawl shrinks to sellers that partners ask for and no lane reaches.
 
 ## What we count
 
