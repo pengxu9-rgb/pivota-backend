@@ -68,8 +68,9 @@ name: Postgres Dialect Gate
 # It lands in the shard its path hashes to (see SHARDED below), next to whichever
 # files share that shard's database. Verify locally against a fresh database with
 # that shard's whole file list, not the file alone:
-#   python scripts/postgres_dialect_gate_shards.py plan --num-shards 3 --shard K \
-#     --ride-along-shard 2 --ride-alongs "<RIDE_ALONGS>" --manifest /tmp/k.json
+#   python scripts/postgres_dialect_gate_shards.py plan --num-shards 4 --shard K \
+#     --ride-along-shard 2 --ride-alongs "<RIDE_ALONGS>" --solo "<SOLO_FILES>" \
+#     --manifest /tmp/k.json
 
 on:
   push:
@@ -224,9 +225,29 @@ concurrency:
 # tests/test_postgres_dialect_gate_shards.py pins it. Three, sized from the run above:
 # hashing those 185 files three ways puts 389 / 362+61 / 475 s of test time in the
 # shards (ride-alongs in shard 2), ~8 min of pytest for the largest, ~9-10 min a shard.
+#
+# FOUR SINCE 2026-11-23: three hashed + one SOLO. By then shard 2 ran 4,863 tests in
+# 947-1,441 s against ~2,100 in 470-620 s for shards 1 and 3 (main runs 11-22..11-23,
+# job 13-24 min), and run 45127613858 (#2892) was cancelled at 25 min. The cause is
+# ONE file: tests/test_a2a_rail_checkout_postgres.py re-collects the rail checkout's
+# whole SQLite suite on Postgres, 2,387 tests and 383-578 s of pytest by itself, and
+# it hashed to shard 2. A file is the unit of a shard, so no hashed shard count
+# balances it (mod 4 leaves its shard at 3,223 tests, mod 5 at 3,686). SOLO_FILES
+# gives it shard 4 alone; shards 1-3 still hash mod 3 over every other file, so no
+# other file moved. Re-measured on main 8ba4185f6 (2026-11-24, 9,563 tests in CI):
+# before, 2,174 / 5,037 / 2,352 tests and 562-612 / 937-1,436 / 573-625 s of pytest;
+# after, ~2,174 / ~2,650 incl. ride-alongs / ~2,352 / 2,389 tests and ~517-525 /
+# ~530-820 / ~493-511 / ~376-575 s (per-file times from those runs' progress lines).
 env:
-  DIALECT_GATE_SHARDS: 3
+  DIALECT_GATE_SHARDS: 4
   RIDE_ALONG_SHARD: 2
+  # Space-separated gate files that each run ALONE in the last shards (here: shard 4),
+  # in this order; the hash covers the other files over the first
+  # DIALECT_GATE_SHARDS - (number of solo files) shards. Adding one means raising
+  # DIALECT_GATE_SHARDS and the matrix by one, which keeps every other file where it
+  # is. scripts/postgres_dialect_gate_shards.py ("SOLO FILES") says when a file earns it.
+  SOLO_FILES: >-
+    tests/test_a2a_rail_checkout_postgres.py
   # The compile-shape guards ride along. They are SQLite-safe and cost
   # under a second, and they are the other half of this story: a compiled
   # SQL string can be malformed in ways only a shape assertion catches
@@ -280,20 +301,24 @@ jobs:
   shard:
     name: execute real routes on real Postgres shard
     runs-on: ubuntu-latest
-    # 25 is ~2.5x a shard's expected ~9-10 min. The unsharded job had 25 against 21-23
-    # min runs, and before that 15 against 14-15 (#2422/#2423 cancelled at 74% with
-    # every test passing, 2026-09-28): a cancelled gate is a red gate for a reason
-    # unrelated to the code. 25 here plus 5 for the final job is this workflow's
-    # 30-minute critical path, inside deploy-prod's and CI Entrypoint's 50-minute
+    # 35 since 2026-11-24, with the solo split. The same shard's pytest ran 937 s on one
+    # runner and 1,395 s on another that day (main 8ba4185f6 vs a7d9b523a): runner speed
+    # alone moves a shard ~1.5x. After the split the slowest shard measures ~530-820 s of
+    # pytest (~10-15 min a job), so 35 keeps the slowest one under ~45% of the limit on
+    # the slowest runner seen, where 25 left it at ~60%. History: the unsharded job had
+    # 25 against 21-23 min runs, and before that 15 against 14-15 (#2422/#2423 cancelled
+    # at 74% with every test passing, 2026-09-28); a cancelled gate is a red gate for a
+    # reason unrelated to the code. 35 here plus 5 for the final job is this workflow's
+    # 40-minute critical path, inside deploy-prod's and CI Entrypoint's 50-minute
     # deadlines (tests/test_deploy_prod_gates_on_the_test_sweep.py sums it).
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       # Every shard runs to its end even when another fails: the final job needs all
       # of their results to say what failed, and a cancelled sibling looks like a
       # missing shard.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
 
     services:
       postgres:
@@ -382,7 +407,8 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          # `tests/test_*_postgres.py` only, hashed to shards by path; the ride-alongs
+          # `tests/test_*_postgres.py` only, hashed to shards by path, except that each
+          # SOLO_FILES file runs alone in one of the last shards; the ride-alongs
           # (workflow `env:` above) are appended in RIDE_ALONG_SHARD. Writes `files`,
           # `gate_modules` (bare module names, for the coverage assertion below, which
           # matches junit `classname` attributes) and this shard's manifest, which the
@@ -390,7 +416,7 @@ jobs:
           python scripts/postgres_dialect_gate_shards.py plan \
             --num-shards "${DIALECT_GATE_SHARDS}" --shard "${SHARD}" \
             --ride-along-shard "${RIDE_ALONG_SHARD}" --ride-alongs "${RIDE_ALONGS}" \
-            --manifest "shard-${SHARD}.manifest.json"
+            --solo "${SOLO_FILES}" --manifest "shard-${SHARD}.manifest.json"
 
       - name: Execute the routes on Postgres
         id: run_gate
@@ -571,4 +597,5 @@ jobs:
           python scripts/postgres_dialect_gate_shards.py verify \
             --shards-dir shards --num-shards "${DIALECT_GATE_SHARDS}" \
             --ride-along-shard "${RIDE_ALONG_SHARD}" --ride-alongs "${RIDE_ALONGS}" \
+            --solo "${SOLO_FILES}" \
             --recovery-shard "${RIDE_ALONG_SHARD}" --needs-result "${SHARD_RESULT}"
