@@ -1,4 +1,4 @@
-"""One-off, READ-ONLY: what does each merchant domain publish for agentic checkout?
+"""One-off: what does each merchant domain publish for agentic checkout? Read-only unless `--store`.
 
 For every domain this job asks AT MOST THREE paths, one request at a time,
 
@@ -6,7 +6,8 @@ For every domain this job asks AT MOST THREE paths, one request at a time,
     GET https://{domain}/.well-known/ucp        the merchant's UCP profile
     GET https://{domain}/.well-known/acp.json   the merchant's ACP discovery document
 
-and prints one line of facts per domain. It writes nothing anywhere: no database row, no file. It
+and prints one line of facts per domain. Without `--store` it writes nothing anywhere: no database
+row, no file. With `--store` it also keeps one row per domain (see STORING below). It
 never calls an MCP endpoint, lists tools, builds a cart or a checkout, follows a tracking link or
 sends a credential. The only URL builder in this module (`well_known_url`) takes a validated
 hostname and one of the three path constants, so no other URL can be requested.
@@ -94,6 +95,31 @@ The two parsers never raise, whatever they are given; a per-domain failure never
 Profile shapes read: UCP 2026-04-08 and 2026-08-25 (the fields and fallbacks follow the gateway's
 `parseMerchantProfile`), ACP discovery 2026-04-17.
 
+STORING (`--store`, off unless the argument is given). After a domain's row is printed, its check
+is written to `merchant_agent_checkout_facts` (migration 294) through
+`db.merchant_agent_checkout_facts.record_check`: the stored fact ADR-030 D8 and D11 ask for.
+`checkout_check` turns the row into one of three outcomes:
+
+    publishes          a readable UCP profile lists `dev.ucp.shopping.checkout`, or a readable ACP
+                       discovery document lists the `checkout` service
+    does_not_publish   both paths answered cleanly and neither offers checkout (404 and 410 are a
+                       clean "publishes nothing")
+    unreadable         anything else (robots, a refused redirect, a timeout, 403, 5xx, a body
+                       that does not parse, a path the deadline kept from being asked)
+
+Only the first two move the fact; an unreadable check never revokes a positive and never renews
+one. BEFORE THE FIRST REQUEST the job checks that the table exists and answers. If it does not
+(migration 294 has not been applied, or the database is unreachable) it prints
+`UCPPROF_REFUSED store_unavailable` and exits 2 without reading any merchant. A write that fails
+later is counted and the run goes on; the run then exits 3. One more line is printed after the
+totals, only when storing:
+
+    UCPPROF_STORE {"written":n,"failed":n,"skipped":n,
+                   "publishes":n,"does_not_publish":n,"unreadable":n}
+
+`skipped` counts rows with no usable domain. The three outcome counts are of WRITTEN rows.
+Without `--store` every line this job prints is what it printed before the option existed.
+
 KNOWN LIMITS, deliberately left (review of 2026-11-10):
   * `--from-directory` is the raw content of the two tables, wider than the listed directory (no
     rig, quarantine or operator exclusion is applied); rows carry `d`, so the reader filters.
@@ -161,6 +187,7 @@ SUM_PREFIX = "UCPPROF_SUM "
 DONE_LINE = "UCPPROF_DONE"
 DISABLED_LINE = f"UCPPROF_DISABLED {FLAG} is off; nothing was read"
 REFUSED_PREFIX = "UCPPROF_REFUSED "
+STORE_PREFIX = "UCPPROF_STORE "
 
 ROBOTS_OK = "ok"
 ROBOTS_ABSENT = "absent"
@@ -187,11 +214,17 @@ DIRECTORY_READ_TIMEOUT_SECONDS = 30.0
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
+EXIT_STORE_FAILED = 3
+STORE_READY_TIMEOUT_SECONDS = 30.0
 
 CAP_CHECKOUT = "dev.ucp.shopping.checkout"
 CAP_ORDER = "dev.ucp.shopping.order"
 CAP_DISCOUNT = "dev.ucp.shopping.discount"
 NETWORK_TOKEN = "network_token"
+#: The ACP discovery service that means the merchant takes agent checkouts (ACP 2026-04-17).
+ACP_SERVICE_CHECKOUT = "checkout"
+#: Statuses that are a clean "this merchant publishes nothing here".
+_PUBLISHES_NOTHING = frozenset({404, 410})
 
 _VERSION_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -847,6 +880,63 @@ def _plain(number: float) -> Any:
     return int(number) if float(number).is_integer() else number
 
 
+# ── the stored fact (only with --store) ──────────────────────────────────────────────────────
+
+
+def _path_offers_checkout(status: Any, readable: bool, offers: bool) -> Optional[bool]:
+    """True / False for a path that answered cleanly, None for one that could not be read."""
+    if readable:
+        return offers
+    if type(status) is int and status in _PUBLISHES_NOTHING:
+        return False
+    return None
+
+
+def checkout_check(row: Dict[str, Any]) -> Any:
+    """One UNCUT row as the `Check` the fact store takes (db.merchant_agent_checkout_facts).
+
+    A document is readable when it answered 200 and gave a valid version, the same test the
+    totals use for `ucp_ok` / `acp_ok`. Pure: no I/O."""
+    from db import merchant_agent_checkout_facts as facts  # noqa: PLC0415 - only a storing run needs it
+
+    ucp = _path_offers_checkout(row["ucp"], row["ucp"] == 200 and bool(row["ver"]), CAP_CHECKOUT in row["cap"])
+    acp = _path_offers_checkout(
+        row["acp"], row["acp"] == 200 and bool(row["acp_ver"]), ACP_SERVICE_CHECKOUT in row["acp_cap"])
+    if ucp is True or acp is True:
+        return facts.Check(facts.PUBLISHES, "ok", ucp is True, acp is True, row["ver"] if ucp is True else None)
+    if ucp is False and acp is False:
+        return facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, False, row["ver"] if row["ucp"] == 200 else None)
+    code = row["err"] or (f"ucp_{row['ucp']}" if ucp is None else f"acp_{row['acp']}")
+    return facts.Check(facts.UNREADABLE, str(code).lower(), False, False, None)
+
+
+class RowStore:
+    """Hands each row's check to `write(domain, check) -> bool` and counts what happened.
+
+    A write that raises or answers anything but True is a failure, and the run goes on."""
+
+    def __init__(self, write: Callable[[str, Any], Awaitable[bool]]) -> None:
+        self._write = write
+        self.counts: Dict[str, int] = {
+            "written": 0, "failed": 0, "skipped": 0, "publishes": 0, "does_not_publish": 0, "unreadable": 0,
+        }  # fmt: skip
+
+    async def take(self, row: Dict[str, Any]) -> None:
+        if not row["d"]:
+            self.counts["skipped"] += 1
+            return
+        try:
+            check = checkout_check(row)
+            written = await self._write(row["d"], check) is True
+        except Exception:  # noqa: BLE001 - one domain's write never stops the run
+            written = False
+        if written:
+            self.counts["written"] += 1
+            self.counts[check.outcome] += 1
+        else:
+            self.counts["failed"] += 1
+
+
 async def run(
     planned: Sequence[Optional[str]],
     *,
@@ -857,6 +947,7 @@ async def run(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    store: Optional[RowStore] = None,
 ) -> Dict[str, int]:
     """Census the planned domains (see `plan_domains`) and print the plan, the rows, the totals and
     the done line through `out`. `transport`, `resolver`, `clock` and `sleep` are test seams; left
@@ -905,8 +996,13 @@ async def run(
                 row["err"] = "row_failed"
             rows.append(row)
             out(_line(ROW_PREFIX, printable_row(row)))
+            if store is not None:
+                # The UNCUT row: the printed one may have lost the capability that decides the fact.
+                await store.take(row)
     totals = summarize(rows)
     out(_line(SUM_PREFIX, totals))
+    if store is not None:
+        out(_line(STORE_PREFIX, store.counts))
     out(DONE_LINE)
     return totals
 
@@ -982,8 +1078,37 @@ async def amain(args: Any, *, out: Callable[[str], None], **seams: Any) -> int:
     if not 0 < args.deadline_seconds <= 86400:
         out(f"{REFUSED_PREFIX}bad_deadline --deadline-seconds must be above 0 and at most 86400")
         return EXIT_REFUSED
-    await run(planned, out=out, deadline_seconds=args.deadline_seconds, **seams)
-    return EXIT_OK
+    if not getattr(args, "store", False):
+        await run(planned, out=out, deadline_seconds=args.deadline_seconds, **seams)
+        return EXIT_OK
+    return await _run_storing(planned, args, out=out, **seams)
+
+
+async def _run_storing(planned: Sequence[Optional[str]], args: Any, *, out: Callable[[str], None], **seams: Any) -> int:
+    """The same run, with each row's check stored. Refuses BEFORE the first request when the fact
+    table cannot be read; connects only if nothing has and disconnects what it connected."""
+    from db import merchant_agent_checkout_facts as facts  # noqa: PLC0415 - only a storing run needs it
+    from db.database import database  # noqa: PLC0415
+    from utils.database_readiness import connect_database_with_timeout  # noqa: PLC0415
+
+    connected_here = not database.is_connected
+    try:
+        if connected_here:
+            await connect_database_with_timeout(STORE_READY_TIMEOUT_SECONDS, db=database)
+        ready = await facts.table_is_readable()
+    except Exception as exc:  # noqa: BLE001 - mapped to a line and an exit code, never a traceback
+        out(f"{REFUSED_PREFIX}store_unavailable error_type={type(exc).__name__}; nothing was read")
+        return EXIT_REFUSED
+    try:
+        if not ready:
+            out(f"{REFUSED_PREFIX}store_unavailable table={facts.TABLE}; nothing was read")
+            return EXIT_REFUSED
+        store = RowStore(facts.record_check)
+        await run(planned, out=out, deadline_seconds=args.deadline_seconds, store=store, **seams)
+        return EXIT_STORE_FAILED if store.counts["failed"] else EXIT_OK
+    finally:
+        if connected_here and database.is_connected:
+            await database.disconnect()
 
 
 def main(argv: Optional[List[str]] = None, *, out: Callable[[str], None] = _print, **seams: Any) -> int:
@@ -998,7 +1123,7 @@ def main(argv: Optional[List[str]] = None, *, out: Callable[[str], None] = _prin
     parser = argparse.ArgumentParser(
         prog="python -m jobs.merchant_protocol_profile_census",
         description="Read each domain's robots.txt, /.well-known/ucp and /.well-known/acp.json once and print "
-        f"what it publishes. Read-only. At most {MAX_DOMAINS} domains per run.",
+        f"what it publishes. Read-only unless --store. At most {MAX_DOMAINS} domains per run.",
     )
     parser.add_argument("--domains", default="", help="comma-separated bare hostnames")
     parser.add_argument("--domains-file", default="", help="a file with one bare hostname per line")
@@ -1006,6 +1131,8 @@ def main(argv: Optional[List[str]] = None, *, out: Callable[[str], None] = _prin
                         help="the merchant directory's domains, read from the database (not with --domains*)")
     parser.add_argument("--deadline-seconds", type=float, default=DEFAULT_DEADLINE_SECONDS,
                         help="stop sending requests this long after the crawl starts (default %(default)s)")
+    parser.add_argument("--store", action="store_true",
+                        help="also store each domain's check in merchant_agent_checkout_facts (migration 294)")
     args = parser.parse_args(argv)
 
     # httpx logs every request URL at INFO; this job's own lines are the whole output. The levels are
