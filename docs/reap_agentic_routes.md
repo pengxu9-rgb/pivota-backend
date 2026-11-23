@@ -303,7 +303,10 @@ numeric variant in the cart URL is what is bought. `null` when the proof recorde
 
 A **replay** (same `idempotency_key`, same agent, same buyer, at any age, **and the same
 request**) returns the same `purchase_id` and the purchase's **current** state, which may not be
-`resolving` (and, on the cart-link lane, the same `variant_title`).
+`resolving` (and, on the cart-link lane, the same `variant_title`). **It replays while create is
+off too** (the rail dial, an unconfigured client, `REAP_AGENTIC_CREATE_ENABLED`, the pilot scope,
+or the cart-link lane's dial): the key is looked up before any of those refuse, and the replay is
+then read-only (the consent tag is not rewritten). Only a new attempt is refused.
 
 The key is compared together with a hash of the request it was used for: item source, merchant, product,
 variant, quantity, buyer email, shipping address and return url. Reuse a key on a **different**
@@ -315,7 +318,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 
 | status | `detail.error` | meaning | what the door should do |
 |---|---|---|---|
-| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | show unavailable; preserve the selected route and original attempt |
+| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured, and this key names no purchase of yours (a retry of one still replays, above) | show unavailable; preserve the selected route and original attempt |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session; do not switch routes |
 | 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | show blocked; do not retry through cart-link |
 | 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | show blocked; do not try another Reap lane |
@@ -934,7 +937,7 @@ The canonical hash is identical to create: merchant domain, product/variant, qua
 * `503 checkout_outcome_unknown`: the retirement receipt could not be read, or the key's stored mapping is a refusal marker this server cannot interpret. Retry recovery with the same body and key; never re-POST.
 * `500`: any other database error (for example while reading the key mapping or the purchase). It says nothing about the outcome; retry recovery the same way, never re-POST.
 
-A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
+A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. With create disabled (any of the dials above), a same-body replay of an existing purchase still returns its `202`, read-only (no consent update); a changed body under a key that opened a purchase is still `409 idempotency_conflict` naming it; a key that opened a purchase on another rail is still `409 opened_on_another_rail`. Every other create request, a new attempt or a malformed one alike, is the one `404 not_available_on_this_rail`. Recover remains the read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
 
 
 
@@ -1037,7 +1040,7 @@ recovered by `GET`, not by a new purchase.
 
 ### Optional direct-create pilot controls
 
-`REAP_AGENTIC_CREATE_ENABLED` pauses fresh work independently of status and authenticated recovery. Production requires `REAP_AGENTIC_PILOT_SCOPE` with all five cohort lists plus `variant_keys`, `currency` and `max_total_minor`; the exact literal `unrestricted` is the only explicit opt-out. Missing, malformed, incomplete or outside-scope create admission returns the private `404 not_available_on_this_rail` before buyer identity/consent writes. Quantity is a strict integer for create; authenticated recovery retains the earlier accepted numeric-body normalization. Existing owner GET/recover and checkout reconciliation remain independent of current create scope. See the runbook for variant namespaces, quote caps and worker pause diagnostics.
+`REAP_AGENTIC_CREATE_ENABLED` pauses fresh work independently of status, authenticated recovery and same-key create replays. Production requires `REAP_AGENTIC_PILOT_SCOPE` with all five cohort lists plus `variant_keys`, `currency` and `max_total_minor`; the exact literal `unrestricted` is the only explicit opt-out. Missing, malformed, incomplete or outside-scope create admission returns the private `404 not_available_on_this_rail` before buyer identity/consent writes. Quantity is a strict integer for create; authenticated recovery retains the earlier accepted numeric-body normalization. Existing owner GET/recover and checkout reconciliation remain independent of current create scope. See the runbook for variant namespaces, quote caps and worker pause diagnostics.
 
 ### Immutable selected money on new attempts
 

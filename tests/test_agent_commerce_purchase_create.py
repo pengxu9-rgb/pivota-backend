@@ -49,6 +49,9 @@ app.include_router(unified_routes.router)
 app.include_router(reap_routes.router)  # the REAL Reap door, for the shared-key cases
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
+#: The REAL Reap create, captured before the autouse `stubs` fixture swaps the door's hand-off for a
+#: recorder; the tests of a hand-off that must actually replay put it back.
+_REAL_START_REAP = reap_routes.start_reap_purchase
 
 # The SQLite arm; tests/test_agent_commerce_purchase_create_postgres.py runs these same tests on Postgres.
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
@@ -828,6 +831,103 @@ async def test_the_reap_door_names_its_own_purchase_on_a_conflict(client, stubs,
     assert resp.status_code == 409 and "idempotency_conflict" in resp.text, resp.text
     detail = resp.json().get("detail") or resp.json()
     assert (detail["purchase_id"], detail["rail"]) == (pid, "reap")
+
+
+# ── a Reap retry while Reap's create is off ──────────────────────────────────────────────────
+# The door hands a key that opened a Reap purchase to the Reap route (a replay, and the loser of a
+# same-key race). With Reap's create dial or the rail off, that hand-off must still replay the
+# purchase: a 404 there tells the client nothing exists while the purchase goes on.
+
+REAP_DOOR = "/agent/v2/commerce/reap/purchases"
+
+
+async def _open_reap_purchase_on_its_own_door(client, monkeypatch) -> Dict[str, Any]:
+    """The REAL Reap create opens an rp_ purchase under `body()`'s key; returns the 202 body a
+    same-key replay gets while create is on."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_off', 'bref_off', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_off"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_off"
+
+    async def _click(click):
+        return None
+
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_linked_buyer_id", _buyer)  # the replay's read of the same buyer
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    opened = await client.post(REAP_DOOR, body())
+    assert opened.status_code == 202, opened.text
+    assert opened.json()["purchase_id"].startswith("rp_")
+    normal = await client.post(REAP_DOOR, body())
+    assert normal.status_code == 202 and normal.json()["purchase_id"] == opened.json()["purchase_id"]
+    return normal.json()
+
+
+def _turn_reap_create_off(monkeypatch, how: str) -> None:
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED" if how == "create_off" else "REAP_AGENTIC_ENABLED", "0")
+
+
+async def _all_rows() -> Dict[str, Any]:
+    tables = _WRITTEN_TABLES + ("reap_agentic_purchases", "reap_agentic_buyer_refs")
+    return {t: sorted((sorted(dict(r).items()) for r in await database.fetch_all(f"SELECT * FROM {t}")), key=repr)
+            for t in tables}
+
+
+@pytest.mark.parametrize("how", ["create_off", "rail_off"])
+@pytest.mark.parametrize("path", ["replay", "lost_race"])
+async def test_a_reap_retry_handed_off_while_reap_create_is_off_replays_the_purchase(
+        client, stubs, reap_door_open, monkeypatch, how, path):
+    normal = await _open_reap_purchase_on_its_own_door(client, monkeypatch)
+    _turn_reap_create_off(monkeypatch, how)
+    monkeypatch.setattr(reap_routes, "start_reap_purchase", _REAL_START_REAP)
+    lookups = []
+    if path == "lost_race":
+        # The door's own lookup misses the key (a concurrent request is still writing it), the router
+        # sends the attempt to the other rail, and that rail's key claim loses to the Reap purchase.
+        real_lookup = reap_routes._replayed_purchase_id
+
+        async def _missed_once(**kwargs):
+            lookups.append(kwargs["idempotency_key"])
+            return None if len(lookups) == 1 else await real_lookup(**kwargs)
+
+        monkeypatch.setattr(reap_routes, "_replayed_purchase_id", _missed_once)
+    before = await _all_rows()
+
+    resp = await client.post(BASE, body())
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == normal, "the same answer the Reap door's own replay gives"
+    assert await _all_rows() == before
+    if path == "lost_race":
+        # door lookup (missed), the A2A key claim's re-read (the Reap winner), the Reap route's replay
+        assert lookups == ["key-1"] * 3 and stubs.catalog, "precondition: the race path ran"
+
+
+@pytest.mark.parametrize("how", ["create_off", "rail_off"])
+async def test_a_new_attempt_handed_to_reap_while_its_create_is_off_is_still_refused(
+        client, stubs, reap_door_open, monkeypatch, how):
+    await _open_reap_purchase_on_its_own_door(client, monkeypatch)
+    _turn_reap_create_off(monkeypatch, how)
+    monkeypatch.setattr(reap_routes, "start_reap_purchase", _REAL_START_REAP)
+    before = await _all_rows()
+    resp = await client.post(BASE, body(idempotency_key="key-new", payment_preference={"rail": "reap"}))
+    assert resp.status_code == 404 and "not_available_on_this_rail" in resp.text, resp.text
+    assert await _all_rows() == before
+
+
+async def test_the_reap_door_names_a_purchase_its_key_opened_on_the_other_rail_while_reap_create_is_off(
+        client, stubs, reap_door_open, monkeypatch):
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    resp = await client.post(REAP_DOOR, body())
+    assert resp.status_code == 409 and "opened_on_another_rail" in resp.text and pid in resp.text, resp.text
+    assert await _count("reap_agentic_purchases") == 0
 
 
 # ── S-29 P2-1: the lookup that picks the buyer's hash cannot answer ──────────────────────────
