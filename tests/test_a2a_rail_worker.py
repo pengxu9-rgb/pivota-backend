@@ -133,10 +133,15 @@ def _client(rail):
     return a2a_rail.A2ARailClient(BASE, KEY, transport=httpx.MockTransport(rail.handler))
 
 
+# What the door stores with capture off: it takes a purchase only with both contact parts.
+_ADDRESS = {"firstName": "Pat", "lastName": "Example", "addressLine1": "1 Example St", "city": "Placeholder City",
+            "country": "US"}
+
+
 async def _open(**kw):
     args = dict(agent_id="agent_w", agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
                 checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=4650,
-                buyer_email=EMAIL)
+                buyer_email=EMAIL, shipping_address=_ADDRESS)
     args.update(kw)
     return await ledger.create_purchase(**args)
 
@@ -200,13 +205,15 @@ async def test_no_card_issues_a_binding_page_and_the_write_was_recorded_before_i
     assert timedelta(minutes=25) < expires - datetime.now(timezone.utc) <= timedelta(seconds=worker.HOSTED_PAGE_SECONDS)
 
 
-async def test_without_an_email_nothing_is_written_and_the_purchase_is_refused():
+async def test_without_an_email_and_capture_off_the_purchase_ends_before_any_rail_call():
+    # Only the door with capture ON opens an email-less row; with capture off the contact can never arrive.
     pid = (await _open(buyer_email=None))["id"]
     rail = Rail().on("payment.method-view#submit", _methods())
-    assert await _step(rail, pid) == "refused"
-    assert rail.actions() == ["payment.method-view#submit"]
+    assert await _step(rail, pid) == "expired"
+    assert rail.sent == []  # not even the card read
     row = await _row(pid)
-    assert (row["state"], row["refusal_reason"]) == ("refused", "buyer_email_required")
+    assert (row["state"], row["last_error_code"], row["payment_method_id"]) == (
+        "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None)
 
 
 async def test_a_failed_card_read_sends_no_write_and_retries_later():

@@ -386,6 +386,7 @@ from routes.agent_keys import router as agent_keys_router
 from routes.agent_identity_issuers import router as agent_identity_issuers_router, internal_router as agent_identity_issuers_internal_router
 from routes.payment_grant_issuers import router as payment_grant_issuers_router, internal_router as payment_grant_issuers_internal_router
 from routes.agent_webhooks import router as agent_webhooks_router
+from routes.agent_portal_orders import router as agent_portal_orders_router
 from routes.init_agent_key import router as init_agent_key_router
 from routes.merchant_products import router as merchant_products_router
 from routes.merchant_citations import router as merchant_citations_router
@@ -1488,6 +1489,7 @@ app.include_router(agent_identity_issuers_internal_router)  # Internal registry 
 app.include_router(payment_grant_issuers_router)  # Which PSPs may authorize money — ADMIN-only registration (Antom lane)
 app.include_router(payment_grant_issuers_internal_router)  # Internal registry the gateway polls (/agent/internal/payment-issuers)
 app.include_router(agent_webhooks_router)  # Agent webhook management and deliveries
+app.include_router(agent_portal_orders_router)  # Developer portal: order list + timeline by portal session
 app.include_router(init_agent_key_router)  # Initialize test agent key
 app.include_router(merchant_products_router)  # Merchant product optimization APIs
 app.include_router(merchant_citations_router)  # Merchant citation observations (get-cited proof loop, B⑤)
@@ -2233,9 +2235,25 @@ async def app_lifespan(_app: FastAPI):
         group_shadow_armer = start_group_shadow_arming()
     except Exception as exc:  # noqa: BLE001
         logger.warning("group shadow arming not started: %s", exc)
+    # API key "last used" stamps, off the auth path: get_agent_by_key only queues them, and this one
+    # drainer writes them (db.agents). Started here, never from a request.
+    key_last_used_drainer = None
+    try:
+        from db.agents import start_key_last_used_drainer
+
+        key_last_used_drainer = start_key_last_used_drainer()
+    except Exception as exc:  # noqa: BLE001 - a usage stamp must never stop the boot
+        logger.warning("agent key last-used drainer not started: %s", exc)
     try:
         yield
     finally:
+        if key_last_used_drainer is not None:
+            from db.agents import stop_key_last_used_drainer
+
+            stop_key_last_used_drainer()
+            key_last_used_drainer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await key_last_used_drainer
         reconnect_supervisor.cancel()
         # Suppress Exception too, not only CancelledError: anything else
         # escaping this await propagates out of the finally and SKIPS

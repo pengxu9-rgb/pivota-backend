@@ -538,6 +538,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
             "intent_id": intent_id,
             "buyer_ref": "guest:123",
             "agent_user_ref": agent_user_ref,
+            "agent_user_ref_verified": True,
             "merchant_ids": ["merch_test"],
             "scopes": ["checkout"],
             "items": [],
@@ -547,7 +548,13 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
 
     class Ctx:
         agent_id = "agent_test"
-        checkout_token_payload = {"intent_id": intent_id, "agent_user_ref": agent_user_ref}
+        # The ref came from a verified X-Agent-User-JWT at mint (an unverified one never unlocks
+        # the vault: tests/test_checkout_prefill_needs_verified_agent_user_ref.py).
+        checkout_token_payload = {
+            "intent_id": intent_id,
+            "agent_user_ref": agent_user_ref,
+            "agent_user_ref_verified": True,
+        }
 
     async def fake_get_agent_context(request: Request):  # noqa: ANN001
         return Ctx()
@@ -658,6 +665,7 @@ def test_create_checkout_intent_uses_verified_agent_user_ref(app, client, monkey
     padded = payload_b64 + "=" * (-len(payload_b64) % 4)
     token_payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
     assert token_payload.get("agent_user_ref") == "https://agent.tools.example:user_123"
+    assert token_payload.get("agent_user_ref_verified") is True
     assert token_payload.get("quote_id") == "q_checkout_intent"
 
 

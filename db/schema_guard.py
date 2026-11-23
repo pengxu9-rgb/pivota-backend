@@ -150,6 +150,20 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
     (a SQL boolean over the catalog) is true, under a transaction-local
     lock_timeout.
 
+    The lock_timeout is the block's FIRST statement, before the check: `needed`
+    can itself take a relation lock (pg_get_constraintdef on a CHECK takes
+    ACCESS SHARE on the table), and that check runs on every boot, so with the
+    timeout set only inside the branch a no-op boot could wait without bound
+    behind an ACCESS EXCLUSIVE holder or a queued ALTER. Transaction-local, and
+    the caller's own value is put back as the block's LAST statement: run alone
+    the setting ends with the statement, and run inside a caller's
+    `database.transaction()` the caller keeps its own lock_timeout for the rest
+    of that transaction (when the block fails, that transaction is aborted
+    anyway). Still, a guarded heal belongs outside any transaction (its DDL locks
+    last until the caller commits): tests/test_schema_guard_ddl_guard.py
+    (no_guarded_ddl_runs_inside_a_callers_transaction) fails on any call, or any
+    function that runs one, inside a transaction block.
+
     `ddl` is kept verbatim and may be several statements: they run in one
     transaction, so a DROP + ADD CONSTRAINT pair is never seen half-done and
     takes the table's lock once.
@@ -158,11 +172,13 @@ def guarded_ddl(table: str, needed: str, ddl: str) -> str:
         raise ValueError("guarded_ddl: the statement carries the block's own quote tag")
     return f"""
         DO $guard$
+        DECLARE guard_lock_timeout_was text := current_setting('lock_timeout');
         BEGIN
+            PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
             IF to_regclass('{table}') IS NOT NULL AND ({needed}) THEN
-                PERFORM set_config('lock_timeout', '{HEAL_LOCK_TIMEOUT}', true);
                 {ddl.strip()}
             END IF;
+            PERFORM set_config('lock_timeout', guard_lock_timeout_was, true);
         END $guard$;
         """
 
@@ -1276,14 +1292,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
-            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
-            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
-            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            # mig 289 + 293: the buyer's AgenPas terms/privacy consents (293 widens the step CHECK with
+            # 'shipping_address', on a table an earlier boot built, under the heal lock_timeout). Own try:
+            # written only behind AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a
+            # failed read there withholds the page: fail closed); DDL in db/agent_purchase_consents.
             try:
                 from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
                 await ensure_agent_purchase_consents_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchase_consents (mig 289/293) unavailable (%s)", type(exc).__name__)
             # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
             # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
             try:
@@ -4083,14 +4100,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_a2a_rail_schema()
             except Exception as exc:
                 logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
-            # mig 289: the buyer's AgenPas terms/privacy consents. Own try: written only behind
-            # AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a failed read there
-            # withholds the page: fail closed); DDL in db/agent_purchase_consents (dialect split there).
+            # mig 289 + 293: the buyer's AgenPas terms/privacy consents (293 widens the step CHECK with
+            # 'shipping_address', on a table an earlier boot built, under the heal lock_timeout). Own try:
+            # written only behind AGENPAS_CONSENT_WRITE_ENABLED and read only behind AGENPAS_CONSENT_GATE (a
+            # failed read there withholds the page: fail closed); DDL in db/agent_purchase_consents.
             try:
                 from db.agent_purchase_consents import ensure_agent_purchase_consents_schema
                 await ensure_agent_purchase_consents_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchase_consents (mig 289) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchase_consents (mig 289/293) unavailable (%s)", type(exc).__name__)
             # mig 291: the affiliate program registry (developer earnings, manual stage). Own try: read and
             # written only behind AFFILIATE_PROGRAM_REGISTRY_ENABLED; DDL in db/affiliate_programs (dialect split there).
             try:
