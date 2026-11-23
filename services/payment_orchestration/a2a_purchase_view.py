@@ -14,6 +14,10 @@ re-vetted at read time, because both came from the rail and both are meant to be
   merchant_order_status_url  the merchant's own order page: https, on the merchant's domain or one of
                              its subdomains. A platform host (any store can mint one) is not
                              evidence it is THIS merchant's page, so it is not shown.
+  shipping_address_required  an `opened` purchase whose buyer email or shipping address is incomplete
+                             (the agent did not send it; AgenPas asks the buyer): `fields_missing` (the
+                             door's field NAMES, email first) and, once the worker has set it, its
+                             `expires_at`. Never a stored value, and no URL.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail, purchase_consent
+from services.payment_orchestration import a2a_rail, a2a_shipping_address, purchase_consent
 
 #: Extra SHA-256 digests (comma-separated, lower-case hex) of hosts the rail serves buyer pages from,
 #: when they are not the API hosts themselves. Configured, not named, like the API host allowlist.
@@ -115,6 +119,14 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
     ):
         view["hosted_url"] = row["buyer_action_url"]
         view["hosted_url_expires_at"] = row.get("buyer_action_expires_at")
+    if a2a_shipping_address.awaits_contact(row, now):
+        # Asked for only while the purchase waits for it: THE shared rule (a2a_shipping_address.awaits_contact),
+        # which the consent POST applies too, so the read never offers a step the POST then refuses.
+        required: Dict[str, Any] = {
+            "fields_missing": a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))}
+        if expires is not None and row.get("buyer_action_kind") is None:
+            required["expires_at"] = row.get("buyer_action_expires_at")
+        view["shipping_address_required"] = required
     if state == "completed" and row.get("merchant_order_id"):
         view["order_reference"] = row["merchant_order_id"]
         if merchant_order_url_is_allowed(row.get("merchant_order_status_url"), str(row.get("merchant_domain") or "")):

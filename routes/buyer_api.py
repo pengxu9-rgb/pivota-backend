@@ -132,6 +132,12 @@ def _constant_time_equals(a: str, b: str) -> bool:
         return False
 
 
+#: The checkout-token claim `routes.agent_checkout_intents` sets (True) only when the token's
+#: agent_user_ref came from a verified X-Agent-User-JWT at mint (its _AGENT_USER_REF_VERIFIED_CLAIM;
+#: not imported, to keep this module's import graph small).
+_AGENT_USER_REF_VERIFIED_CLAIM = "agent_user_ref_verified"
+
+
 def verify_checkout_token(token: str) -> Dict[str, Any]:
     raw = (token or "").strip()
     if not raw:
@@ -1491,14 +1497,21 @@ async def save_from_checkout(
     # Keep backward compatibility: fall back to legacy buyer_ref when no explicit agent_user_ref.
     agent_user_ref = raw_agent_user_ref or legacy_buyer_ref
 
-    # Persist agent identity link only when explicit agent_user_ref is present.
+    # The identity link maps (agent_id, ref) -> this buyer, and the upsert MOVES an existing link,
+    # so only a ref the checkout token marks verified (it came from an X-Agent-User-JWT at mint) may
+    # write it. An unverified token ref, the order's agent_user_ref column and its metadata are all
+    # caller-assertable: with them, a partner could re-point another buyer's link (and so their
+    # vault prefill) to whoever saves. They stay attribution only, on the order update below.
+    link_agent_user_ref: Optional[str] = None
+    if checkout_payload.get(_AGENT_USER_REF_VERIFIED_CLAIM) is True:
+        link_agent_user_ref = str(checkout_payload.get("agent_user_ref") or "").strip() or None
     identity_linked = False
-    if raw_agent_user_ref:
+    if link_agent_user_ref:
         identity_linked = bool(
             await _upsert_buyer_identity_link(
                 buyer_id=principal.user_id,
                 agent_id=agent_id,
-                agent_user_ref=raw_agent_user_ref,
+                agent_user_ref=link_agent_user_ref,
             )
         )
 

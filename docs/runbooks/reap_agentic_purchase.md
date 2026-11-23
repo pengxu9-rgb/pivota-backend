@@ -1860,6 +1860,11 @@ This is an observation category, not evidence of payment failure. These rows rem
 and are counted in `checkout_needs_human`, separately from ordinary `stuck_over_age`; errors
 that are not explicitly classified still count as ordinary stuck work. A transient outage does
 not clear the human category; a valid provider waiting/processing/terminal outcome does.
+A third cohort counts there too, listed by `list-needs-human` as `legacy_awaiting_approval`: a row in
+`awaiting_approval` with no checkout id and no version-1 dispatch tracking (created before migration
+256). The expire sweep never ends it (a legacy row's missing id is not proof that no checkout exists),
+and in reconciliation-only mode nothing claims it, so it would otherwise wait unseen. Counting and
+listing it changes nothing; resolve it with provider evidence like the parked-create cohort.
 The report also exposes `contact_retention_blocked` for preserved precheckout work whose contact
 cap elapsed. Both figures need an operator review queue; no new cloud policy is provisioned here.
 
