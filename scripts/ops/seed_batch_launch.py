@@ -11,7 +11,8 @@ Subcommands, in build order:
   lock      create gs://pivota-prod-ops-locks/seed-batch.lock with ifGenerationMatch=0 (the gate is not a lock)
   run       gate (a real scripts/ops/oneoff_gate.py run, parsed into the job's gate dict) -> deploy the ARMED job ->
             execute --async (the execution name is saved at once) -> poll it BY NAME to a terminal state ->
-            DISARM the job (redeploy with no write flag, gate, plan, approval or receipts) -> write run.json.
+            DISARM the job (redeploy with no write flag, gate, plan, approval or receipts) -> READ THE JOB BACK
+            (anything beyond the disarmed set = not disarmed) -> write run.json.
             A failed execute call may still have started an execution: it is looked up as the ONE execution
             created since arming; none or several keeps the lock held
   publish   always: log.txt, rows.json, then result.json (each create-only), to
@@ -56,6 +57,7 @@ SECRET_IDS = {"MANIFEST": "seed-batch-manifest", "PLAN": "seed-batch-plan", "APP
 NEEDED = {"plan": {"MANIFEST", "NAMED"}, "apply": {"MANIFEST", "PLAN", "APPROVAL", "NAMED"},
           "rollback": {"MANIFEST", "PLAN", "APPROVAL", "RECEIPTS", "NAMED"}}
 EXECUTION_POLL_SECONDS = 15
+READBACK_TIMEOUT_SECONDS = 30       # the disarm read-back (`gcloud run jobs describe`)
 EXECUTION_DEADLINE_SECONDS = 1900      # task timeout 1800 s + cold start; under the run step's timeout
 LOG_POLL_SECONDS = 20
 LOG_DEADLINE_SECONDS = 300
@@ -176,7 +178,12 @@ def parse_secrets(mode: str, raw: dict, named_sha256: str) -> dict:
 def job_spec_args(*, mode: str, batch_id: str, release: str, digest: str, secrets: dict, gate: dict | None,
                   armed: bool) -> list[str]:
     """`gcloud run jobs deploy` args. Armed: the mode's inputs, the gate and (apply/rollback) the write flag.
-    Disarmed: the same job with only the manifest and named pin, no gate, no write flag (a re-execution refuses)."""
+    Disarmed: the same job with only the manifest and named pin, no gate, no write flag (a re-execution refuses).
+
+    EVERY deploy first clears the job's volume mounts and volumes (gcloud applies those before the secret changes).
+    `--set-secrets` alone drops the old secret MOUNTS but leaves their secret VOLUME definitions on the template (seen
+    on the prod test-transaction job, build fc63d22a, 2026-11-22), so a disarmed job would still list the plan,
+    approval or receipts secret as an unmounted volume, and stale volumes would pile up across deploys."""
     require(mode in MODES, "mode must be plan, apply or rollback")
     require(re.fullmatch(r"[0-9a-f]{40}", release) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest),
             "release must be a commit and digest a sha256 digest")
@@ -209,6 +216,7 @@ def job_spec_args(*, mode: str, batch_id: str, release: str, digest: str, secret
             # --args=VALUE in ONE token: the value starts with a dash, so `--args -m,...` is read as a second flag
             # (gcloud exits 2, "argument --args: expected one argument"; #2367).
             "--command", "python", f"--args=-m,scripts.ops.reviewed_seed_batch,{mode}",
+            "--clear-volume-mounts", "--clear-volumes",
             "--set-secrets", ",".join(["DATABASE_URL=DATABASE_URL:latest", *mounts]),
             # ^@^ makes gcloud split on @ (JSON values contain commas). --set-env-vars REPLACES every env var.
             "--set-env-vars", "^@^" + "@".join(f"{k}={v}" for k, v in env.items())]
@@ -394,16 +402,60 @@ def cmd_run(args) -> None:
         # Disarm once nothing can still be running: execute never attempted, or the execution is terminal.
         if state["armed"] and (not state["execute_attempted"] or state["state"] is not None):
             try:
+                disarm_secrets = parse_secrets(args.mode, {"MANIFEST": args.manifest, "PLAN": args.plan,
+                                                           "APPROVAL": args.approval, "RECEIPTS": args.receipts,
+                                                           "NAMED": args.named}, args.named_sha256)
                 run(job_spec_args(mode=args.mode, batch_id=args.batch_id, release=args.release, digest=args.digest,
-                                  secrets=parse_secrets(args.mode, {"MANIFEST": args.manifest, "PLAN": args.plan,
-                                                                    "APPROVAL": args.approval, "RECEIPTS": args.receipts,
-                                                                    "NAMED": args.named}, args.named_sha256),
-                                  gate=None, armed=False))
+                                  secrets=disarm_secrets, gate=None, armed=False))
+                # Disarmed only when the job READ BACK carries nothing beyond the disarmed set: exit 0 is not proof.
+                problems = disarmed_spec_problems(json.loads(run(
+                    ["gcloud", "run", "jobs", "describe", job, "--project", PROJECT, "--region", REGION,
+                     "--format", "json"], timeout=READBACK_TIMEOUT_SECONDS)), disarm_secrets)
+                state["disarm_check"] = problems
+                require(not problems, f"the disarmed job still carries: {'; '.join(problems)}")
                 state["disarmed"] = True
             except Exception as error:  # noqa: BLE001
                 state["disarmed"] = False
                 state["error"] = (state.get("error") or "") + f"; disarm failed: {error}"[:300]
             path.write_text(json.dumps(state))
+
+
+DISARMED_SECRET_ENV = frozenset({"DATABASE_URL"})
+ARMING_ENV = frozenset({"REVIEWED_SEED_BATCH_GATE", "REVIEWED_SEED_BATCH_WRITE_ENABLED"} | {
+    f"REVIEWED_SEED_BATCH_{name}_{part}" for name in ("PLAN", "APPROVAL", "RECEIPTS") for part in ("PATH", "SHA256")})
+
+
+def disarmed_spec_problems(doc: dict, secrets: dict) -> list[str]:
+    """What the job read back (`gcloud run jobs describe --format json`) carries BEYOND the disarmed set. Disarmed =
+    secret volumes of exactly the manifest and the named pin, each at its given version; mounts only at their two
+    directories; DATABASE_URL the only secret env; no gate, write flag or plan / approval / receipts env. Names and
+    version numbers only, never values. An unreadable document is itself a problem."""
+    allowed = {secrets["MANIFEST"][0]: str(secrets["MANIFEST"][1]), secrets["NAMED"][0]: str(secrets["NAMED"][1])}
+    allowed_mounts = {NAMED_MOUNT, f"{BATCH_MOUNT}-manifest"}
+    try:
+        template = doc["spec"]["template"]["spec"]["template"]["spec"]
+        containers = template["containers"]
+    except (KeyError, TypeError):
+        return ["an unreadable job document"]
+    problems = []
+    for volume in template.get("volumes") or []:
+        source = volume.get("secret")
+        if not source:
+            continue
+        name = source.get("secretName")
+        versions = sorted(str(item.get("key")) for item in source.get("items") or [])
+        if name not in allowed:
+            problems.append(f"secret volume {volume.get('name')} ({name})")
+        elif versions != [allowed[name]]:
+            problems.append(f"secret volume {volume.get('name')} ({name}) at versions {versions}")
+    for container in containers:
+        problems += [f"volume mount {m.get('mountPath')}" for m in container.get("volumeMounts") or []
+                     if m.get("mountPath") not in allowed_mounts]
+        env = container.get("env") or []
+        problems += [f"secret env {e.get('name')}" for e in env
+                     if "valueFrom" in e and e.get("name") not in DISARMED_SECRET_ENV]
+        problems += [f"env {e.get('name')}" for e in env if e.get("name") in ARMING_ENV]
+    return problems
 
 
 def lock_decision(state: dict) -> str | None:
