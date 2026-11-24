@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import Counter
@@ -212,13 +213,27 @@ def new_purchase_id() -> str:
     return f"pp_{uuid.uuid4().hex[:24]}"
 
 
-def _routing_plan(basis: str, rail: str = "reap", dropped: Optional[Mapping[str, str]] = None) -> str:
+_POLICY_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+_MARKET_RE = re.compile(r"^[A-Z]{2}$")
+
+
+def _routing_plan(
+    basis: str, rail: str = "reap", dropped: Optional[Mapping[str, str]] = None, *,
+    policy: Optional[str] = None, market: Optional[str] = None,
+) -> str:
     """How this purchase came to be on its rail: who decided (the agent called a rail's route itself,
     the router chose, or the row predates the ledger and was backfilled) and, when the router chose,
-    every rail it did not take with the named reason (services/payment_orchestration/router.py)."""
+    every rail it did not take with the named reason, the router's rule set (`policy`) and the buyer's
+    market (services/payment_orchestration/router.decision_record). `policy` and `market` are written
+    only when well-formed: a value that is not is left out, never stored as given and never an error
+    (this runs on the best-effort parent write, after the purchase has committed)."""
     plan: Dict[str, Any] = {"rail": rail, "executor": "rail_managed", "basis": basis}
     if dropped:
         plan["dropped"] = {str(k): str(v) for k, v in dropped.items()}
+    if isinstance(policy, str) and _POLICY_RE.fullmatch(policy):
+        plan["policy"] = policy
+    if isinstance(market, str) and _MARKET_RE.fullmatch(market):
+        plan["market"] = market
     return json.dumps(plan, separators=(",", ":"), sort_keys=True)
 
 
@@ -244,8 +259,14 @@ _SELECT_PARENT_ID_SQL = """
 """
 
 
-async def ensure_reap_parent(rail_purchase_id: str, *, basis: str = "agent_selected_rail") -> Optional[str]:
+async def ensure_reap_parent(
+    rail_purchase_id: str, *, basis: str = "agent_selected_rail", dropped: Optional[Mapping[str, str]] = None,
+    policy: Optional[str] = None, market: Optional[str] = None,
+) -> Optional[str]:
     """The parent id for a Reap purchase, writing it if absent. None when no such Reap row exists.
+
+    `dropped`, `policy` and `market` are the router's decision, given only when the rail-neutral route
+    chose this rail (the default is an agent that called the Reap route itself: nothing was dropped).
 
     Idempotent and race-safe: the INSERT is ON CONFLICT DO NOTHING on (rail, rail_purchase_id),
     and the id is read back afterwards, so a concurrent writer's row is the answer either way.
@@ -255,7 +276,7 @@ async def ensure_reap_parent(rail_purchase_id: str, *, basis: str = "agent_selec
         return None
     values = {
         "id": new_purchase_id(),
-        "routing_plan": _routing_plan(basis),
+        "routing_plan": _routing_plan(basis, "reap", dropped, policy=policy, market=market),
         "rail_purchase_id": rail_purchase_id,
     }
     # Statement form, not an IfExp, so the PREPARE gate plans the Postgres INSERT (see the schema note).
@@ -286,7 +307,8 @@ _INSERT_A2A_PARENT_SQL_SQLITE = _INSERT_A2A_PARENT_SQL.replace(
 
 
 async def ensure_a2a_parent(
-    rail_purchase_id: str, *, basis: str = "orchestrator_selected_rail", dropped: Optional[Mapping[str, str]] = None
+    rail_purchase_id: str, *, basis: str = "orchestrator_selected_rail", dropped: Optional[Mapping[str, str]] = None,
+    policy: Optional[str] = None, market: Optional[str] = None,
 ) -> Optional[str]:
     """The parent id for an A2A-rail purchase, writing it if absent; None when no such child row.
     Same contract as `ensure_reap_parent`: identity copied from the committed child, idempotent (an
@@ -296,7 +318,7 @@ async def ensure_a2a_parent(
         return None
     values = {
         "id": new_purchase_id(),
-        "routing_plan": _routing_plan(basis, "a2a", dropped),
+        "routing_plan": _routing_plan(basis, "a2a", dropped, policy=policy, market=market),
         "rail_purchase_id": rail_purchase_id,
     }
     if IS_POSTGRES:
