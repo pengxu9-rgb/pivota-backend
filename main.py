@@ -2248,12 +2248,11 @@ async def app_lifespan(_app: FastAPI):
         yield
     finally:
         if key_last_used_drainer is not None:
-            from db.agents import stop_key_last_used_drainer
+            from db.agents import shutdown_key_last_used_drainer
 
-            stop_key_last_used_drainer()
-            key_last_used_drainer.cancel()
+            # Bounded (3 s): a stuck stamp write must not hold up the DB shutdown below.
             with suppress(asyncio.CancelledError, Exception):
-                await key_last_used_drainer
+                await shutdown_key_last_used_drainer(timeout=3.0)
         reconnect_supervisor.cancel()
         # Suppress Exception too, not only CancelledError: anything else
         # escaping this await propagates out of the finally and SKIPS

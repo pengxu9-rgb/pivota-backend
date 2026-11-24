@@ -523,6 +523,18 @@ the row's pending write and code are the only record of what may have happened a
 The buyer learns the outcome from a fresh read: the agent's `get_order` in the chat (the purchase body,
 `state` `failed` with `last_error_code` `operator_confirmed_not_charged`), never from the old link.
 
+### Rail scorecard (read-only)
+
+`python -m jobs.purchase_rail_scorecard [--days 14] [--min-sample 30] [--exclude-agent-id <id> ...]`
+prints one JSON object: per rail, merchant domain, market and new or returning buyer, how many
+purchases were routed, how they ended (completed, failed, refused, expired, held, in flight), the
+success rate (completed over finished; a held purchase counts against the rail) and the named codes
+that ended the rest. It also counts how those purchases came to their rail, from the parent's stored
+routing plan. It only reads (three SELECTs), calls no rail, changes no routing, and prints no buyer,
+agent or purchase identifier. In production it runs as a one-off job behind the one-off gate. Test
+agents are not removed by themselves: pass each as `--exclude-agent-id`. The module docstring defines
+every number and states the limits.
+
 ## Webhook events (`purchase.*`)
 
 Agents can be told about a purchase instead of polling. Events go through the existing agent

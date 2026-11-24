@@ -9595,6 +9595,11 @@ async def agent_create_order(
                     v = token_payload.get(key)
                     if v and not order_request.metadata.get(key):
                         order_request.metadata[key] = v
+            else:
+                # Not a checkout-token caller: an intent id in its metadata is the caller's claim,
+                # and an order carrying a token's intent is one that token may then read and pay
+                # for (checkout_token_may_use_order). Only a token puts its intent on an order.
+                order_request.metadata.pop("intent_id", None)
 
             # Agent tools end-user attribution (verified via JWKS).
             if agent_user and not order_request.metadata.get("agent_user_ref"):
