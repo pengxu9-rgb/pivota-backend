@@ -107,6 +107,13 @@ does not exist. Turning it on needs a restart.
   `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
   when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
   field.
+- Either rail's body carries `"agent_display_name": "<name>"` only when Pivota has reviewed a name for the
+  purchase's agent (`agents.buyer_display_name`, migration 297, set by hand as a gated one-off; NULL for
+  every agent until then). Never `agents.agent_name`, which the agent's developer typed. No field when no
+  name is reviewed, the stored one fails the shape check (`db/agents.clean_buyer_display_name`: 1-64
+  characters, NFC, no control or format characters, at least one letter or digit) or the read fails (the
+  body is still served). No dial: a NULL column is the off position. Never in the public route or the
+  webhooks.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 
