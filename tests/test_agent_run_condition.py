@@ -42,6 +42,42 @@ def test_the_setting_names_rails_and_nothing_else(monkeypatch, raw, rails):
         assert rail_router.run_condition_enforced(rail) == (rail in rails)
 
 
+@pytest.mark.parametrize("raw,unknown,enforced", [
+    ("reap;a2a", 1, "no rail"), ("reap a2a", 1, "no rail"), ("a2a-rail", 1, "no rail"),
+    ("reap, a2a-rail, all", 2, "reap"),
+])
+def test_a_misspelt_setting_is_logged_once_and_still_enforces_only_what_it_names(
+        monkeypatch, caplog, raw, unknown, enforced):
+    """A typo leaves the filter off on the rails it misses: an operator must see that in the log."""
+    monkeypatch.setattr(rail_router, "_RUN_CONDITION_WARNED", set())
+    monkeypatch.setenv(RAILS_ENV, raw)
+    with caplog.at_level("WARNING", logger=rail_router.__name__):
+        for _ in range(3):
+            rail_router.run_condition_rails()
+    [record] = [r for r in caplog.records if r.name == rail_router.__name__]
+    assert record.levelname == "WARNING"
+    assert f"{RAILS_ENV} has {unknown} entr" in record.getMessage()
+    assert record.getMessage().endswith(f"enforced on: {enforced}")
+    assert raw not in record.getMessage(), "the count is logged, not what was typed"
+    caplog.clear()
+    monkeypatch.setenv(RAILS_ENV, raw + ",x")
+    with caplog.at_level("WARNING", logger=rail_router.__name__):
+        rail_router.run_condition_rails()
+    assert len([r for r in caplog.records if r.name == rail_router.__name__]) == 1, "a changed value warns again"
+
+
+@pytest.mark.parametrize("raw", [None, "", " , ", "a2a", " Reap , a2a ,", "reap,reap"])
+def test_a_setting_of_rail_names_only_logs_nothing(monkeypatch, caplog, raw):
+    monkeypatch.setattr(rail_router, "_RUN_CONDITION_WARNED", set())
+    if raw is None:
+        monkeypatch.delenv(RAILS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(RAILS_ENV, raw)
+    with caplog.at_level("WARNING", logger=rail_router.__name__):
+        rail_router.run_condition_rails()
+    assert not [r for r in caplog.records if r.name == rail_router.__name__]
+
+
 @pytest.mark.parametrize("raw,policy", [
     (None, "env_v1"), ("reap", "env_v1"), ("a2a", "env_v2"), ("reap,a2a", "env_v2"),
 ])
@@ -196,6 +232,23 @@ async def test_a_reader_that_raises_anyway_is_not_met(monkeypatch):
 
     monkeypatch.setattr(facts, "meets_run_condition", boom)
     assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.NO_CHECKOUT_FACT
+
+
+async def test_a_block_reader_that_raises_anyway_is_not_met(monkeypatch, caplog):
+    async def yes(*_a, **_k):
+        return True
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("reader broke its promise")
+
+    monkeypatch.setattr(facts, "meets_run_condition", yes)
+    monkeypatch.setattr(blocks, "is_clear", boom)
+    monkeypatch.setenv(RAILS_ENV, "a2a")
+    with caplog.at_level("WARNING", logger=run_condition.__name__):
+        assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.NO_CHECKOUT_FACT
+        assert await run_condition.agent_may_run("a2a", SHOP, agent_id="agent_x") is False
+    assert "read failed rail=a2a error_type=RuntimeError" in caplog.text
+    assert "reader broke its promise" not in caplog.text
 
 
 async def test_nothing_is_read_while_the_rails_filter_is_off(monkeypatch):

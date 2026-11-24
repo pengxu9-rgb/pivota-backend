@@ -51,12 +51,15 @@ Everything is off by default: with no configuration every request goes to Reap, 
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Set, Tuple
 
 from services.payment_orchestration import a2a_rail
+
+logger = logging.getLogger(__name__)
 
 PAYMENT_ORCHESTRATOR_ENABLED_ENV = "PAYMENT_ORCHESTRATOR_ENABLED"
 A2A_RAIL_CREATE_ENABLED_ENV = "A2A_RAIL_CREATE_ENABLED"
@@ -95,10 +98,28 @@ def pilot_agents() -> FrozenSet[str]:
     return _csv(A2A_RAIL_PILOT_AGENT_IDS_ENV)
 
 
+#: The setting's raw values already warned about, so a misspelt value is logged once per process,
+#: and again only when the value changes.
+_RUN_CONDITION_WARNED: Set[str] = set()
+
+
 def run_condition_rails() -> FrozenSet[str]:
     """The rails on PARTNER_AGENT_RUN_CONDITION_RAILS. An entry that is not a rail name is ignored
-    (it enforces nothing), never widened to every rail."""
-    return frozenset(name.lower() for name in _csv(PARTNER_AGENT_RUN_CONDITION_RAILS_ENV)) & frozenset(RAILS)
+    (it enforces nothing), never widened to every rail, and logged as a WARNING: a misspelt list
+    (`reap;a2a`, `reap a2a`, `a2a-rail`) would otherwise leave the filter silently off."""
+    names = frozenset(name.lower() for name in _csv(PARTNER_AGENT_RUN_CONDITION_RAILS_ENV))
+    rails = names & frozenset(RAILS)
+    unknown = names - rails
+    if unknown:
+        raw = os.getenv(PARTNER_AGENT_RUN_CONDITION_RAILS_ENV) or ""
+        if raw not in _RUN_CONDITION_WARNED:
+            _RUN_CONDITION_WARNED.add(raw)
+            logger.warning(
+                "router: %s has %d entr%s that %s not a rail name (rails are %s, comma-separated); "
+                "enforced on: %s", PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, len(unknown),
+                "y" if len(unknown) == 1 else "ies", "is" if len(unknown) == 1 else "are",
+                ",".join(RAILS), ",".join(sorted(rails)) or "no rail")
+    return rails
 
 
 def run_condition_enforced(rail: str) -> bool:
