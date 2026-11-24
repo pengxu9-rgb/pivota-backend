@@ -361,7 +361,8 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
 1. The request is normalised exactly as the Reap cart-link lane does it, and the **idempotency key
    is looked up first**, in the key table both rails share: a retry with the same key and body
    replays the ORIGINAL purchase on its ORIGINAL rail, whatever the router would answer today. A
-   Reap original is answered by the Reap route; a different body is 409 `idempotency_conflict`, which
+   Reap original is answered by the Reap route, which replays it even while Reap's create is off (so
+   does the loser of a same-key race to a Reap purchase); a different body is 409 `idempotency_conflict`, which
    names the key's purchase (`purchase_id`, `rail`) when it opened one, so the caller can read it.
 2. A new attempt without the shown-money pair is 400 `invalid_request`, before the router.
 3. The router:
