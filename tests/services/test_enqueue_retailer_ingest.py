@@ -42,3 +42,23 @@ def test_a_known_retailer_is_refused_as_a_brand_official_store_at_enqueue():
     with pytest.raises(ValueError, match="known retailer"):
         _row_to_job({"domain": "sephora.com", "brand": "Clinique", "vendors": ["Clinique"],
                      "options": {"source_role": "brand_official"}})
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, [True], {"on": True}])
+def test_hold_after_dry_run_must_be_a_bool(value):
+    with pytest.raises(ValueError, match="hold_after_dry_run"):
+        _row_to_job({"domain": "example-store.test", "brand": "Example Brand", "vendors": ["Example Brand"],
+                     "options": {"hold_after_dry_run": value}})
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_hold_after_dry_run_is_accepted_on_a_storefront_row(value):
+    job = _row_to_job({"domain": "example-store.test", "brand": "Example Brand", "vendors": ["Example Brand"],
+                       "options": {"hold_after_dry_run": value}})
+    assert job["options"]["hold_after_dry_run"] is value
+
+
+def test_hold_after_dry_run_is_refused_on_a_markets_capture_that_runs_no_checks():
+    with pytest.raises(ValueError, match="hold_after_dry_run"):
+        _row_to_job({"domain": "example-store.test", "brand": "Example Brand", "vendors": ["Example Brand"],
+                     "options": {"hold_after_dry_run": True, "source": "shopify_markets"}})
