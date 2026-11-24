@@ -593,6 +593,12 @@ _SERVER_ONLY_ORDER_METADATA_KEYS = (
     # only, by _apply_server_granted_test_psp_stamp; a caller value would take a live order out
     # of billing.
     "test_psp_probe_granted",
+    # The order's Pivota-account owner and that owner's pairwise ref for the agent, copied into the
+    # orders.buyer_id / agent_scoped_buyer_ref columns below. Only the buyer's own save
+    # (routes.buyer_api.save_from_checkout) writes them; nothing sets them before create. A caller
+    # value put an order into that account's /buyer/v1/orders, across partners.
+    "buyer_id",
+    "agent_scoped_buyer_ref",
 )
 
 

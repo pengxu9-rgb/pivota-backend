@@ -275,6 +275,29 @@ async def test_a_second_call_returns_the_same_parent_and_writes_nothing():
     assert json.loads(rows[0]["routing_plan"])["basis"] == "agent_selected_rail"
 
 
+async def test_a_routers_decision_is_stored_whole_on_the_reap_parent():
+    rp = await _reap()
+    await purchases.ensure_reap_parent(
+        rp, basis="orchestrator_selected_rail", dropped={"a2a": "merchant_not_proven"}, policy="env_v1", market="US")
+    [row] = await _parent_rows()
+    assert json.loads(row["routing_plan"]) == {
+        "rail": "reap", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
+        "dropped": {"a2a": "merchant_not_proven"}, "policy": "env_v1", "market": "US",
+    }
+
+
+@pytest.mark.parametrize("policy,market", [
+    ("Env V1", "us"), ("x" * 33, "USA"), ("", ""), (None, None), (7, 7), ("env-v1", "U1"), ("env_v1\n", "US\n"),
+])
+async def test_a_malformed_policy_or_market_is_left_out_and_the_parent_is_still_written(policy, market):
+    rp = await _reap()
+    assert await purchases.ensure_reap_parent(rp, basis="orchestrator_selected_rail", policy=policy, market=market)
+    [row] = await _parent_rows()
+    assert json.loads(row["routing_plan"]) == {
+        "rail": "reap", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
+    }
+
+
 async def test_no_reap_row_means_no_parent():
     assert await purchases.ensure_reap_parent("rp_missing") is None
     assert await purchases.ensure_reap_parent("") is None
