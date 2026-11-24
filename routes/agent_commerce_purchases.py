@@ -8,8 +8,9 @@ READS (GET), DARK BY DEFAULT. While `AGENT_PURCHASE_LEDGER_ENABLED` is off every
 same 404, whatever its shape. Nothing a read does calls a rail.
 
 CREATE (POST), DARK BY DEFAULT, behind its own dial (`PAYMENT_ORCHESTRATOR_ENABLED`; off: 404 to
-everything, and agents keep calling the Reap route directly). It takes the Reap route's create body
-plus an optional `payment_preference.rail`, and:
+everything but a retry of the caller's own purchase, which replays it read-only, and agents keep
+calling the Reap route directly). It takes the Reap route's create body plus an optional
+`payment_preference.rail`, and:
   1. normalises the request exactly as the Reap route's cart-link lane does and looks the
      idempotency key up FIRST, in the one key table both rails share: a retry replays the original
      purchase on its original rail, whatever the router would answer today;
@@ -250,6 +251,10 @@ async def _a2a_accepted(purchase_id: str, agent_id: str, owner: str) -> JSONResp
     view = await a2a_purchase_view.owner_view(purchase_id=purchase_id, agent_id=agent_id, agent_user_ref_hash=owner)
     if view is None:
         return reap_routes._not_found()
+    return _a2a_accepted_from_view(purchase_id, view)
+
+
+def _a2a_accepted_from_view(purchase_id: str, view: Mapping[str, Any]) -> JSONResponse:
     # The unified read's words (`state` is the shared vocabulary, `rail_state` the rail's own), so a
     # caller sees one shape on create and on GET. A request handed to Reap answers in Reap's shape.
     return JSONResponse(status_code=202, content={
@@ -260,6 +265,45 @@ async def _a2a_accepted(purchase_id: str, agent_id: str, owner: str) -> JSONResp
         "poll_after_seconds": view.get("poll_after_seconds"),
         "variant_title": view.get("variant_title"),
     })
+
+
+def _reap_replay_body(purchase_id: str, view: Mapping[str, Any], item_source: str) -> Dict[str, Any]:
+    """The Reap route's create-replay 202 body, field for field (`start_reap_purchase`'s replay):
+    the same id and the purchase's real state, from the owner view."""
+    body: Dict[str, Any] = {
+        "purchase_id": purchase_id,
+        "status": view.get("state"),
+        "poll_after_seconds": view.get("poll_after_seconds"),
+        "checkout_dispatch_state": view["checkout_dispatch_state"],
+        "contact_reentry_required": view["contact_reentry_required"],
+    }
+    if item_source == "cart_link":
+        # The key's request hash covers `item_source`, so a replay is always the same lane.
+        body["variant_title"] = view.get("variant_title")
+    return body
+
+
+async def _replay_while_dark(replayed: Optional[str], *, item_source: str, agent_id: str, owner: str) -> JSONResponse:
+    """The door's answer while it is dark, once the key lookup has run: the caller's own purchase under
+    this key and fingerprint is REPLAYED with the answer a retry gets while the door is on, as a READ (no
+    consent, key or buyer write, and no hand-off to the Reap route, whose replay records a consent).
+    Anything else (no purchase under the key, or one the owner view cannot see) is the dark 404."""
+    if replayed and replayed.startswith("rp_"):
+        view = await reap_routes._owner_view(purchase_id=replayed, agent_id=agent_id, agent_user_ref_hash=owner)
+        if view:
+            return JSONResponse(status_code=202, content=_reap_replay_body(replayed, view, item_source))
+    elif replayed:
+        view = await a2a_purchase_view.owner_view(purchase_id=replayed, agent_id=agent_id, agent_user_ref_hash=owner)
+        if view is not None:
+            return _a2a_accepted_from_view(replayed, view)
+    return _dark()
+
+
+def _names_the_callers_purchase(exc: reap_svc.PurchaseRefused) -> bool:
+    """A conflict naming the purchase the caller's own key opened (`_replayed_purchase_id` sets the id only
+    from the owner-scoped key row, and only for a well-formed rail purchase id)."""
+    return (getattr(exc, "reason", None) == "idempotency_conflict"
+            and isinstance(getattr(exc, "existing_purchase_id", None), str))
 
 
 #: The heartbeat read is one indexed row; past this it counts as unreadable.
@@ -286,11 +330,22 @@ async def create_purchase(
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
-    """Open a purchase on the rail the router picks. MAKES NO RAIL CALL."""
+    """Open a purchase on the rail the router picks. MAKES NO RAIL CALL.
+
+    ── A RETRY IS ANSWERED BEFORE THE DOOR'S DIALS ───────────────────────────────────────────
+
+    While the door is dark, a same-key same-body retry of a purchase the caller already opened (on
+    either rail) still REPLAYS it, read-only, with the answer it gets while the door is on; a changed
+    body under the caller's own key is still the 409 that names its purchase. Answering those "not
+    available" told a retrying client nothing exists while the purchase went on: a client that then
+    mints a new key, or sends the buyer elsewhere, can buy twice. Every other request (a new attempt,
+    a malformed body, a missing end user, another buyer's key, a refusal tombstone) is the dark 404,
+    unchanged, so a dark door is still no probe.
+    """
     # Both dials: a purchase this door opens is read through the unified ledger (an A2A purchase has no
-    # other read), so the door is dark while the ledger is.
-    if not rail_router.is_enabled() or not purchases.is_enabled():
-        return _dark()
+    # other read), so the door is dark while the ledger is. Decided first, answered after the key lookup:
+    # nothing past the lookup runs while it is set.
+    door_dark = not rail_router.is_enabled() or not purchases.is_enabled()
     try:
         agent_user_ref = reap_routes._require_agent_user(agent_user)
         try:
@@ -348,6 +403,8 @@ async def create_purchase(
         # THE KEY FIRST. Raises `idempotency_conflict` when this key was used for a different body.
         replayed = await reap_routes._replayed_purchase_id(
             agent_id=agent_id, agent_user_ref_hash=owner, idempotency_key=idempotency_key, request_hash=request_hash)
+        if door_dark:
+            return await _replay_while_dark(replayed, item_source=req.item_source, agent_id=agent_id, owner=owner)
         if replayed and replayed.startswith("rp_"):
             # The original is a Reap purchase: the Reap route replays it (and records the consent).
             return await reap_routes.start_reap_purchase(request, context, agent_user)
@@ -367,6 +424,16 @@ async def create_purchase(
             has_offer_code=offer_code is not None, preferred=preferred,
         )
         if choice.rail == "reap":
+            # The Reap route writes this purchase's parent row. The decision travels to it on the
+            # request's server-side state (nothing a caller sends reaches `request.state`), so the
+            # parent says the router chose Reap and why the other rail was dropped. Set ONLY here, for
+            # a request the router decided just now (the two other hand-overs in this function, a
+            # replay and a lost key race, carry none). The Reap route stores it only on a purchase
+            # THIS request opens: if the request then loses its key to an earlier one inside that
+            # route, it answers with that purchase and gives it at most a neutral `backfill` parent,
+            # never this decision. Best-effort, like the parent row itself
+            # (`reap_routes._record_purchase_parent`).
+            request.state.purchase_routing = rail_router.decision_record(choice, market_country=market_country)
             return await reap_routes.start_reap_purchase(request, context, agent_user)
         if choice.rail is None:
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
@@ -390,6 +457,9 @@ async def create_purchase(
     except reap_routes._PurchasePersistenceUnavailable:
         return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
     except reap_svc.PurchaseRefused as exc:
+        if door_dark and not _names_the_callers_purchase(exc):
+            # Dark: every refusal but the caller's own conflict is the dark door's one answer.
+            return _dark()
         return reap_routes._refused(exc)
 
 
@@ -501,7 +571,8 @@ async def _open_a2a_purchase(
     try:
         # Best effort, bounded: the unified read heals a missing parent from the committed child.
         await asyncio.wait_for(
-            purchases.ensure_a2a_parent(purchase_id, basis=choice.basis, dropped=choice.dropped),
+            purchases.ensure_a2a_parent(
+                purchase_id, **rail_router.decision_record(choice, market_country=market_country)),
             _RECORD_PARENT_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent_purchases: a2a parent write deferred error_type=%s", type(exc).__name__)
