@@ -92,6 +92,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -2880,7 +2881,25 @@ async def _owner_public_body(row, *, consents: Any = purchase_consent.LOOKUP):
 _RECORD_PARENT_TIMEOUT_S = 1.0
 
 
-async def _record_purchase_parent(purchase_id: str) -> None:
+_ROUTING_KEYS = frozenset({"basis", "dropped", "policy", "market"})
+#: The plan for a parent written on behalf of ANOTHER request's purchase (a key-race loser, for the
+#: winner): the same word the heal and the backfill use for "how this purchase was routed is not known".
+_NEUTRAL_ROUTING: Mapping[str, Any] = MappingProxyType({"basis": "backfill"})
+
+
+def _handed_routing(request: Request) -> Dict[str, Any]:
+    """The router's decision, when the rail-neutral route (routes/agent_commerce_purchases.py) chose this
+    rail and handed the request here: it leaves `router.decision_record(...)` on `request.state`. Empty
+    for an agent that called this route itself, which is recorded as before (`agent_selected_rail`).
+    `request.state` is this process's own object: no header, query or body value lands on it. Anything
+    that is not the expected mapping is ignored, so a fault here can never fail a purchase."""
+    routing = getattr(getattr(request, "state", None), "purchase_routing", None)
+    if not isinstance(routing, Mapping) or not isinstance(routing.get("basis"), str):
+        return {}
+    return {k: v for k, v in routing.items() if k in _ROUTING_KEYS}
+
+
+async def _record_purchase_parent(purchase_id: str, routing: Optional[Mapping[str, Any]] = None) -> None:
     """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
 
     AFTER this route's own transaction has committed, never inside it, and it never raises: the
@@ -2891,14 +2910,24 @@ async def _record_purchase_parent(purchase_id: str) -> None:
     pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
     agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
     or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
-    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
-    never reaches it; both get their parent from the heal or the backfill.
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent
+    replay returns before this hook. A request that lost its key to an earlier one calls it for the
+    WINNER's purchase with `_NEUTRAL_ROUTING` (`basis="backfill"`), never with its own decision: that
+    covers a winner whose own write was cut, and cannot overwrite one that landed. Whatever is still
+    missing is written by the heal on a read, or by the backfill.
+
+    `routing` (see `_handed_routing`) IS BEST-EFFORT, LIKE THE ROW. The first parent write wins and is
+    never updated, so the router's decision is stored only when THIS write is the first. When the 1 s
+    bound cuts it, or a concurrent read's heal or the backfill writes the parent before it, the parent
+    says `basis="backfill"` and the decision is not recoverable. A reader must treat `backfill` as
+    "how this purchase was routed is not known", never as a decision.
     """
     if not agent_purchase_ledger.is_enabled():
         return
     try:
         await asyncio.wait_for(
-            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+            agent_purchase_ledger.ensure_reap_parent(purchase_id, **dict(routing or {})),
+            timeout=_RECORD_PARENT_TIMEOUT_S
         )
     except Exception as exc:  # noqa: BLE001 (TimeoutError included)
         logger.warning(
@@ -3415,6 +3444,8 @@ async def start_reap_purchase(
 
         winning_view = None
         other_rail_winner = None
+        # True when this request lost its key to an earlier one and answers with THAT purchase.
+        adopted_winner = False
         try:
             # start_purchase makes no partner call. This short durable unit hides
             # the purchase from other connections until its immutable key lands.
@@ -3464,6 +3495,7 @@ async def start_reap_purchase(
                 elif winner != purchase_id:
                     await _abandon_duplicate(purchase_id)
                     purchase_id = winner
+                    adopted_winner = True
                     winning_view = await _owner_view(
                         purchase_id=winner, agent_id=agent_id,
                         agent_user_ref_hash=agent_user_ref_hash,
@@ -3496,7 +3528,16 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
-        await _record_purchase_parent(purchase_id)
+        if adopted_winner:
+            # NOT THIS REQUEST'S DECISION. A request that lost its key answers with the winner's
+            # purchase, and how THIS request came to this rail says nothing about that one. But it is
+            # also the winner's only second chance at a parent row when its own write was cut (the 1 s
+            # bound, a fault): nothing scheduled heals a parent, and a purchase with no parent emits no
+            # events. So write a NEUTRAL parent: `backfill` (how it was routed is not known), never the
+            # handed decision. Insert-only: it cannot overwrite the parent the winner wrote.
+            await _record_purchase_parent(purchase_id, _NEUTRAL_ROUTING)
+        else:
+            await _record_purchase_parent(purchase_id, _handed_routing(request))
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
