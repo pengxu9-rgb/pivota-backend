@@ -25,6 +25,12 @@ the answer.
      currency_unsupported     the shown currency is not one the rail's token step can carry
                               (a2a_rail.TOKEN_CURRENCIES: the rail's amount has no currency field)
      amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR names no cap at all: no cap, no rail
+     agent_run_condition_unmet  only while PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`: the merchant
+                              does not meet ADR-030 D11's run condition for this rail's checkout agent
+                              (no fresh stored "publishes an agentic checkout" fact, or an open
+                              challenge or block on this rail). The route reads both records
+                              (services/payment_orchestration/agent_run_condition.py) only for a request
+                              that passes every filter above, and passes the answer in
    The amount itself is checked by the route once OUR catalog has priced the item (`amount_ok`),
    because the price is never the caller's. Caps are PER CURRENCY (`USD:10000,SGD:13500`): a minor
    unit is not one risk bound across currencies, and a currency with no cap is refused.
@@ -45,23 +51,32 @@ Everything is off by default: with no configuration every request goes to Reap, 
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Set, Tuple
 
 from services.payment_orchestration import a2a_rail
+
+logger = logging.getLogger(__name__)
 
 PAYMENT_ORCHESTRATOR_ENABLED_ENV = "PAYMENT_ORCHESTRATOR_ENABLED"
 A2A_RAIL_CREATE_ENABLED_ENV = "A2A_RAIL_CREATE_ENABLED"
 A2A_RAIL_PILOT_AGENT_IDS_ENV = "A2A_RAIL_PILOT_AGENT_IDS"
 A2A_RAIL_MERCHANTS_ENV = "A2A_RAIL_MERCHANTS"
 A2A_RAIL_MAX_TOTAL_MINOR_ENV = "A2A_RAIL_MAX_TOTAL_MINOR"
+#: The rails whose checkout agent must meet ADR-030 D11's run condition: a comma-separated list of
+#: names from RAILS (`a2a`, `reap`, `reap,a2a`). Unset or empty: no rail, and nothing is read.
+PARTNER_AGENT_RUN_CONDITION_RAILS_ENV = "PARTNER_AGENT_RUN_CONDITION_RAILS"
 
 RAILS = ("reap", "a2a")
 #: The name of THE RULES above. It is stored with every decision (`decision_record`), so a decision made
 #: under a later rule set can be told from one made under this one. Change it when a rule changes.
 POLICY_VERSION = "env_v1"
+#: The same rules plus `agent_run_condition_unmet`: the name stored while the token rail's run
+#: condition is enforced (`policy_version`).
+POLICY_VERSION_RUN_CONDITION = "env_v2"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 
@@ -81,6 +96,40 @@ def _csv(name: str) -> FrozenSet[str]:
 
 def pilot_agents() -> FrozenSet[str]:
     return _csv(A2A_RAIL_PILOT_AGENT_IDS_ENV)
+
+
+#: The setting's raw values already warned about, so a misspelt value is logged once per process,
+#: and again only when the value changes.
+_RUN_CONDITION_WARNED: Set[str] = set()
+
+
+def run_condition_rails() -> FrozenSet[str]:
+    """The rails on PARTNER_AGENT_RUN_CONDITION_RAILS. An entry that is not a rail name is ignored
+    (it enforces nothing), never widened to every rail, and logged as a WARNING: a misspelt list
+    (`reap;a2a`, `reap a2a`, `a2a-rail`) would otherwise leave the filter silently off."""
+    names = frozenset(name.lower() for name in _csv(PARTNER_AGENT_RUN_CONDITION_RAILS_ENV))
+    rails = names & frozenset(RAILS)
+    unknown = names - rails
+    if unknown:
+        raw = os.getenv(PARTNER_AGENT_RUN_CONDITION_RAILS_ENV) or ""
+        if raw not in _RUN_CONDITION_WARNED:
+            _RUN_CONDITION_WARNED.add(raw)
+            logger.warning(
+                "router: %s has %d entr%s that %s not a rail name (rails are %s, comma-separated); "
+                "enforced on: %s", PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, len(unknown),
+                "y" if len(unknown) == 1 else "ies", "is" if len(unknown) == 1 else "are",
+                ",".join(RAILS), ",".join(sorted(rails)) or "no rail")
+    return rails
+
+
+def run_condition_enforced(rail: str) -> bool:
+    return rail in run_condition_rails()
+
+
+def policy_version() -> str:
+    """The rule set in force now: `env_v2` while the token rail's run condition is enforced, else
+    `env_v1`. The Reap route's own filter is not a routing rule and does not change it."""
+    return POLICY_VERSION_RUN_CONDITION if run_condition_enforced("a2a") else POLICY_VERSION
 
 
 def proven_merchants() -> FrozenSet[Tuple[str, str]]:
@@ -146,7 +195,7 @@ def decision_record(choice: RailChoice, *, market_country: str) -> Dict[str, obj
     wins: when a heal or the backfill writes it first, the plan says `basis="backfill"` and this record
     is lost. It is evidence for a report, never a fact a later decision may depend on."""
     return {
-        "basis": choice.basis, "dropped": dict(choice.dropped), "policy": POLICY_VERSION,
+        "basis": choice.basis, "dropped": dict(choice.dropped), "policy": policy_version(),
         "market": str(market_country or "").upper(),
     }
 
@@ -158,9 +207,11 @@ def a2a_create_dials_on() -> bool:
 
 def a2a_unavailable_reason(
     *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, currency: str,
-    worker_alive: bool, has_offer_code: bool = False,
+    worker_alive: bool, has_offer_code: bool = False, agent_may_run: bool = True,
 ) -> Optional[str]:
-    """None when the A2A rail may take this request (before pricing); else the named reason."""
+    """None when the A2A rail may take this request (before pricing); else the named reason.
+    `agent_may_run` is the route's run-condition read (True when it did not read: the filter is off,
+    or an earlier reason answers first)."""
     if not a2a_create_dials_on():
         return "a2a_rail_disabled"
     if str(agent_id or "") not in pilot_agents():
@@ -177,18 +228,22 @@ def a2a_unavailable_reason(
         return "currency_unsupported"
     if not max_total_minor():
         return "amount_limit_unset"
+    if agent_may_run is not True and run_condition_enforced("a2a"):
+        return "agent_run_condition_unmet"
     return None
 
 
 def choose_rail(
     *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, currency: str,
     worker_alive: bool, has_offer_code: bool = False, preferred: Optional[str] = None,
+    agent_may_run: bool = True,
 ) -> RailChoice:
     """See the module docstring. `merchant_domain` is the canonical merchant (lower case, no `www.`),
-    `currency` the one the buyer was shown, `worker_alive` the A2A worker's heartbeat (the route's read)."""
+    `currency` the one the buyer was shown, `worker_alive` the A2A worker's heartbeat and
+    `agent_may_run` the run-condition read (both the route's reads)."""
     a2a_reason = a2a_unavailable_reason(
         agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country, item_source=item_source,
-        currency=currency, worker_alive=worker_alive, has_offer_code=has_offer_code)
+        currency=currency, worker_alive=worker_alive, has_offer_code=has_offer_code, agent_may_run=agent_may_run)
     if preferred == "a2a":
         if a2a_reason is not None:
             return RailChoice(rail=None, basis="buyer_selected_rail", refusal=a2a_reason)
