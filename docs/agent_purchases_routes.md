@@ -100,6 +100,13 @@ does not exist. Turning it on needs a restart.
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
   appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
   the offer is stateless (an HMAC, below).
+- With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
+  is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
+  checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
+  two display attributes, the card the checkout was created with. `network` is the partner's word or
+  `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
+  when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
+  field.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 
@@ -350,7 +357,13 @@ rather than leaving that purchase out (a missing row would read as a purchase th
 
 Opens a purchase on the rail `services/payment_orchestration/router.py` picks. **Dark**: unless BOTH
 `PAYMENT_ORCHESTRATOR_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are on, every request answers
-404 `not_available`. Same authentication as the reads.
+404 `not_available`, with two exceptions decided after the key lookup (step 1 below): a same-key
+same-body retry of the caller's own purchase, on either rail, replays it with the answer it gets
+while the door is on, READ-ONLY (no consent, key or buyer write); and a changed body under the
+caller's own key is the 409 `idempotency_conflict` that names its purchase. Anything else (a new
+attempt, a malformed body, a missing end user or consent, another buyer's key, a refusal tombstone,
+a key whose purchase is not visible) is the same 404 `not_available`, so a dark door is no probe.
+Same authentication as the reads.
 
 **Body**: the Reap create body (docs/reap_agentic_routes.md, `item_source`, `merchant_domain`,
 `product_key`, `variant_key` (never the `<product_key>::canonical` placeholder: `409 row_variant_unverified`) or (cart link) `variant_id`, `quantity`, `buyer {email, shipping_address, consent_version}`,
@@ -361,7 +374,8 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
 1. The request is normalised exactly as the Reap cart-link lane does it, and the **idempotency key
    is looked up first**, in the key table both rails share: a retry with the same key and body
    replays the ORIGINAL purchase on its ORIGINAL rail, whatever the router would answer today. A
-   Reap original is answered by the Reap route; a different body is 409 `idempotency_conflict`, which
+   Reap original is answered by the Reap route, which replays it even while Reap's create is off (so
+   does the loser of a same-key race to a Reap purchase); a different body is 409 `idempotency_conflict`, which
    names the key's purchase (`purchase_id`, `rail`) when it opened one, so the caller can read it.
 2. A new attempt without the shown-money pair is 400 `invalid_request`, before the router.
 3. The router:
@@ -490,8 +504,8 @@ same rule; the go for the preview does not cover it unless it names --lookup.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
-`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`, and
-`checkout_answer_scrubbed`, written when an answer that may follow a confirm echoed a card code (the confirm's
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`,
+`checkout_payment_reached_declined` (the measured decline, below), and `checkout_answer_scrubbed`, written when an answer that may follow a confirm echoed a card code (the confirm's
 answer, a poll, a result, or a lookup, which may also run on a row whose confirm never went out); the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
 written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
@@ -522,6 +536,73 @@ the row's pending write and code are the only record of what may have happened a
 **What the buyer sees.** A resolution usually lands after the buyer's 30-minute payment link has expired.
 The buyer learns the outcome from a fresh read: the agent's `get_order` in the chat (the purchase body,
 `state` `failed` with `last_error_code` `operator_confirmed_not_charged`), never from the old link.
+
+### A provider-confirmed decline (`close-declined`)
+
+**The hold.** The worker writes `checkout_payment_reached_declined` for exactly one answer: status
+`payment-reached`, `success` EXACTLY `false`, and no order id in the RAW answer (the `order_id` key absent, or
+`null`, or exactly `""`; `a2a_rail_worker._raw_order_id_absent`). Anything else stays
+`checkout_payment_reached_unconfirmed`: `success` missing, or an order id of any other shape (a whitespace
+string, `"#"`, `0`, a float, an object, a list), since a malformed order id may still be an order. It is a
+payment-reached hold like the others: `resolve-held` refuses it, and the worker never looks it up.
+
+**The close.** After the provider confirms **in writing** that this purchase was declined (no authorization
+approved or captured, and no order at the merchant), a human ends it as `failed` /
+`operator_confirmed_declined`:
+
+       python -m jobs.a2a_rail_operator close-declined --purchase-id ap_... \
+           --evidence-reference <opaque handle> --evidence-file-sha256 <sha256 of the statement file> \
+           --evidence-observed-at <when it was sent, ISO with offset> \
+           --provider-reference-kind checkout_task_id|external_order_reference --provider-reference <value> \
+           --attest-no-authorization --attest-no-merchant-order [--lookup]
+       # then, with the fence the preview printed:
+           ... --apply --operator <handle> --expect-env <PIVOTA_ENV> --expected-code <code> \
+           --expected-state-entered-at <iso> --expected-token-digest16 <hex> --expected-task-digest16 <hex> \
+           --expected-pending-write <w|none>
+
+- **Off by default:** `A2A_RAIL_OPERATOR_CLOSE_DECLINED_ENABLED` on the one-off job's env only. When it's off,
+  the command refuses before any read. It also refuses while the audit table or its append-only trigger is
+  missing. Migration 296 is their only builder: it has no startup heal, and it's applied once, as a gated
+  one-off after the merge.
+- **Who:** a production one-off, one at a time, with the owner's go for THAT purchase. The go names the
+  statement's reference and whether `--lookup` runs. Preview first: it prints the fence (the code,
+  `state_entered_at`, 16-hex sha256 prefixes of the token id and of the task id, whether a task is recorded,
+  the pending write) and never either id. Given the evidence, it also says whether the apply would be accepted.
+- **The evidence:**
+  - The statement must name one of OUR ids: the checkout task id, or the external order reference we sent
+    with the token. It must equal the purchase's own value.
+  - It must be dated at least `OPERATOR_MIN_HOLD_AGE_SECONDS` after the hold began (after the staged checkout
+    lapsed), no later than now plus 5 s, and no more than 7 days ago.
+  - Only the reference, the file's hash and the facts above are recorded, append-only, in
+    `a2a_rail_manual_resolution_audit`, with a digest computed on the server. Never the statement's text,
+    card data, the buyer's contact or the token id.
+- **The fence:** the code, `state_entered_at`, the token and task digests, and the pending write. Every
+  `--apply` guard runs before anything is read or sent, so a wrong `--expect-env` costs no provider call. Not
+  `updated_at`, because the worker claims and releases a held row every `POLL_PARKED`; not `claimed_by`,
+  because that claim never moves the row, and its release writes nothing once the close clears it. On
+  Postgres the transition and the audit row are ONE statement.
+- **`--lookup`:** ONE read-only lookup (a provider call, so the go must name it). It must be BOUND (the
+  task the purchase recorded from its own confirm answer), with `success` false, a decline status and no
+  order id (`a2a_rail_worker.answer_is_confirmed_decline`). Anything else refuses. A row held under the
+  legacy `checkout_payment_reached_unconfirmed` closes only with `--legacy-unconfirmed`, which makes that
+  lookup mandatory. That needs `A2A_RAIL_CHECKOUT_STEP_ENABLED` in the one-off's env; the lookup doesn't count
+  toward `checkout_lookups`. A legacy row with no recorded task is refused.
+- **A replay** with the same evidence and operator answers `already_resolved` and writes nothing; anything
+  else on a closed purchase is refused.
+- **Never:** a retry, a setup, a confirm, a cancel, a new token, a refund claim, `completed`, an order id or a
+  total, another code, state or rail, or a batch.
+
+**What a close causes.**
+- **The agent:** `get_order` shows `failed` / `operator_confirmed_declined`, and `purchase.failed` fires
+  ("ended without an order"). The agent may offer to buy again, which is right only because the decline is
+  confirmed in writing.
+- **The token:** it stays OFF the orphan list for 72 hours after `terminal_at`
+  (`ORPHAN_DECLINED_HOLD_SECONDS`), so a late authorization or dispute can still be matched to it first.
+
+**If a late order or a reversed authorization appears after a close.** `failed` is terminal. Write an
+incident note with the purchase id, the merchant's order number or the authorization reference, and the time.
+The owner then contacts the merchant and the provider (cancel or refund at the merchant). Nothing is written to
+the ledger by hand; the audit row stays as the record of what was believed and why.
 
 ### Rail scorecard (read-only)
 
