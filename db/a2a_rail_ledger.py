@@ -1658,11 +1658,16 @@ MANUAL_RESOLUTION_AUDIT_TRIGGER = "a2a_rail_manual_resolution_audit_immutable"
 
 async def manual_resolution_audit_ready() -> bool:
     """The audit table exists AND carries its append-only trigger(s) (migration 296 on Postgres; the test
-    arm's own builder on SQLite). The close refuses otherwise."""
+    arm's own builder on SQLite). The close refuses otherwise.
+
+    On Postgres the trigger must also FIRE in an ordinary session: `tgenabled` 'O' (origin, the default) or
+    'A' (always). 'D' (ALTER TABLE ... DISABLE TRIGGER) and 'R' (replica-only) leave the audit row writable by
+    UPDATE/DELETE/TRUNCATE, so they read as not ready. SQLite has no disabled trigger: present = enforced."""
     if IS_POSTGRES:
         row = await database.fetch_one(
             "SELECT to_regclass(:t) IS NOT NULL AS has_table, EXISTS (SELECT 1 FROM pg_trigger "
-            "WHERE tgrelid = to_regclass(:t) AND tgname = :g AND NOT tgisinternal) AS has_trigger",
+            "WHERE tgrelid = to_regclass(:t) AND tgname = :g AND NOT tgisinternal "
+            "AND tgenabled IN ('O', 'A')) AS has_trigger",
             {"t": MANUAL_RESOLUTION_AUDIT_TABLE, "g": MANUAL_RESOLUTION_AUDIT_TRIGGER})
         return bool(row and row["has_table"] and row["has_trigger"])
     names = {r["name"] for r in await database.fetch_all(
