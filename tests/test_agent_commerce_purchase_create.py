@@ -13,6 +13,7 @@ every check before any write and writes the purchase and its key in one unit; no
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -121,6 +122,7 @@ class Stubs:
         self.catalog = []
         self.clicks = []
         self.reap = []
+        self.reap_routing = []  # what the route left on request.state for the Reap route, per hand-over
         self.tierb = True
         self.facts = dict(FACTS)
 
@@ -141,6 +143,7 @@ def stubs(monkeypatch):
 
     async def _reap(request, context, agent_user):
         s.reap.append(json.loads(await request.body()))
+        s.reap_routing.append(getattr(request.state, "purchase_routing", None))
         return JSONResponse(status_code=202, content={"handled_by": "reap"})
 
     monkeypatch.setattr(reap_routes, "_load_cart_link_item", _catalog)
@@ -278,7 +281,7 @@ async def test_an_eligible_request_opens_an_a2a_purchase_with_our_price_link_and
     plan = json.loads(parent["routing_plan"]) if isinstance(parent["routing_plan"], str) else parent["routing_plan"]
     assert parent["rail"] == "a2a"
     assert plan == {"rail": "a2a", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
-                    "dropped": {"reap": "a2a_preferred"}}
+                    "dropped": {"reap": "a2a_preferred"}, "policy": rail_router.POLICY_VERSION, "market": "US"}
 
 
 async def test_the_created_purchase_reads_back_through_the_unified_get(client):
@@ -376,6 +379,8 @@ async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(c
     resp = await client.post(BASE, body())
     assert resp.json() == {"handled_by": "reap"} and len(stubs.reap) == 1
     assert stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
+    # A replay is not a routing decision: nothing is handed over for the parent row.
+    assert stubs.reap_routing == [None]
 
 
 @pytest.mark.parametrize("setup,status,reason", [
@@ -429,9 +434,19 @@ async def test_a_lost_key_race_to_a_reap_purchase_is_handed_to_the_reap_route(cl
     monkeypatch.setattr(reap_routes, "_claim_idempotency_key", _reap_won)
     resp = await client.post(BASE, body())
     assert resp.json() == {"handled_by": "reap"} and await _count("a2a_rail_purchases") == 0
+    # The router chose the OTHER rail for this request; the winner's own create recorded its decision.
+    assert stubs.reap_routing == [None]
 
 
 # ── routing ──────────────────────────────────────────────────────────────────────────────────
+
+
+_DROPPED_FOR = {
+    "rail_off": "a2a_rail_disabled", "create_off": "a2a_rail_disabled", "worker_down": "a2a_worker_unavailable",
+    "worker_stale": "a2a_worker_unavailable", "not_pilot": "agent_not_in_pilot", "not_proven": "merchant_not_proven",
+    "currency": "currency_unsupported", "no_cap": "amount_limit_unset", "variant_lane": "item_source_unsupported",
+    "offer_code": "offer_code_unsupported",
+}
 
 
 @pytest.mark.parametrize("change", ["rail_off", "create_off", "worker_down", "worker_stale", "not_pilot", "not_proven",
@@ -462,12 +477,22 @@ async def test_without_a_choice_an_ineligible_request_goes_to_reap_unchanged(cli
     resp = await client.post(BASE, b)
     assert resp.json() == {"handled_by": "reap"}
     assert stubs.reap == [b]  # the body as sent
+    # ... and the decision goes with it, for the parent row the Reap route writes: who decided, the
+    # named reason the other rail was dropped, the rule set and the buyer's market.
+    assert stubs.reap_routing == [{
+        "basis": "orchestrator_selected_rail", "dropped": {"a2a": _DROPPED_FOR[change]},
+        "policy": rail_router.POLICY_VERSION, "market": "US",
+    }]
     await _nothing_written()
 
 
 async def test_an_explicit_reap_choice_goes_to_reap_even_when_a2a_could_take_it(client, stubs):
     resp = await client.post(BASE, body(payment_preference={"rail": "reap"}))
     assert resp.json() == {"handled_by": "reap"} and len(stubs.reap) == 1
+    assert stubs.reap_routing == [{
+        "basis": "buyer_selected_rail", "dropped": {"a2a": "not_selected"},
+        "policy": rail_router.POLICY_VERSION, "market": "US",
+    }]
     await _nothing_written()
 
 
@@ -499,6 +524,20 @@ async def test_an_explicit_a2a_choice_records_the_buyer_as_the_decider(client):
     parent = await database.fetch_one("SELECT routing_plan FROM agent_purchases WHERE rail_purchase_id = :p", {"p": pid})
     plan = json.loads(parent["routing_plan"]) if isinstance(parent["routing_plan"], str) else parent["routing_plan"]
     assert plan["basis"] == "buyer_selected_rail" and plan["dropped"] == {"reap": "not_selected"}
+
+
+def test_the_decision_record_is_the_parent_writers_keyword_arguments():
+    choice = rail_router.choose_rail(
+        agent_id="agent_x", merchant_domain=SHOP, market_country="sg", item_source="cart_link", currency="USD",
+        worker_alive=True)
+    record = rail_router.decision_record(choice, market_country="sg")
+    assert record == {"basis": "orchestrator_selected_rail", "dropped": {"a2a": "agent_not_in_pilot"},
+                      "policy": rail_router.POLICY_VERSION, "market": "SG"}
+    # A copy: the stored record cannot change the frozen choice it was made from.
+    record["dropped"]["a2a"] = "edited"
+    assert choice.dropped == {"a2a": "agent_not_in_pilot"}
+    for writer in (purchases.ensure_reap_parent, purchases.ensure_a2a_parent):
+        assert set(record) <= set(inspect.signature(writer).parameters)
 
 
 # ── the router, pure ─────────────────────────────────────────────────────────────────────────
