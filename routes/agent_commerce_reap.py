@@ -307,6 +307,31 @@ def _require_rail() -> None:
         raise svc.PurchaseRefused("not_available_on_this_rail")
 
 
+def _create_off_reason() -> Optional[str]:
+    """Why create refuses a NEW attempt right now, or None: `_require_rail()`'s check, then the
+    create dial (which also covers the pilot scope). The same two refusals, in the same order, that
+    create raised before it answered a retry first; both are the one private 404 on the wire."""
+    if not _rail_is_live():
+        return "not_available_on_this_rail"
+    if not svc.is_create_enabled():
+        return "create_disabled"
+    return None
+
+
+def _while_create_off(exc: svc.PurchaseRefused, create_off: Optional[str]) -> svc.PurchaseRefused:
+    """The refusal create answers while `create_off` is set.
+
+    A conflict that names the caller's own purchase stands: the key opened a purchase, and saying
+    "unavailable" about it is the answer a client reads as "nothing exists". Every other refusal is
+    the create-off one, so a malformed body, a missing end user or an old refusal tombstone answers
+    the same 404 a dark rail always has, and is no probe for whether the rail is there."""
+    if create_off is None or getattr(exc, "reason", None) == create_off:
+        return exc
+    if getattr(exc, "reason", None) == "idempotency_conflict" and getattr(exc, "existing_purchase_id", None):
+        return exc
+    return svc.PurchaseRefused(create_off)
+
+
 #: Characters that must never reach a bind on this path. `Cc`/`Cf`/`Cs`/`Co`/`Cn` is the same
 #: Unicode-category set `services.reap_agentic_purchase._clean_buyer_text` uses, and it is used
 #: here for the opposite outcome — see `_identifier` below.
@@ -2968,6 +2993,22 @@ def _is_reap_purchase_id(purchase_id: Optional[str]) -> bool:
     return str(purchase_id or "").startswith("rp_")
 
 
+def _replay_body(purchase_id: str, view: Mapping[str, Any], item_source: str) -> Dict[str, Any]:
+    """A create replay's 202 body: THE SAME ID, AND THE PURCHASE'S REAL STATE (from `view`)."""
+    body: Dict[str, Any] = {
+        "purchase_id": purchase_id,
+        "status": view.get("state"),
+        "poll_after_seconds": view.get("poll_after_seconds"),
+        "checkout_dispatch_state": view["checkout_dispatch_state"],
+        "contact_reentry_required": view["contact_reentry_required"],
+    }
+    if item_source == "cart_link":
+        # The same additive field the cart-link create answered with. The key's request hash
+        # covers `item_source`, so a replay is always the same lane.
+        body["variant_title"] = view.get("variant_title")
+    return body
+
+
 def _not_found() -> JSONResponse:
     """WRONG OWNER AND NO SUCH PURCHASE ARE THE SAME ANSWER. 404, never 403: a 403 confirms the
     id exists, which turns this endpoint into an oracle for guessing other buyers' purchase ids.
@@ -3139,11 +3180,22 @@ async def start_reap_purchase(
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
-    """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that."""
+    """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that.
+
+    ── A RETRY IS ANSWERED BEFORE THE CREATE DIALS ───────────────────────────────────────────
+
+    With the rail off, its client unconfigured, create off (or its pilot scope unreadable), or the
+    cart-link lane off, a same-key same-body retry of a purchase the caller already opened still
+    REPLAYS it, read-only (no consent write, no key write, no buyer write), exactly as `/recover`
+    and the owner GET read it. Refusing it told the client nothing exists while the purchase went
+    on: a client that then sends the buyer elsewhere, or mints a new key, can buy twice. A conflict
+    naming the caller's purchase, and a key that opened one on another rail, are answered as with
+    create on, for the same reason. Every other request (a new attempt, a malformed body, a missing
+    end user) still gets the create-off refusal, unchanged: see `_while_create_off`.
+    """
+    # Decided first, answered after the replay lookup. Nothing below the lookup runs while it is set.
+    create_off = _create_off_reason()
     try:
-        _require_rail()
-        if not svc.is_create_enabled():
-            raise svc.PurchaseRefused("create_disabled")
         agent_user_ref = _require_agent_user(agent_user)
 
         try:
@@ -3162,20 +3214,25 @@ async def start_reap_purchase(
             # is the buyer's address. Never forwarded, never logged.
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
-        # The cart-link lane has two further dark gates. Decide them before consent or any
-        # merchant/catalog read so a disabled lane is the same 404 unavailability as the base rail.
-        if req.item_source == "cart_link" and not svc.is_cart_link_enabled():
-            raise svc.PurchaseRefused("not_available_on_this_rail")
+        # The cart-link lane has two further dark gates. Decided here, before consent or any
+        # merchant/catalog read, so a disabled lane is the same 404 unavailability as the base
+        # rail; like the base dials, it refuses a new attempt only after the replay lookup. (With
+        # it off, `_fingerprint_prefixes_live` is off too, so a key spelled with a selector prefix
+        # is not refused before the lookup: it can only replay the caller's own purchase under
+        # that same key and fingerprint, read-only, and otherwise gets the same 404.)
+        if create_off is None and req.item_source == "cart_link" and not svc.is_cart_link_enabled():
+            create_off = "not_available_on_this_rail"
 
         # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
         #
-        # AFTER THE DIAL, WHICH IS NOT A STYLE CHOICE. `_require_rail()` is the first statement
-        # of this handler and everything about a dark rail depends on it staying first: a
-        # `consent_required` answered before the dial is a 400 where every well-formed request
+        # UNDER THE DIAL, WHICH IS NOT A STYLE CHOICE. The dials are read first (`create_off`)
+        # and everything about a dark rail depends on what `_while_create_off` does with that: a
+        # `consent_required` answered while create is off is a 400 where every well-formed request
         # gets a 404, which is a working probe for a feature that is supposed to be absent. That
         # is the exact defect the note above these handlers records about `Body(...)` and
-        # `Query(...)`, and moving this check one line up would reintroduce it. The mutant table
-        # for this PR kills it in that direction specifically.
+        # `Query(...)`. So while create is off this refusal, and every other one before the
+        # replay lookup, is answered as the create-off 404; only a purchase the caller's key
+        # already opened is answered for what it is.
         #
         # BEFORE ELIGIBILITY, THE CATALOG READ AND EVERY WRITE, which is the other half. A buyer
         # who has not consented must not have an identity minted for them, must not have a
@@ -3277,6 +3334,11 @@ async def start_reap_purchase(
                 agent_id=agent_id,
                 agent_user_ref_hash=agent_user_ref_hash,
             )
+            if view and create_off is not None:
+                # CREATE IS OFF: the replay is a read, like `/recover` and the owner GET. No
+                # consent write (the attempt's consent was recorded when it opened).
+                replay_body = _replay_body(replayed, view, req.item_source)
+                return JSONResponse(status_code=202, content=replay_body)
             if view:
                 # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
                 # `_linked_buyer_id` exists as a separate read.
@@ -3301,20 +3363,15 @@ async def start_reap_purchase(
                 # the attempt's consent was recorded when it was opened.
                 if replay_buyer_id and not legacy_retry:
                     await _record_consent(replay_buyer_id, consent_version)
-                replay_body: Dict[str, Any] = {
-                    "purchase_id": replayed,
-                    "status": view.get("state"),
-                    "poll_after_seconds": view.get("poll_after_seconds"),
-                    "checkout_dispatch_state": view["checkout_dispatch_state"],
-                    "contact_reentry_required": view["contact_reentry_required"],
-                }
-                if req.item_source == "cart_link":
-                    # The same additive field the cart-link create answered with. The key's
-                    # request hash covers `item_source`, so a replay is always the same lane.
-                    replay_body["variant_title"] = view.get("variant_title")
+                replay_body = _replay_body(replayed, view, req.item_source)
                 return JSONResponse(status_code=202, content=replay_body)
+            if create_off is not None:
+                raise svc.PurchaseRefused(create_off)
             # An immutable key without an owner-visible row cannot authorize a new attempt.
             return _not_found()
+        if create_off is not None:
+            # No purchase under this key: this is a NEW attempt, and create is off.
+            raise svc.PurchaseRefused(create_off)
         if legacy_retry:
             # No attempt under this key and fingerprint: a NEW attempt, and a new attempt binds
             # the money the buyer was shown. Refused before any write.
@@ -3570,7 +3627,7 @@ async def start_reap_purchase(
     except _PurchasePersistenceUnavailable:
         return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
     except svc.PurchaseRefused as exc:
-        return _refused(exc)
+        return _refused(_while_create_off(exc, create_off))
 
 
 async def _validate_resume_selection(req, row, merchant, host, product, variant, market, *, product_url=None):

@@ -1,6 +1,6 @@
 # ADR-030: Pivota is the UCP/ACP platform; the checkout is the merchant's; card networks are only the credential layer
 
-**Status:** Proposed (draft 6), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later". Draft 6 applies D11 beyond the pilot, and records the answers to owner questions 2, 3 and 5.
+**Status:** Proposed (draft 6), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later". Draft 6 applies D11 beyond the pilot, and records the answers to owner questions 2, 3 and 5. **Amended 2026-11-23 (amendment 1)** with one decision of the decision owner: a payment partner whose checkout request cannot start from the entry link may still complete orders (D7). See "Amendment 1" below.
 
 **Decision owner:** Founder. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
@@ -21,7 +21,7 @@
   - quote and payment in one checkout session;
   - the buyer approves every purchase;
   - the pilot is one card network, one currency, guest checkout;
-  - the order enters the merchant through our entry link;
+  - the order enters the merchant through our entry link (amended 2026-11-23 for a partner that cannot load it; see amendment 1);
   - the first supervised live purchase runs on the partner that already has quote, approve and place;
   - the model where the agent polls for the credential and pays is never used.
 
@@ -46,6 +46,27 @@
   - its owner questions 1 (a card vault) and 3 (a platform protocol as a completion route) are answered "no" by amendment 1 and the 2026-11-10 rule, once the owner confirms (question 6 below).
 
   ADR-029 carries notes at each of these places that point here.
+
+## Amendment 1 (2026-11-23): a payment partner that cannot load the entry link
+
+D7 makes the entry link a required field of the partner contract, and the agreed partner flow of 2026-11-10 says the order enters the merchant through it. One of the two payment partners cannot meet that as its interface stands. The decision owner decided on 2026-11-23 how that partner's orders are treated. This amendment builds nothing and switches nothing on.
+
+*Owner decision of 2026-11-23, to be confirmed by the owner when this amendment is merged.*
+
+**The limit.** Reap's external-checkout request takes a merchant domain and a checkout URL, and the domain must be the URL's own host. A request where they differ is refused. A network tracking link sits on the network's host, so it cannot be the checkout URL, and the request has no other field for a link the partner's agent loads first. Our own check of that URL (`services/reap_cart_link.py`) accepts one shape only: the cart line, our click id as a cart attribute, and the market.
+
+**The decision.** A payment partner that cannot load the entry link may complete orders without it. This is an exception to D7 for a named partner. D7 itself is unchanged.
+- **The exception is recorded per partner.** The partner's path declaration (ADR-029 D2, `attribution`) says that its orders do not enter through the entry link. Today that is Reap only.
+- **The entry link stays required for every other payment partner,** and it is a condition for admitting a new one. A partner that can load it must.
+- **What still rides on such an order.** The cart link carries our click id as a cart attribute, unchanged. That attributes the order wherever Pivota can read the merchant's orders. It earns no network commission: a network credits a click through its own link, and this order has none.
+- **How the order is treated.** For D7's commission fact it counts as **none** on the network, whatever the merchant's stored fact says for other paths. It follows ADR-028 D4: the order first, then the loop is fixed. That is one standing task for this partner, the "To be revisited" item below, not a task per order. It never changes an offer's rank (ADR-025).
+- **The cost is accepted for now.** An order this partner completes can earn nothing where the handoff link on the same offer would have earned commission. ADR-029 decides which partner takes a purchase. Its amendment 1, point 1, puts the buyer's existing credential and the agent's partner before attribution among payment partners, so that choice may land on a partner whose order earns none.
+
+**To be revisited** once the partner has answered whether its agent can start from a tracking link that lands on the merchant. Two other ways to earn on such an order are open and undecided:
+- a code that the merchant's programme issues to us, sent in the partner's offer-code field. A code usually changes the buyer's price, so the price check has to expect it;
+- a direct agreement with a merchant, or with its store platform, that credits orders by our click id.
+
+**What is built (origin/main, 2026-11-23).** No partner path loads an entry link today. It is remaining work of the agreed flow (see "the freeze and the agreed partner flow" under "Questions for the owner").
 
 ## Scope
 
@@ -159,6 +180,8 @@ The buyer pays on the merchant's own checkout.
 - **Start.** The purchase starts at the existing rail-neutral purchase door (ADR-029). Pivota checks the price and the cap, picks the payment partner, and records the purchase.
 - **Card.** First time only, the buyer binds a card on the partner's hosted page.
 - **Quote.** Pivota sends the partner: our reference, the entry link, the cart link, the items, the currency of the buyer's market and the ship-to. The partner's agent opens the merchant's checkout through the entry link, then the cart link byte for byte, keeping cookies. It returns the merchant's items, discount, shipping, tax and total. Nothing is charged.
+
+  > **Amended 2026-11-23 (amendment 1).** For the one named partner that cannot load the entry link, the quote carries no entry link: its agent opens the cart link only.
 - **Approval.** The buyer approves **every** purchase, on the partner's page that shows the merchant and the quoted total.
 - **Payment.** In the same checkout session as the quote, payment is for exactly the approved total.
   - If the session cannot be held, the partner re-opens it. A lower total is then paid without re-asking only when the seller of record, the items and the currency are unchanged. Any other change re-asks the buyer.
@@ -233,6 +256,8 @@ Partner-facing `get_order` on an `esc_` id answers only what a source says, labe
 ### D7. Attribution: our click id rides inside the checkout; commission rides the network
 
 - **A partner-completed order (D3 path 2) enters the merchant through our entry link.** The entry link is our network tracking link, with our click id as the network sub-id. The partner's agent loads it first, follows its redirects and keeps its cookies, then opens the cart link byte for byte. The cart link carries our click id as a cart attribute. There is exactly one entry-link load per buyer order attempt, never one from a quote retry or a probe (ADR-028 D3). The entry link is a required field of the partner contract.
+
+  > **Amended 2026-11-23 (amendment 1).** One named partner, whose checkout request cannot start from the entry link, is excepted. Its orders count as **none** for network commission.
 - **Every merchant checkout Pivota creates (D3 path 1)** carries `attribution` with our click id, as `click_id_tag` / `click_id_value` (the pair already used on referral URLs), plus `referring_domain`. Because update is a full replacement, it is re-sent on every update.
 - **Where an ACP merchant offers `affiliate_attribution`:** the network provider, our publisher id, and our click id as the sub-id.
 - **Labels are not commission.** A checkout created server-side skips the network's tracking link. Per merchant and market, a stored fact records which path carries commission:
@@ -352,7 +377,7 @@ Pivota's own completion is not a phase of this ADR (D3, "Later, conditionally").
 
 ## Risks
 
-- **Commission leakage.** A protocol checkout bypasses network tracking. Revenue depends on the per-merchant attribution fact (D7), on the entry link being honoured by the payment partner's agent, and on networks crediting an order a checkout agent placed. None is proven yet.
+- **Commission leakage.** A protocol checkout bypasses network tracking. Revenue depends on the per-merchant attribution fact (D7), on the entry link being honoured by the payment partner's agent, and on networks crediting an order a checkout agent placed. None is proven yet. One payment partner cannot load the entry link at all (amendment 1), so its orders earn no network commission.
 - **The payment partner's checkout agent is the weak link.** Its success rate, its behaviour on bot challenges, and whether it can hold a session through the buyer's approval are the partner's, and are unmeasured on real merchants.
 - **Order visibility.** Merchant webhooks may need per-platform partner onboarding. Until then path 1 shows `handed_off` only.
 - **Version drift.** Merchants move spec versions without notice; negotiation and stored versions replace the pin.
