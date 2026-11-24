@@ -508,3 +508,15 @@ async def test_an_a2a_purchase_never_carries_a_card(monkeypatch):
     rail_id = await _a2a()
     answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
     assert answer.status_code == 200 and "payment_card" not in answer.json()
+
+
+@pytest.mark.parametrize("stored", ["12a4", "    ", "4 42"])
+async def test_a_stored_last4_that_is_not_four_digits_shows_no_card(monkeypatch, stored):
+    """The writer refuses such a value; a row written another way (by hand, an older writer) still shows nothing."""
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    enrollment_id = await _card()
+    await database.execute("UPDATE reap_agentic_enrollments SET card_last4 = :v WHERE id = :i",
+                           {"v": stored, "i": enrollment_id})
+    rail_id = await _reap(state="awaiting_approval", **_bound(enrollment_id))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and "payment_card" not in answer.json()
