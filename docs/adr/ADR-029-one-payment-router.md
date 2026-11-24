@@ -1,6 +1,6 @@
 # ADR-029: One purchase router for agent-paid orders on merchants not connected to Pivota
 
-**Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR.
+**Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR. **Amended 2026-11-23 (amendment 1)** with two decisions of the decision owner: the order among payment partners (D6, order rule 3) and an agent-set preference for agents that are not test agents (D2). See "Amendment 1" below.
 
 **Decision owner:** Founder. **Runtime owner of the router:** the payment orchestration code owner (to be named at acceptance).
 
@@ -11,6 +11,38 @@
 - **ADR-016:** Pivota is non-custodial.
 - **ADR-028:** Pivota completes the order on the merchant's checkout, D1 to D9. Unchanged, except where D6 below says how its rules are applied before any quote exists. Its D2 would be amended only if question 3 is answered yes.
 - **Payment orchestration P0 to P2c** (`services/payment_orchestration/`): the router (`router.choose_rail`), the unified purchase states (`rails.py`) and the parent ledger (`db/agent_purchase_ledger.py`).
+
+## Amendment 1 (2026-11-23): the order among payment partners, and an agent-set preference
+
+The decision owner decided two questions on 2026-11-23. Both are about the choice among payment partners (`rail_managed` paths) for one purchase, and about nothing else in this ADR. This amendment builds nothing and switches nothing on; "What is built" at the end says what main does today.
+
+*Owner decision of 2026-11-23, to be confirmed by the owner when this amendment is merged.*
+
+1. **The order among payment partners (D6, order rule 3, amended).** Where totals are not known and the candidates are payment partners, they are ordered by these rules. A lower rule never overrides a higher one.
+   1. **The buyer's existing credential.** When the buyer already holds an active credential with exactly one of the candidate partners, that partner goes first. Enrolling a card again is the step most likely to lose the buyer.
+   2. **The agent's partner.** Each agent has a routing policy that Pivota sets on the owner's decision. The agent never sends it. The policy is *open* (no preference), *preferred* (the named partner first whenever it is a candidate) or *pinned* (only the named partner). An agent that a payment partner brought to Pivota is *preferred* for that partner for 12 months. The owner sets the start date when the first such agent arrives. After the term the agent is *open* unless the owner renews. A *pinned* policy is applied with the hard filters: the other partners are not candidates, a purchase the pinned partner cannot take is refused and never moved, and rule 1 does not apply.
+   3. **A fixed order,** set by the owner. Today: the A2A rail, then Reap. A measured order may replace it only by a separate owner decision, and only on figures that separate the partners. Such figures need a planned split of new buyers between the partners, which is an owner decision of its own.
+   4. **Income,** from attribution and from a partner's commercial terms, as a tie-break only between partners whose measured success cannot be told apart. It is off until such terms and such figures exist.
+
+   **What this changes.** D6 puts "a path that carries our attribution first". Among payment partners, attribution is now part of the last rule. A partner whose orders carry less attribution can therefore be chosen ahead of one whose orders carry more: for a buyer who holds a credential with it, for an agent it brought, or by the fixed order. One example is a partner whose checkout request cannot start from the entry link of ADR-030 D7.
+
+   **What it does not change:**
+   - the hard filters, which are applied first;
+   - D6's order rules 1 and 2: the buyer's own choice wins, and attribution never outranks a known lower total;
+   - the order between a protocol route and a partner's route, where both are candidates (rule 3 as written);
+   - the fallback rules;
+   - the handoff, which is offered whenever an offer is served, and an offer's rank (ADR-025).
+
+2. **An agent-set preference (D2, amended for agents that are not test agents).** D2 defines the preference as a filter that is refused only when it cannot be met. That stays the rule for a test agent. A test agent is identified by a server-set signal in the one test-traffic predicate (`services/test_traffic`), never by anything the caller sends. For every other agent the preference does not steer the route:
+   - when it names the path the router chooses anyway, the purchase goes ahead;
+   - when it names another path, the request is refused, **even when that path could take the purchase**;
+   - it is never silently changed, and the request is never moved to a path the caller did not name.
+
+   The reason: the choice of partner is Pivota's stated policy for every agent, an *open* one included, and a per-request choice would let an agent override it.
+
+   **This is a contract change for callers,** so it ships behind its own switch. That switch is not one of D8's: off does not stop payment, it leaves D2 as first written. In the same release the gateway stops accepting and forwarding the field for agents that are not test agents, and the routes page and the partner integration guide say so. The backend refusal stays as the safety net.
+
+**What is built (origin/main, 2026-11-23).** None of it. `router.choose_rail` lets an explicit choice win for any caller, as D2 says, and applies only the fixed order. There is no agent routing policy, no rule on the buyer's existing credential and no test-agent signal for purchases. The owner holds all of the build (2026-11-23). It is taken up again when a first agent brought by a payment partner is in sight, and each step then needs its own owner decision.
 
 ## Scope
 
@@ -90,6 +122,8 @@ A path is admitted only with a declaration. An undeclared or incomplete one fail
 
 The router branches on these fields, never on a path's name. An agent-set preference (today `payment_preference.rail`) is a **filter**: it can narrow the candidates, and is refused when it cannot be met. It never widens them, and it is not treated as the buyer's choice (D6).
 
+> **Amended 2026-11-23 (amendment 1, point 2).** For an agent that is not a test agent, a preference that names a path other than the one the router chooses is refused, even when that path could take the purchase.
+
 ### D3. Card data
 
 > **Read with ADR-028 D6 as amended (2026-11-08, narrowed 2026-11-10) and ADR-030 D3.** For now Pivota handles no card credential, so "in memory for one attempt, on a route Pivota executes" below does not apply to any admitted path. "Stripped on arrival" is a detector; the rule is that the partner never sends a credential.
@@ -136,12 +170,16 @@ A path is admitted only with a written funds flow showing that the buyer's payme
 - **The caller and the buyer:** the caller class is allowed (ADR-012); the amount is within the consent's ceiling (ADR-028 D7) and the path's cap; the buyer holds the credential or can enrol it in the flow.
 - **The path's own requirements** (D2 `requires`, `works_on`) and its dial (D8).
 
+> **Amended 2026-11-23 (amendment 1, point 1).** One more hard filter among payment partners: for an agent whose routing policy is *pinned*, only the named partner is a candidate.
+
 **Order among the candidates** keeps ADR-028 D2's order and only says how it is applied before any quote exists:
 1. **A choice the buyer makes** among the paths shown to them, recorded in the consent, wins.
 2. **The lower buyer total** (ADR-028 D2 rule 1) wins wherever totals are known **without creating a checkout**. Quoting several paths to compare them is not allowed: it leaves abandoned checkouts, and Shopify asks that Shop checkouts be created only when the shopper asks.
 3. **Where totals are not known:** a path that carries our attribution first; when both do, a protocol route before a partner's (ADR-028 D2 rules 2 and 3); then fewer buyer steps.
 
 Attribution never outranks a known lower total.
+
+> **Amended 2026-11-23 (amendment 1, point 1).** Among payment partners (`rail_managed` paths), rule 3's order is replaced: the buyer's existing credential, then the agent's partner, then a fixed order, then income as a tie-break. Rules 1 and 2, and rule 3 between a protocol route and a partner's route, stand as written.
 
 **Fallback.** This amends the router's rule 4 ("no fallback after routing") to match ADR-028 D1:
 - A purchase never changes path after its first write (rule 5 stands).
@@ -156,7 +194,7 @@ What this gives with today's paths:
 
 | Merchant | First candidate | Otherwise |
 |---|---|---|
-| Shopify store, Tier B cart-link eligible, fact allows, permitted and proven on a rail | that rail (A2A or Reap, by the order above) | handoff |
+| Shopify store, Tier B cart-link eligible, fact allows, permitted and proven on a rail | that rail (A2A or Reap, by the order above as amended by amendment 1) | handoff |
 | Shopify store offering Shop Pay, shopper signed in, permission granted, wallet fact fresh, **and question 3 answered yes** | Shop MCP completion, ranked by attribution like any route (it carries none today) | handoff |
 | anything else | handoff | — |
 
@@ -218,7 +256,7 @@ What this gives with today's paths:
 ## Questions for the owner
 
 1. *(Answered "keep D3; no card vault" by ADR-028 amendment 1; ADR-030 owner question 6 asks the owner to confirm.)* **Card numbers.** Keep D3, which excludes Shop spend requests unless a PCI-scoped executor receives the number? Or open a separate decision on a card vault, which would change ADR-028 D6 and Pivota's card-data scope?
-2. **Attribution against convenience.** Shop MCP completion carries no attribution today, so D6 ranks it below an attributed rail when totals are unknown. Is that right when the buyer already holds Shop Pay and the rail needs a new enrolment?
+2. **Attribution against convenience.** Shop MCP completion carries no attribution today, so D6 ranks it below an attributed rail when totals are unknown. Is that right when the buyer already holds Shop Pay and the rail needs a new enrolment? *(Answered between payment partners by amendment 1, point 1: the buyer's existing credential goes before attribution. Still open for Shop MCP against a rail.)*
 3. *(Answered "handoff only, for now" by ADR-030 D3; ADR-030 owner question 6 asks the owner to confirm.)* **Shop MCP as a completion route.** ADR-028 D2 defines the protocol route as the merchant's protocol at the tier the merchant requires. Shop MCP's tier is granted by Shopify, not by the merchant. Admitting it means amending ADR-028 D2 to add a platform protocol route, admitted on the platform's grant plus the merchant not having opted out. Amend it, or leave Shop MCP as a handoff only?
 4. **Partner attestation.** On `rail_managed` paths the buyer's authorization is the partner's attestation, not a primitive Pivota verified (D5). Is that acceptable for admission, or does a rail need to return verifiable evidence?
 5. **Shadow routing.** Start Phase 1 now, before any new path exists?
