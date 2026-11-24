@@ -367,6 +367,16 @@ async def create_purchase(
             has_offer_code=offer_code is not None, preferred=preferred,
         )
         if choice.rail == "reap":
+            # The Reap route writes this purchase's parent row. The decision travels to it on the
+            # request's server-side state (nothing a caller sends reaches `request.state`), so the
+            # parent says the router chose Reap and why the other rail was dropped. Set ONLY here, for
+            # a request the router decided just now (the two other hand-overs in this function, a
+            # replay and a lost key race, carry none). The Reap route stores it only on a purchase
+            # THIS request opens: if the request then loses its key to an earlier one inside that
+            # route, it answers with that purchase and gives it at most a neutral `backfill` parent,
+            # never this decision. Best-effort, like the parent row itself
+            # (`reap_routes._record_purchase_parent`).
+            request.state.purchase_routing = rail_router.decision_record(choice, market_country=market_country)
             return await reap_routes.start_reap_purchase(request, context, agent_user)
         if choice.rail is None:
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
@@ -501,7 +511,8 @@ async def _open_a2a_purchase(
     try:
         # Best effort, bounded: the unified read heals a missing parent from the committed child.
         await asyncio.wait_for(
-            purchases.ensure_a2a_parent(purchase_id, basis=choice.basis, dropped=choice.dropped),
+            purchases.ensure_a2a_parent(
+                purchase_id, **rail_router.decision_record(choice, market_country=market_country)),
             _RECORD_PARENT_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent_purchases: a2a parent write deferred error_type=%s", type(exc).__name__)

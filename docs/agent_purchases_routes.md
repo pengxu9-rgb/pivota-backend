@@ -590,6 +590,18 @@ incident note with the purchase id, the merchant's order number or the authoriza
 The owner then contacts the merchant and the provider (cancel or refund at the merchant). Nothing is written to
 the ledger by hand; the audit row stays as the record of what was believed and why.
 
+### Rail scorecard (read-only)
+
+`python -m jobs.purchase_rail_scorecard [--days 14] [--min-sample 30] [--exclude-agent-id <id> ...]`
+prints one JSON object: per rail, merchant domain, market and new or returning buyer, how many
+purchases were routed, how they ended (completed, failed, refused, expired, held, in flight), the
+success rate (completed over finished; a held purchase counts against the rail) and the named codes
+that ended the rest. It also counts how those purchases came to their rail, from the parent's stored
+routing plan. It only reads (three SELECTs), calls no rail, changes no routing, and prints no buyer,
+agent or purchase identifier. In production it runs as a one-off job behind the one-off gate. Test
+agents are not removed by themselves: pass each as `--exclude-agent-id`. The module docstring defines
+every number and states the limits.
+
 ## Webhook events (`purchase.*`)
 
 Agents can be told about a purchase instead of polling. Events go through the existing agent
