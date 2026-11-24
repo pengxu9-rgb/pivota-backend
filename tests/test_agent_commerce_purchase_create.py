@@ -1135,3 +1135,118 @@ async def test_removing_the_copy_after_the_rotation_is_a_503_and_only_remounting
     split = await client.post(BASE, body())
     assert split.status_code == 202 and split.json()["purchase_id"] not in (pre_pid, post_pid)
     assert await _count("a2a_rail_purchases") == 3 and len(stubs.clicks) == 3
+
+
+# ── ADR-030 D11: the token rail's agent runs only where the run condition holds (step 2b, PR C) ──
+
+
+class _RunConditionReads:
+    """Stand-ins for the two record reads (the readers' own suites own what they read), recording
+    every call. `fact` and `clear` are the answers."""
+
+    def __init__(self, monkeypatch, *, fact: bool = True, clear: bool = True):
+        import db.merchant_agent_checkout_facts as checkout_facts
+        import db.partner_agent_merchant_blocks as agent_blocks
+
+        self.fact, self.clear, self.calls = fact, clear, []
+
+        async def _fact(domain):
+            self.calls.append(("fact", domain))
+            return self.fact
+
+        async def _clear(rail, domain):
+            self.calls.append(("clear", rail, domain))
+            return self.clear
+
+        monkeypatch.setattr(checkout_facts, "meets_run_condition", _fact)
+        monkeypatch.setattr(agent_blocks, "is_clear", _clear)
+
+
+@pytest.mark.parametrize("unmet", ["no_fact", "open_block"])
+async def test_without_a_choice_a_merchant_failing_the_run_condition_goes_to_reap(client, stubs, monkeypatch, unmet):
+    """A drop, not a refusal: the record is per rail, so the other partner may still take it (and applies
+    its own filter there). The decision names the reason and the rule set that had it."""
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    reads = _RunConditionReads(monkeypatch, fact=unmet != "no_fact", clear=unmet != "open_block")
+    resp = await client.post(BASE, body())
+    assert resp.json() == {"handled_by": "reap"}
+    assert stubs.reap_routing == [{
+        "basis": "orchestrator_selected_rail", "dropped": {"a2a": "agent_run_condition_unmet"},
+        "policy": rail_router.POLICY_VERSION_RUN_CONDITION, "market": "US",
+    }]
+    assert reads.calls[0] == ("fact", SHOP) and all(call[1] == "a2a" for call in reads.calls[1:])
+    assert stubs.catalog == []
+    await _nothing_written()
+
+
+async def test_an_explicit_a2a_choice_failing_the_run_condition_is_the_same_404(client, stubs, monkeypatch):
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    _RunConditionReads(monkeypatch, fact=False)
+    resp = await client.post(BASE, body(payment_preference={"rail": "a2a"}))
+    assert resp.status_code == 404 and "not_available_on_this_rail" in resp.text
+    for word in ("fact", "block", "protocol", "run_condition"):
+        assert word not in resp.text
+    assert stubs.reap == [] and stubs.catalog == []
+    await _nothing_written()
+
+
+async def test_a_merchant_meeting_the_run_condition_opens_on_the_token_rail(client, stubs, monkeypatch):
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "reap,a2a")
+    reads = _RunConditionReads(monkeypatch)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a", resp.text
+    assert reads.calls == [("fact", SHOP), ("clear", "a2a", SHOP)]
+    parent = await database.fetch_one(
+        "SELECT routing_plan FROM agent_purchases WHERE rail_purchase_id = :p", {"p": resp.json()["purchase_id"]})
+    plan = json.loads(parent["routing_plan"]) if isinstance(parent["routing_plan"], str) else parent["routing_plan"]
+    assert plan["policy"] == rail_router.POLICY_VERSION_RUN_CONDITION
+
+
+@pytest.mark.parametrize("why", ["unset", "reap_only", "not_a_rail", "reap_chosen", "not_pilot", "not_proven",
+                                 "worker_down", "variant_lane"])
+async def test_the_run_condition_is_read_only_for_a_request_the_token_rail_would_take(client, stubs, monkeypatch, why):
+    """So a create the filter cannot change pays for no read, and keeps its own drop reason."""
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    b = body()
+    if why == "unset":
+        monkeypatch.delenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV)
+    elif why == "reap_only":
+        monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "reap")
+    elif why == "not_a_rail":
+        monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "all, A2A_RAIL")
+    elif why == "reap_chosen":
+        b = body(payment_preference={"rail": "reap"})
+    elif why == "not_pilot":
+        CALLER.agent_id = "agent_not_in_pilot"
+    elif why == "not_proven":
+        monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:SG")
+    elif why == "worker_down":
+        await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    else:
+        b = body(item_source="reap_variant")
+    resp = await client.post(BASE, b)
+    assert reads.calls == []
+    if why in ("unset", "reap_only", "not_a_rail"):
+        assert resp.status_code == 202 and resp.json()["rail"] == "a2a", resp.text
+        return
+    assert resp.json() == {"handled_by": "reap"}
+    assert stubs.reap_routing[0]["dropped"]["a2a"] != "agent_run_condition_unmet"
+
+
+async def test_a_retry_of_an_open_token_rail_purchase_is_never_refused_by_the_run_condition(client, stubs, monkeypatch):
+    first = await client.post(BASE, body())
+    assert first.status_code == 202 and first.json()["rail"] == "a2a"
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert reads.calls == [] and stubs.reap == []
+
+
+async def test_the_token_rails_run_condition_is_read_by_the_host_the_request_names(client, stubs, monkeypatch):
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    reads = _RunConditionReads(monkeypatch)
+    resp = await client.post(BASE, body(merchant_domain="WWW." + SHOP.upper()))
+    assert resp.status_code == 202, resp.text
+    assert reads.calls == [("fact", "www." + SHOP), ("clear", "a2a", "www." + SHOP)]

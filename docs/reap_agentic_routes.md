@@ -317,7 +317,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 |---|---|---|---|
 | 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | show unavailable; preserve the selected route and original attempt |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session; do not switch routes |
-| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | show blocked; do not retry through cart-link |
+| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market**; or, while `PARTNER_AGENT_RUN_CONDITION_RAILS` names `reap`, the merchant does not meet ADR-030 D11's run condition (see below) | show blocked; do not retry through cart-link |
 | 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | show blocked; do not try another Reap lane |
 | 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | show unknown or unavailable; recover the exact original attempt before retrying |
 | 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | show blocked; resolve the refusal before any new purchase intent |
@@ -407,6 +407,22 @@ including a body that is not JSON, the wrong content-type, and `?limit=500`:
 > rail exists at all.
 
 ---
+
+### The run condition for Reap's checkout agent (ADR-030 D11, dark)
+
+`PARTNER_AGENT_RUN_CONDITION_RAILS` (unset: off) names the rails whose checkout agent must meet ADR-030
+D11's run condition. While it names `reap`, a NEW attempt on either lane is admitted only when the host
+it names has a fresh stored "publishes an agentic checkout protocol" fact (`db/merchant_agent_checkout_facts`,
+migration 294, written by the census run with `--store`; a positive counts for 30 days) and no open
+challenge or block recorded for the `reap` rail (`db/partner_agent_merchant_blocks`, migration 295,
+entered and cleared by an operator). Anything else, a missing or unreadable table included, is
+`409 merchant_not_eligible`, the lane's own answer; the cause is a WARNING log line
+(`agent_run_condition: not met ... cause=...`), never the body.
+
+It runs after the key lookup (a retry of an existing purchase is never refused by it), after the pilot
+scope, purchasability, an operator's disabled row and the lane's own eligibility, and before any catalog
+read on the cart-link lane and any buyer, click, key or purchase write. Create only: the resume door
+does not re-check it, and purchases already open are not re-checked.
 
 ## `GET /agent/v2/commerce/reap/purchases/{purchase_id}`
 

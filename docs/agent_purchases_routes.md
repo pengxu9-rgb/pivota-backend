@@ -371,7 +371,16 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
      goes to the Reap route.
    - **No choice**: the A2A rail when it may take the request (its dials, the agent's pilot
      membership, a cart link with no offer code, the (merchant, market) proven list, a cap for the
-     currency), else the Reap route, unchanged.
+     currency, and, while `PARTNER_AGENT_RUN_CONDITION_RAILS` names `a2a`, ADR-030 D11's run
+     condition), else the Reap route, unchanged.
+   - **The run condition (dark).** While `PARTNER_AGENT_RUN_CONDITION_RAILS` names `a2a`, a request
+     that passes every other A2A filter has two records read for the host it names: a fresh stored
+     "publishes an agentic checkout protocol" fact (`db/merchant_agent_checkout_facts`, migration 294)
+     and no open challenge or block on the A2A rail (`db/partner_agent_merchant_blocks`, migration 295).
+     Either one failing, or unreadable, drops the A2A rail with `agent_run_condition_unmet`: no choice
+     goes to Reap (which applies its own run condition when `reap` is listed), an `a2a` choice is the
+     404 above. Nothing is read for any other request, a replay included. The decision's rule set is
+     `env_v2` while it is on, `env_v1` otherwise.
    - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
      refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
      that reason. It is never retried on Reap: the router decides once, before anything is written.

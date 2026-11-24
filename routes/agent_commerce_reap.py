@@ -119,7 +119,7 @@ from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
-from services.payment_orchestration import purchase_consent
+from services.payment_orchestration import agent_run_condition, purchase_consent
 from services.text_normalization.display_text import clean_product_name
 from services.outbound_links_service import (
     build_shopify_cart_permalink,
@@ -766,6 +766,20 @@ async def _refuse_if_merchant_disabled(*, merchant_domain: str, market_country: 
         raise svc.PurchaseRefused(
             "merchant_disabled", "an eligibility row for this domain and market is disabled"
         )
+
+
+async def _refuse_unless_partner_agent_may_run(*, merchant_host: str, agent_id: str) -> None:
+    """ADR-030 D11's run condition for Reap's checkout agent, while PARTNER_AGENT_RUN_CONDITION_RAILS
+    names `reap` (services/payment_orchestration/agent_run_condition.py; off: nothing is read).
+
+    CALLED ON BOTH LANES right after that lane's own merchant eligibility, with the same answer:
+    `merchant_not_eligible`, never a code of its own (the cause is logged there). So it runs after the
+    replay lookup (a retry of an existing purchase is never refused by it), after the pilot list and the
+    merchant checks, before any catalog read on the cart-link lane, and before the buyer row, the click
+    and the purchase are written. Outside every transaction, as its two readers require. CREATE ONLY:
+    `_validate_resume_selection` does not call it."""
+    if not await agent_run_condition.agent_may_run("reap", merchant_host, agent_id=agent_id):
+        raise svc.PurchaseRefused("merchant_not_eligible", "the partner agent's run condition is not met")
 
 
 async def _eligibility(
@@ -3364,6 +3378,7 @@ async def start_reap_purchase(
                 merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            await _refuse_unless_partner_agent_may_run(merchant_host=merchant_host, agent_id=agent_id)
             if product_key is None:
                 # A NEW attempt: the `product_url` becomes OUR record's key; nothing downstream sees the URL.
                 product_key = await _resolved_product_key(None, product_url, market_country)
@@ -3394,6 +3409,7 @@ async def start_reap_purchase(
                 product_key=product_key,
                 variant_key=variant_key,
             )
+            await _refuse_unless_partner_agent_may_run(merchant_host=merchant_host, agent_id=agent_id)
             row = await _load_catalog_row(
                 merchant_domain=merchant_domain,
                 storefront_host=merchant_host,
