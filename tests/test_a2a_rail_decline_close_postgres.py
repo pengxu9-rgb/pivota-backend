@@ -112,3 +112,38 @@ async def test_the_close_refuses_while_the_audit_trigger_is_disabled():
     row = await ledger.get_decline_candidate(pid)
     assert (row["state"], row["last_error_code"]) == ("paying", worker.CHECKOUT_PAYMENT_REACHED_DECLINED)
     assert await _audit(pid) is None
+
+
+# ── the gate reads WHICH guard the trigger is, not only its name ─────────────────────────────────────
+
+
+async def _replace_trigger(function, events="UPDATE OR DELETE OR TRUNCATE"):
+    from db.database import database
+
+    await database.execute(f"DROP TRIGGER {_AUDIT_TRIGGER} ON a2a_rail_manual_resolution_audit")
+    await database.execute(f"CREATE TRIGGER {_AUDIT_TRIGGER} BEFORE {events} ON a2a_rail_manual_resolution_audit "
+                           f"FOR EACH STATEMENT EXECUTE FUNCTION {function}()")
+
+
+async def test_a_same_named_trigger_on_a_no_op_function_reads_not_ready():
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    await database.execute("CREATE OR REPLACE FUNCTION a2a_rail_test_audit_no_op() RETURNS trigger "
+                           "LANGUAGE plpgsql AS $fn$ BEGIN RETURN NULL; END $fn$")
+    try:
+        await _replace_trigger("a2a_rail_test_audit_no_op")
+        assert (await _tgenabled(), await ledger.manual_resolution_audit_ready()) == ("O", False)
+    finally:
+        await database.execute(f"DROP TRIGGER IF EXISTS {_AUDIT_TRIGGER} ON a2a_rail_manual_resolution_audit")
+        await database.execute("DROP FUNCTION IF EXISTS a2a_rail_test_audit_no_op()")
+
+
+@pytest.mark.parametrize("events", ["UPDATE", "UPDATE OR DELETE", "DELETE OR TRUNCATE"])
+async def test_the_append_only_function_on_fewer_events_reads_not_ready(events):
+    import db.a2a_rail_ledger as ledger
+
+    await _replace_trigger(ledger.MANUAL_RESOLUTION_AUDIT_FUNCTION, events)
+    assert not await ledger.manual_resolution_audit_ready()
+    await _replace_trigger(ledger.MANUAL_RESOLUTION_AUDIT_FUNCTION)  # 296's own shape
+    assert await ledger.manual_resolution_audit_ready()
