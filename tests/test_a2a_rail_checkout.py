@@ -2140,7 +2140,8 @@ def test_every_hold_code_is_classified_and_the_payment_reached_branch_writes_onl
 
 @pytest.mark.parametrize("code", sorted([
     "checkout_total_over_approved", "checkout_total_unverified", "checkout_order_id_card_shaped",
-    "checkout_payment_no_order", "checkout_payment_reached_unconfirmed", "checkout_answer_scrubbed"]))
+    "checkout_payment_no_order", "checkout_payment_reached_unconfirmed", "checkout_payment_reached_declined",
+    "checkout_answer_scrubbed"]))
 async def test_the_operator_never_marks_a_recorded_payment_not_charged(code):
     pid = await _placing()
     await database.execute("UPDATE a2a_rail_purchases SET last_error_code = :c, claimed_by = NULL WHERE id = :i",
@@ -3637,7 +3638,7 @@ async def test_resolve_held_shows_an_unbound_answers_safe_fields_labelled_and_st
     code_, preview, rail = await _preview_lookup(pid, _documented_result(task="ckout_B"))
     assert code_ == 3 and preview["outcome"] == "dry_run"
     assert preview["lookup"] == {
-        "ran": True, "found": True, "bound": False, "says_done": True,
+        "ran": True, "found": True, "bound": False, "says_done": True, "confirmed_decline": False,
         "label": "UNBOUND: this answer may belong to another purchase; not verified as ours",
         "fields": {"state": "completed", "result_status": "payment-reached", "total": "$51.49", "currency": "USD",
                    "task_id": "ckout_B"}}

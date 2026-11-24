@@ -137,8 +137,14 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                                        Luhn-valid 13..19 digit run or is exactly a TAVV cryptogram's
                                        shape (the card or the token echoed back): completed WITHOUT the
                                        reference (`checkout_order_reference_withheld`), never stored
-                             payment-reached, no order id  -> HELD `checkout_payment_no_order` (a charge may
-                                       exist: a failed purchase would invite the agent to buy again)
+                             payment-reached, success true, no order id -> HELD `checkout_payment_no_order` (a
+                                       charge may exist: a failed purchase would invite the agent to buy again)
+                             payment-reached, success EXACTLY false, no order id in the RAW answer (the key absent,
+                                       None or exactly "") -> HELD `checkout_payment_reached_declined`, the
+                                       measured decline; success missing, or any other order id value ->
+                                       `checkout_payment_reached_unconfirmed`. Both are payment-reached codes;
+                                       only the declined one can be closed, by a human with the provider's
+                                       written confirmation (jobs/a2a_rail_operator.py `close-declined`)
                              captcha-failed / form-error / pay-disabled with success false -> failed, the
                                        status as the code (nothing was submitted); with success true or
                                        missing: a contradiction, HELD (`checkout_result_unrecognised`)
@@ -1578,6 +1584,11 @@ CHECKOUT_CONFIRM_AMBIGUOUS_4XX = "checkout_confirm_ambiguous_4xx"
 #: know that speaks of payment or completion (`paid`, `payment_reached`, `completed`): a charge may exist.
 #: Held, as a payment-reached code.
 CHECKOUT_PAYMENT_REACHED_UNCONFIRMED = "checkout_payment_reached_unconfirmed"
+#: The measured decline: `payment-reached` with `success` EXACTLY false and no order id in the RAW answer
+#: (`_raw_order_id_absent`). Held, as a payment-reached code (resolve-held refuses it; the worker never looks
+#: it up). The ONLY code services/payment_orchestration/a2a_rail_decline_close.py may close, and only after the
+#: provider confirms the decline in writing.
+CHECKOUT_PAYMENT_REACHED_DECLINED = "checkout_payment_reached_declined"
 #: An answer that may come after the confirm echoed a card security code (a2a_rail.has_card_code: prose or a
 #: card string, scrubbed in the transport): the confirm's own answer, a poll, a result, or a LOOKUP. A lookup
 #: also runs on rows held as setup_unresolved / pending_check / paying_without_task, where the confirm may
@@ -1594,7 +1605,7 @@ _CHECKOUT_HOLD_CODES = frozenset({
     CHECKOUT_CONFIRM_CONFLICT, CHECKOUT_CONFIRM_AMBIGUOUS_4XX, CHECKOUT_CONFIRM_TEXT_ONLY,
     CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_SETUP_SUBMITTED, CHECKOUT_SETUP_UNRESOLVED,
     CHECKOUT_CONFIRM_PENDING_CHECK, CHECKOUT_CONFIRM_NOT_SENT, CHECKOUT_PAYING_WITHOUT_TASK,
-    CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
+    CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_PAYMENT_REACHED_DECLINED, CHECKOUT_ANSWER_SCRUBBED,
 })
 #: THE HOLD CODES WRITTEN AFTER THE PROVIDER REPORTED `payment-reached` (in `_checkout_result`), and
 #: `checkout_answer_scrubbed`, written on an answer that may come after the confirm (the confirm's answer, a
@@ -1608,7 +1619,8 @@ _CHECKOUT_HOLD_CODES = frozenset({
 #: the held-checkout lookup).
 _CHECKOUT_PAYMENT_REACHED_CODES = frozenset({
     CHECKOUT_TOTAL_OVER_APPROVED, CHECKOUT_TOTAL_UNVERIFIED, CHECKOUT_ORDER_ID_CARD_SHAPED,
-    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_ANSWER_SCRUBBED,
+    CHECKOUT_PAYMENT_NO_ORDER, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED, CHECKOUT_PAYMENT_REACHED_DECLINED,
+    CHECKOUT_ANSWER_SCRUBBED,
 })
 #: The holds a human may end as `operator_confirmed_not_charged`, after checking the provider's side: the
 #: outcome at the provider is unknown to us, and no payment was reported.
@@ -2293,6 +2305,43 @@ def _answer_says_done(data: Mapping[str, Any]) -> bool:
     return state not in _CHECKOUT_LIFECYCLE_DONE_STATES and _status_says_paid(state)
 
 
+def _raw_order_id_absent(data: Mapping[str, Any]) -> bool:
+    """True only when the RAW answer carries no order id: the `order_id` key is absent, or its value is None or
+    exactly the empty string. NOT the normalised order id (`_checkout_result` turns a float, a dict or a list
+    into ""): any other value, a whitespace string, "#", 0 or false included, may be an order and is not absent.
+    Shared by the decline split and `answer_is_confirmed_decline`, so the two can never disagree."""
+    if "order_id" not in data:
+        return True
+    value = data["order_id"]
+    return value is None or (type(value) is str and value == "")
+
+
+#: Result statuses that state a decline in words. A `declined` status never reaches `_checkout_result`'s
+#: payment-reached branch (it is unrecognised there); a bound lookup answer may carry one.
+_CONFIRMED_DECLINE_STATUSES = frozenset({"payment-reached", "declined", "payment_declined", "card_declined"})
+
+
+def answer_is_confirmed_decline(data: Mapping[str, Any], row: Optional[Mapping[str, Any]]) -> bool:
+    """Whether a checkout answer CONFIRMS a decline for THIS row, for the decline close's lookup
+    (a2a_rail_decline_close). Every condition must hold, else False:
+      * BOUND: its task_id equals the task the row recorded from its own confirm answer;
+      * `success` is exactly False;
+      * its result status is payment-reached or a decline word (`_CONFIRMED_DECLINE_STATUSES`);
+      * no order id in the raw answer (`_raw_order_id_absent`).
+    NOT `_answer_says_done`: that reads payment-reached as paid, so the measured decline always reads done.
+    A card-code echo is checked by the caller on the whole answer (a scrubbed answer is never a confirmation)."""
+    if not isinstance(data, Mapping) or row is None:
+        return False
+    recorded = row.get("checkout_task_id")
+    if not recorded or data.get("task_id") != recorded:
+        return False
+    if data.get("success") is not False:
+        return False
+    if _result_status(data) not in _CONFIRMED_DECLINE_STATUSES:
+        return False
+    return _raw_order_id_absent(data)
+
+
 async def _checkout_result(s: _Step, card: Any) -> str:
     """The merchant's answer, as the provider reports it. Only `payment-reached` with an order id completes.
     Fields this does not read (subtotal, shipping_fee, tax, errors, duration_ms, card_last4) are ignored and
@@ -2306,8 +2355,13 @@ async def _checkout_result(s: _Step, card: Any) -> str:
     # A store's order NAME is often its number with a leading "#": the number is what is kept.
     order_id = order_id[1:].strip() if order_id.startswith("#") else order_id
     if status == "payment-reached":
+        if data.get("success") is False and _raw_order_id_absent(data):
+            # The measured decline: payment reached, success EXACTLY false, no order id in the RAW answer. Still
+            # a payment-reached hold (a charge is not ruled out until the provider confirms it in writing).
+            return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_DECLINED)
         if data.get("success") is not True:
-            # Payment reached, but not reported a success: a charge may exist.
+            # Payment reached, but not reported a success (success missing, or an order id of any shape): a
+            # charge may exist.
             return await _checkout_hold(s, CHECKOUT_PAYMENT_REACHED_UNCONFIRMED)
         if not order_id:
             # The checkout reached the payment gateway but the merchant gave no order: a declined card
@@ -2434,7 +2488,9 @@ async def operator_lookup_preview(client: Any, row: Optional[Mapping[str, Any]])
     return {"ran": True, "found": True, "bound": bound,
             "label": CHECKOUT_LOOKUP_BOUND_LABEL if bound else CHECKOUT_LOOKUP_UNBOUND_LABEL, "fields": fields,
             # Bound or not: money may have moved for this purchase. resolve-held then never resolves it.
-            "says_done": _answer_says_done(card.data)}
+            "says_done": _answer_says_done(card.data),
+            # For close-declined only: the answer is BOUND and states the decline (answer_is_confirmed_decline).
+            "confirmed_decline": answer_is_confirmed_decline(card.data, row)}
 
 
 #: resolve-held's refusal when its own lookup (preview or --apply) reports a payment.
