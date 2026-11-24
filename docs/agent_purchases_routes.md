@@ -100,6 +100,13 @@ does not exist. Turning it on needs a restart.
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
   appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
   the offer is stateless (an HMAC, below).
+- With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
+  is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
+  checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
+  two display attributes, the card the checkout was created with. `network` is the partner's word or
+  `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
+  when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
+  field.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 
