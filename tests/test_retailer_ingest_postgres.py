@@ -560,3 +560,21 @@ async def test_a_refile_moves_a_handle_an_earlier_approval_excluded_and_back(db)
     with pytest.raises(ValueError, match="both re-filed and excluded"):
         await ledger.approve(job_id, approved_by="owner", exclude_handles=["a"], accepted_flags=[],
                              refile_handles=["A/"], db=db)
+
+
+async def test_hold_after_dry_run_is_not_scope_and_approvals_append_accepted_flags(db):
+    held_opts = {"vendors": ["Example Brand"], "hold_after_dry_run": True}
+    assert ledger.scope_key(DOMAIN, "HOLD", held_opts) == ledger.scope_key(DOMAIN, "HOLD", {"vendors": ["Example Brand"]})
+    job_id = await _enqueue(db, brand="HOLD", options=held_opts)
+    assert job_id and await _enqueue(db, brand="HOLD", options={"vendors": ["Example Brand"]}) is None  # exists
+    await ledger.transition(job_id, status="held", reason="1 blocking flag(s): review_requested", run_id=None, db=db)
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=[], accepted_flags=["review_requested"], db=db)
+    # the apply holds again on a row flag; a second approval APPENDS, never drops review_requested
+    await ledger.transition(job_id, status="held", reason="1 blocking flag(s): placed_by_lip_title", run_id=None, db=db)
+    assert await ledger.approve(job_id, approved_by="owner", exclude_handles=[],
+                                accepted_flags=["placed_by_lip_title:a-row"], db=db)
+    import json as _json
+    row = await db.fetch_one("SELECT status, options FROM retailer_ingest_jobs WHERE id=:id", {"id": job_id})
+    options = row["options"] if isinstance(row["options"], dict) else _json.loads(row["options"])
+    assert row["status"] == "apply_due" and options["hold_after_dry_run"] is True
+    assert options["accepted_flags"] == ["review_requested", "placed_by_lip_title:a-row"]

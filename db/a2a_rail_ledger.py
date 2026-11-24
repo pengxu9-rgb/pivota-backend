@@ -1649,6 +1649,10 @@ async def forget_orphan_token(purchase_id: str, payment_token_id: str) -> Option
 # times and the two attestations.
 MANUAL_RESOLUTION_AUDIT_TABLE = "a2a_rail_manual_resolution_audit"
 MANUAL_RESOLUTION_AUDIT_TRIGGER = "a2a_rail_manual_resolution_audit_immutable"
+MANUAL_RESOLUTION_AUDIT_FUNCTION = "prevent_a2a_rail_manual_resolution_audit_mutation"
+#: pg_trigger.tgtype event bits (TRIGGER_TYPE_DELETE 8 | UPDATE 16 | TRUNCATE 32): migration 296's trigger
+#: fires on all three, and the gate requires all three.
+_AUDIT_TRIGGER_EVENT_BITS = 8 | 16 | 32
 # NO STARTUP HEAL, ON PURPOSE. Production does not run db/migrations/ at boot, and migration 296 is applied
 # there once, as a gated one-off after its PR has merged: nothing in this module or db/schema_guard creates
 # the table, its function or its trigger, so a deploy never builds them ahead of that run. Until it has run,
@@ -1658,12 +1662,22 @@ MANUAL_RESOLUTION_AUDIT_TRIGGER = "a2a_rail_manual_resolution_audit_immutable"
 
 async def manual_resolution_audit_ready() -> bool:
     """The audit table exists AND carries its append-only trigger(s) (migration 296 on Postgres; the test
-    arm's own builder on SQLite). The close refuses otherwise."""
+    arm's own builder on SQLite). The close refuses otherwise.
+
+    On Postgres the trigger must also FIRE in an ordinary session: `tgenabled` 'O' (origin, the default) or
+    'A' (always). 'D' (ALTER TABLE ... DISABLE TRIGGER) and 'R' (replica-only) leave the audit row writable by
+    UPDATE/DELETE/TRUNCATE, so they read as not ready. It must also be migration 296's guard, not only its name:
+    it runs the append-only function and fires on UPDATE, DELETE and TRUNCATE. SQLite has no disabled
+    trigger: present = enforced."""
     if IS_POSTGRES:
         row = await database.fetch_one(
-            "SELECT to_regclass(:t) IS NOT NULL AS has_table, EXISTS (SELECT 1 FROM pg_trigger "
-            "WHERE tgrelid = to_regclass(:t) AND tgname = :g AND NOT tgisinternal) AS has_trigger",
-            {"t": MANUAL_RESOLUTION_AUDIT_TABLE, "g": MANUAL_RESOLUTION_AUDIT_TRIGGER})
+            "SELECT to_regclass(:t) IS NOT NULL AS has_table, EXISTS (SELECT 1 FROM pg_trigger t "
+            "JOIN pg_proc p ON p.oid = t.tgfoid "
+            "WHERE t.tgrelid = to_regclass(:t) AND t.tgname = :g AND NOT t.tgisinternal "
+            "AND t.tgenabled IN ('O', 'A') AND p.proname = :f "
+            "AND (CAST(t.tgtype AS INTEGER) & :events) = :events) AS has_trigger",
+            {"t": MANUAL_RESOLUTION_AUDIT_TABLE, "g": MANUAL_RESOLUTION_AUDIT_TRIGGER,
+             "f": MANUAL_RESOLUTION_AUDIT_FUNCTION, "events": _AUDIT_TRIGGER_EVENT_BITS})
         return bool(row and row["has_table"] and row["has_trigger"])
     names = {r["name"] for r in await database.fetch_all(
         "SELECT name FROM sqlite_master WHERE (type = 'table' AND name = :t) OR (type = 'trigger' AND tbl_name = :t)",

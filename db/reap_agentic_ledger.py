@@ -1371,6 +1371,56 @@ async def get_purchase_for_owner(
     return row if include_private else public_purchase_view(row)
 
 
+# THE CARD A BOUND CHECKOUT PAYS WITH, for the AgenPas buyer page ("Visa ending 4242"). Only the two
+# attributes migration 224 lets the enrollment table hold, and only for a purchase whose checkout EXISTS
+# and was dispatched under the journal (dispatch_tracking_version 1): `reap_continuation.begin_dispatch`
+# writes the enrollment it dispatches with onto the row (`enrollment_id=:enrollment_row`), atomically with
+# the journal's `started` event and BEFORE the create, and the create names exactly that enrollment
+# (`POST /agentic/checkouts`: quoteId, enrollmentId, presentation). So on such a row `enrollment_id` IS the
+# card the checkout is bound to. Before the checkout (resolving, needs_enrollment, quoting) no card is bound
+# yet, and a legacy row (no journal) cannot show which card its create used: neither has a card here. The
+# enrollment must be the same buyer's. Scoped like `get_purchase_for_owner` (agent AND agent user).
+_SELECT_PAYMENT_CARD_FOR_OWNER_SQL = """
+    SELECT e.card_network, e.card_last4
+      FROM reap_agentic_purchases p
+      JOIN reap_agentic_enrollments e
+        ON e.id = p.enrollment_id
+       AND e.buyer_ref = p.buyer_ref
+     WHERE p.id = :id
+       AND p.agent_id = :agent_id
+       AND p.agent_user_ref_hash = :agent_user_ref_hash
+       AND p.state IN ('awaiting_approval', 'processing', 'completed')
+       AND p.reap_checkout_id IS NOT NULL
+       AND p.checkout_dispatch_key IS NOT NULL
+       AND p.dispatch_tracking_version = 1
+"""
+
+#: A network name as the buyer may see it: the partner's own word (`VISA`), a letter first, nothing else.
+_CARD_NETWORK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,31}\Z")
+_CARD_LAST4_RE = re.compile(r"^[0-9]{4}\Z")
+
+
+async def get_payment_card_for_owner(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str
+) -> Optional[Dict[str, Any]]:
+    """`{"network": str | None, "last4": "4242"}` for the card the purchase's checkout is bound to, or None.
+
+    None when the purchase is not the owner's, has no bound checkout (see the statement above), is in any
+    other state, or its enrollment holds no four-digit last4. A network that is not a plain name is dropped
+    (`network: None`; the page then says "Card"). Writes nothing."""
+    row = await database.fetch_one(
+        _SELECT_PAYMENT_CARD_FOR_OWNER_SQL,
+        {"id": purchase_id, "agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash},
+    )
+    if row is None:
+        return None
+    last4 = str(row["card_last4"] or "").strip()
+    if not _CARD_LAST4_RE.match(last4):
+        return None
+    network = str(row["card_network"] or "").strip()
+    return {"network": network if _CARD_NETWORK_RE.match(network) else None, "last4": last4}
+
+
 async def list_purchases_for_owner(
     agent_id: str,
     agent_user_ref_hash: str,

@@ -515,3 +515,15 @@ async def test_approve_passes_refile_handles_to_the_ledger(fake):
     assert resp.status_code == 200, resp.text
     assert resp.json()["refile_handles"] == ["cream-duo-gift-set"]
     assert fake.refiles == ["cream-duo-gift-set"]
+
+
+async def test_approve_accepts_review_requested_raised_by_hold_after_dry_run(fake):
+    # the pipeline's flag shape (services.retailer_ingest.pipeline, options.hold_after_dry_run): acceptable
+    from services.retailer_ingest.pipeline import REVIEW_REQUESTED
+    fake.runs["rij_held"] = [{"id": "rir_held", "job_id": "rij_held", "stage": "dry_run", "outcome": "held",
+                              "flags": json.dumps([{"key": REVIEW_REQUESTED, "rule": REVIEW_REQUESTED,
+                                                    "severity": "block", "acceptable": True}])}]
+    resp = await _send(_app(), "POST", "/admin/retailer-ingest/jobs/rij_held/approve",
+                       {"accepted_flags": [REVIEW_REQUESTED]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "apply_due" and resp.json()["accepted_flags"] == [REVIEW_REQUESTED]

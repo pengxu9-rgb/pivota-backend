@@ -73,6 +73,13 @@ _OPTION_TYPES = {
     # has never gated on it, so a USD-base retailer that does not ship to the US would land as a US seller.
     # Opt-in, so no existing cohort changes: set it on the base crawl that precedes an SG capture.
     "require_ships_to_market": bool,
+    # A person asked to read this cohort's dry run before anything is written (2026-11-24: a multi-brand batch
+    # queued while a publish-step bug was open). Every _check of the job raises one ACCEPTABLE block flag,
+    # `review_requested`, so even a clean dry run is held through the ordinary held path (and the held alert),
+    # and the ordinary approve route releases it by accepting that key. The apply re-runs _check and raises the
+    # flag again: it passes only because approve APPENDED the key to accepted_flags. Not part of the cohort
+    # (db/retailer_ingest.scope_key), and a shopify_markets capture runs no _check, so it is refused there.
+    "hold_after_dry_run": bool,
     # Whose store this is: "retailer" (default) or "brand_official" (the brand's own storefront, the
     # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
     # the allowed values and the retailer_name rule; enqueue runs that same normalization.
@@ -185,6 +192,8 @@ WRITE_MARGIN_S = 900
 # must reach a human instead of retrying unseen forever.
 WRITE_LOCK_RETRY_OUTCOMES = ("write_lock_busy", "write_lock_unavailable")
 WRITE_LOCK_STARVED_AFTER = 12
+#: The flag options.hold_after_dry_run raises on every check of the job (an acceptable block flag).
+REVIEW_REQUESTED = "review_requested"
 # Integer options where 0 is meaningful ("fetch none"); every other integer option must be >= 1.
 _ZERO_ALLOWED_INT_OPTIONS = frozenset({"max_pdp_inci_fetches"})
 
@@ -217,6 +226,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     source = options.get("source") or "storefront"
     if source not in SOURCES:
         raise ValueError(f"options.source must be one of {list(SOURCES)}")
+    if options.get("hold_after_dry_run") and source == MARKETS_SOURCE:
+        raise ValueError("options.hold_after_dry_run is not supported for a shopify_markets capture: "
+                         "that stage runs no dry-run checks, so nothing would hold it")
     if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer"
                                        or source not in ("storefront", MARKETS_SOURCE)):
         # A brand's own store is one brand (its domain must prove it); a feed maps one retailer listing.
@@ -1056,6 +1068,11 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         if f.get("handle") and not f.get("brand"):
             f["brand"] = brand_of.get(f["handle"])
     flags.extend(row_flags)
+    if o.get("hold_after_dry_run"):
+        flags.append({"key": REVIEW_REQUESTED, "rule": REVIEW_REQUESTED, "severity": detectors.BLOCK,
+                      "acceptable": True,
+                      "detail": "options.hold_after_dry_run: a person reads this dry run before any write; "
+                                f"approve with accepted_flags [\"{REVIEW_REQUESTED}\"] to release it"})
     accepted = list(o.get("accepted_flags") or [])
     if o.get("accept_listing_collisions"):
         accepted += [f["key"] for f in flags if f.get("rule") == "same_key_other_listing"]
