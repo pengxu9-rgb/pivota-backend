@@ -64,7 +64,6 @@ async def _ensure_checkout_intents_table() -> None:
         """
         ALTER TABLE IF EXISTS checkout_intents
           ADD COLUMN IF NOT EXISTS agent_user_ref TEXT,
-          ADD COLUMN IF NOT EXISTS order_id TEXT,
           ADD COLUMN IF NOT EXISTS requested_scopes JSONB,
           ADD COLUMN IF NOT EXISTS linked_buyer_id TEXT,
           ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ,
@@ -76,7 +75,6 @@ async def _ensure_checkout_intents_table() -> None:
         await database.execute(statement)
     for index in (
         "CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer ON checkout_intents(agent_id, buyer_ref)",
-        "CREATE INDEX IF NOT EXISTS idx_checkout_intents_order_id ON checkout_intents(order_id)",
         "CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at ON checkout_intents(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used ON checkout_intents(expires_at, used_at)",
     ):
@@ -1029,13 +1027,15 @@ async def create_checkout_intent(
     )
 
     # Best-effort: store intent server-side (prefill never goes into URLs/tokens).
+    # The intent row has no order_id column: a bound order lives in the signed token
+    # (token_payload["order_id"] above) and nothing reads it from this row. Naming a
+    # column the Table lacks makes the insert fail to compile, and this swallows it.
     # If the table isn't migrated yet, we still return a usable checkout_url without prefill.
     try:
         await database.execute(
             checkout_intents.insert().values(
                 intent_id=intent_id,
                 agent_id=context.agent_id,
-                order_id=(str(req.order_id or "").strip() or None),
                 buyer_ref=buyer_ref,
                 agent_user_ref=agent_user_ref,
                 expires_at=expires_at_dt,
@@ -1057,7 +1057,6 @@ async def create_checkout_intent(
                 checkout_intents.insert().values(
                     intent_id=intent_id,
                     agent_id=context.agent_id,
-                    order_id=(str(req.order_id or "").strip() or None),
                     buyer_ref=buyer_ref,
                     agent_user_ref=agent_user_ref,
                     expires_at=expires_at_dt,
