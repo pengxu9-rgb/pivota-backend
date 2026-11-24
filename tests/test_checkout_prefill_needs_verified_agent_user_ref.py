@@ -25,7 +25,6 @@ from typing import Any, Dict, Optional
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
-from sqlalchemy import Column, MetaData, String, Table
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -113,16 +112,6 @@ def world(monkeypatch):
     import services.merchant_store_service as merchant_store_service
 
     w = _World()
-    # The module's Table has no `order_id` column although the intent insert names one, so that
-    # insert cannot compile and the route swallows it (a separate defect, not this one's). A copy
-    # with the column stands in, so the intent row exists here as it does wherever the insert lands.
-    table = Table(
-        "checkout_intents",
-        MetaData(),
-        *[c._copy() for c in intents.checkout_intents.columns],
-        Column("order_id", String(100), nullable=True),
-    )
-    monkeypatch.setattr(intents, "checkout_intents", table)
     monkeypatch.setattr(intents.database, "execute", w.execute)
     monkeypatch.setattr(intents.database, "fetch_one", w.fetch_one)
 
