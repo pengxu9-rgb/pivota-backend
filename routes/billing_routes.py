@@ -219,6 +219,14 @@ async def get_my_current_billing_period(
     if not merchant_id:
         raise HTTPException(status_code=400, detail="Authenticated merchant is missing merchant_id")
     snapshot = await monthly_brand_statements_service.current_period_usage_snapshot(merchant_id)
+    # The free link-check allowance, so the portal's credits panel can say how many free checks
+    # are left instead of "0 available". Best effort: a failed count leaves the key out.
+    try:
+        from routes.merchant_audit_routes import free_url_audit_allowance
+
+        snapshot = {**snapshot, "free_link_checks": await free_url_audit_allowance(merchant_id)}
+    except Exception as exc:  # noqa: BLE001 - never fail the credits snapshot on a display extra
+        logger.warning("free link-check allowance unavailable for current-period: %s", type(exc).__name__)
     return jsonable_encoder(snapshot, custom_encoder={Decimal: float})
 
 
