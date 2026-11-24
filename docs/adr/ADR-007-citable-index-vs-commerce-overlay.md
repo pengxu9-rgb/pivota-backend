@@ -3,24 +3,24 @@
 **Status:** **Accepted** (2026-06-24 — both founder questions resolved, see "Founder decisions" below; slices 1–3 merged to `main`) · adversarial review 2026-06-23 → GO-WITH-CHANGES, corrections folded into Action Items · **Date:** 2026-06-23 · **Scope:** `pivota-backend` index/serving pipeline + agent read surfaces · **Supersedes:** the offer-minting approach in the verify-to-serve spec (`pivota-merchants-portal#117`)
 **Deciders:** founder (positioning) + backend (index pipeline)
 **Part of:** the agent-protocol interoperability model — **ADR-014** (meta). ADR-007 is its **discovery / read-layer** instance: the single unified read surface across MCP / ACP / UCP / API-key agents (no protocol adds its own discovery endpoints).
-**Amended 2026-11-24 (amendment 1, proposed):** the citation index is one mode of the commerce catalog, serves only content Pivota may keep, and gets no new build until partner orders complete. Three questions are open. See "Amendment 1" below.
+**Amended 2026-11-24 (amendment 1, proposed):** the citation index is one mode of the commerce catalog, serves only content Pivota may keep, and gets no new build until partner orders complete. The owner answered its three questions on 2026-11-24. See "Amendment 1" below.
 
 ---
 
 ## Amendment 1 (2026-11-24): the citation index is a mode of the commerce catalog
 
-*Owner decision of 2026-11-24, to be confirmed by the owner when this amendment is merged. The three questions at the end are open.*
+*Owner decision of 2026-11-24, with the owner's answers of the same day to the three questions at the end, to be confirmed by the owner when this amendment is merged.*
 
 Under the owner's direction of 2026-11-24 (the scope document is still a draft), the frontend agent talks to the shopper and recommends products. Pivota supplies catalog access across store platforms, product identity, live price and stock, and the route to payment. This amendment says where the offer-free citation lane sits. It builds nothing and switches nothing on.
 
-1. **One catalog, two modes.** The citation lane is not a separate product. It reads the same products and the same identity records (ADR-010) as the commerce lane. An answer without an offer is a catalog answer with no seller attached. `transact_eligible` stays as decided below. `index_eligible` gains a condition on where content came from (question A). Founder decision 1 stands: offer-free citation stays a lasting surface. Item 2 narrows what that surface may serve.
+1. **One catalog, two modes.** The citation lane is not a separate product. It reads the same products and the same identity records (ADR-010) as the commerce lane. An answer without an offer is a catalog answer with no seller attached. `transact_eligible` stays as decided below. `index_eligible` gains a condition on where content came from (answer A). Founder decision 1 stands: offer-free citation stays a lasting surface. Item 2 narrows what that surface may serve.
 2. **Only content Pivota may keep.** An offer-free answer serves only content Pivota may store and pass on. The test is how the content was obtained:
    - content the brand supplied or authorised;
    - brand and affiliate feeds whose terms allow it;
-   - Pivota's own crawl, within the limits the owner sets for it (question C).
+   - Pivota's own crawl, which includes a store's public product pages and its public catalog files (answer C).
 
-   It never serves content read from a platform's catalog or from a store's endpoints, unless that platform agrees. A provider's terms for web-search grounding forbid storing its results, so such results are never stored or served on this lane.
-3. **Exclusions apply to sellers, not products.** Once ADR-033 (seller admission, proposed) is accepted, an excluded seller's offers, links and seller-attributed content are never served on either mode. A product whose only seller is excluded stays citable (ADR-033, the owner's answer to Q4), but only on content from another permitted source: content the brand supplied or authorised, or a feed. Where the excluded seller was the only source of the product's content, nothing is served (question B). A seller's admission tier is never shown.
+   It never serves content read from a platform's catalog, or from a store's other endpoints, unless that platform agrees. Answer C says only how crawled content is classed on this lane. Whether and how Pivota may read a store's pages at all is a separate owner question, and this amendment does not answer it. A provider's terms for web-search grounding forbid storing its results, so such results are never stored or served on this lane.
+3. **Exclusions apply to sellers, not products.** Once ADR-033 (seller admission, proposed) is accepted, an excluded seller's offers, links and seller-attributed content are never served on either mode. A product whose only seller is excluded stays citable (ADR-033, the owner's answer to Q4), but only on content from another permitted source: content the brand supplied or authorised, or a feed. Where the excluded seller was the only source of the product's content, nothing is served (answer B). A seller's admission tier is never shown.
 4. **No new build until partner orders complete.** These wait until orders placed through partner agents complete:
    - the rest of the external citation API contract's phases;
    - the MCP read door;
@@ -35,13 +35,13 @@ Under the owner's direction of 2026-11-24 (the scope document is still a draft),
    Whether each switch (`INDEX_ELIGIBLE_READ`, `INDEX_ELIGIBLE_RECALL`, `INDEX_ELIGIBLE_SITEMAP`) is on in production was not checked.
 5. **Not changed here.** Which callers are offer-gated: slice 3 already gates by surface (`strict_serving_mode`), not by app. Founder decision 2 names the first-party app; what that app becomes under the narrower scope is an open owner question. ADR-001 and ADR-002 are not amended by this amendment.
 
-**What is built against item 2.** Nothing. The `index_eligible` check (`services/index_pipeline_state_service.py`) has no condition on where content came from, and much of the stored content comes from Pivota's crawl of store pages and public store catalog files.
+**What is built against item 2.** Nothing. The `index_eligible` check (`services/index_pipeline_state_service.py`) has no condition on where content came from, so it cannot tell crawled or brand content from content read through a platform's catalog.
 
-**Open questions for the owner:**
+**Resolved questions (the owner, 2026-11-24):**
 
-- **A. A source condition before any switch-on.** Item 2 needs a new eligibility condition on how content was obtained. *Recommendation:* no offer-free surface is switched on or widened in production before that condition is built.
-- **B. ADR-033's keep-findable switch-on.** ADR-033 phase 1 turns on the offer-free lane for a product whose only seller is excluded. *Recommendation:* that switch-on is not new build and is exempt from item 4. It waits on A, and serves only content from another permitted source (item 3).
-- **C. What counts as Pivota's own crawl.** Pivota's crawl reads a store's public product pages and its public catalog files. Does either fall inside item 2's ban on content read from a store's endpoints? *Recommendation:* decide it with the owner's open question on reading store pages. Until then, both are treated as inside the ban on this lane.
+- **A. A source condition before any switch-on.** Item 2 needs a new eligibility condition on how content was obtained. **Answer:** no offer-free surface is switched on or widened in production before that condition is built.
+- **B. ADR-033's keep-findable switch-on.** ADR-033 phase 1 turns on the offer-free lane for a product whose only seller is excluded. **Answer:** that switch-on is not new build and is exempt from item 4. It waits on A, and serves only content from another permitted source (item 3).
+- **C. What counts as Pivota's own crawl.** Pivota's crawl reads a store's public product pages and its public catalog files. Does either fall inside item 2's ban on content read from a store's endpoints? **Answer:** no. Both count as Pivota's own crawl and may be served on this lane, once A's condition is built. The recommendation had been to treat both as inside the ban until the separate question on reading store pages is decided; the owner chose otherwise.
 
 ---
 

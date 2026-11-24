@@ -1,6 +1,6 @@
 # ADR-034: One written order for a product's offers, and the reasons returned with it
 
-**Status:** Proposed, 2026-11-24, revised twice the same day after review. It records three owner decisions of 2026-11-24 (see "Owner decisions"). Five questions are open (see the end). The order in D1 is written on the recommended answers; where an answer differs, D1 changes with it. Nothing here is built or switched on by this ADR.
+**Status:** Proposed, 2026-11-24, revised twice the same day after review. It records three owner decisions of 2026-11-24 (see "Owner decisions") and the owner's answers of 2026-11-24 to its five questions (see "Resolved questions"). Nothing here is built or switched on by this ADR.
 
 **Decision owner:** Founder. **Runtime owners:** the backend's `offers.resolve` code owner and the agent gateway's `get_offers` code owner, to be named at acceptance. Both are needed: the backend cuts the offer list before the gateway sees it, and the gateway reads merchants live after that cut.
 
@@ -10,7 +10,7 @@
 - **ADR-025 (proposed), Q4:** an owner decision of 2026-09-24. Whether Pivota can earn on a seller never moves it up or down, including as a tie-break.
 - **ADR-026 (accepted):**
   - for a buyer market, only offers in that market's currency, then a domestic storefront before a cross-border one, "then ranks as today" (Decision 5);
-  - cross-border offers are served, ranked below domestic ones and labelled (Resolved question 3);
+  - cross-border offers are served, ranked below domestic ones and labelled (ADR-026's Resolved question 3);
   - one retailer counts as one seller (Decision 4, item 5);
   - the registry keeps a per-market override for a domestic-only market.
 - **ADR-027 (proposed), Q6 and Q16:**
@@ -81,9 +81,9 @@ Under the owner's direction of 2026-11-24, the frontend agent talks to the shopp
 
 ## Decision
 
-### D1. One written order for a product's offers (contingent on questions 1 to 4)
+### D1. One written order for a product's offers
 
-One order governs both the list and the best offer, for `get_offers`. Whether `get_pdp`'s buy pick follows it is question 5. The order is applied twice, with the same rules:
+One order governs both the list and the best offer, for `get_offers`. From P2, `get_pdp`'s buy pick follows it too, so one product has one best offer on every tool (Resolved question 5). The order is applied twice, with the same rules:
 
 - **In the backend, before the cut to the limit,** so an offer the order puts first is not cut.
 - **In the gateway, after its live read and withholding,** over the offers it serves. The gateway's result is the answer. It assigns `rank`, and its facts are the ones D2 reports.
@@ -118,12 +118,12 @@ One order governs both the list and the best offer, for `get_offers`. Whether `g
 Notes on the rules:
 
 - **Rule 0** groups by match confidence. It does not prove the size. Size comparability is the best-offer filter's job where a resolved group exists.
-- **Rule 2** is on only in a market where ADR-028 Phase C has opened; until then it is skipped. When a product has a completable offer that passes the best-offer filter, a click-out offer is never its best offer. Click-outs stay in the list, after the completable offers, so the agent can see them (question 2).
+- **Rule 2** is on only in a market where ADR-028 Phase C has opened; until then it is skipped. When a product has a completable offer that passes the best-offer filter, a click-out offer is never its best offer. Click-outs stay in the list, after the completable offers, so the agent can see them (Resolved question 2).
 - **Rule 3** is skipped while offers carry no ships-from fact. A cross-border offer carries "ships from X; duties may apply".
 - **Rule 5** uses the served price. The verified effective price replaces it only on a lane where ADR-027 Q6's gate has opened, with the `savings.v1` ranking amendment in force and `DEAL_LANE_RANKING_ENABLED` on.
 - **Rule 6** uses a hash, not the id itself, because ids carry a lane prefix and sorting them would prefer one lane.
 
-The primary seller is not in the order (question 1).
+The primary seller is not in the order (Resolved question 1).
 
 **What never enters the order:**
 
@@ -230,6 +230,7 @@ When a fact-based product ranking is designed, it returns its reasons in the sam
   - A backend switch moves `offers.resolve` to D1, and a gateway switch moves the gateway's order and pick to D1.
   - The backend switch goes on first. Both repositories deploy separately, and the gateway never deploys on merge.
   - Rules 2 and 3 start as `skipped`. Rule 3 turns on once offers carry a ships-from fact, and rule 2 turns on per market at ADR-028 Phase C.
+  - `get_pdp`'s buy pick (`services/offer_buyability.py`) moves to D1 behind the same backend switch (Resolved question 5).
   - Version 0's facts make each change visible before and after.
 - **P3, the recommendation lane off every door** (D4). It is independent of P1 and P2.
 
@@ -242,26 +243,28 @@ When a fact-based product ranking is designed, it returns its reasons in the sam
 
 ## Alternatives considered
 
-- **Accept ADR-027 and ADR-028 in full.** Not taken. They also decide deal sources, code verification, program permissions, completion routes and card handling, and much of that has changed since through ADR-030 (proposed). Only their ordering rules are needed here (question 4).
+- **Accept ADR-027 and ADR-028 in full.** Not taken. They also decide deal sources, code verification, program permissions, completion routes and card handling, and much of that has changed since through ADR-030 (proposed). Only their ordering rules are needed here (Resolved question 4).
 - **Free-text reasons from a model.** Rejected: they cannot be checked, compared or versioned, and ADR-002 requires evidence and source.
 - **Let the agent send weights.** Rejected: the order is Pivota's recommendation. An agent that wants another order already has every fact it needs to apply its own.
 
-## Open questions for the owner
+## Resolved questions (the owner, 2026-11-24)
+
+*Owner answers of 2026-11-24, to be confirmed by the owner when this ADR is merged. Each one took the recommendation the question gave.*
 
 1. **The primary seller.**
    - Today it is the best-offer pick's second rule, above stock confidence and price. No ADR decides it, and it is not a fact about the buyer's outcome.
    - The product's primary merchant is often the brand's own store, so a `primary_seller` reason would stand in for ADR-033's `brand_own` tier.
    - It would also change when an exclusion removes the primary row, which would reveal the exclusion.
-   - *Recommendation:* drop it from the order and from the reasons. `is_primary` stays where it is emitted today; removing it is a separate question.
-2. **Click-outs when a completable offer exists.** ADR-028 D1 says click-out offers for such a product "are not recommended". *Recommendation:*
+   - **Answer:** it is dropped from the order and from the reasons. `is_primary` stays where it is emitted today; removing it is a separate question.
+2. **Click-outs when a completable offer exists.** ADR-028 D1 says click-out offers for such a product "are not recommended". **Answer:**
    - they are never the best offer while a completable offer passes the best-offer filter;
    - they stay in the list after the completable offers, with their reasons, so the agent sees every admitted seller.
 3. **Where availability and domestic sit.**
    - ADR-026 (accepted) puts domestic right after currency, "then ranks as today". Read literally, that is above availability.
    - ADR-028 D1 puts a completable offer above every click-out, and orders completable offers by price only.
-   - *Recommendation:* match, then available, then completable, then domestic, then stock, then price, as D1 writes it.
+   - **Answer:** match, then available, then completable, then domestic, then stock, then price, as D1 writes it.
      - An out-of-stock offer is never shown above an in-stock one, whether it is completable or domestic.
      - Domestic and stock still apply among completable offers.
-     - Accepting this amends ADR-026 Decision 5 and ADR-028 D1 on these points.
-4. **What acceptance binds.** *Recommendation:* accepting this ADR makes ADR-028 D1's serving rules and ADR-027 Q6 and Q16 binding for this order only, as D1 adapts them. The rest of ADR-027 and ADR-028 stays proposed.
-5. **`get_pdp`'s buy pick.** It is a third best-offer rule: the cheapest in-stock domestic offer. *Recommendation:* in P2 it follows D1, so one product has one best offer on every tool.
+     - Accepting this ADR amends ADR-026 Decision 5 and ADR-028 D1 on these points. Each gets a note pointing here when this ADR is accepted.
+4. **What acceptance binds.** **Answer:** accepting this ADR makes ADR-028 D1's serving rules and ADR-027 Q6 and Q16 binding for this order only, as D1 adapts them. The rest of ADR-027 and ADR-028 stays proposed.
+5. **`get_pdp`'s buy pick.** It is a third best-offer rule: the cheapest in-stock domestic offer. **Answer:** in P2 it follows D1, so one product has one best offer on every tool.
