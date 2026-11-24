@@ -27,8 +27,9 @@ kept on the listed events. It deletes nothing and rewrites nothing: the events s
 and one that was already cleared keeps its first clearance. Only the two bases D11 names are
 accepted. `--evidence` says where the evidence is kept (a ticket or a document reference), never
 the evidence itself: a query string, a link with a user name or password in it, a labelled
-credential and text shaped like a secret (a key's armour line included) are refused. A refusal names the part that failed (`part=evidence_query_string`, `part=by_missing`,
-`part=domain`, ...) and never repeats what was typed.
+credential and text shaped like a secret (a key's armour line included) are refused. A refusal
+names the part that failed (`part=evidence_query_string`, `part=by_missing`, `part=domain`, ...)
+and never repeats what was typed.
 
 BEFORE ANYTHING ELSE the tool checks that the table exists and answers. If it does not (migration
 295 has not been applied, or the database is unreachable) it prints
