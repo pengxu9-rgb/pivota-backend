@@ -350,7 +350,13 @@ rather than leaving that purchase out (a missing row would read as a purchase th
 
 Opens a purchase on the rail `services/payment_orchestration/router.py` picks. **Dark**: unless BOTH
 `PAYMENT_ORCHESTRATOR_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are on, every request answers
-404 `not_available`. Same authentication as the reads.
+404 `not_available`, with two exceptions decided after the key lookup (step 1 below): a same-key
+same-body retry of the caller's own purchase, on either rail, replays it with the answer it gets
+while the door is on, READ-ONLY (no consent, key or buyer write); and a changed body under the
+caller's own key is the 409 `idempotency_conflict` that names its purchase. Anything else (a new
+attempt, a malformed body, a missing end user or consent, another buyer's key, a refusal tombstone,
+a key whose purchase is not visible) is the same 404 `not_available`, so a dark door is no probe.
+Same authentication as the reads.
 
 **Body**: the Reap create body (docs/reap_agentic_routes.md, `item_source`, `merchant_domain`,
 `product_key`, `variant_key` (never the `<product_key>::canonical` placeholder: `409 row_variant_unverified`) or (cart link) `variant_id`, `quantity`, `buyer {email, shipping_address, consent_version}`,

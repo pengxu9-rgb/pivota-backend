@@ -1235,3 +1235,228 @@ async def test_removing_the_copy_after_the_rotation_is_a_503_and_only_remounting
     split = await client.post(BASE, body())
     assert split.status_code == 202 and split.json()["purchase_id"] not in (pre_pid, post_pid)
     assert await _count("a2a_rail_purchases") == 3 and len(stubs.clicks) == 3
+
+
+# ── a retry while the door is dark ───────────────────────────────────────────────────────────
+# The door's own dials (the orchestrator and the ledger) are read first and answered AFTER the key
+# lookup. A same-key same-body retry of the caller's own purchase replays it, read-only, with the
+# answer it gets while the door is on; a changed body under the caller's own key is the same 409 that
+# names it. Everything else is the dark door's one 404, so a dark door is still no probe.
+
+#: The REAL Reap create, captured at import, before the autouse `stubs` fixture swaps the door's
+#: hand-off for a recorder: a Reap replay with the door on is answered by it.
+_REAL_REAP_CREATE = reap_routes.start_reap_purchase
+_REAP_CREATE_PATH = "/agent/v2/commerce/reap/purchases"
+
+
+def _wire(resp) -> tuple:
+    """What a caller can tell apart: the status and the body, less the per-request envelope metadata."""
+    out = resp.json()
+    if isinstance(out, dict):
+        out.pop("metadata", None)
+    return resp.status_code, out
+
+
+def _assert_dark(resp) -> None:
+    """The dark door's one answer (`_dark()`, through the app's error envelope), and nothing more."""
+    status, out = _wire(resp)
+    assert status == 404, resp.text
+    assert set(out) == {"status", "error", "detail"} and out["detail"] == {"error": "not_available"}, resp.text
+    assert (out["error"]["code"], out["error"]["message"], out["error"]["details"]) == (
+        "PRODUCT_NOT_FOUND", "not_available", {"error": "not_available"}), resp.text
+
+
+def _door_dark(monkeypatch, dial: str) -> None:
+    monkeypatch.delenv(
+        rail_router.PAYMENT_ORCHESTRATOR_ENABLED_ENV if dial == "orchestrator" else purchases.AGENT_PURCHASE_LEDGER_ENABLED_ENV)
+
+
+async def _every_row() -> Dict[str, Any]:
+    """Every row of every table a create, a replay or a consent write could touch."""
+    tables = _TABLES + ("reap_agentic_purchases",)
+    return {t: sorted((sorted(dict(r).items()) for r in await database.fetch_all(f"SELECT * FROM {t}")), key=repr)
+            for t in tables}
+
+
+def _body_hash(b: Dict[str, Any]) -> str:
+    """The door's fingerprint of `b` (the Reap route's, byte for byte)."""
+    req = unified_routes.CreatePurchaseRequest.model_validate(b)
+    return reap_routes._request_hash(
+        merchant_domain=SHOP, product_key="pk_1", variant_key=None, quantity=int(req.quantity), email=EMAIL,
+        shipping_address=reap_routes._buyer_address_for_client(req.buyer), return_url=reap_routes._default_return_url(),
+        item_source="cart_link", expected_unit_price_minor=req.expected_unit_price_minor,
+        expected_currency=req.expected_currency)
+
+
+def _money_less(b: Dict[str, Any]) -> Dict[str, Any]:
+    b.pop("expected_unit_price_minor"), b.pop("expected_currency")
+    return b
+
+
+async def _open_on(rail: str, client, monkeypatch) -> str:
+    """Open the caller's purchase under `body()`'s key on `rail`, with the door on; returns its id."""
+    if rail == "a2a":
+        opened = await client.post(BASE, body())
+    else:
+        for name, value in (("REAP_AGENTIC_ENABLED", "1"), ("REAP_AGENTIC_CREATE_ENABLED", "1"),
+                            ("REAP_AGENTIC_CART_LINK_ENABLED", "1"), ("REAP_AGENTIC_PILOT_SCOPE", "unrestricted"),
+                            ("REAP_API_BASE_URL", "https://reap.test"), ("REAP_API_KEY", "reap_test_key")):
+            monkeypatch.setenv(name, value)
+        await database.execute(
+            "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+            "VALUES ('buyer_dark', 'bref_dark', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+        async def _buyer(**kwargs):
+            return "buyer_dark"
+
+        async def _bref(buyer_id, **kwargs):
+            return "bref_dark"
+
+        async def _click(click):
+            return None
+
+        monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+        monkeypatch.setattr(reap_routes, "_linked_buyer_id", _buyer)  # a replay's read of the same buyer
+        monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+        monkeypatch.setattr(reap_routes, "issue_click", _click)
+        # The door hands a Reap key to the REAL Reap route, which replays it while the door is on.
+        monkeypatch.setattr(reap_routes, "start_reap_purchase", _REAL_REAP_CREATE)
+        opened = await client.post(_REAP_CREATE_PATH, body())
+    assert opened.status_code == 202, opened.text
+    pid = opened.json()["purchase_id"]
+    assert pid.startswith("ap_" if rail == "a2a" else "rp_")
+    return pid
+
+
+async def _post_raw(content: bytes):
+    transport = httpx.ASGITransport(app=app)
+    async with _REAL_ASYNC_CLIENT(transport=transport, base_url="http://test") as http:
+        return await http.post(BASE, content=content, headers={"content-type": "application/json"})
+
+
+@pytest.mark.parametrize("dial", ["orchestrator", "ledger"])
+@pytest.mark.parametrize("rail", ["a2a", "reap"])
+@pytest.mark.parametrize("money", ["shown", "money_less_legacy"])
+async def test_a_retry_while_the_door_is_dark_replays_the_callers_purchase_and_writes_nothing(
+        client, stubs, monkeypatch, dial, rail, money):
+    pid = await _open_on(rail, client, monkeypatch)
+    retry = body()
+    if money == "money_less_legacy":
+        # A key opened before the money pair was required: its fingerprint is the money-less one.
+        retry = _money_less(retry)
+        await database.execute("UPDATE reap_agentic_purchase_keys SET request_hash = :r WHERE purchase_id = :p",
+                               {"r": _body_hash(retry), "p": pid})
+    normal = await client.post(BASE, retry)
+    assert normal.status_code == 202 and normal.json()["purchase_id"] == pid, normal.text
+    seen = (len(stubs.catalog), len(stubs.clicks), len(stubs.reap))
+    before = await _every_row()
+
+    _door_dark(monkeypatch, dial)
+    resp = await client.post(BASE, retry)
+
+    assert resp.status_code == 202, resp.text
+    assert _wire(resp) == _wire(normal), "the answer a retry gets with the door on"
+    assert await _every_row() == before
+    assert (len(stubs.catalog), len(stubs.clicks), len(stubs.reap)) == seen
+
+
+@pytest.mark.parametrize("dial", ["orchestrator", "ledger"])
+@pytest.mark.parametrize("reap", ["on", "create_off", "rail_off"])
+async def test_a_reap_retry_while_the_door_is_dark_records_no_consent_whatever_reaps_dials(
+        client, stubs, monkeypatch, dial, reap):
+    """With the door on, a Reap replay rewrites the buyer's consent tag. Dark, it is a read: a newer
+    consent version under the same key and fingerprint replays, and the tag is not touched."""
+    pid = await _open_on("reap", client, monkeypatch)
+    normal = await client.post(BASE, body())
+    assert normal.status_code == 202 and normal.json()["purchase_id"] == pid, normal.text
+    if reap == "create_off":
+        monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    elif reap == "rail_off":
+        monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    before = await _every_row()
+
+    _door_dark(monkeypatch, dial)
+    retry = body()
+    retry["buyer"]["consent_version"] = "terms-2026-11"
+    resp = await client.post(BASE, retry)
+
+    assert resp.status_code == 202 and _wire(resp) == _wire(normal), resp.text
+    assert await _every_row() == before
+    tag = await database.fetch_one("SELECT consent_version FROM reap_agentic_buyer_refs WHERE buyer_id = 'buyer_dark'")
+    assert tag["consent_version"] == "terms-2026-10"
+
+
+@pytest.mark.parametrize("dial", ["orchestrator", "ledger"])
+@pytest.mark.parametrize("rail", ["a2a", "reap"])
+async def test_a_changed_body_under_the_callers_key_while_the_door_is_dark_is_the_conflict_naming_it(
+        client, stubs, monkeypatch, dial, rail):
+    pid = await _open_on(rail, client, monkeypatch)
+    normal = await client.post(BASE, body(quantity=2))
+    assert normal.status_code == 409 and normal.json()["detail"] == {
+        "error": "idempotency_conflict", "purchase_id": pid, "rail": rail}, normal.text
+    before = await _every_row()
+
+    _door_dark(monkeypatch, dial)
+    resp = await client.post(BASE, body(quantity=2))
+
+    assert _wire(resp) == _wire(normal), resp.text
+    assert await _every_row() == before
+
+
+_DARK_CASES = [
+    "new_key", "new_key_explicit_rail", "money_less_new_key", "other_buyer_same_body", "other_buyer_changed_body",
+    "not_json", "not_an_object", "invalid_body", "no_end_user", "no_consent", "tombstone_same_body",
+    "tombstone_changed_body", "retirement_marker", "key_without_a_visible_purchase",
+]
+
+
+@pytest.mark.parametrize("dial", ["orchestrator", "ledger"])
+@pytest.mark.parametrize("rail", ["a2a", "reap"])
+@pytest.mark.parametrize("case", _DARK_CASES)
+async def test_anything_but_the_callers_own_replay_or_conflict_is_the_dark_404_while_the_door_is_dark(
+        client, stubs, monkeypatch, dial, rail, case):
+    pid = await _open_on(rail, client, monkeypatch)
+    owner = hash_agent_user_ref(USER_REF)
+    b: Any = body()
+    if case == "new_key":
+        b = body(idempotency_key="key-new")
+    elif case == "new_key_explicit_rail":
+        b = body(idempotency_key="key-new", payment_preference={"rail": rail})
+    elif case == "money_less_new_key":
+        b = _money_less(body(idempotency_key="key-new"))
+    elif case in ("other_buyer_same_body", "other_buyer_changed_body"):
+        # Another end user's key with the same name: never this caller's purchase.
+        CALLER.agent_user_ref = "user-grace"
+        b = body() if case == "other_buyer_same_body" else body(quantity=2)
+    elif case == "invalid_body":
+        b = body(quantity=0)
+    elif case == "no_end_user":
+        CALLER.agent_user_ref = None
+    elif case == "no_consent":
+        b["buyer"].pop("consent_version")
+    elif case in ("tombstone_same_body", "tombstone_changed_body", "retirement_marker"):
+        marker = "refused:attempt_retired:" + "a" * 32 if case == "retirement_marker" else "refused:merchant_not_eligible"
+        await database.execute(
+            "UPDATE reap_agentic_purchase_keys SET purchase_id = :m WHERE purchase_id = :p", {"m": marker, "p": pid})
+        if case == "tombstone_changed_body":
+            b = body(quantity=2)
+    elif case == "key_without_a_visible_purchase":
+        await database.execute(
+            "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, idempotency_key, purchase_id, "
+            "request_hash) VALUES (:a, :h, 'key-ghost', :g, :r)",
+            {"a": AGENT, "h": owner, "g": ("ap_" if rail == "a2a" else "rp_") + "f" * 24, "r": _body_hash(body())})
+        b = body(idempotency_key="key-ghost")
+    seen = (len(stubs.catalog), len(stubs.clicks), len(stubs.reap))
+    before = await _every_row()
+
+    _door_dark(monkeypatch, dial)
+    if case == "not_json":
+        resp = await _post_raw(b"{not json")
+    elif case == "not_an_object":
+        resp = await _post_raw(b"[1]")
+    else:
+        resp = await client.post(BASE, b)
+
+    _assert_dark(resp)
+    assert await _every_row() == before
+    assert (len(stubs.catalog), len(stubs.clicks), len(stubs.reap)) == seen
