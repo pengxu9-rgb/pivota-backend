@@ -5280,6 +5280,25 @@ async def test_a_retry_of_an_open_purchase_is_never_refused_by_the_run_condition
     assert reads.calls == []
 
 
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_the_resume_door_is_never_refused_by_the_run_condition(client, monkeypatch, lane):
+    """Owner, 2026-11-24, "create only": a purchase opened before the filter went on (or before its
+    merchant stopped meeting the condition) resumes, and the resume reads neither record."""
+    request = await _seed_lane(lane, monkeypatch)
+    created = await client.post(f"{BASE}/purchases", json=request)
+    assert created.status_code == 202, created.text
+    pid = created.json()["purchase_id"]
+    aged = "clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')"
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={aged} WHERE id=:id", {"id": pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap,a2a")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    resumed = await client.post(f"{BASE}/purchases/{pid}/resume", json=request)
+    assert resumed.status_code == 200, resumed.text
+    assert (await ledger.get_purchase_internal(pid))["contact_revision"] == 1
+    assert reads.calls == []
+
+
 async def test_the_run_condition_is_read_by_the_host_the_request_names(client, monkeypatch):
     """The census stores its fact under the host it was given; both readers fold it themselves."""
     await _seed_catalog()

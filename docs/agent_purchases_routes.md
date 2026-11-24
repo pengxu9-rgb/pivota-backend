@@ -380,7 +380,13 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
      Either one failing, or unreadable, drops the A2A rail with `agent_run_condition_unmet`: no choice
      goes to Reap (which applies its own run condition when `reap` is listed), an `a2a` choice is the
      404 above. Nothing is read for any other request, a replay included. The decision's rule set is
-     `env_v2` while it is on, `env_v1` otherwise.
+     `env_v2` while it is on, `env_v1` otherwise. Because the router answers before the A2A create
+     runs, an `a2a` choice for a merchant that is both switched off and failing the run condition
+     answers that 404 (`not_available_on_this_rail`), not `merchant_disabled`.
+     Each read is bounded at 2 s, and the two run one after the other. With both rails listed and
+     every read timing out, a request that goes to Reap can wait about 8 s longer: up to 4 s here and
+     up to 4 s in Reap's own filter. A setting with an entry that is not a rail name (`reap;a2a`,
+     `a2a-rail`) enforces only the names it does spell right, and logs one WARNING per value.
    - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
      refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
      that reason. It is never retried on Reap: the router decides once, before anything is written.

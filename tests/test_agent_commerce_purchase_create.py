@@ -1250,3 +1250,59 @@ async def test_the_token_rails_run_condition_is_read_by_the_host_the_request_nam
     resp = await client.post(BASE, body(merchant_domain="WWW." + SHOP.upper()))
     assert resp.status_code == 202, resp.text
     assert reads.calls == [("fact", "www." + SHOP), ("clear", "a2a", "www." + SHOP)]
+
+
+#: The REAL Reap create, taken before the `stubs` fixture replaces it, for the cases that follow a request
+#: through both rails' filters.
+_REAL_START_REAP = reap_routes.start_reap_purchase
+
+
+@pytest.mark.parametrize("unmet", ["no_fact", "open_block"])
+async def test_with_both_rails_listed_a_merchant_failing_both_is_reaps_409(
+        client, stubs, reap_door_open, monkeypatch, unmet):
+    """No choice: the token rail is dropped, the request goes to Reap, and Reap's own filter refuses it
+    with the lane's existing code. Both rails ask about the same host; nothing is written."""
+    monkeypatch.setattr(reap_routes, "start_reap_purchase", _REAL_START_REAP)
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "reap,a2a")
+    reads = _RunConditionReads(monkeypatch, fact=unmet != "no_fact", clear=unmet != "open_block")
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 409 and "merchant_not_eligible" in resp.text, resp.text
+    for word in ("fact", "block", "protocol", "run_condition"):
+        assert word not in resp.text
+    per_rail = {"no_fact": lambda rail: [("fact", SHOP)],
+                "open_block": lambda rail: [("fact", SHOP), ("clear", rail, SHOP)]}[unmet]
+    assert reads.calls == per_rail("a2a") + per_rail("reap")
+    assert stubs.catalog == [] and await _count("reap_agentic_purchases") == 0
+    await _nothing_written()
+
+
+async def test_with_both_rails_listed_a_retry_of_an_open_reap_purchase_reads_nothing(
+        client, stubs, reap_door_open, monkeypatch):
+    """Create only, through the rail-neutral door: an rp_ key is replayed by the Reap route before either
+    rail's filter could read."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_replay', 'bref_replay', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_replay"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_replay"
+
+    async def _click(click):
+        return None
+
+    # The buyer identity is the Reap route's own business (its tests own the minting and the link read).
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_linked_buyer_id", _buyer)
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    monkeypatch.setattr(reap_routes, "start_reap_purchase", _REAL_START_REAP)
+    opened = await client.post("/agent/v2/commerce/reap/purchases", body())
+    assert opened.status_code == 202 and opened.json()["purchase_id"].startswith("rp_"), opened.text
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "reap,a2a")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == opened.json()["purchase_id"], again.text
+    assert reads.calls == [] and await _count("a2a_rail_purchases") == 0
