@@ -403,3 +403,108 @@ def test_main_registers_the_read_through_mount_only():
     source = (Path(__file__).resolve().parents[1] / "main.py").read_text("utf-8")
     assert "agent_internal_commerce_purchases.mount(app)" in source
     assert "agent_internal_commerce_purchases_router" not in source
+
+
+# ── the card on the page (AGENPAS_PAYMENT_CARD_ENABLED) ──────────────────────────────────────────
+
+
+async def _card(*, buyer_ref: str = "bref_pat", network: Optional[str] = "VISA", last4: Optional[str] = "4242",
+                reap_id: str = "enr_card_1") -> str:
+    pending = await reap_ledger.upsert_pending_enrollment(buyer_ref=buyer_ref, agent_id=AGENT)
+    active = await reap_ledger.mark_enrollment_active(
+        pending["id"], reap_enrollment_id=reap_id, card_network=network, card_last4=last4)
+    assert active is not None
+    return active["id"]
+
+
+#: The columns a checkout dispatched under the journal leaves on the row (db/reap_continuation.begin_dispatch).
+def _bound(enrollment_id: str, **extra: Any) -> dict:
+    return {"enrollment_id": enrollment_id, "reap_checkout_id": "chk_card_1", "checkout_dispatch_key": "k" * 64,
+            "dispatch_tracking_version": 1, **extra}
+
+
+async def test_with_the_card_dial_off_the_body_has_no_card_and_equals_the_public_body(monkeypatch):
+    monkeypatch.delenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, raising=False)
+    rail_id = await _reap(state="awaiting_approval", **_bound(await _card()))
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    public = await _public(f"{PUBLIC}/{rail_id}")
+    assert internal.status_code == 200 and "payment_card" not in internal.json()
+    assert internal.json() == public.json()
+
+
+@pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
+async def test_with_the_card_dial_on_a_bound_checkout_shows_its_enrollments_card(monkeypatch, state):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state=state, **_bound(await _card()))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["payment_card"] == {"network": "VISA", "last4": "4242"}
+    # Only the page's read carries it: never the public route (nor, by the same builder, the webhooks).
+    assert "payment_card" not in (await _public(f"{PUBLIC}/{rail_id}")).json()
+
+
+@pytest.mark.parametrize("state", ["resolving", "needs_enrollment", "quoting", "failed", "refused", "expired"])
+async def test_no_card_before_the_checkout_is_bound_or_on_a_row_that_ended_without_one(monkeypatch, state):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state=state, **_bound(await _card()))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and "payment_card" not in answer.json()
+
+
+@pytest.mark.parametrize("missing", ["reap_checkout_id", "checkout_dispatch_key", "dispatch_tracking_version"])
+async def test_no_card_without_a_checkout_dispatched_under_the_journal(monkeypatch, missing):
+    """A legacy row (no journal) cannot show which enrollment its create used; a row with no checkout has none."""
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state="awaiting_approval", **_bound(await _card(), **{missing: None}))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and "payment_card" not in answer.json()
+
+
+async def test_a_newer_card_of_the_same_buyer_is_not_the_card_the_checkout_was_bound_to(monkeypatch):
+    """The buyer adds another card after the checkout was created: the page still names the bound one."""
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    bound = await _card(network="VISA", last4="4242", reap_id="enr_card_old")
+    rail_id = await _reap(state="awaiting_approval", **_bound(bound))
+    await _card(network="MASTERCARD", last4="5454", reap_id="enr_card_new")
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.json()["payment_card"] == {"network": "VISA", "last4": "4242"}
+
+
+async def test_another_buyers_enrollment_is_never_shown(monkeypatch):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state="awaiting_approval", **_bound(await _card(buyer_ref="bref_someone_else")))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and "payment_card" not in answer.json()
+
+
+@pytest.mark.parametrize("network, last4, expected", [
+    (None, "4242", {"network": None, "last4": "4242"}),
+    ("VISA<script>", "4242", {"network": None, "last4": "4242"}),
+    ("American Express", "0005", {"network": "American Express", "last4": "0005"}),
+    ("VISA", None, None),
+])
+async def test_the_card_is_only_a_plain_network_name_and_exactly_four_digits(monkeypatch, network, last4, expected):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state="awaiting_approval", **_bound(await _card(network=network, last4=last4)))
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and answer.json().get("payment_card") == expected
+
+
+async def test_a_card_read_fault_drops_the_card_never_the_body(monkeypatch):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _reap(state="awaiting_approval", **_bound(await _card()))
+
+    async def _broken(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(reap_ledger, "get_payment_card_for_owner", _broken)
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and answer.json()["state"] == "awaiting_buyer_authorization"
+    assert "payment_card" not in answer.json()
+
+
+async def test_an_a2a_purchase_never_carries_a_card(monkeypatch):
+    monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    rail_id = await _a2a()
+    answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert answer.status_code == 200 and "payment_card" not in answer.json()
