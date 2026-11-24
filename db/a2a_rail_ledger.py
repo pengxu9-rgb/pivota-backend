@@ -243,6 +243,12 @@ _ADD_CEILING_SOURCE_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
 )
 _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_source VARCHAR(32)"
+# Migration 290: how many times a held checkout was looked up, counted BEFORE each lookup goes out
+# (`count_checkout_lookup_as_holder`), so a crash mid-lookup still counts. Nullable, no default, like 287.
+_ADD_CHECKOUT_LOOKUPS_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
+)
+_ADD_CHECKOUT_LOOKUPS_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN checkout_lookups INTEGER"
 #: Both checkout columns in ONE guarded ALTER on Postgres (the DDL of 287 and 288, as one statement): they
 #: land together or not at all, so a boot that times out never leaves one without the other. The worker
 #: also refuses the checkout path on a row read without either (`a2a_rail_worker._checkout_schema_ready`):
@@ -250,18 +256,20 @@ _ADD_CEILING_SOURCE_SQLITE = "ALTER TABLE a2a_rail_purchases ADD COLUMN ceiling_
 _HEAL_CHECKOUT_COLUMNS_PG = (
     "ALTER TABLE IF EXISTS a2a_rail_purchases"
     " ADD COLUMN IF NOT EXISTS checkout_task_id VARCHAR(128),"
-    " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32)"
+    " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32),"
+    " ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
 )
 #: (column, SQLite heal), in migration order.
 _HEALED_COLUMNS_SQLITE = (
     ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
     ("ceiling_source", _ADD_CEILING_SOURCE_SQLITE),
+    ("checkout_lookups", _ADD_CHECKOUT_LOOKUPS_SQLITE),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287 and 288. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268, 278, 287, 288 and 290. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -829,6 +837,57 @@ async def record_checkout_task_as_holder(
     return _purchase(await database.fetch_one(_RECORD_CHECKOUT_TASK_SQL_SQLITE, values))
 
 
+# A held checkout's lookups, counted WRITE-AHEAD (before the read goes out), so a step that crashes in the
+# middle of one still counts it: at most `max_tries` per row, ever. Fenced on the holder and `paying`.
+_COUNT_CHECKOUT_LOOKUP_SQL = """
+    UPDATE a2a_rail_purchases
+       SET checkout_lookups = COALESCE(checkout_lookups, 0) + 1,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'paying'
+       AND claimed_by = :holder
+       AND COALESCE(checkout_lookups, 0) < :max_tries
+    RETURNING *
+"""
+_COUNT_CHECKOUT_LOOKUP_SQL_SQLITE = _COUNT_CHECKOUT_LOOKUP_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def count_checkout_lookup_as_holder(purchase_id: str, worker_id: str, *, max_tries: int) -> Optional[Dict[str, Any]]:
+    """Count one lookup of a held checkout before it is sent. None when the cap is reached, or the row is not
+    this worker's `paying` row: then no lookup may go out."""
+    if isinstance(max_tries, bool) or not isinstance(max_tries, int) or not 1 <= max_tries <= 50:
+        raise ValueError("max_tries must be in 1..50")
+    values = {"id": _require(_ID_RE, purchase_id, "purchase_id"),
+              "holder": _require(_WORKER_RE, worker_id, "worker_id"), "max_tries": max_tries}
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_COUNT_CHECKOUT_LOOKUP_SQL, values))
+    return _purchase(await database.fetch_one(_COUNT_CHECKOUT_LOOKUP_SQL_SQLITE, values))
+
+
+# A task id an answer AFTER the confirm named, noted on a row held for that answer (its card code was
+# scrubbed): recorded so a human has the task to look up, WITHOUT resolving the confirm's pending write.
+_NOTE_CHECKOUT_TASK_SQL = """
+    UPDATE a2a_rail_purchases
+       SET checkout_task_id = :checkout_task_id, updated_at = clock_timestamp()
+     WHERE id = :id AND state = 'paying' AND claimed_by = :holder AND checkout_task_id IS NULL
+    RETURNING *
+"""
+_NOTE_CHECKOUT_TASK_SQL_SQLITE = _NOTE_CHECKOUT_TASK_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def note_checkout_task_as_holder(purchase_id: str, worker_id: str, *, checkout_task_id: str) -> Optional[Dict[str, Any]]:
+    """Record the task id on a `paying` row this worker holds that has none, leaving any pending write. None
+    otherwise. Malformed values raise before any SQL."""
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "checkout_task_id": _rail_ref(_require(_RAIL_REF_RE, checkout_task_id, "checkout_task_id"), "checkout_task_id"),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_NOTE_CHECKOUT_TASK_SQL, values))
+    return _purchase(await database.fetch_one(_NOTE_CHECKOUT_TASK_SQL_SQLITE, values))
+
+
 # ── the operator's resolution of a HELD checkout ─────────────────────────────────────────────
 #
 # A checkout the worker HELD (a code in a2a_rail_worker._CHECKOUT_HOLD_CODES) stays in `paying` for good:
@@ -925,6 +984,152 @@ async def operator_fail_held_checkout(
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL, values))
     return _purchase(await database.fetch_one(_OPERATOR_FAIL_HELD_CHECKOUT_SQL_SQLITE, values))
+
+
+# ── the buyer's shipping address, when the agent did not send it (AgenPas asks the buyer) ──────────
+#
+# NO NEW COLUMN, NO NEW STATE. A row waits in `opened` with `last_error_code` = 'shipping_address_required'
+# and its deadline in `buyer_action_expires_at` (no `buyer_action_kind` / `_url`: there is no rail page). The
+# worker parks it (`park_for_shipping_address_as_holder`); the gateway's write (`submit_shipping_address`)
+# fills the email and the address ONLY while the row waits and the part it fills is still empty; the expiry
+# sweep ends a row past its deadline as 'shipping_address_expired'. Nothing here logs a value.
+SHIPPING_ADDRESS_REQUIRED_CODE = "shipping_address_required"
+SHIPPING_ADDRESS_EXPIRED_CODE = "shipping_address_expired"
+
+_PARK_FOR_SHIPPING_ADDRESS_SQL = """
+    UPDATE a2a_rail_purchases
+       SET claimed_by = NULL,
+           claimed_at = NULL,
+           -- The buyer's submit can land while this worker holds the row (it takes no claim): when both parts
+           -- are there by now, the wait is over. The code and the deadline are cleared, never re-armed, so the
+           -- expiry sweep can never end a purchase whose contact is complete. An address still EXACTLY the
+           -- incomplete one the worker read (incomplete_address) is not there: it counts as absent, as in
+           -- a2a_shipping_address.awaits_contact and the submit below.
+           buyer_action_expires_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
+                THEN NULL ELSE COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)) END,
+           last_error_code = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
+                THEN NULL ELSE 'shipping_address_required' END,
+           next_poll_at = CASE WHEN buyer_email IS NOT NULL AND shipping_address IS NOT NULL
+                AND (CAST(:incomplete_address AS JSONB) IS NULL OR shipping_address <> CAST(:incomplete_address AS JSONB))
+                THEN clock_timestamp() ELSE CAST(:next_poll_at AS TIMESTAMPTZ) END,
+           updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'opened' AND pending_write IS NULL
+    RETURNING *
+"""
+_PARK_FOR_SHIPPING_ADDRESS_SQL_SQLITE = (
+    _PARK_FOR_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:expires_at AS TIMESTAMPTZ)", ":expires_at")
+    .replace("CAST(:next_poll_at AS TIMESTAMPTZ)", ":next_poll_at")
+    .replace("CAST(:incomplete_address AS JSONB)", ":incomplete_address")
+)
+
+
+async def park_for_shipping_address_as_holder(
+    purchase_id: str, worker_id: str, *, expires_at: Any, next_poll_at: Any,
+    incomplete_address: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Park an `opened` row the worker holds until the buyer's contact arrives: the claim given back, the
+    deadline set once (never moved later), the park code written. When the contact landed meanwhile, the
+    row is due at once. `incomplete_address`: the stored address the worker read when it lacks a required
+    field (a2a_shipping_address.incomplete_address); while the row still holds exactly that, its address is
+    not there. None when the row is not held, not `opened`, or has a pending write."""
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "expires_at": _bind_dt(expires_at),
+        "next_poll_at": _bind_dt(next_poll_at),
+        "incomplete_address": _address_text(incomplete_address),
+    }
+    if values["expires_at"] is None or values["next_poll_at"] is None:
+        raise ValueError("expires_at and next_poll_at are required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_PARK_FOR_SHIPPING_ADDRESS_SQL, values))
+    return _purchase(await database.fetch_one(_PARK_FOR_SHIPPING_ADDRESS_SQL_SQLITE, values))
+
+
+# THE COMPARE-AND-SWAP. Only while the row waits (`opened`, a part of the contact empty, the deadline not
+# passed, the contact never purged, no write pending), and only into an EMPTY part: a stored email (compared
+# case-insensitively) or address that differs is never overwritten. Owner-scoped like every agent read.
+# "Empty" is THE waiting rule's (a2a_shipping_address.awaits_contact): an address that lacks a required field
+# counts as absent. The caller passes the incomplete address it read (:replaces_address), and only a row that
+# still holds exactly that one may have it replaced (a compare-and-swap on the value, so a concurrent write
+# of a complete address is never overwritten).
+_SUBMIT_SHIPPING_ADDRESS_SQL = """
+    UPDATE a2a_rail_purchases
+       SET buyer_email = COALESCE(buyer_email, CAST(:buyer_email AS TEXT)),
+           shipping_address = CASE WHEN shipping_address IS NULL OR shipping_address = CAST(:replaces_address AS JSONB)
+                THEN COALESCE(CAST(:shipping_address AS JSONB), shipping_address) ELSE shipping_address END,
+           last_error_code = CASE WHEN last_error_code = 'shipping_address_required'
+                THEN NULL ELSE last_error_code END,
+           buyer_action_expires_at = CASE WHEN buyer_action_kind IS NULL
+                THEN NULL ELSE buyer_action_expires_at END,
+           next_poll_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+       AND state = 'opened' AND pending_write IS NULL AND contact_purged_at IS NULL
+       AND (buyer_email IS NULL OR shipping_address IS NULL OR shipping_address = CAST(:replaces_address AS JSONB))
+       AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
+       AND (buyer_email IS NOT NULL OR CAST(:email_sent AS TEXT) IS NOT NULL)
+       AND ((shipping_address IS NOT NULL AND CAST(:replaces_sent AS TEXT) IS NULL)
+            OR CAST(:address_sent AS TEXT) IS NOT NULL)
+       AND (CAST(:email_sent AS TEXT) IS NULL OR buyer_email IS NULL
+            OR lower(buyer_email) = lower(CAST(:buyer_email AS TEXT)))
+       AND (CAST(:address_sent AS TEXT) IS NULL OR shipping_address IS NULL
+            OR shipping_address = CAST(:shipping_address AS JSONB)
+            OR shipping_address = CAST(:replaces_address AS JSONB))
+    RETURNING *
+"""
+_SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE = (
+    _SUBMIT_SHIPPING_ADDRESS_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:shipping_address AS JSONB)", ":shipping_address")
+    .replace("CAST(:replaces_address AS JSONB)", ":replaces_address")
+)
+
+
+def _address_text(address: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """An address as the door stores it (create_purchase): one canonical text, so equal addresses compare
+    equal on both dialects. None for none."""
+    if address is None:
+        return None
+    if not isinstance(address, Mapping):
+        raise ValueError("an address must be an object")
+    return json.dumps(dict(address), sort_keys=True) if address else None
+
+
+async def submit_shipping_address(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str, *,
+    buyer_email: Optional[str], shipping_address: Optional[Mapping[str, Any]],
+    replaces_address: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fill the waiting row's empty email and/or address (the compare-and-swap above) and make it due now.
+    `replaces_address`: the stored address the caller read when it lacks a required field
+    (a2a_shipping_address.incomplete_address); it counts as empty, and is replaced only while the row still
+    holds exactly it. None when the row is not this owner's, does not wait, or a part sent differs from the
+    stored one: the caller re-reads to tell an identical resubmission (idempotent) from a conflict."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    if buyer_email is None and not shipping_address:
+        raise ValueError("nothing to submit")
+    if shipping_address is not None and not isinstance(shipping_address, Mapping):
+        raise ValueError("shipping_address must be an object")
+    values = {
+        "id": purchase_id,
+        "agent_id": str(agent_id or "").strip(),
+        "agent_user_ref_hash": str(agent_user_ref_hash or "").strip(),
+        "buyer_email": (str(buyer_email).strip() or None) if buyer_email is not None else None,
+        # The door's own encoding (create_purchase): one canonical text, so equal addresses compare equal.
+        "shipping_address": json.dumps(dict(shipping_address), sort_keys=True) if shipping_address else None,
+    }
+    # Whether each part was sent, as its own TEXT parameter: one placeholder is never cast two ways.
+    values["email_sent"] = "1" if values["buyer_email"] is not None else None
+    values["address_sent"] = "1" if values["shipping_address"] is not None else None
+    values["replaces_address"] = _address_text(replaces_address)
+    values["replaces_sent"] = "1" if values["replaces_address"] is not None else None
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL, values))
+    return _purchase(await database.fetch_one(_SUBMIT_SHIPPING_ADDRESS_SQL_SQLITE, values))
 
 
 async def get_paying_checkout(purchase_id: str) -> Optional[Dict[str, Any]]:
@@ -1096,6 +1301,9 @@ _EXPIRE_SQL = """
     UPDATE a2a_rail_purchases
        SET state = 'expired',
            last_error_code = CASE WHEN buyer_action_expires_at IS NOT NULL
+                AND buyer_action_expires_at < clock_timestamp() AND last_error_code = 'shipping_address_required'
+                THEN 'shipping_address_expired'
+                WHEN buyer_action_expires_at IS NOT NULL
                 AND buyer_action_expires_at < clock_timestamp() THEN 'buyer_action_expired' ELSE 'stale' END,
            buyer_action_kind = NULL, buyer_action_url = NULL, buyer_action_expires_at = NULL,
            buyer_email = NULL, shipping_address = NULL,
@@ -1125,6 +1333,9 @@ _EXPIRE_SQL_SQLITE = """
     UPDATE a2a_rail_purchases
        SET state = 'expired',
            last_error_code = CASE WHEN buyer_action_expires_at IS NOT NULL
+                AND buyer_action_expires_at < CURRENT_TIMESTAMP AND last_error_code = 'shipping_address_required'
+                THEN 'shipping_address_expired'
+                WHEN buyer_action_expires_at IS NOT NULL
                 AND buyer_action_expires_at < CURRENT_TIMESTAMP THEN 'buyer_action_expired' ELSE 'stale' END,
            buyer_action_kind = NULL, buyer_action_url = NULL, buyer_action_expires_at = NULL,
            buyer_email = NULL, shipping_address = NULL,

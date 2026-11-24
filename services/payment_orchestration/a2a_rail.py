@@ -76,10 +76,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
 import re
+import unicodedata
+import urllib.parse
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -202,6 +205,16 @@ READ_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
 #: Key prefixes whose whole subtree is a payment credential. Matched case-insensitively with `_`,
 #: `-` and `.` removed, at any depth.
 _CREDENTIAL_SUBTREE_PREFIXES = ("networktoken",)
+#: THE ONE NAME of the token-result field that carries the DAVV, inside `networkToken`. The provider's documented
+#: token-result (11-19): networkToken {brand, value (the DPAN), expiryDate, cvv, cryptogram, eci,
+#: dynamicDataType: "DAVV"}: the DAVV is `cvv`, read ONLY when `DAVV_MARKER_FIELD` is exactly `DAVV_MARKER`
+#: (`davv_from_network_token`). A `cvv` without that marker could be a real card's CVV: it is never read or
+#: relayed (`davv_missing`, nothing sent). NEVER the cryptogram: that is the TAVV, for gateway token
+#: transactions, and a card form cannot take it.
+DAVV_FIELD = "cvv"
+#: The marker that makes `networkToken.cvv` a DAVV: exact and case-sensitive ("davv", "CVV", null or absent: no).
+DAVV_MARKER_FIELD = "dynamicDataType"
+DAVV_MARKER = "DAVV"
 #: Keys whose value is a credential wherever they appear (same matching).
 _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
@@ -209,6 +222,8 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
     # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
     "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
+    # the DAVV's own field, from its one constant (so a renamed field is stripped wherever it is echoed)
+    DAVV_FIELD.lower().replace("_", "").replace("-", "").replace(".", ""),
     # a card's or token's expiry (the checkout's `card.expiry`, echoed back): no digit rule sees "11/29"
     "expiry", "expirydate", "expdate", "expirationdate", "cardexpiry", "tokenexpiry",
 })
@@ -355,6 +370,11 @@ class A2AResult:
     recoverable: Optional[bool] = None
     http_status: Optional[int] = None
     credential_fields_stripped: int = 0
+    #: How many card-code echoes (a 3-digit run next to a card-code word, `_CARD_CODE_RE`) the answer had, in
+    #: its prose or its card strings. Each card string is removed WHOLE; prose is never returned anyway. Also
+    #: counted in `credential_fields_stripped`. Before a confirm the setup's answer is then not confirmed; after
+    #: a confirm the worker HOLDS on it (money may have moved), never fails it.
+    card_codes_scrubbed: int = 0
     #: The conversation id the provider answered under (validated), to check it kept ours.
     context_id: Optional[str] = None
     #: Whether the action sent may have changed state on the provider's side.
@@ -539,8 +559,100 @@ def _artifacts_report_money(task: Mapping[str, Any]) -> bool:
     return False
 
 
-def parse_response(body: Any) -> A2AResult:
-    """Classify one JSON-RPC response body. Pure: no I/O, no logging."""
+#: A card security code echoed in text: a standalone 3-digit run beside a card-code word, with at most three
+#: words or separators between them, either order ("cvv 715", "CVV: 715", "security code is 715",
+#: "715 (cvv)", "davv=715"). Read case-insensitively after NFKC and the invisible-character strip. ANY such
+#: code counts, ours or not: the DAVV is token data. Bare "card" and bare "verification" are NOT words here
+#: ("card ending 123", "order verification 123", "card 1 of 3" never match).
+#: Aligned with the credential and card-shaped key lists (cvv / cvc / cvn / cv2 / cid / csc, the dynamic ones).
+_CARD_CODE_WORDS = (
+    r"cvv2|cvc2|dcvv2|dcvv|dcvc|icvv|cvv|cvc|cvn|cv2|cid|csc|davv|dynamic[\W_]*(?:cvv2?|cvc|security[\W_]*code)"
+    r"|security[\W_]*code|card[\W_]*code|verification[\W_]*code"
+    r"|card[\W_]*verification(?:[\W_]*(?:value|number|code))?"
+)
+_CARD_CODE_GAP = r"(?:[\W_]+[a-z]+){0,3}[\W_]*"
+_CARD_CODE_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _CARD_CODE_WORDS + r")(?![a-z])" + _CARD_CODE_GAP + r"(?<![0-9])[0-9]{3}(?![0-9])"
+    r"|(?<![0-9.,$])[0-9]{3}(?![0-9])[\W_]*(?:[a-z]+[\W_]+){0,3}?(?:" + _CARD_CODE_WORDS + r")(?![a-z])"
+)
+
+
+def _fold(text: str) -> str:
+    """What a card-code match is made on: HTML entities and %-escapes decoded ("&#55;", "cvv%20715"), NFKC,
+    invisible characters removed, lower case, every decimal digit (Arabic-Indic, full-width, ...) read as its
+    ASCII digit, dotted letters joined ("c.v.v" -> "cvv"; never digits: "7.1.5" stays a version, not a code),
+    and runs of whitespace collapsed to one space."""
+    text = html.unescape(text)
+    if "%" in text:
+        text = urllib.parse.unquote(text)
+    text = checkout_amounts.normalise(text).lower()
+    text = "".join(str(unicodedata.digit(ch)) if ch.isdigit() and not ch.isascii() and unicodedata.digit(ch, None) is not None
+                   else ch for ch in text)
+    text = _DOTTED_WORD_RE.sub(lambda m: m.group(0).replace(".", ""), text)
+    return _WHITESPACE_RE.sub(" ", text)
+
+
+#: A word spelt with dots between single LETTERS ("c.v.v", "c.v.v.2"). Digits are never joined: "Version 7.1.5"
+#: must not read as the code 715.
+_DOTTED_WORD_RE = re.compile(r"(?<![a-z0-9])(?:[a-z]\.){2,}[a-z0-9](?![a-z0-9])")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def has_card_code(text: Any) -> bool:
+    """Whether `text` shows ANY card security code (`_CARD_CODE_RE`): the rule for answers AFTER the confirm,
+    where a match holds (safe) and the DAVV is no longer known. Pure; never logs."""
+    if not isinstance(text, str) or not text:
+        return False
+    return _CARD_CODE_RE.search(_fold(text)) is not None
+
+
+def davv_echo_matcher(davv: str) -> Callable[[Any], bool]:
+    """The rule for the relay's setup answer (BEFORE the confirm): only OUR DAVV, digits folded to ASCII and
+    separators allowed between them ("7 1 5", "7-1-5"), beside a card-code word, at most three words away.
+    "CVV verified. Order 123" is not our code, so the purchase is not cancelled for it. A leading-zero DAVV
+    ("077") is also caught without its zeros ("cvv 77"), as it reads once echoed as a number."""
+    forms = {davv}
+    short = _davv_short_form(davv)
+    if short is not None:
+        forms.add(short)
+    digits = "|".join(r"[\W_]?".join(re.escape(d) for d in form) for form in sorted(forms, key=len, reverse=True))
+    code = r"(?<![0-9])(?:" + digits + r")(?![0-9])"
+    pattern = re.compile(
+        r"(?<![a-z0-9])(?:" + _CARD_CODE_WORDS + r")(?![a-z])" + _CARD_CODE_GAP + code
+        + r"|" + code + r"[\W_]*(?:[a-z]+[\W_]+){0,3}?(?:" + _CARD_CODE_WORDS + r")(?![a-z])")
+
+    def _matches(text: Any) -> bool:
+        return isinstance(text, str) and bool(text) and pattern.search(_fold(text)) is not None
+
+    return _matches
+
+
+def _scrub_card_codes(value: Any, matches: Callable[[Any], bool] = has_card_code, depth: int = 0) -> Tuple[Any, int]:
+    """`value` with every string that shows a card code (`matches`) removed WHOLE (None), and how many."""
+    if depth > _MAX_STRIP_DEPTH:
+        return value, 0
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        total = 0
+        for key, item in value.items():
+            out[key], count = _scrub_card_codes(item, matches, depth + 1)
+            total += count
+        return out, total
+    if isinstance(value, list):
+        items, total = [], 0
+        for item in value:
+            cleaned, count = _scrub_card_codes(item, matches, depth + 1)
+            items.append(cleaned)
+            total += count
+        return items, total
+    if isinstance(value, str) and matches(value):
+        return None, 1
+    return value, 0
+
+
+def parse_response(body: Any, *, card_code: Callable[[Any], bool] = has_card_code) -> A2AResult:
+    """Classify one JSON-RPC response body. Pure: no I/O, no logging. `card_code` decides which echoed card
+    codes count (any code by default; the relay's setup answer passes `davv_echo_matcher(<our DAVV>)`)."""
     if not isinstance(body, dict):
         return A2AResult(kind="protocol_error")
     if "error" in body:
@@ -564,6 +676,11 @@ def parse_response(body: Any) -> A2AResult:
         if part.get("kind") == "data" and isinstance(part.get("data"), dict):
             card, removed = _card_from(part["data"])
             result.credential_fields_stripped += removed
+            scrubbed_data, codes = _scrub_card_codes(card.data, card_code)
+            if codes:
+                card = Card(component=card.component, kind=card.kind, data=scrubbed_data, actions=card.actions)
+                result.card_codes_scrubbed += codes
+                result.credential_fields_stripped += codes
             if card.component == "error":
                 code = str(card.data.get("code") or "")
                 result.kind = "error_card"
@@ -573,6 +690,9 @@ def parse_response(body: Any) -> A2AResult:
             result.cards.append(card)
         elif part.get("kind") == "text":
             result.text_parts += 1
+            if card_code(part.get("text")):
+                result.card_codes_scrubbed += 1
+                result.credential_fields_stripped += 1
     # Artifacts are never returned, but a money-result card there is still a money flow.
     money = money or _artifacts_report_money(task)
     if money:
@@ -592,31 +712,53 @@ CHECKOUT_SHIPPING_REQUIRED: Tuple[str, ...] = (
 )
 CHECKOUT_SHIPPING_OPTIONAL: Tuple[str, ...] = ("address2", "state")
 _CHECKOUT_SHIPPING_MAX = 256
-_TOKEN_NUMBER_RE = re.compile(r"^\d{13,19}\Z")
-_TOKEN_EXPIRY_RE = re.compile(r"^(0[1-9]|1[0-2])(\d{2})\Z")
-_CRYPTOGRAM_RE = re.compile(r"^[A-Za-z0-9+/=_-]{4,128}\Z")
+_TOKEN_NUMBER_RE = re.compile(r"^[0-9]{13,19}\Z")
+_TOKEN_EXPIRY_RE = re.compile(r"^(0[1-9]|1[0-2])([0-9]{2})\Z")
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}\Z")
 _COUNTRY_RE = re.compile(r"^[A-Z]{2}\Z")
+
+
+#: The DAVV: exactly three ASCII digits (a dynamic CVV).
+_DAVV_RE = re.compile(r"^[0-9]{3}\Z")
+
+
+def davv_from_network_token(network_token: Any) -> Optional[str]:
+    """The token's DAVV (`networkToken[DAVV_FIELD]`, i.e. `cvv`), or None. ONLY when `networkToken.dynamicDataType`
+    is exactly "DAVV" (case-sensitive; missing, null, "davv" or any other value: None), and only a STRING of
+    exactly 3 ASCII digits, kept as is: "077" stays "077" (an int 77 is None: its leading zero is lost). Pure;
+    never logs. There is no fallback to any other field."""
+    if not isinstance(network_token, Mapping):
+        return None
+    marker = network_token.get(DAVV_MARKER_FIELD)
+    if not isinstance(marker, str) or marker != DAVV_MARKER:
+        return None
+    value = network_token.get(DAVV_FIELD)
+    return value if isinstance(value, str) and _DAVV_RE.match(value) else None
 
 
 def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: Any) -> Optional[Dict[str, str]]:
     """THE ONE PLACE the approved network token becomes the checkout skill's `card`. Pure: no I/O, no
     logging, never raises; None when any field is missing or malformed (the caller sees only that).
 
-    OPEN QUESTION WITH THE PROVIDER: which card field takes the token cryptogram. Until it is answered
-    the mapping is: number = `networkToken.value` (the DPAN), expiry = `networkToken.expiryDate` read as
-    MMYY and sent as "MM/YY", cvv = `networkToken.cryptogram`, brand = the card's brand, name = the
-    cardholder name the caller gives. Changing that answer changes this function and nothing else."""
+    THE PROVIDER'S ANSWER (11-18): `checkout.setup` has no network-token field; the card is filled as a
+    normal card, EXACTLY these five keys (their example: {"number", "expiry", "cvv", "name", "brand"}):
+      number = `networkToken.value` (the DPAN); expiry = `networkToken.expiryDate` read as MMYY and sent as
+      "MM/YY"; cvv = the 3-digit DAVV (`davv_from_network_token`: `networkToken.cvv`, only when the token's
+      `dynamicDataType` is exactly "DAVV"; minted with `dynamic_data_type: "DAVV"`);
+      name = the buyer's first + last name from the purchase's shipping contact (no cardholder name is
+      received); brand = the card's brand (visa).
+    The cryptogram and the ECI (the TAVV, for gateway token transactions) are NEVER sent. No DAVV: None (the
+    relay says `davv_missing`); any other field missing or malformed, an empty name included: None."""
     if not isinstance(network_token, Mapping):
         return None
     number = network_token.get("value")
-    cryptogram = network_token.get("cryptogram")
+    davv = davv_from_network_token(network_token)
     expiry = network_token.get("expiryDate")
     card_brand = str(brand or "").strip().lower()
     holder = " ".join(str(name or "").split())
     if not (isinstance(number, str) and _TOKEN_NUMBER_RE.match(number)):
         return None
-    if not (isinstance(cryptogram, str) and _CRYPTOGRAM_RE.match(cryptogram)):
+    if davv is None:
         return None
     match = _TOKEN_EXPIRY_RE.match(expiry) if isinstance(expiry, str) else None
     if match is None or card_brand not in CHECKOUT_CARD_BRANDS or not 0 < len(holder) <= _CHECKOUT_SHIPPING_MAX:
@@ -624,7 +766,7 @@ def checkout_card_from_network_token(network_token: Any, *, brand: Any, name: An
     return {
         "number": number,
         "expiry": f"{match.group(1)}/{match.group(2)}",
-        "cvv": cryptogram,
+        "cvv": davv,
         "name": holder,
         "brand": card_brand,
     }
@@ -706,7 +848,7 @@ class TokenRelay:
     token     the answer to the token step that was sent (`paid` or the await poll)
     checkout  the answer to `checkout.setup#submit`, or None when it was not sent
     refused   why it was not sent although the answer was THIS purchase's ACTIVE token (a code:
-              `network_token_missing`, `card_unmappable`); None otherwise
+              `network_token_missing`, `davv_missing`, `card_unmappable`); None otherwise
     """
 
     token: A2AResult
@@ -719,17 +861,27 @@ class TokenRelay:
 _SCRUB_SUBSTRING_MIN = 8
 
 
-#: The token-result field that will carry the DAVV (the 3-digit dynamic CVV the checkout card is filled with:
-#: the provider's 11-18 answer; the mapping lands with the DAVV change). Read here already so a DAVV that
-#: arrives under it is scrubbed from the setup answer BY VALUE, like the expiry: as a WHOLE value only
-#: ("715" alone), never inside another value ("$715.00", "Suite 715"), and in prose only as a whole token in
-#: card context. PENDING THE PROVIDER'S A2A UPDATE AND SANDBOX MEASUREMENT of the field's name.
-DAVV_FIELD = "davv"
+
+
+def _davv_short_form(davv: str) -> Optional[str]:
+    """A leading-zero DAVV without its zeros ("077" -> "77"), as an echo reads once it went through a number; None
+    when there is no leading zero, or when fewer than TWO digits would remain ("007", "000"): a one-digit needle
+    would cancel on any `quantity: 7`, `errorCount: "0"` or "Ships in 7 days". Such a DAVV is caught verbatim
+    ("007"), and in prose beside a card word as written. RESIDUAL: a short form split across two values
+    ({"a": "7", "b": "7"}) is not caught; nothing stores or sends it."""
+    if not (davv.isdigit() and davv.isascii()):
+        return None
+    short = str(int(davv))
+    return short if short != davv and len(short) >= 2 else None
 
 
 def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], FrozenSet[str]]:
     """(substrings, exact values) to scrub: the token's value and cryptogram anywhere in a string, its
-    expiry (raw and as "MM/YY") and its DAVV only as a whole value."""
+    expiry (raw and as "MM/YY") and its DAVV (`DAVV_FIELD`) only as a WHOLE value: "715" alone, never inside
+    another value ("$715.00", "Suite 715"), and in prose only as a whole token in card context; a leading-zero
+    DAVV also without its zeros when two digits remain (`_davv_short_form`).
+    ON PURPOSE the needle reads `networkToken.cvv` WITHOUT the dynamicDataType marker: an unmarked cvv is never
+    relayed (davv_missing comes first), and scrubbing it if echoed is only stricter. Do not "fix" it."""
     contains: List[str] = []
     exact = set()
     for key in ("value", "cryptogram", "expiryDate", DAVV_FIELD):
@@ -737,6 +889,10 @@ def _scrub_needles(network_token: Mapping[str, Any]) -> Tuple[Tuple[str, ...], F
         if not isinstance(raw, str) or not raw.strip():
             continue
         raw = raw.strip()
+        short = _davv_short_form(raw) if key == DAVV_FIELD else None
+        if short is not None:
+            # A leading-zero DAVV ("077") may come back as the number 77 or the string "77": the same code.
+            exact.add(short)
         # A cryptogram is base64: its padding is optional, so the unpadded form is the same credential.
         for form in {raw, raw.rstrip("=")} if key == "cryptogram" else {raw}:
             if len(form) >= _SCRUB_SUBSTRING_MIN and key != DAVV_FIELD:
@@ -1081,6 +1237,12 @@ class A2ARailClient:
             if not isinstance(network_token, Mapping):
                 relay.refused = "network_token_missing"
                 return relay
+            if davv_from_network_token(network_token) is None:
+                # No DAVV: no `cvv`, a `cvv` on a token not marked dynamicDataType "DAVV" (it could be a real
+                # card's CVV: never read, never relayed), or not a string of exactly 3 ASCII digits: the card form
+                # cannot be filled. Never the cryptogram instead. Nothing goes to the checkout.
+                relay.refused = "davv_missing"
+                return relay
             brand = approved.get("paymentBrand") or network_token.get("brand")
             card = checkout_card_from_network_token(network_token, brand=brand, name=setup.cardholder_name)
             if card is None:
@@ -1103,7 +1265,9 @@ class A2ARailClient:
 
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",
-                action="submit", payload=checkout_payload, inspect=_read_setup_answer)
+                action="submit", payload=checkout_payload, inspect=_read_setup_answer,
+                # Before the confirm: only an echo of OUR DAVV refuses the answer (cancel, not confirm).
+                card_code=davv_echo_matcher(card["cvv"]))
             known = None
         except Exception as exc:  # noqa: BLE001 - classified, never raised: the frame holds the token
             # `_send` classifies every transport failure itself; this is anything else. The setup may or
@@ -1133,6 +1297,7 @@ class A2ARailClient:
         action: str,
         payload: Optional[Mapping[str, Any]] = None,
         inspect: Optional[Callable[[A2AResult, Any], None]] = None,
+        card_code: Callable[[Any], bool] = has_card_code,
     ) -> Tuple[A2AResult, Any]:
         """(the classified, stripped result, the RAW parsed body or None). The raw body may carry a
         credential: only `relay_token_to_checkout` looks at it, and nothing returns it upward.
@@ -1203,7 +1368,7 @@ class A2ARailClient:
             refused = 400 <= status < 500 and status != 408
             kind = "outcome_unknown" if may_write and not refused else "http_error"
             return self._done(A2AResult(kind=kind, http_status=status), component, action, started), None
-        result = parse_response(parsed)
+        result = parse_response(parsed, card_code=card_code)
         result.http_status = status
         if may_write and result.kind == "protocol_error":
             result.kind = "outcome_unknown"

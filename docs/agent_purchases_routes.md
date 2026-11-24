@@ -160,7 +160,8 @@ human. The row holds no PII (no IP, no user agent, no email).
 Default off, read per request. Off, every body above is byte for byte what it was (golden-tested).
 
 On, for a step that needs a consent (`card_binding` while the buyer binds a card, `approval` while they
-approve) and while none is recorded for (rail, rail purchase, step, approval epoch), **no surface carries
+approve, and, on the A2A rail, `shipping_address` while the purchase waits for the buyer's address: its form
+is withheld the same way, see the shipping-address write) and while none is recorded for (rail, rail purchase, step, approval epoch), **no surface carries
 the rail's hosted URL**: this door's read and list, the Reap rail's own routes (GET, list, create, resume,
 recover), the `purchase.*` webhook payloads, and the internal AgenPas read. The rail's `detail` drops
 `hosted_url`, keeps its deadline (`hosted_url_expires_at`, `approval_deadline`) and adds
@@ -229,6 +230,110 @@ consent step first.
 **Turn off**: unset `AGENPAS_CONSENT_GATE` on **`web` first, then the worker**; bodies are today's again at
 once. The records stay
 (insert-only: nothing updates or deletes them, no PII scrub touches them).
+
+## `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address` (server to server, AgenPas)
+
+The partner agent sends the buyer's shipping address; when it does not, AgenPas asks the buyer for
+it. Same router as the read above: the same dial (`AGENPAS_INTERNAL_READ_ENABLED`, at startup), the same
+key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read and ignored.
+
+- **Capture** is ONE predicate (`a2a_shipping_address.capture_enabled`), read by the door, the view, this
+  write and the worker alike. It is on only when ALL of these are:
+  - `A2A_SHIPPING_CAPTURE_ENABLED`, capture's own dial, default off;
+  - this read dial (`AGENPAS_INTERNAL_READ_ENABLED`);
+  - the checkout step (`A2A_RAIL_CHECKOUT_STEP_ENABLED`) and the token step (`A2A_RAIL_TOKEN_STEP_ENABLED`);
+  - the AgenPas consent gate (`AGENPAS_CONSENT_GATE`: no address is ever asked for without it), AND a consent
+    that can actually be given: the terms / privacy configuration and offer secret valid,
+    `AGENPAS_CONSENT_WRITE_ENABLED` on and `AGENPAS_INTERNAL_CONSENT_KEY` valid
+    (`purchase_consent.consent_can_be_given`).
+
+  Every one is an env value, so the predicate gives the SAME answer in every process that has the same env
+  (web and worker). It deliberately does not ask whether this process mounted the consent write's router
+  (`purchase_consent.write_ready`'s mount record): only `web` mounts it, so the worker would answer
+  differently from web for the same row. Set the same values on both services.
+  Only with capture on does the worker wait for a missing contact, so only then does
+  `POST /agent/v2/commerce/purchases` on the A2A rail accept a body without `buyer.email` and/or
+  `buyer.shipping_address`, and only then does the view ask for it. One that is given is read by the Reap
+  rules, plus, for the US, a real state or DC in `region` and a ZIP (12345 or 12345-6789) in `postalCode`
+  (`invalid_address`). Capture off (any one of them off, e.g. this read dial on before the checkout dial):
+  both stay required and every answer is exactly as before. A request the router hands to Reap is parsed by
+  Reap's own model, which still requires both.
+- **Turn capture on, in this order**: the read dial, the checkout step and the token step (each per its own
+  runbook), then the consent gate and its configuration (the section above), and
+  `A2A_SHIPPING_CAPTURE_ENABLED` LAST: on the **worker FIRST, then `web`** (with web on and the worker off,
+  the door opens purchases without a contact that the worker ends at once, `shipping_address_not_collected`).
+  **Turn it off** with `A2A_SHIPPING_CAPTURE_ENABLED` on **`web` first** (no new purchase opens without its
+  contact), then the worker. **Check both boot lines** (WARNING `purchase_consent: service=…`): each carries
+  `A2A_SHIPPING_CAPTURE_ENABLED=on|off`, `consent_givable=yes|no` and `shipping_capture=on|off`, and web and
+  the worker must agree. A worker at `shipping_capture=off` (its consent key or offer secret missing, say)
+  while web is on ends every waiting purchase at its next poll.
+- **What happens to waiting purchases when capture goes off** (any of the dials above, the consent gate's
+  rollback included), as the code does it:
+  - the worker, at the row's next poll (a parked row is polled every 60 s,
+    `a2a_rail_worker.POLL_SHIPPING_ADDRESS`), ends an A2A purchase that is `opened` with its email or its
+    address ABSENT: `expired`, `last_error_code` `shipping_address_not_collected`, before any rail call (no
+    card read, no binding) and with the contact dropped like every terminal write
+    (`a2a_rail_worker._contact_never_coming`). Only the door with capture on opens such a row, so nothing
+    the capture-off door took (both parts present) is touched;
+  - the view stops showing the form and the shipping step at once (the same predicate), the consent POST
+    answers 409 `consent_stale` for the step (404 where its own dial is off), and this write answers 409
+    `shipping_address_not_collected` (404 with the read dial off: the router is dark);
+  - a recorded consent stays (insert-only). Turning capture back on does not revive an ended purchase: the
+    agent opens a new one.
+- **Consent first.** The form is a consent-gated step (`shipping_address`, A2A only, approval epoch 0; the
+  owner's decision of 11-20). Until the buyer accepted the terms and privacy policy on the AgenPas page, no
+  surface carries the field list: `detail.shipping_address_required` is withheld, `detail.buyer_step` is
+  `{"kind": "shipping_address", "expires_at", "consent_required": true, "available"}` and `next_action` is
+  `{"kind": "shipping_address", "consent_required": true, "expires_at"}` (no `fields_missing`). The internal
+  read's `consent` block is offered for the step, the consent POST accepts `"step": "shipping_address"` (only
+  for an A2A purchase that waits for its contact; otherwise 409 `consent_stale`), and once it is recorded the
+  form appears as above. The write below answers 409 `shipping_address_not_collected` while capture is off
+  and 409 `consent_required` before the consent (nothing written in either case; both checks run before the
+  body is read), and 503 when the consent table cannot be read. Stored `purchase.*` payloads that still carry the form are
+  re-gated when they are sent, retried or listed. A terms / privacy version bump does not re-ask.
+- **Market.** The address's country; with no address, the one market of the purchase's own currency
+  (`expected_currency`), never a default: none (or several) is 400 `shipping_market_unknown`. The A2A pilot
+  is the US, in code: any other market on the A2A rail is 400 `shipping_country_unsupported`.
+- **Waiting.** The purchase stays `opened` (unified `routing`), and the worker sends NOTHING for it, not even
+  a card read, until its email and address are complete. The email is listed first: the card binding needs
+  it. `last_error_code` is `shipping_address_required`, and the deadline is 30 minutes from creation
+  (`a2a_rail_worker.SHIPPING_ADDRESS_SECONDS`). Then it is `expired` with `shipping_address_expired`, by the
+  worker or the expiry sweep. "Waits" is ONE rule (`a2a_shipping_address.awaits_contact`) for the read (the
+  form and the consent offer) and the consent POST: `opened`, a part missing field by field
+  (`fields_missing`), never purged, the deadline not passed, capture on. Past the deadline the read offers
+  nothing and the consent POST answers 409 `consent_stale`, even before the worker or the sweep ends it. There is no new state and no migration: the deadline sits in
+  `buyer_action_expires_at`, with no `buyer_action_kind` / URL.
+- **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
+  has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
+  NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
+  `country`), never a stored value. The same names sit in `detail.shipping_address_required`.
+- **Body.** Flat JSON: `email, firstName, lastName, phone, addressLine1, addressLine2, city, region,
+  postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
+  in `fields_missing`); a part that is sent is read whole. US only. Region is one of the 50 states or DC.
+- **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
+  deadline not passed, the contact never purged) and fills only an empty part. "Empty" is the waiting
+  rule's: a stored address that lacks a required field counts as absent, so the form asks for the whole
+  address and the write replaces exactly that stored value (it compares on it, so an address a concurrent
+  write completed is never overwritten). A complete stored address is never replaced. The purchase is then due
+  at once. A submit that lands while the worker holds the row is never undone: the worker's park then finds
+  the contact complete and clears the code and the deadline, so the expiry sweep cannot end it.
+- **Answers.**
+  - 200: the unified view (as the read).
+  - The same contact sent again: 200.
+  - 409 `shipping_address_conflict`: the purchase no longer waits and holds something else, the
+    email or address sent differs from the stored one, or it is not an A2A-rail purchase. The body is the
+    error middleware's wrapper: `{"status": "error", "error": {"code": "CONFLICT", "message":
+    "shipping_address_conflict", "details": {"error": "shipping_address_conflict"}, "documentation_url":
+    ...}, "detail": {"error": "shipping_address_conflict"}, "metadata": {...}}`: read `detail.error`.
+  - 422 `{"status": "error", "error": "invalid_shipping_address", "field_errors": {field: code}}`.
+    The codes are `required`, `invalid`, `too_long` and `unsupported`; a submitted value is never
+    echoed.
+  - 409 `shipping_address_not_collected`: capture is off (any of its dials, see above); nothing is
+    written and the body is not read. 409 `consent_required`: no consent to the step yet. Both are wrapped
+    like the conflict above: read `detail.error`.
+  - 404 `purchase_not_found`: another agent's purchase, or none.
+  - 400 `agent_id_required`. 401. 503.
+  - Nothing of the body is logged.
 
 ## `GET /agent/v2/commerce/purchases?limit=N`
 
@@ -311,7 +416,32 @@ The A2A rail's checkout step HOLDS a purchase whenever it cannot prove what happ
 a setup or confirm whose answer nobody saw (`checkout_setup_unresolved`, `checkout_confirm_unresolved`),
 a `paid` sent through the relay whose step was cut, a total it cannot verify, and the other codes in
 `a2a_rail_worker._CHECKOUT_HOLD_CODES`. A held purchase stays in `paying` (the agent sees `placing`) for
-good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human does:
+good: no sweep ends `paying`, and **nothing ends a hold automatically** except one READ: for a hold whose
+cause is an answer nobody saw (`a2a_rail_worker._CHECKOUT_LOOKUP_CODES`: setup / confirm / cancel unresolved,
+the pending check, paying without a task, a prose / unrecognised / error-card confirm answer), the worker
+asks the provider `checkout.lookup#submit` with our idempotency key (`pvt-<purchase id>-checkout`), read-only,
+in its own conversation. The first lookup comes when the hold's own park ends, about 10 minutes after the
+hold (`POLL_PARKED`); then again each time the time in `paying` has doubled, within 4 hours, and at most 9
+times per purchase, ever: each one is counted BEFORE it is sent (`checkout_lookups`, migration 290), so a
+crash in the middle of one still counts. An answer for the task the purchase recorded from ITS OWN confirm
+answer (bound) goes through the ordinary result rules: completed only on a verified total in the row's
+currency (a `currency` field naming another one is unverified), a held code stays held, a "not submitted"
+fails it, an await goes back to polling. **N1 IS CLOSED BY "NO UNBOUND COMPLETION"**: the provider (11-19)
+creates a checkout task only after our confirm, and a lookup answer echoes nothing we sent (no idempotency
+key, checkout URL or merchant; its `card_last4` names the card, not the purchase), so an answer for a task
+the purchase never recorded (unbound) cannot be verified as ours. It never completes the purchase, never
+records an order id or a total, never adopts the task, never fails it and never makes it "not charged": the
+hold stays, whatever it says. One that says the checkout succeeded or payment happened (`success: true`, or a
+`result_status` / `status` that says paid, completed or payment-reached; a `state` only when it itself names a
+payment, never `completed` alone, which is the task's lifecycle) moves the hold to
+`checkout_payment_reached_unconfirmed`, which resolve-held refuses. Exact binding (an `idempotency_key`
+echo) comes back only in its own review, once the provider confirms it. A result's status is read from
+`status` or the documented `result_status` (both present and different: unrecognised, held); the fields
+not read (`subtotal`, `shipping_fee`, `tax`, `errors`, `duration_ms`, `card_last4`) are ignored and never
+stored. A money-result answer parks it for good (`money_result_seen`, never "not charged"); anything else
+leaves it held. It never resends a setup or a confirm, and never looks up a
+hold written after payment was reported. A 409 on the
+confirm (the same key with another body: our own bug) is held and never looked up. Otherwise a human does:
 
 1. List them (read-only, no PII): `python -m jobs.a2a_rail_operator list-held`. Each line is one purchase:
    its id, its hold code, whether a write is pending, whether a checkout task id is recorded.
@@ -321,8 +451,24 @@ good: no sweep ends `paying`, and **nothing ends a hold automatically**. A human
    (`scripts/ops/run_oneoff_job.sh`, behind the one-off gate):
 
        python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <the code from step 1>
+       python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> --lookup
        python -m jobs.a2a_rail_operator resolve-held --purchase-id ap_... --expected-code <code> \
            --apply --operator <handle> --expect-env production --provider-checked
+
+   `--lookup` (dry run only) adds ONE read-only lookup by our idempotency key and shows its safe fields only
+   (`state`, `result_status`, `total`, `currency`, `task_id`; never `card_last4` or the order id), read at
+   that moment and NEVER stored (not even as a lookup count). An answer for a task the purchase did not
+   record from its own confirm answer is labelled "UNBOUND: this answer may belong to another purchase;
+   not verified as ours": it is a hint for your check in step 2, never proof. An answer that reports payment
+   (bound or not, read as above) makes the preview `eligible: false`, reason `payment_reported_by_lookup`:
+   escalate, never resolve it here. Only a HELD row is looked up.
+
+   `--apply` runs its OWN read-only lookup the same way (when the rail client is configured) and refuses
+   (exit 3, `payment_reported_by_lookup`) on an answer that reports payment: what the preview saw is never
+   stored, so the apply reads again. With no client configured, or a lookup that fails, the apply rests on
+   your `--provider-checked` statement, as before. `--lookup` together with `--apply` is a usage error
+   (exit 2): `--apply` always does its own. That lookup is a provider call too: the go for an `--apply` run
+   covers it only when it says so.
 
    The purchase ends `failed` / `operator_confirmed_not_charged`. The write is a compare-and-swap on the
    code you read and refuses a row a worker holds right now, so a row that moved since is not touched
@@ -339,10 +485,14 @@ was set up, and the purchase can be resolved as above.
 all read or write production, so each is a **production one-off**: run it through the one-off gate (`oneoff_gate.sh`,
 GATE_OPEN first; the ops tooling, not this repo), **one job at a time**, and only with **the owner's go for that purchase**. The tool does not
 check the gate itself.
+`--lookup` also sends a provider call (one read-only checkout lookup), so it is a production one-off under the
+same rule; the go for the preview does not cover it unless it names --lookup.
 
 **Never "not charged" over a recorded payment.** A hold written after the provider reported
 `payment-reached` (`checkout_total_over_approved`, `checkout_total_unverified`,
-`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`; the
+`checkout_order_id_card_shaped`, `checkout_payment_no_order`, `checkout_payment_reached_unconfirmed`, and
+`checkout_answer_scrubbed`, written when an answer that may follow a confirm echoed a card code (the confirm's
+answer, a poll, a result, or a lookup, which may also run on a row whose confirm never went out); the
 set is `a2a_rail_worker._CHECKOUT_PAYMENT_REACHED_CODES`; `checkout_payment_reached_unconfirmed` is also
 written for a result status we do not know that speaks of payment or completion, e.g. `paid`, `completed`, never
 for its negation such as `unpaid` or `payment_failed`; `checkout_order_id_card_shaped` is no longer written: an order id
