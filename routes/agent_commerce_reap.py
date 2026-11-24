@@ -92,6 +92,7 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -304,6 +305,31 @@ def _rail_is_live() -> bool:
 def _require_rail() -> None:
     if not _rail_is_live():
         raise svc.PurchaseRefused("not_available_on_this_rail")
+
+
+def _create_off_reason() -> Optional[str]:
+    """Why create refuses a NEW attempt right now, or None: `_require_rail()`'s check, then the
+    create dial (which also covers the pilot scope). The same two refusals, in the same order, that
+    create raised before it answered a retry first; both are the one private 404 on the wire."""
+    if not _rail_is_live():
+        return "not_available_on_this_rail"
+    if not svc.is_create_enabled():
+        return "create_disabled"
+    return None
+
+
+def _while_create_off(exc: svc.PurchaseRefused, create_off: Optional[str]) -> svc.PurchaseRefused:
+    """The refusal create answers while `create_off` is set.
+
+    A conflict that names the caller's own purchase stands: the key opened a purchase, and saying
+    "unavailable" about it is the answer a client reads as "nothing exists". Every other refusal is
+    the create-off one, so a malformed body, a missing end user or an old refusal tombstone answers
+    the same 404 a dark rail always has, and is no probe for whether the rail is there."""
+    if create_off is None or getattr(exc, "reason", None) == create_off:
+        return exc
+    if getattr(exc, "reason", None) == "idempotency_conflict" and getattr(exc, "existing_purchase_id", None):
+        return exc
+    return svc.PurchaseRefused(create_off)
 
 
 #: Characters that must never reach a bind on this path. `Cc`/`Cf`/`Cs`/`Co`/`Cn` is the same
@@ -2880,7 +2906,25 @@ async def _owner_public_body(row, *, consents: Any = purchase_consent.LOOKUP):
 _RECORD_PARENT_TIMEOUT_S = 1.0
 
 
-async def _record_purchase_parent(purchase_id: str) -> None:
+_ROUTING_KEYS = frozenset({"basis", "dropped", "policy", "market"})
+#: The plan for a parent written on behalf of ANOTHER request's purchase (a key-race loser, for the
+#: winner): the same word the heal and the backfill use for "how this purchase was routed is not known".
+_NEUTRAL_ROUTING: Mapping[str, Any] = MappingProxyType({"basis": "backfill"})
+
+
+def _handed_routing(request: Request) -> Dict[str, Any]:
+    """The router's decision, when the rail-neutral route (routes/agent_commerce_purchases.py) chose this
+    rail and handed the request here: it leaves `router.decision_record(...)` on `request.state`. Empty
+    for an agent that called this route itself, which is recorded as before (`agent_selected_rail`).
+    `request.state` is this process's own object: no header, query or body value lands on it. Anything
+    that is not the expected mapping is ignored, so a fault here can never fail a purchase."""
+    routing = getattr(getattr(request, "state", None), "purchase_routing", None)
+    if not isinstance(routing, Mapping) or not isinstance(routing.get("basis"), str):
+        return {}
+    return {k: v for k, v in routing.items() if k in _ROUTING_KEYS}
+
+
+async def _record_purchase_parent(purchase_id: str, routing: Optional[Mapping[str, Any]] = None) -> None:
     """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
 
     AFTER this route's own transaction has committed, never inside it, and it never raises: the
@@ -2891,14 +2935,24 @@ async def _record_purchase_parent(purchase_id: str) -> None:
     pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
     agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
     or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
-    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
-    never reaches it; both get their parent from the heal or the backfill.
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent
+    replay returns before this hook. A request that lost its key to an earlier one calls it for the
+    WINNER's purchase with `_NEUTRAL_ROUTING` (`basis="backfill"`), never with its own decision: that
+    covers a winner whose own write was cut, and cannot overwrite one that landed. Whatever is still
+    missing is written by the heal on a read, or by the backfill.
+
+    `routing` (see `_handed_routing`) IS BEST-EFFORT, LIKE THE ROW. The first parent write wins and is
+    never updated, so the router's decision is stored only when THIS write is the first. When the 1 s
+    bound cuts it, or a concurrent read's heal or the backfill writes the parent before it, the parent
+    says `basis="backfill"` and the decision is not recoverable. A reader must treat `backfill` as
+    "how this purchase was routed is not known", never as a decision.
     """
     if not agent_purchase_ledger.is_enabled():
         return
     try:
         await asyncio.wait_for(
-            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+            agent_purchase_ledger.ensure_reap_parent(purchase_id, **dict(routing or {})),
+            timeout=_RECORD_PARENT_TIMEOUT_S
         )
     except Exception as exc:  # noqa: BLE001 (TimeoutError included)
         logger.warning(
@@ -2923,6 +2977,22 @@ def _opened_on_another_rail(purchase_id: str) -> JSONResponse:
 
 def _is_reap_purchase_id(purchase_id: Optional[str]) -> bool:
     return str(purchase_id or "").startswith("rp_")
+
+
+def _replay_body(purchase_id: str, view: Mapping[str, Any], item_source: str) -> Dict[str, Any]:
+    """A create replay's 202 body: THE SAME ID, AND THE PURCHASE'S REAL STATE (from `view`)."""
+    body: Dict[str, Any] = {
+        "purchase_id": purchase_id,
+        "status": view.get("state"),
+        "poll_after_seconds": view.get("poll_after_seconds"),
+        "checkout_dispatch_state": view["checkout_dispatch_state"],
+        "contact_reentry_required": view["contact_reentry_required"],
+    }
+    if item_source == "cart_link":
+        # The same additive field the cart-link create answered with. The key's request hash
+        # covers `item_source`, so a replay is always the same lane.
+        body["variant_title"] = view.get("variant_title")
+    return body
 
 
 def _not_found() -> JSONResponse:
@@ -3096,11 +3166,22 @@ async def start_reap_purchase(
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
-    """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that."""
+    """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that.
+
+    ── A RETRY IS ANSWERED BEFORE THE CREATE DIALS ───────────────────────────────────────────
+
+    With the rail off, its client unconfigured, create off (or its pilot scope unreadable), or the
+    cart-link lane off, a same-key same-body retry of a purchase the caller already opened still
+    REPLAYS it, read-only (no consent write, no key write, no buyer write), exactly as `/recover`
+    and the owner GET read it. Refusing it told the client nothing exists while the purchase went
+    on: a client that then sends the buyer elsewhere, or mints a new key, can buy twice. A conflict
+    naming the caller's purchase, and a key that opened one on another rail, are answered as with
+    create on, for the same reason. Every other request (a new attempt, a malformed body, a missing
+    end user) still gets the create-off refusal, unchanged: see `_while_create_off`.
+    """
+    # Decided first, answered after the replay lookup. Nothing below the lookup runs while it is set.
+    create_off = _create_off_reason()
     try:
-        _require_rail()
-        if not svc.is_create_enabled():
-            raise svc.PurchaseRefused("create_disabled")
         agent_user_ref = _require_agent_user(agent_user)
 
         try:
@@ -3119,20 +3200,25 @@ async def start_reap_purchase(
             # is the buyer's address. Never forwarded, never logged.
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
-        # The cart-link lane has two further dark gates. Decide them before consent or any
-        # merchant/catalog read so a disabled lane is the same 404 unavailability as the base rail.
-        if req.item_source == "cart_link" and not svc.is_cart_link_enabled():
-            raise svc.PurchaseRefused("not_available_on_this_rail")
+        # The cart-link lane has two further dark gates. Decided here, before consent or any
+        # merchant/catalog read, so a disabled lane is the same 404 unavailability as the base
+        # rail; like the base dials, it refuses a new attempt only after the replay lookup. (With
+        # it off, `_fingerprint_prefixes_live` is off too, so a key spelled with a selector prefix
+        # is not refused before the lookup: it can only replay the caller's own purchase under
+        # that same key and fingerprint, read-only, and otherwise gets the same 404.)
+        if create_off is None and req.item_source == "cart_link" and not svc.is_cart_link_enabled():
+            create_off = "not_available_on_this_rail"
 
         # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
         #
-        # AFTER THE DIAL, WHICH IS NOT A STYLE CHOICE. `_require_rail()` is the first statement
-        # of this handler and everything about a dark rail depends on it staying first: a
-        # `consent_required` answered before the dial is a 400 where every well-formed request
+        # UNDER THE DIAL, WHICH IS NOT A STYLE CHOICE. The dials are read first (`create_off`)
+        # and everything about a dark rail depends on what `_while_create_off` does with that: a
+        # `consent_required` answered while create is off is a 400 where every well-formed request
         # gets a 404, which is a working probe for a feature that is supposed to be absent. That
         # is the exact defect the note above these handlers records about `Body(...)` and
-        # `Query(...)`, and moving this check one line up would reintroduce it. The mutant table
-        # for this PR kills it in that direction specifically.
+        # `Query(...)`. So while create is off this refusal, and every other one before the
+        # replay lookup, is answered as the create-off 404; only a purchase the caller's key
+        # already opened is answered for what it is.
         #
         # BEFORE ELIGIBILITY, THE CATALOG READ AND EVERY WRITE, which is the other half. A buyer
         # who has not consented must not have an identity minted for them, must not have a
@@ -3234,6 +3320,11 @@ async def start_reap_purchase(
                 agent_id=agent_id,
                 agent_user_ref_hash=agent_user_ref_hash,
             )
+            if view and create_off is not None:
+                # CREATE IS OFF: the replay is a read, like `/recover` and the owner GET. No
+                # consent write (the attempt's consent was recorded when it opened).
+                replay_body = _replay_body(replayed, view, req.item_source)
+                return JSONResponse(status_code=202, content=replay_body)
             if view:
                 # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
                 # `_linked_buyer_id` exists as a separate read.
@@ -3258,20 +3349,15 @@ async def start_reap_purchase(
                 # the attempt's consent was recorded when it was opened.
                 if replay_buyer_id and not legacy_retry:
                     await _record_consent(replay_buyer_id, consent_version)
-                replay_body: Dict[str, Any] = {
-                    "purchase_id": replayed,
-                    "status": view.get("state"),
-                    "poll_after_seconds": view.get("poll_after_seconds"),
-                    "checkout_dispatch_state": view["checkout_dispatch_state"],
-                    "contact_reentry_required": view["contact_reentry_required"],
-                }
-                if req.item_source == "cart_link":
-                    # The same additive field the cart-link create answered with. The key's
-                    # request hash covers `item_source`, so a replay is always the same lane.
-                    replay_body["variant_title"] = view.get("variant_title")
+                replay_body = _replay_body(replayed, view, req.item_source)
                 return JSONResponse(status_code=202, content=replay_body)
+            if create_off is not None:
+                raise svc.PurchaseRefused(create_off)
             # An immutable key without an owner-visible row cannot authorize a new attempt.
             return _not_found()
+        if create_off is not None:
+            # No purchase under this key: this is a NEW attempt, and create is off.
+            raise svc.PurchaseRefused(create_off)
         if legacy_retry:
             # No attempt under this key and fingerprint: a NEW attempt, and a new attempt binds
             # the money the buyer was shown. Refused before any write.
@@ -3415,6 +3501,8 @@ async def start_reap_purchase(
 
         winning_view = None
         other_rail_winner = None
+        # True when this request lost its key to an earlier one and answers with THAT purchase.
+        adopted_winner = False
         try:
             # start_purchase makes no partner call. This short durable unit hides
             # the purchase from other connections until its immutable key lands.
@@ -3464,6 +3552,7 @@ async def start_reap_purchase(
                 elif winner != purchase_id:
                     await _abandon_duplicate(purchase_id)
                     purchase_id = winner
+                    adopted_winner = True
                     winning_view = await _owner_view(
                         purchase_id=winner, agent_id=agent_id,
                         agent_user_ref_hash=agent_user_ref_hash,
@@ -3496,7 +3585,16 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
-        await _record_purchase_parent(purchase_id)
+        if adopted_winner:
+            # NOT THIS REQUEST'S DECISION. A request that lost its key answers with the winner's
+            # purchase, and how THIS request came to this rail says nothing about that one. But it is
+            # also the winner's only second chance at a parent row when its own write was cut (the 1 s
+            # bound, a fault): nothing scheduled heals a parent, and a purchase with no parent emits no
+            # events. So write a NEUTRAL parent: `backfill` (how it was routed is not known), never the
+            # handed decision. Insert-only: it cannot overwrite the parent the winner wrote.
+            await _record_purchase_parent(purchase_id, _NEUTRAL_ROUTING)
+        else:
+            await _record_purchase_parent(purchase_id, _handed_routing(request))
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
@@ -3513,7 +3611,7 @@ async def start_reap_purchase(
     except _PurchasePersistenceUnavailable:
         return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
     except svc.PurchaseRefused as exc:
-        return _refused(exc)
+        return _refused(_while_create_off(exc, create_off))
 
 
 async def _validate_resume_selection(req, row, merchant, host, product, variant, market, *, product_url=None):

@@ -162,6 +162,19 @@ async def test_jsonb_and_timestamptz_come_back_as_python_values():
     assert parent["created_at"].tzinfo is not None
 
 
+async def test_a_routers_decision_comes_back_whole_from_jsonb():
+    import db.agent_purchase_ledger as purchases
+
+    rp = await _reap()
+    pp = await purchases.ensure_reap_parent(
+        rp, basis="orchestrator_selected_rail", dropped={"a2a": "merchant_not_proven"}, policy="env_v1", market="US")
+    parent = await purchases.get_for_owner(pp, AGENT, OWNER)
+    assert parent["routing_plan"] == {
+        "rail": "reap", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
+        "dropped": {"a2a": "merchant_not_proven"}, "policy": "env_v1", "market": "US",
+    }
+
+
 async def test_owner_reads_lists_and_backfill_on_postgres():
     import db.agent_purchase_ledger as purchases
 

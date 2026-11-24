@@ -8,8 +8,8 @@ the caller's too, so a partner could name another buyer's ref and the saver's ac
 buyer's link (and with it the identity-linked prefill of their saved email and address).
 
 Now only a token carrying `agent_user_ref_verified: true` (set at mint only when the ref came from a
-verified JWT) writes the link. Everything else the save does is unchanged, including the order's
-agent_user_ref attribution.
+verified JWT) writes the link. The order's agent_user_ref stamp follows the same rule (see
+tests/test_save_from_checkout_claims_only_the_tokens_order.py): an unverified ref leaves it as it is.
 
 Tokens are minted by the real signer and read by the route's real verifier; the link upsert is the
 real `_upsert_buyer_identity_link` against a fake table that keeps its ON CONFLICT semantics.
@@ -44,15 +44,33 @@ SAVER_EMAIL = "saver@example.com"
 UI_KEY = {"X-Checkout-UI-Key": "test-checkout-ui-key"}
 
 
+_UNSET = object()
+
+
 class _World:
     def __init__(self) -> None:
         self.links: Dict[Tuple[str, str], str] = {}
         self.order_row: Optional[Dict[str, Any]] = None
         self.order_updates: list = []
+        # The row's buyer_id at UPDATE time, when a case makes it differ from the read (a concurrent
+        # save). Unset: the row as read.
+        self.owner_at_write: Any = _UNSET
+
+    def _update_order(self, v: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # The UPDATE's WHERE: the order, and buyer_id NULL, '' or the saver's own. RETURNING order_id.
+        owner = self.owner_at_write
+        if owner is _UNSET:
+            owner = (self.order_row or {}).get("buyer_id")
+        if self.order_row is None or not (owner is None or owner == "" or owner == v.get("buyer_id")):
+            return None
+        self.order_updates.append(dict(v))
+        return {"order_id": v.get("order_id")}
 
     async def fetch_one(self, query, values=None):  # noqa: ANN001
         text = str(query).lower()
         v = values or {}
+        if isinstance(query, str) and text.lstrip().startswith("update orders"):
+            return self._update_order(v)
         if "from buyer_identity_links" in text:
             buyer = self.links.get((v.get("agent_id"), v.get("agent_user_ref_hash")))
             return {"buyer_id": buyer} if buyer else None
@@ -69,7 +87,9 @@ class _World:
                 self.links[(v["agent_id"], v["agent_user_ref_hash"])] = v["buyer_id"]
             elif text.lstrip().startswith("update orders"):
                 self.order_updates.append(dict(v))
-        return 1
+        # As on Postgres: `databases` 0.7 answers execute with fetchval, None for a write without
+        # RETURNING. Code that reads a row count from execute must fail here as it does there.
+        return None
 
 
 @pytest.fixture
@@ -179,8 +199,8 @@ def test_only_a_literal_true_marker_counts_as_verified(client, world, marker):
 )
 def test_the_order_ref_is_never_used_for_the_link(client, world, order_fields):
     world.order_row = _order(**order_fields)
-    # Via a checkout token that names no ref...
-    _save(client, _token(), order_id=ORDER)
+    # Via a checkout token that names no ref (bound to this order)...
+    _save(client, _token(order_id=ORDER), order_id=ORDER)
     assert world.links == {}
     # ...and via the legacy order-only path (no checkout token).
     _save(client, None, order_id=ORDER)
@@ -196,7 +216,7 @@ def test_an_unverified_save_does_not_repoint_another_buyers_link(client, world):
 
     _save(client, _token(agent_user_ref=REF))
     world.order_row = _order(agent_user_ref=REF, metadata={"agent_user_ref": REF})
-    _save(client, _token(agent_user_ref=REF), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, order_id=ORDER), order_id=ORDER)
     _save(client, None, order_id=ORDER)
 
     assert world.links == {key: OWNER}
@@ -213,17 +233,17 @@ def test_a_verified_token_ref_links_the_saver(client, world):
 
 def test_a_verified_token_ref_is_the_ref_linked_even_when_the_order_names_another(client, world):
     world.order_row = _order(agent_user_ref="https://issuer.placeholder.example:user_two")
-    _save(client, _token(agent_user_ref=REF, agent_user_ref_verified=True), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, agent_user_ref_verified=True, order_id=ORDER), order_id=ORDER)
     assert world.links == {(AGENT, _ref_hash(REF)): SAVER}
 
 
 # -- the rest of the save is unchanged -------------------------------------------------------------
 
 
-def test_an_unverified_ref_is_still_stamped_on_the_order_as_attribution(client, world):
+def test_an_unverified_ref_saves_the_order_without_stamping_its_ref(client, world):
     world.order_row = _order()
-    _save(client, _token(agent_user_ref=REF), order_id=ORDER)
+    _save(client, _token(agent_user_ref=REF, order_id=ORDER), order_id=ORDER)
     assert world.links == {}
     assert len(world.order_updates) == 1
-    assert world.order_updates[0]["agent_user_ref"] == REF
+    assert world.order_updates[0]["agent_user_ref"] is None
     assert world.order_updates[0]["buyer_id"] == SAVER

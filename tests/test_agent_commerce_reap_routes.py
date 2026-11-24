@@ -1393,6 +1393,192 @@ async def test_a_stalled_ledger_write_cannot_hold_the_202(client, monkeypatch):
     assert time.monotonic() - started < 5
 
 
+def _plan(parent: dict) -> dict:
+    raw = parent["routing_plan"]
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
+def _with_request_state(inner, **state):
+    """The app, with `state` already on the request's server-side state when the route runs: what the
+    rail-neutral route leaves there before it hands a request to this one."""
+
+    async def _app(scope, receive, send):
+        if scope["type"] == "http":
+            scope.setdefault("state", {}).update(state)
+        await inner(scope, receive, send)
+
+    return _app
+
+
+async def test_an_agent_that_calls_this_route_itself_is_recorded_as_the_decider(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
+async def test_a_request_the_router_handed_over_records_the_routers_decision(client, monkeypatch):
+    """The value on the request state is the one the router really makes (`decision_record` of a real
+    `choose_rail` answer), not a hand-built look-alike."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+    from services.payment_orchestration import router as rail_router
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    choice = rail_router.choose_rail(
+        agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+        currency="USD", worker_alive=True)
+    assert choice.rail == "reap" and choice.dropped  # the other rail is off here, and says so
+    client._app = _with_request_state(
+        client._app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {
+        "rail": "reap", "executor": "rail_managed", "basis": "orchestrator_selected_rail",
+        "dropped": dict(choice.dropped), "policy": rail_router.POLICY_VERSION, "market": "US",
+    }
+
+
+@pytest.mark.parametrize("left_on_state", [
+    None, "orchestrator_selected_rail", ["basis"], {}, {"dropped": {"a2a": "x"}}, {"basis": 7},
+])
+async def test_anything_else_on_the_request_state_is_ignored_and_never_fails_the_purchase(
+    client, monkeypatch, left_on_state
+):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    client._app = _with_request_state(client._app, purchase_routing=left_on_state)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
+async def _lose_the_key_race(client, monkeypatch, same_body, *, loser_was_routed: bool):
+    """Send `same_body` again as a request whose replay read misses once (the race): it opens its own row,
+    loses the key claim and answers with the earlier request's purchase. Returns its response."""
+    from services.payment_orchestration import router as rail_router
+
+    real_replay, misses = routes_reap._replayed_purchase_id, []
+
+    async def _miss_once(**kwargs):
+        if not misses:
+            misses.append(1)
+            return None
+        return await real_replay(**kwargs)
+
+    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", _miss_once)
+    if loser_was_routed:
+        choice = rail_router.choose_rail(
+            agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+            currency="USD", worker_alive=True)
+        client._app = _with_request_state(
+            client._app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    response = await client.post(f"{BASE}/purchases", json=same_body)
+    assert response.status_code == 202 and misses == [1], response.text
+    return response
+
+
+@pytest.mark.parametrize("loser_was_routed", [True, False])
+async def test_a_request_that_lost_its_key_gives_the_winner_a_neutral_parent_when_it_has_none(
+    client, monkeypatch, loser_was_routed
+):
+    """The winner's own parent write FAILED. The loser is then its only second chance (nothing scheduled
+    heals a parent, and no parent means no events), so it writes one: `backfill`, never its own decision."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    same_body = _body()  # one key, one body, sent twice
+    real_ensure, calls = agent_purchase_ledger.ensure_reap_parent, []
+
+    async def _fail_first(rail_purchase_id, **kwargs):
+        calls.append((rail_purchase_id, dict(kwargs)))
+        if len(calls) == 1:
+            raise RuntimeError("agent_purchases unavailable")
+        return await real_ensure(rail_purchase_id, **kwargs)
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _fail_first)
+    first = await client.post(f"{BASE}/purchases", json=same_body)
+    assert first.status_code == 202, first.text
+    winner = first.json()["purchase_id"]
+    assert await _agent_purchase_parents(winner) == []
+
+    second = await _lose_the_key_race(client, monkeypatch, same_body, loser_was_routed=loser_was_routed)
+    assert second.json()["purchase_id"] == winner
+    [loser] = await database.fetch_all(
+        "SELECT id, state, refusal_reason FROM reap_agentic_purchases WHERE id <> :w", {"w": winner})
+    assert (loser["state"], loser["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
+    # By purchase id, not "the table has one row": other files' parents can be in this table.
+    [parent] = await _agent_purchase_parents(winner)
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "backfill"}
+    assert await _agent_purchase_parents(loser["id"]) == []
+    # The loser's call carried the neutral plan only: none of its own decision's keys.
+    assert calls[1] == (winner, {"basis": "backfill"})
+
+
+@pytest.mark.parametrize("winner_was_routed", [True, False])
+async def test_a_request_that_lost_its_key_cannot_change_the_parent_the_winner_wrote(
+    client, monkeypatch, winner_was_routed
+):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+    from services.payment_orchestration import router as rail_router
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    same_body = _body()
+    plain_app = client._app
+    if winner_was_routed:
+        choice = rail_router.choose_rail(
+            agent_id=AGENT, merchant_domain="brand.example", market_country="US", item_source="cart_link",
+            currency="USD", worker_alive=True)
+        client._app = _with_request_state(
+            plain_app, purchase_routing=rail_router.decision_record(choice, market_country="US"))
+    first = await client.post(f"{BASE}/purchases", json=same_body)
+    winner = first.json()["purchase_id"]
+    [written] = await _agent_purchase_parents(winner)
+    assert _plan(written)["basis"] == ("orchestrator_selected_rail" if winner_was_routed else "agent_selected_rail")
+
+    client._app = plain_app
+    second = await _lose_the_key_race(client, monkeypatch, same_body, loser_was_routed=not winner_was_routed)
+    assert second.json()["purchase_id"] == winner
+    [after] = await _agent_purchase_parents(winner)
+    assert (after["id"], _plan(after)) == (written["id"], _plan(written))
+
+
+def test_only_the_decisions_own_keys_are_taken_from_the_request_state():
+    from types import SimpleNamespace
+
+    handed = {"basis": "buyer_selected_rail", "dropped": {"a2a": "not_selected"}, "policy": "env_v1",
+              "market": "US", "rail_purchase_id": "rp_other", "id": "pp_other"}
+    request = SimpleNamespace(state=SimpleNamespace(purchase_routing=handed))
+    assert routes_reap._handed_routing(request) == {
+        "basis": "buyer_selected_rail", "dropped": {"a2a": "not_selected"}, "policy": "env_v1", "market": "US"}
+    assert routes_reap._handed_routing(SimpleNamespace()) == {}
+
+
+async def test_a_caller_cannot_put_a_decision_on_the_request_state(client, monkeypatch):
+    """Nothing a caller sends lands on `request.state`: not a header, not a query value, not a body key."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    claim = {"basis": "orchestrator_selected_rail", "dropped": {"a2a": "claimed"}, "policy": "env_v1", "market": "US"}
+    resp = await client.post(
+        f"{BASE}/purchases?purchase_routing=orchestrator_selected_rail",
+        json=_body(), headers={"purchase-routing": json.dumps(claim), "x-purchase-routing": json.dumps(claim)},
+    )
+    assert resp.status_code == 202
+    [parent] = await _agent_purchase_parents(resp.json()["purchase_id"])
+    assert _plan(parent) == {"rail": "reap", "executor": "rail_managed", "basis": "agent_selected_rail"}
+
+
 async def test_the_price_is_our_catalogs_and_the_request_cannot_move_it(client):
     """THE CENTRAL GUARD. `verify_quote` compares `quantity * our_price_minor` against Reap's
     subtotal EXACTLY. If the caller could set that number, the comparison would be the caller's
@@ -4725,6 +4911,186 @@ async def test_create_only_pause_precedes_buyer_writes_and_preserves_read_recove
     recovered = await client.post(f"{BASE}/purchases/recover", json=body)
     assert recovered.status_code == 200 and recovered.json()["id"] == purchase_id
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+# ── a retry while create is off ──────────────────────────────────────────────────────────────
+#
+# A same-key, same-body retry of an attempt that EXISTS is answered with that attempt whatever the
+# create dials say now. A refusal there tells the client nothing was opened, and a client that acts
+# on it (sends the buyer to another route, mints a new key) can buy twice. Only NEW attempts, and
+# every request that names no existing purchase, get the dark 404.
+
+#: Every way create is off for a NEW attempt. `cart_link_off` is the cart-link lane's own dial.
+_CREATE_OFF = {
+    "create_off": {"REAP_AGENTIC_CREATE_ENABLED": "0"},
+    "pilot_scope_malformed": {"REAP_AGENTIC_PILOT_SCOPE": "not-json"},
+    "rail_off": {"REAP_AGENTIC_ENABLED": "0"},
+    "unconfigured": {"REAP_API_KEY": None},
+    "cart_link_off": {"REAP_AGENTIC_CART_LINK_ENABLED": "0"},
+}
+_CREATE_OFF_CASES = [(lane, how) for lane in ("reap_variant", "cart_link") for how in _CREATE_OFF
+                     if how != "cart_link_off" or lane == "cart_link"]
+
+
+def _turn_create_off(monkeypatch, how: str) -> None:
+    for name, value in _CREATE_OFF[how].items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+async def _rail_rows() -> Dict[str, Any]:
+    """Every row a create (or a replay's consent write) can touch, in full."""
+    out: Dict[str, Any] = {}
+    for table in ("reap_agentic_purchases", "reap_agentic_purchase_keys", "reap_agentic_buyer_refs",
+                  "buyer_identity_links"):
+        out[table] = sorted((sorted(dict(r).items()) for r in await database.fetch_all(f"SELECT * FROM {table}")),
+                            key=repr)
+    return out
+
+
+def _forbid_create_writes(monkeypatch) -> None:
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("a request while create is off reached a create write")
+    for seam in ("_buyer_id_for", "_record_consent", "_claim_idempotency_key", "_write_idempotency_key"):
+        monkeypatch.setattr(routes_reap, seam, forbidden)
+
+
+@pytest.mark.parametrize("lane,how", _CREATE_OFF_CASES)
+async def test_a_retry_while_create_is_off_replays_the_existing_purchase_and_writes_nothing(
+        client, monkeypatch, lane, how):
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    body = _body(item_source=lane, idempotency_key="retry-while-create-off")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    normal = await client.post(f"{BASE}/purchases", json=body)
+    assert normal.status_code == 202 and normal.json()["purchase_id"] == created.json()["purchase_id"]
+    _turn_create_off(monkeypatch, how)
+    before = await _rail_rows()
+    _forbid_create_writes(monkeypatch)
+
+    replay = await client.post(f"{BASE}/purchases", json=body)
+
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == normal.json(), "the same answer a replay gets with create on"
+    assert await _rail_rows() == before
+
+
+@pytest.mark.parametrize("lane,how", _CREATE_OFF_CASES)
+async def test_a_money_less_retry_while_create_is_off_still_replays(client, monkeypatch, lane, how):
+    """The read-only legacy replay (a key sent before the money pair was required) too."""
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    body = _body(item_source=lane, idempotency_key="legacy-retry-while-off")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    legacy = _legacy(body)
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET request_hash = :h WHERE idempotency_key = :k",
+        {"h": _legacy_request_hash(body), "k": "legacy-retry-while-off"})
+    _turn_create_off(monkeypatch, how)
+    before = await _rail_rows()
+    _forbid_create_writes(monkeypatch)
+    replay = await client.post(f"{BASE}/purchases", json=legacy)
+    assert replay.status_code == 202 and replay.json()["purchase_id"] == created.json()["purchase_id"], replay.text
+    assert await _rail_rows() == before
+
+
+@pytest.mark.parametrize("how", ["create_off", "rail_off"])
+async def test_a_changed_body_under_an_existing_key_while_create_is_off_is_the_conflict_naming_it(
+        client, monkeypatch, how):
+    await _seed_all()
+    body = _body(idempotency_key="conflict-while-off")
+    pid = (await client.post(f"{BASE}/purchases", json=body)).json()["purchase_id"]
+    _turn_create_off(monkeypatch, how)
+    _forbid_create_writes(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json={**body, "quantity": 2})
+    assert resp.status_code == 409 and _error(resp) == "idempotency_conflict", resp.text
+    assert (resp.json()["detail"]["purchase_id"], resp.json()["detail"]["rail"]) == (pid, "reap")
+
+
+#: The cart-link lane's dial can only be read once the body names the lane, so a body that does not
+#: parse, or a request with no end user, answers as it always has with only that dial off.
+_BEFORE_THE_LANE_IS_KNOWN = ("not_json", "no_agent_user")
+
+#: The caller's OWN key, mapped to no purchase: a refusal tombstone, an operator's retirement marker,
+#: and a changed body under a tombstoned key (a conflict that names no purchase). With create on each
+#: answers its 409 (`test_an_own_key_naming_no_purchase_answers_its_409_with_create_on`); with create
+#: off each is the dark 404, because none of them is a purchase a client could lose track of.
+_OWN_KEY_NAMING_NO_PURCHASE = {
+    "own_tombstone": ("merchant_not_eligible", "merchant_not_eligible"),
+    "own_retired_attempt": ("attempt_retired:" + "a" * 32, "attempt_retired"),
+    "changed_body_on_own_tombstone": ("merchant_not_eligible", "idempotency_conflict"),
+}
+
+
+async def _own_key_naming_no_purchase(kind: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Plant the caller's own key for `kind` and return the retry body that reaches it."""
+    marker, _ = _OWN_KEY_NAMING_NO_PURCHASE[kind]
+    await _plant_legacy_tombstone(body, reason=marker)
+    # A tombstone is keyed under the money-less fingerprint; the body WITH money is a different
+    # request under the same key.
+    return body if kind == "changed_body_on_own_tombstone" else _legacy(body)
+
+
+@pytest.mark.parametrize("kind", sorted(_OWN_KEY_NAMING_NO_PURCHASE))
+async def test_an_own_key_naming_no_purchase_answers_its_409_with_create_on(client, monkeypatch, kind):
+    """The control for the dark-404 cases below: these setups are real, and create on answers them."""
+    await _seed_atomic_request_lane(monkeypatch, "cart_link")
+    retry = await _own_key_naming_no_purchase(kind, _body(item_source="cart_link"))
+    resp = await client.post(f"{BASE}/purchases", json=retry)
+    assert resp.status_code == 409 and _error(resp) == _OWN_KEY_NAMING_NO_PURCHASE[kind][1], resp.text
+    assert "purchase_id" not in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("how,kind", [
+    (how, kind) for how in sorted(_CREATE_OFF)
+    for kind in ("new_key", "no_consent", "blank_key", "money_less_new", "key_of_another_buyer",
+                 "key_without_its_purchase") + tuple(sorted(_OWN_KEY_NAMING_NO_PURCHASE))
+    + _BEFORE_THE_LANE_IS_KNOWN
+    if how != "cart_link_off" or kind not in _BEFORE_THE_LANE_IS_KNOWN
+])
+async def test_while_create_is_off_a_request_naming_no_existing_purchase_is_the_dark_404(
+        client, monkeypatch, how, kind):
+    """THE DARK-RAIL RULE STILL HOLDS: with create off, every request that does not name one of the
+    caller's own purchases is the same 404, so a malformed body is no probe for whether the rail is
+    there (a 400 or 401 here would be), and nothing is written."""
+    await _seed_atomic_request_lane(monkeypatch, "cart_link")
+    existing = _body(item_source="cart_link", idempotency_key="someone-elses-key")
+    CALLER.agent_user_ref = OTHER_USER_REF
+    assert (await client.post(f"{BASE}/purchases", json=existing)).status_code == 202
+    CALLER.agent_user_ref = USER_REF
+    body = _body(item_source="cart_link")
+    if kind == "key_without_its_purchase":
+        # The caller's own key, whose purchase is not visible to them any more.
+        orphan = await client.post(f"{BASE}/purchases", json=body)
+        assert orphan.status_code == 202, orphan.text
+        await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": orphan.json()["purchase_id"]})
+    own_retry = (await _own_key_naming_no_purchase(kind, body)
+                 if kind in _OWN_KEY_NAMING_NO_PURCHASE else None)
+    _turn_create_off(monkeypatch, how)
+    before = await _rail_rows()
+    _forbid_create_writes(monkeypatch)
+    kwargs: Dict[str, Any] = {"json": body}
+    if kind == "no_consent":
+        body["buyer"].pop("consent_version")
+    elif kind == "blank_key":
+        body["idempotency_key"] = " "
+    elif kind == "money_less_new":
+        kwargs["json"] = _legacy(body)
+    elif kind == "not_json":
+        kwargs = {"content": b"not json", "headers": {"content-type": "application/json"}}
+    elif kind == "no_agent_user":
+        CALLER.agent_user_ref = None
+    elif kind == "key_of_another_buyer":
+        kwargs["json"] = existing
+    elif own_retry is not None:
+        kwargs["json"] = own_retry
+
+    resp = await client.post(f"{BASE}/purchases", **kwargs)
+
+    assert resp.status_code == 404 and _error(resp) == "not_available_on_this_rail", resp.text
+    assert await _rail_rows() == before
 
 
 @pytest.mark.parametrize("field,value", [
