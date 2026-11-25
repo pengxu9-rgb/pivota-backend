@@ -1,6 +1,6 @@
 # ADR-035: Several items from one store in one purchase, only once a rail's quote names every line
 
-**Status:** Proposed, 2026-11-25. It records one owner decision of 2026-11-25 (see "Owner decision"). Nothing here is built or switched on by this ADR. Until a rail meets D1, every purchase on that rail stays one line, exactly as today.
+**Status:** Proposed, 2026-11-25. It records two owner decisions of 2026-11-25 (see "Owner decisions"): per-line quotes for one store, and several stores as several purchases (amendment 1, D6). Nothing here is built or switched on by this ADR. Until a rail meets D1, every purchase on that rail stays one line, exactly as today.
 
 **Decision owner:** Founder. **Runtime owners:** the backend's agent-purchase code owner (both rails, the unified ledger and the views) and the AgenPas gateway's code owner (the `start_purchase` tool, the buyer page), to be named at acceptance.
 
@@ -33,12 +33,27 @@ Every layer of the purchase flow assumes one line.
 - **The views and the page are one line.** `PUBLIC_PURCHASE_COLUMNS` (Reap), `_PUBLIC_COLUMNS` (A2A), the gateway's `view.js` allowlist (`product_name`, `variant_title`, `quantity`, `amounts.unit_price_minor`) and `app.js` (one item card). The product image (`services/payment_orchestration/purchase_product_image.py`, when it lands) is one image per purchase.
 - **What already handles lines.** Reap's quote REQUEST takes `items[1..20]` on its discovery lane (`build_quote_items`), though our caller always sends one. `checkout_amounts.py` (the confirm-card shapes) sums `quantity x price` over `line_items[]` against an aggregate ceiling.
 
-## Owner decision (2026-11-25)
+## Owner decisions (2026-11-25)
+
+### 1. One store: "Wait for per-line quotes."
 
 **"Wait for per-line quotes."** Multi-item carts are built only for a rail whose quote names every line. Until then every purchase on that rail stays one line. Ruled out on the same day:
 
 - one page that opens one single-line purchase per line: today's check per line, but one store order per line, shipping possibly charged per order, and lines that can fail one by one;
 - one checkout checked on the items total only: the gap the single-line design exists to close.
+
+### 2. Several stores: one purchase per store (amendment 1)
+
+The owner accepted six recommendations on the same day. They are D6 below:
+
+1. a basket from several stores is several per-store purchases tied by a group, never one charge across stores;
+2. this amendment, in this ADR;
+3. each store stands alone; no approval is shown until every store in the group has a quote, and the page says up front that the basket is several separate orders and charges;
+4. at most 5 stores per group;
+5. timing: the group and its page are not built ahead of the single-line path's first supervised order;
+6. the partner questions below (1 to 14) go out together, after this ADR is accepted, each send with its own go.
+
+What was ruled out above, one purchase per *line* of one store, is not this. Across stores, separate orders, shipping per store and stores that refuse on their own exist whatever Pivota builds.
 
 ## Decision
 
@@ -51,6 +66,8 @@ A rail is **multi-line capable** only when, for a cart of N lines (2 <= N <= the
 - the line's price (unit or line total, and which one it is);
 
 and no line we did not send. A rail that answers only an aggregate, drops a line silently, or substitutes a variant is not capable. Capability is a fact proven per rail and per lane (Reap discovery, Reap external checkout, the A2A rail), recorded in this ADR's "Rail capability" table when the partner answers and a sandbox run confirm it, and switched on per lane by a dial that defaults off.
+
+D1 governs purchases a payment partner places on a store's checkout from our cart link. It does not change the checkout-session tools (UCP, ACP, `create_checkout_session`), which already take up to 50 lines from one store.
 
 ### D2. The check is per line, and the whole purchase passes or fails
 
@@ -76,6 +93,17 @@ and no line we did not send. A rail that answers only an aggregate, drops a line
 - The buyer page lists the lines (collapsed after three on a phone, "and N more"), with one image per line where `purchase_product_image`'s rule finds one.
 - Webhooks and events carry `lines[]` through the unified body, as they carry the view today.
 
+### D6. Several stores are several purchases (amendment 1)
+
+- **One purchase per store.** A basket that names two or more stores becomes one purchase per store. Each is a complete purchase under D1 to D5: its own lines (one line until its rail meets D1), its own quote, approval, token, order and refunds.
+- **Nothing spans stores.** No purchase, charge, approval, token or cart mandate covers two stores. This restates ADR-028 D7, ADR-030 D1 and ADR-031 D7; it does not change them. No agentic checkout protocol spans merchants, and an agent network token is scoped to one merchant and one amount.
+- **A group ties them, and only shows them.** A new table `agent_purchase_groups` (group id, agent, buyer reference, created at, idempotency key). The parent `agent_purchases` gains a nullable `group_id`. A purchase joins a group at create time only, for the same agent and buyer, and never moves. The group holds no money, amount, consent or order.
+- **The request.** `start_purchase` and `POST /agent/v2/commerce/purchases` gain an optional `group_ref`, supplied by the agent. The first purchase that names it creates the group. The group ref is not part of a purchase's fingerprint: a one-store purchase hashes exactly as today. A replay that names a different group is refused (`group_conflict`).
+- **The read.** A new `get_purchase_group` returns `purchases[]`, each the unified purchase view as today. The group's status is derived from its purchases, never stored.
+- **Each store stands alone.** A refusal, failure, expiry or refund at one store never cancels or changes another. No approval is shown until every store in the group has a quote. Before the first approval, the page says the basket is N separate orders with N charges.
+- **A cap.** At most 5 stores per group. A sixth is refused (`group_store_cap`).
+- **The page.** One group page lists the stores, each with its total and its own approve step. v1 approves store by store. One approval for all stores needs a yes to questions 11 and 13 and a later amendment.
+
 ## Questions for the partners (not sent; to send once this ADR is accepted)
 
 Every answer is checked in a sandbox run before a lane is marked capable.
@@ -99,6 +127,21 @@ Every answer is checked in a sandbox run before a lane is marked capable.
 9. Does the cart mandate bind each line, and what does the network check against it?
 10. Partial availability and partial fulfilment: refused, dropped, or a partial order?
 
+**Several stores (D6), Reap:**
+
+11. Each checkout gets its own hosted approval page. Can one buyer approve two or more checkouts, one per store, on one page or with one passkey?
+12. Can two or more checkouts on the same enrollment be open at the same time, each with its own single-use credential and amount?
+
+**Several stores (D6), the A2A rail's provider:**
+
+13. Can token-setup mint several single-use tokens on one payment method at once, each bound to its own order and amount, under one buyer approval?
+
+**Several stores (D6), both:**
+
+14. The quote's lifetime is the approval window. Can quotes for several stores be held open together while the buyer reviews all of them? If not, what is the longest window?
+
+D6 works if 11 and 13 are answered "one approval per purchase": the page then shows one approve step per store.
+
 ## Open decisions (at acceptance)
 
 1. **Partial availability.** v1 refuses the whole purchase (D2). Should a later version offer the buyer the available lines as a new approval?
@@ -114,6 +157,8 @@ Every answer is checked in a sandbox run before a lane is marked capable.
 4. **The page.** The buyer page lists lines; the gateway's `start_purchase` tool takes `items[]` for that lane only.
 5. **On.** Per lane, with the owner's go, after the staging run.
 
+**D6, the group,** is independent of phases 1 to 5 and needs no partner answer: the group table, `group_ref`, `get_purchase_group` and the group page, behind a dial off by default. It is not built ahead of the single-line path's first supervised order (owner decision 2, point 5).
+
 ## Rail capability
 
 | Lane | Quote names every line | Evidence | Dial |
@@ -127,8 +172,11 @@ Every answer is checked in a sandbox run before a lane is marked capable.
 - No purchase gets a weaker check than today: a rail that cannot name every line never carries two.
 - Multi-item carts wait on the partners; the work starts with sending ten questions, not with code.
 - Phase 2 is safe to build ahead (one line still), and shortens the path once a partner says yes.
+- Several stores never wait on a partner: each store is today's purchase, and the group only shows them together. The cost is one approval per store until a partner allows one approval for several.
 
 ## Alternatives considered
+
+- **One charge across several stores** (ruled out by the owner, 2026-11-25, decision 2): no agentic checkout protocol spans merchants, an agent token is locked to one merchant and amount, and someone would have to charge once and pay out, which makes Pivota or a partner the merchant of record (ADR-016, ADR-030 D1).
 
 - **One purchase per line under one page** (ruled out by the owner, 2026-11-25): keeps today's check per line, but splits one basket into several store orders, with shipping per order and lines that fail one by one.
 - **One checkout checked on the total only** (ruled out by the owner, 2026-11-25): a swap between lines at the same total goes uncaught.
