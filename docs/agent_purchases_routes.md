@@ -100,6 +100,18 @@ does not exist. Turning it on needs a restart.
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
   appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
   the offer is stateless (an HMAC, below).
+- With `AGENPAS_PRODUCT_IMAGE_ENABLED` on (default off, read per request), either rail's body carries
+  `"product_image_url": "https://..."` only when the catalog has an image that is surely of the variant
+  bought (`services/payment_orchestration/purchase_product_image`). The bought sku is the Reap row's
+  `variant_key`, or every sku naming the Shopify variant of a cart link (Reap `shopify:<n>`, the A2A
+  `checkout_url` line), never the `::canonical` placeholder, and only live (unsuppressed) rows. Their images
+  must agree. The sku's own image shows when it differs from the product's (the Shopify sync copies the hero
+  onto every sku). The product's image shows only for a one-variant product (counted over every sku row,
+  withdrawn ones too) whose purchase names no variant of its own (no variant title, or "Default Title").
+  The URL is a clean public https URL whose authority is exactly a host name, optionally `:443`
+  (`clean_product_image_url`); the AgenPas gateway fetches it server-side, and
+  the buyer's browser never loads a store's host. No field otherwise or when the read fails (the body is
+  still served). Never in the public route or the webhooks. Off: no field.
 - With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
   is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
   checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
