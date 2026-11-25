@@ -365,6 +365,8 @@ async def test_a_clearance_without_a_d11_basis_a_name_and_evidence_is_refused(_b
     "e-signature on file", "SIG-1234", "cookie policy page", "password reset ticket IT-33",
     "letters a & b, folder 2026-11", "api-key rotation note in the vault runbook", "session_id column, ticket DATA-9",
     "token rail incident INC-2026-0042", "1" * 40, "abcdefghijklmnopqrstuvwxyz-abcdefghij",
+    # An address and a separator line are not a link's credentials or a key's armour.
+    "emailed by ops@brand-a.example, ticket OPS-2", "letters ----- 2026 folder", "begin-of-month review OPS-3",
 ])
 async def test_a_plain_reference_to_where_the_evidence_is_kept_is_accepted(_blocks_db, evidence):
     await _worker_event()
@@ -382,6 +384,11 @@ async def test_a_plain_reference_to_where_the_evidence_is_kept_is_accepted(_bloc
     (dict(evidence="https://files.example/a?token=abc"), "evidence_query_string"),
     (dict(evidence="token: abc123"), "evidence_credential_label"),
     (dict(evidence="ghp_" + "a1B2c3D4e5" * 4), "evidence_looks_like_a_secret"),
+    # Built from parts, so the test file holds no string a secret scanner would flag.
+    (dict(evidence="https://" + "ops" + ":" + "pw1" + "@files.example/letters"), "evidence_url_credentials"),
+    (dict(evidence="sftp://" + "ops" + "@files.example/letters"), "evidence_url_credentials"),
+    (dict(evidence="-" * 5 + "BEGIN " + "PRIVATE KEY" + "-" * 5), "evidence_looks_like_a_secret"),
+    (dict(evidence="pasted: " + "-" * 5 + "begin certificate"), "evidence_looks_like_a_secret"),
     (dict(), None),
 ])
 def test_a_refused_clearance_names_the_part_that_failed(change, part):
@@ -793,7 +800,12 @@ def test_no_statement_in_the_application_can_delete_or_rewrite_an_event():
         assert "AND listed.cleared_at IS NULL" in where and ") = CAST(:expected AS INTEGER)" in where
 
 
-def test_nothing_reads_or_writes_the_record_on_a_request_path_yet():
-    for folder in ("routes", "services"):
-        for path in (_REPO / folder).rglob("*.py"):
-            assert TABLE not in path.read_text("utf-8", errors="ignore"), path
+def test_one_request_path_module_reads_the_record_and_it_never_writes():
+    """The run-condition filter is the one request-path reader, and it calls `is_clear` only."""
+    reader = _REPO / "services/payment_orchestration/agent_run_condition.py"
+    readers = [
+        path for folder in ("routes", "services") for path in (_REPO / folder).rglob("*.py")
+        if TABLE in path.read_text("utf-8", errors="ignore")
+    ]
+    assert readers == [reader]
+    assert set(re.findall(r"agent_blocks\.([a-z_]+)", reader.read_text("utf-8"))) == {"is_clear"}

@@ -5352,3 +5352,149 @@ async def test_full_production_pilot_admits_resolved_primary_route_and_replays(c
     replayed = await client.post(f"{BASE}/purchases", json=body)
     assert replayed.status_code == 202 and replayed.json()["purchase_id"] == purchase["id"], replayed.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+# ── ADR-030 D11: Reap's checkout agent runs only where the run condition holds (step 2b, PR C) ──
+
+
+class _RunConditionReads:
+    """Stand-ins for the two record reads (the readers' own suites own what they read), recording
+    every call. `fact` and `clear` are the answers."""
+
+    def __init__(self, monkeypatch, *, fact: bool = True, clear: bool = True):
+        import db.merchant_agent_checkout_facts as checkout_facts
+        import db.partner_agent_merchant_blocks as agent_blocks
+
+        self.fact, self.clear, self.calls = fact, clear, []
+
+        async def _fact(domain):
+            self.calls.append(("fact", domain))
+            return self.fact
+
+        async def _clear(rail, domain):
+            self.calls.append(("clear", rail, domain))
+            return self.clear
+
+        monkeypatch.setattr(checkout_facts, "meets_run_condition", _fact)
+        monkeypatch.setattr(agent_blocks, "is_clear", _clear)
+
+
+async def _seed_lane(lane: str, monkeypatch) -> Dict[str, Any]:
+    """A request that opens a purchase on that lane, and its fixtures."""
+    if lane == "cart_link":
+        await _seed_tierb_shopify_item()
+        await _seed_tierb_verdict()
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        return _body(item_source="cart_link")
+    await _seed_catalog()
+    await _seed_eligibility()
+    return _body()
+
+
+async def _reap_writes() -> Dict[str, int]:
+    return {table: await database.fetch_val(f"SELECT COUNT(*) FROM {table}") for table in (
+        "reap_agentic_purchases", "reap_agentic_purchase_keys", "reap_agentic_buyer_refs", "buyer_identity_links")}
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+@pytest.mark.parametrize("unmet", ["no_fact", "open_block"])
+async def test_reaps_agent_is_refused_where_the_run_condition_fails_with_the_lanes_own_code(
+    client, monkeypatch, lane, unmet
+):
+    """The existing `merchant_not_eligible`, never a code of its own, and nothing is written: no buyer,
+    no key, no purchase. On the cart-link lane it is answered before the catalog read."""
+    request = await _seed_lane(lane, monkeypatch)
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap")
+    reads = _RunConditionReads(monkeypatch, fact=unmet != "no_fact", clear=unmet != "open_block")
+    loaded = []
+    real_load = routes_reap._load_cart_link_item
+
+    async def _load(**kw):
+        loaded.append(1)
+        return await real_load(**kw)
+
+    monkeypatch.setattr(routes_reap, "_load_cart_link_item", _load)
+    resp = await client.post(f"{BASE}/purchases", json=request)
+    assert resp.status_code == 409 and _error(resp) == "merchant_not_eligible", resp.text
+    for word in ("fact", "block", "challenge", "protocol", "run_condition"):
+        assert word not in resp.text
+    assert await _reap_writes() == {name: 0 for name in await _reap_writes()}
+    assert loaded == []
+    # The fact first; with no fact the challenge record is not asked.
+    expected = [("fact", DOMAIN)] if unmet == "no_fact" else [("fact", DOMAIN), ("clear", "reap", DOMAIN)]
+    assert reads.calls == expected
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_reaps_agent_runs_where_the_run_condition_holds(client, monkeypatch, lane):
+    request = await _seed_lane(lane, monkeypatch)
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap,a2a")
+    reads = _RunConditionReads(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json=request)
+    assert resp.status_code == 202, resp.text
+    assert reads.calls == [("fact", DOMAIN), ("clear", "reap", DOMAIN)]
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+@pytest.mark.parametrize("rails", [None, "", "a2a", "reap_rail", "all"])
+async def test_nothing_is_read_for_reap_unless_its_rail_is_listed(client, monkeypatch, lane, rails):
+    request = await _seed_lane(lane, monkeypatch)
+    if rails is not None:
+        monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", rails)
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    resp = await client.post(f"{BASE}/purchases", json=request)
+    assert resp.status_code == 202, resp.text
+    assert reads.calls == []
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_a_retry_of_an_open_purchase_is_never_refused_by_the_run_condition(client, monkeypatch, lane):
+    """Create only: the key lookup answers first, and the replay reads nothing."""
+    request = await _seed_lane(lane, monkeypatch)
+    first = await client.post(f"{BASE}/purchases", json=request)
+    assert first.status_code == 202, first.text
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    again = await client.post(f"{BASE}/purchases", json=request)
+    assert again.status_code == 202 and again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert reads.calls == []
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_the_resume_door_is_never_refused_by_the_run_condition(client, monkeypatch, lane):
+    """Owner, 2026-11-24, "create only": a purchase opened before the filter went on (or before its
+    merchant stopped meeting the condition) resumes, and the resume reads neither record."""
+    request = await _seed_lane(lane, monkeypatch)
+    created = await client.post(f"{BASE}/purchases", json=request)
+    assert created.status_code == 202, created.text
+    pid = created.json()["purchase_id"]
+    aged = "clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')"
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={aged} WHERE id=:id", {"id": pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap,a2a")
+    reads = _RunConditionReads(monkeypatch, fact=False, clear=False)
+    resumed = await client.post(f"{BASE}/purchases/{pid}/resume", json=request)
+    assert resumed.status_code == 200, resumed.text
+    assert (await ledger.get_purchase_internal(pid))["contact_revision"] == 1
+    assert reads.calls == []
+
+
+async def test_the_run_condition_is_read_by_the_host_the_request_names(client, monkeypatch):
+    """The census stores its fact under the host it was given; both readers fold it themselves."""
+    await _seed_catalog()
+    await _seed_eligibility()
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap")
+    reads = _RunConditionReads(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain="WWW.Brand.example"))
+    assert resp.status_code == 202, resp.text
+    assert reads.calls == [("fact", "www.brand.example"), ("clear", "reap", "www.brand.example")]
+
+
+async def test_an_operators_off_and_the_lanes_own_eligibility_answer_before_the_run_condition(client, monkeypatch):
+    """Their answers stand (`merchant_disabled` stays distinct), and the records are not read."""
+    await _seed_catalog()
+    await _seed_eligibility(enabled=False)
+    monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap")
+    reads = _RunConditionReads(monkeypatch, fact=False)
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert _error(resp) == "merchant_disabled" and reads.calls == []

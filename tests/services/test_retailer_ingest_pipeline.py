@@ -1651,3 +1651,71 @@ def test_family_without_options_brands_writes_canonical(host, vendor, canonical)
         domain=host, category_path="beauty/skincare", currency="USD", source_role="retailer", retailer_name=host,
     )
     assert row["pdp"]["brand"] == canonical
+
+
+# --- options.hold_after_dry_run (2026-11-24): a person reads the dry run before any write -------------------
+
+def _block_keys(env):
+    return sorted(f["key"] for f in list(env.ledger.runs.values())[-1]["flags"] if f["severity"] == "block")
+
+
+async def test_hold_after_dry_run_holds_a_clean_dry_run_through_the_ordinary_held_path(env):
+    out = await pipeline.run_stage(job(hold_after_dry_run=True), db=env.db)
+    # outcome "held" is what the drain's summary line carries: the held alert filter matches it
+    assert out == {"job_id": "rij_1", "stage": "dry_run", "outcome": "held", "status": "held"}, run_flags(env)
+    run = list(env.ledger.runs.values())[-1]
+    assert run["outcome"] == "held" and _block_keys(env) == [pipeline.REVIEW_REQUESTED]
+    [flag] = [f for f in run["flags"] if f["key"] == pipeline.REVIEW_REQUESTED]
+    assert flag["acceptable"] is True and flag["rule"] == pipeline.REVIEW_REQUESTED
+    t = env.ledger.transitions[-1]
+    assert t["status"] == "held" and "review_requested" in t["reason"]
+    assert env.applied == []
+
+
+async def test_an_approval_that_accepts_review_requested_lets_the_apply_pass(env):
+    out = await pipeline.run_stage(job("apply_due", hold_after_dry_run=True,
+                                       accepted_flags=[pipeline.REVIEW_REQUESTED]), db=env.db)
+    assert out["status"] == "done" and out["outcome"] == "applied", run_flags(env)
+    assert len(env.applied) == 1
+
+
+async def test_an_approval_that_does_not_accept_review_requested_is_held_again_at_apply(env):
+    # approve() without accepted_flags still moves held -> apply_due; the apply re-runs _check and holds
+    out = await pipeline.run_stage(job("apply_due", hold_after_dry_run=True), db=env.db)
+    assert out["status"] == "held" and env.applied == []
+    assert _block_keys(env) == [pipeline.REVIEW_REQUESTED]
+    # accepting some OTHER key does not release it either
+    out = await pipeline.run_stage(job("apply_due", hold_after_dry_run=True, accepted_flags=["something_else"]),
+                                   db=env.db)
+    assert out["status"] == "held" and env.applied == []
+
+
+async def test_a_flagged_dry_run_with_the_option_is_held_with_both_flags(env):
+    env.rows = [TINT, TONE_UP]
+    await pipeline.run_stage(job(), db=env.db)
+    row_keys = _block_keys(env)
+    assert row_keys and pipeline.REVIEW_REQUESTED not in row_keys
+    out = await pipeline.run_stage(job(hold_after_dry_run=True), db=env.db)
+    assert out["status"] == "held"
+    assert _block_keys(env) == sorted(row_keys + [pipeline.REVIEW_REQUESTED])
+    # accepting only review_requested leaves the row flag holding the apply
+    out = await pipeline.run_stage(job("apply_due", hold_after_dry_run=True,
+                                       accepted_flags=[pipeline.REVIEW_REQUESTED]), db=env.db)
+    assert out["status"] == "held" and env.applied == []
+    out = await pipeline.run_stage(job("apply_due", hold_after_dry_run=True,
+                                       accepted_flags=[pipeline.REVIEW_REQUESTED, *row_keys]), db=env.db)
+    assert out["status"] == "done"
+
+
+@pytest.mark.parametrize("rows", [["TINT"], ["TINT", "TONE_UP"]])
+async def test_without_the_option_nothing_changes(env, rows):
+    env.rows = [globals()[r] for r in rows]
+
+    async def outcome(**opts):
+        env.ledger.runs.clear(); env.ledger.transitions.clear()
+        out = await pipeline.run_stage(job(**opts), db=env.db)
+        run = list(env.ledger.runs.values())[-1]
+        return out, json.dumps(run["flags"], sort_keys=True, default=str), env.ledger.transitions[-1]["status"]
+    absent = await outcome()
+    assert await outcome(hold_after_dry_run=False) == absent
+    assert pipeline.REVIEW_REQUESTED not in absent[1]

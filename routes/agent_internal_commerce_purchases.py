@@ -76,6 +76,14 @@ THE WRITE is a SECOND router with its OWN key and its OWN dial, so the read key 
   DIAL   AGENPAS_CONSENT_WRITE_ENABLED, default off, read at build (`mount`) like the read's dial: off, the
          route is not registered (the OpenAPI schema is unchanged); turned off without a restart, the
          write answers the unknown-route 404 before the key is looked at.
+
+THE CARD (AGENPAS_PAYMENT_CARD_ENABLED, default off, read per request). On, a Reap-rail GET body carries a
+top-level `payment_card = {network, last4}` (network the partner's own word, e.g. "VISA", or null) once the
+purchase's checkout is bound to a card (awaiting_approval, processing, completed, under the dispatch journal:
+db/reap_agentic_ledger.get_payment_card_for_owner says why that row's enrollment IS the paying card). Never
+before the checkout exists, never on the A2A rail (its rail does not hand us the last four yet), never in the
+public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
+shows no card), never the body. Off: the body is byte for byte what it was.
 """
 
 from __future__ import annotations
@@ -94,6 +102,7 @@ from fastapi.responses import JSONResponse
 import db.a2a_rail_ledger as a2a_ledger
 import db.agent_purchase_consents as consents_db
 import db.agent_purchase_ledger as purchases
+import db.reap_agentic_ledger as reap_ledger
 import db.reap_continuation as continuation
 from routes import agent_commerce_purchases as public
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
@@ -112,8 +121,27 @@ _TRUTHY = frozenset({"1", "true", "on", "yes"})
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 
 
+#: The card on the GET body (see THE CARD above). Read per request.
+AGENPAS_PAYMENT_CARD_ENABLED_ENV = "AGENPAS_PAYMENT_CARD_ENABLED"
+
+
 def is_enabled() -> bool:
     return (os.getenv(AGENPAS_INTERNAL_READ_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+def payment_card_enabled() -> bool:
+    return (os.getenv(AGENPAS_PAYMENT_CARD_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+async def _payment_card(parent: Dict[str, Any], agent_id: str, owner: str) -> Optional[Dict[str, Any]]:
+    """The Reap purchase's bound card, or None (another rail, no bound card, or a failed read: never a 503)."""
+    if parent.get("rail") != "reap":
+        return None
+    try:
+        return await reap_ledger.get_payment_card_for_owner(str(parent["rail_purchase_id"]), agent_id, owner)
+    except Exception as exc:  # noqa: BLE001 - the card is decoration: its fault drops it, never the body
+        logger.warning("agent_internal_purchases: card read failed error_type=%s", type(exc).__name__)
+        return None
 
 
 def _read_enabled() -> None:
@@ -225,7 +253,13 @@ async def get_purchase_for_gateway(
     except Exception as exc:  # noqa: BLE001 - a rail read or view fault is "try again", never a 500
         logger.warning("agent_internal_purchases: view failed error_type=%s", type(exc).__name__)
         return _unavailable()
-    return error if error is not None else body
+    if error is not None:
+        return error
+    if payment_card_enabled():
+        card = await _payment_card(parent, agent_id, owner)
+        if card is not None:
+            body["payment_card"] = card
+    return body
 
 
 def _conflict() -> JSONResponse:

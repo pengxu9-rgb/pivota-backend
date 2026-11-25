@@ -100,6 +100,13 @@ does not exist. Turning it on needs a restart.
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
   appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
   the offer is stateless (an HMAC, below).
+- With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
+  is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
+  checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
+  two display attributes, the card the checkout was created with. `network` is the partner's word or
+  `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
+  when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
+  field.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 
@@ -378,7 +385,22 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
      goes to the Reap route.
    - **No choice**: the A2A rail when it may take the request (its dials, the agent's pilot
      membership, a cart link with no offer code, the (merchant, market) proven list, a cap for the
-     currency), else the Reap route, unchanged.
+     currency, and, while `PARTNER_AGENT_RUN_CONDITION_RAILS` names `a2a`, ADR-030 D11's run
+     condition), else the Reap route, unchanged.
+   - **The run condition (dark).** While `PARTNER_AGENT_RUN_CONDITION_RAILS` names `a2a`, a request
+     that passes every other A2A filter has two records read for the host it names: a fresh stored
+     "publishes an agentic checkout protocol" fact (`db/merchant_agent_checkout_facts`, migration 294)
+     and no open challenge or block on the A2A rail (`db/partner_agent_merchant_blocks`, migration 295).
+     Either one failing, or unreadable, drops the A2A rail with `agent_run_condition_unmet`: no choice
+     goes to Reap (which applies its own run condition when `reap` is listed), an `a2a` choice is the
+     404 above. Nothing is read for any other request, a replay included. The decision's rule set is
+     `env_v2` while it is on, `env_v1` otherwise. Because the router answers before the A2A create
+     runs, an `a2a` choice for a merchant that is both switched off and failing the run condition
+     answers that 404 (`not_available_on_this_rail`), not `merchant_disabled`.
+     Each read is bounded at 2 s, and the two run one after the other. With both rails listed and
+     every read timing out, a request that goes to Reap can wait about 8 s longer: up to 4 s here and
+     up to 4 s in Reap's own filter. A setting with an entry that is not a rail name (`reap;a2a`,
+     `a2a-rail`) enforces only the names it does spell right, and logs one WARNING per value.
    - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
      refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
      that reason. It is never retried on Reap: the router decides once, before anything is written.
