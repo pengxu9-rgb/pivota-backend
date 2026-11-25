@@ -417,7 +417,10 @@ def _queue_worker_enabled() -> bool:
     # On a managed host, only production drains the shared queue; the shim's
     # fail-closed "production" therefore keeps the prod worker running, which
     # is the direction this gate has always erred in.
-    if is_deployed() and platform_env() in ("staging", "development", "test"):
+    # The partner sandbox (PIVOTA_ENV=sandbox) is off by default like staging: its worker opts in
+    # with AUDIT_WORKER_ENABLED=true, and config.sandbox_guard then requires a
+    # SCHEDULER_JOB_ALLOWLIST naming only sandbox-safe jobs.
+    if is_deployed() and platform_env() in ("staging", "sandbox", "development", "test"):
         return False
     return True
 

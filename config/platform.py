@@ -56,7 +56,7 @@ from typing import Any, Dict, Mapping, Optional
 try:  # pragma: no cover - typing_extensions is not a hard dependency
     from typing import Literal
 
-    PlatformEnv = Literal["production", "staging", "development", "test"]
+    PlatformEnv = Literal["production", "staging", "sandbox", "development", "test"]
     PlatformName = Literal["railway", "cloud_run", "local"]
 except ImportError:  # pragma: no cover
     PlatformEnv = str  # type: ignore[misc,assignment]
@@ -67,12 +67,14 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PRODUCTION",
     "STAGING",
+    "SANDBOX",
     "DEVELOPMENT",
     "TEST",
     "platform_env",
     "platform_name",
     "is_production",
     "is_staging",
+    "is_sandbox",
     "is_development",
     "is_deployed",
     "pytest_bypass_allowed",
@@ -90,6 +92,14 @@ __all__ = [
 
 PRODUCTION = "production"
 STAGING = "staging"
+#: The partner sandbox (its own GCP project; design doc N72GzumjqaW8h7SCE96jt7). Deliberately its
+#: OWN label, not an alias of staging: is_staging() is False there, is_production() is False, and
+#: is_deployed() is True (see is_deployed). Accepted ONLY from PIVOTA_ENV, never from
+#: RAILWAY_ENVIRONMENT: the sandbox never runs on Railway, and a Railway environment that names
+#: itself "sandbox" keeps today's answer (fail closed to production). What every existing caller
+#: does with this label is written down in docs/sandbox/platform_env_sandbox_caller_audit.md, and a
+#: process that resolves here must pass config.sandbox_guard before it serves (main.app_lifespan).
+SANDBOX = "sandbox"
 DEVELOPMENT = "development"
 TEST = "test"
 
@@ -275,6 +285,14 @@ def _normalize(raw: Optional[str]) -> Optional[str]:
     return _ENV_ALIASES.get(raw.strip().lower())
 
 
+def _normalize_explicit(raw: Optional[str]) -> Optional[str]:
+    """PIVOTA_ENV's vocabulary: every alias above, plus exactly ``sandbox`` (no aliases for it:
+    a near-miss such as ``sandbx`` keeps failing closed to production)."""
+    if raw and raw.strip().lower() == SANDBOX:
+        return SANDBOX
+    return _normalize(raw)
+
+
 def _warn_once(signature: str, message: str, *args: Any) -> None:
     if signature in _WARNED_SIGNATURES:
         return
@@ -319,8 +337,16 @@ def is_deployed(env: Optional[Mapping[str, str]] = None) -> bool:
     This is the honest replacement for the old ``bool(os.getenv(
     "RAILWAY_GIT_COMMIT_SHA"))`` idiom, which meant "Railway injected build
     metadata, so I am deployed" and silently became False on Cloud Run.
+
+    ``PIVOTA_ENV=sandbox`` is deployed by definition, even with no platform marker: every
+    ``is_deployed()`` gate in this service is a "be strict" gate (signed webhooks, no
+    ``DB_SSL_NO_VERIFY``, no ephemeral signing key, no pytest bypass, long JWT secret), and the
+    sandbox is reachable by outside partners. Only that one label is added; production, staging,
+    development and test answer exactly as before.
     """
-    return platform_name(env) != "local"
+    if platform_name(env) != "local":
+        return True
+    return _normalize_explicit(_first(env, "PIVOTA_ENV")) == SANDBOX
 
 
 def _resolve_env(env: Optional[Mapping[str, str]] = None) -> tuple:
@@ -330,7 +356,7 @@ def _resolve_env(env: Optional[Mapping[str, str]] = None) -> tuple:
     ``fail_closed`` / ``local_default``.
     """
     explicit_raw = _first(env, "PIVOTA_ENV")
-    explicit = _normalize(explicit_raw)
+    explicit = _normalize_explicit(explicit_raw)
     if explicit:
         return explicit, "pivota_env", explicit_raw
 
@@ -465,7 +491,13 @@ def pytest_bypass_allowed(
 
 
 def is_staging(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Staging only. The sandbox is NOT staging (False there)."""
     return platform_env(env) == STAGING
+
+
+def is_sandbox(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True only when PIVOTA_ENV is exactly ``sandbox`` (case/whitespace-insensitive)."""
+    return platform_env(env) == SANDBOX
 
 
 def is_development(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -607,7 +639,7 @@ def require_platform_env(env: Optional[Mapping[str, str]] = None) -> PlatformEnv
             "platform: cannot resolve the deployment environment on a managed "
             "host (platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r "
             "cloud_run_marker=%s). Set "
-            "PIVOTA_ENV=production|staging|development on this revision or job. "
+            "PIVOTA_ENV=production|staging|sandbox|development on this revision or job. "
             "Refusing to boot: every prod guard would otherwise run on a "
             "fail-closed guess."
             % (
