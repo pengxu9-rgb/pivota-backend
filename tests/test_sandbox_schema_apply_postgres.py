@@ -303,3 +303,35 @@ async def test_a_malformed_lock_wait_or_deadline_is_refused(dbs, tmp_path):
     for extra in ({"SCHEMA_DUMP_LOCK_WAIT": "forever"}, {"SCHEMA_DUMP_DEADLINE_SECONDS": "10m"}):
         done = _dump(tmp_path, env_extra=extra)
         assert done.returncode == 2 and "SCHEMA_DUMP_" in done.stderr
+
+
+async def test_literals_are_read_standard_conforming_even_if_the_session_is_not(dbs, tmp_path):
+    """The tokenizer reads '...' as standard-conforming. The apply forces the server to agree, so a file
+    without pg_dump's own SET (and a session left with it off) still means what the tokenizer read."""
+    import gzip
+    import hashlib
+    import json
+
+    import asyncpg
+
+    stamp = "20261125T2359Z"
+    schema = "CREATE TABLE public.bs (a text DEFAULT 'C:\\temp');\n--\n-- PostgreSQL database dump complete\n--\n"
+    ledgers = A.LEDGER_TRAILER + "\n"
+    store = LocalDirStore(tmp_path / "drop2")
+    files = {}
+    for part, text in (("schema", schema), ("ledgers", ledgers)):
+        data = gzip.compress(text.encode())
+        store.put("%s/%s.sql.gz" % (stamp, part), data)
+        files[part] = {"file": "%s/%s.sql.gz" % (stamp, part), "sha256": hashlib.sha256(data).hexdigest()}
+    store.put("%s/_MANIFEST.json" % stamp, json.dumps({
+        "format_version": A.FORMAT_VERSION, "kind": "schema", "stamp": stamp, "tables_live": 1, "ledger_rows": 0,
+        "files": files}).encode())
+    dst = await asyncpg.connect(DST)
+    try:
+        await dst.execute("SET standard_conforming_strings = off")
+        await A.apply_schema(dst, store)
+        await dst.execute("INSERT INTO public.bs DEFAULT VALUES")
+        value = await dst.fetchval("SELECT a FROM public.bs")
+    finally:
+        await dst.close()
+    assert value == "C:\\temp"  # a backslash and a t, not a tab

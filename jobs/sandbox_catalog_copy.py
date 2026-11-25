@@ -351,14 +351,28 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
     def __init__(self, uri: str):
         if not uri.startswith("gs://"):
             raise CopyRefused("CATALOG_COPY_GCS_URI must start with gs://")
+        from config.sandbox_identity import SANDBOX_DROP_BUCKET
+
         bucket, _, prefix = uri[5:].partition("/")
-        if not bucket:
-            raise CopyRefused("CATALOG_COPY_GCS_URI names no bucket")
+        if bucket != SANDBOX_DROP_BUCKET:
+            raise CopyRefused("the GCS URI must name the sandbox drop bucket %s" % SANDBOX_DROP_BUCKET)
+        if ".." in prefix.split("/"):
+            raise CopyRefused("the GCS URI prefix may not contain '..'")
         self.bucket = bucket
         self.prefix = prefix.strip("/")
 
     def _name(self, name: str) -> str:
         return "%s/%s" % (self.prefix, name) if self.prefix else name
+
+    @staticmethod
+    def _call(method, what: str, *args, **kwargs):
+        """httpx.<method>(...), with every transport failure a refusal naming the operation only."""
+        import httpx
+
+        try:
+            return getattr(httpx, method)(*args, **kwargs)
+        except httpx.HTTPError as exc:
+            raise CopyRefused("GCS unreachable for %s (%s)" % (what, type(exc).__name__)) from None
 
     @staticmethod
     def _ok(response, what: str) -> None:
@@ -367,16 +381,13 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
             raise CopyRefused("GCS answered HTTP %d for %s" % (response.status_code, what))
 
     def _token(self) -> str:
-        import httpx
-
-        response = httpx.get(self._TOKEN_URL, headers={"Metadata-Flavor": "Google"}, timeout=10)
+        response = self._call("get", "the metadata token", self._TOKEN_URL, headers={"Metadata-Flavor": "Google"}, timeout=10)
         self._ok(response, "the metadata token")
         return response.json()["access_token"]
 
     def put(self, name: str, data: bytes) -> None:
-        import httpx
-
-        response = httpx.post(
+        response = self._call(
+            "post", "create %s" % name,
             "https://storage.googleapis.com/upload/storage/v1/b/%s/o" % self.bucket,
             params={"uploadType": "media", "name": self._name(name), "ifGenerationMatch": "0"},
             content=data,
@@ -390,9 +401,8 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
     def get(self, name: str) -> bytes:
         import urllib.parse
 
-        import httpx
-
-        response = httpx.get(
+        response = self._call(
+            "get", "read %s" % name,
             "https://storage.googleapis.com/storage/v1/b/%s/o/%s"
             % (self.bucket, urllib.parse.quote(self._name(name), safe="")),
             params={"alt": "media"},
@@ -403,8 +413,6 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
         return response.content
 
     def list(self, prefix: str = "") -> List[str]:
-        import httpx
-
         names: List[str] = []
         token = None
         full = self._name(prefix)
@@ -412,7 +420,8 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
             params = {"prefix": full, "fields": "items(name),nextPageToken"}
             if token:
                 params["pageToken"] = token
-            response = httpx.get(
+            response = self._call(
+                "get", "list",
                 "https://storage.googleapis.com/storage/v1/b/%s/o" % self.bucket,
                 params=params, headers={"Authorization": "Bearer " + self._token()}, timeout=60,
             )

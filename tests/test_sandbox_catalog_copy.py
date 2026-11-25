@@ -288,3 +288,21 @@ async def test_the_export_refuses_a_spec_naming_one_before_reading_anything(tmp_
     with pytest.raises(C.CopyRefused, match="never copied: agents,orders"):
         await C.export_catalog(NoDb(), C.LocalDirStore(tmp_path), stamp="20261125T0100Z",
                                specs=(C.TableSpec("orders", "x"), C.TableSpec("agents", "x")))
+
+
+@pytest.mark.parametrize("uri", ["gs://other-bucket/catalog", "gs://pivota-sandbox-catalog-drop-2/x",
+                                 "gs://pivota-sandbox-catalog-drop/../x", "s3://pivota-sandbox-catalog-drop/x"])
+def test_the_gcs_store_takes_only_the_pinned_drop_bucket(uri):
+    with pytest.raises(C.CopyRefused):
+        C.GcsStore(uri)
+
+
+def test_a_gcs_transport_error_is_a_refusal(monkeypatch):
+    import httpx
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "get", boom)
+    with pytest.raises(C.CopyRefused, match="unreachable for the metadata token"):
+        C.GcsStore("gs://pivota-sandbox-catalog-drop/catalog").get("x")

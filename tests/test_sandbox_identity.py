@@ -83,6 +83,16 @@ def test_one_source_for_every_sandbox_db_writer():
     assert register_gateway_service_agent.sandbox_database_refusal is I.sandbox_database_refusal
 
 
+@pytest.mark.parametrize("addr,ok", [
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432", True),
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432\n", False),  # `$` would let this pass
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432/x", False),
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/../../tmp/.s.PGSQL.5432", False),
+])
+def test_the_socket_path_shape_is_exact(addr, ok):
+    assert I._address_ok(addr) is ok
+
+
 # --- the range is held only as a hash (the repo is public) ---------------------------------------
 def test_the_real_range_is_one_hashed_slash_20():
     import re

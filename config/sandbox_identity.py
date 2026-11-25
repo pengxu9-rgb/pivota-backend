@@ -21,6 +21,9 @@ from typing import List, Mapping, Optional, Tuple, Union
 
 #: The sandbox's GCP project.
 SANDBOX_PROJECT = "pivota-sandbox"
+#: The one-way drop between prod and the sandbox (catalog copy and schema dump). Pinned: the jobs refuse
+#: any other bucket. scripts/sandbox/dump_prod_schema.sh carries the same name (a test holds them equal).
+SANDBOX_DROP_BUCKET = "pivota-sandbox-catalog-drop"
 #: The sandbox Cloud SQL private range (sandbox-infra pins it), as (prefix length, sha256 of the masked
 #: network string str(ipaddress.ip_network("<addr>/<prefix>", strict=False))). The repo is public, so
 #: the range is not written here; an address is in it when its own masked network hashes the same.

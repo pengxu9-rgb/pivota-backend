@@ -18,40 +18,55 @@ plus prod's two migration ledgers. Code: `scripts/sandbox/dump_prod_schema.sh` (
 
 ## 10a-prod: `scripts/sandbox/dump_prod_schema.sh`
 
-* Image: `pg_dump`/`psql` of the **server's major version** (prod is Postgres 17) and `curl`, e.g.
-  `FROM postgres:17` + `apt-get install curl` at build time. The backend image has neither
-  (`libpq5` only). Cloud Run job with VPC egress to the private Cloud SQL, like
-  `infra/gcp/restore_to_cloudsql.sh`.
-* Env: `PIVOTA_ENV=production` (refuses otherwise), `DATABASE_URL` from prod's secret,
-  `SANDBOX_SCHEMA_GCS_URI=gs://pivota-sandbox-catalog-drop/schema`.
-* SA: needs only `storage.objectCreator` on the drop bucket (uploads are `ifGenerationMatch=0`, no
-  list, no read) and the DB secret. The export SA (`sa-sandbox-export@pivota-prod`) fits.
-* Writes `schema/<stamp>/schema.sql.gz`, `ledgers.sql.gz`, then `_MANIFEST.json` last.
-* `pg_dump --schema-only --no-owner --no-privileges --no-comments --no-publications
-  --no-subscriptions --no-security-labels --no-tablespaces`; ledgers by
-  `--data-only --column-inserts -t public.startup_sql_migrations -t public.schema_migrations`
-  (whichever exist).
-* **Refuses (exit 3, nothing uploaded)** a dump carrying `CREATE SERVER / USER MAPPING /
-  SUBSCRIPTION / PUBLICATION / ROLE / DATABASE`, `ALTER ROLE / SYSTEM / SERVER`, `GRANT / REVOKE`,
-  `COPY / INSERT` (rows) in the schema file, any psql meta-command but `\restrict`/`\unrestrict`, or
-  a ledger statement that is not a ledger INSERT. A user mapping holds an FDW password; that is
-  the case this exists for (tested with a real postgres_fdw mapping). Also refuses a missing
-  completion trailer or fewer dumped tables than the live source.
-* Checks run at column 0, where pg_dump writes top-level statements. A function body that starts a
-  line with `INSERT`/`GRANT` at column 0 would be refused too (fail closed); the sandbox half's
-  check ignores function bodies.
+* Image: `pg_dump`/`psql` of the **server's major version** (prod is Postgres 17), coreutils `timeout`
+  and `curl` (`-H @file`), e.g. `FROM postgres:17` + `apt-get install curl` at build time. Cloud Run job
+  with VPC egress to the private Cloud SQL, like `infra/gcp/restore_to_cloudsql.sh`.
+* Env: `PIVOTA_ENV=production` (refuses otherwise), `DATABASE_URL` from prod's secret in the form
+  `postgresql://user:password@<host>[:port]/<db>[?sslmode=...]` (anything else is refused),
+  `SANDBOX_SCHEMA_GCS_URI=gs://pivota-sandbox-catalog-drop/schema` (bucket pinned).
+* The DSN never reaches argv: it becomes `PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`/`PGSSLMODE` and a 0600
+  passfile. The bearer token goes in a 0600 header file read by `curl -H @file`.
+* **Role (infra Q3):** pg_dump takes ACCESS SHARE on every table it dumps, which needs SELECT on each, so
+  the narrow catalog-export role cannot dump the schema. Run this under its own role with SELECT on every
+  table (it reads no rows but the two ledgers) and its own secret; keep the catalog export's role narrow.
+* Prod impact: `--lock-wait-timeout=10s` (a dump never queues behind a pending ACCESS EXCLUSIVE with prod's
+  queries queued behind it), a hard client-side deadline on every call (`SCHEMA_DUMP_DEADLINE_SECONDS`,
+  default 600), `PGAPPNAME=sandbox-schema-dump`, `PGOPTIONS` statement/idle timeouts. Measured: pg_dump
+  resets its own session's `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+  to 0 after connecting, so `PGOPTIONS` caps `psql` and pg_dump's first query only.
+* Writes `schema/<stamp>/schema.sql.gz`, `ledgers.sql.gz`, then `_MANIFEST.json` (format 2) last, each
+  create-only (`ifGenerationMatch=0`; objectCreator suffices).
+* Ledgers: one `INSERT` per row over EXPLICIT columns only, built by `psql format(%L)`:
+  `schema_migrations(id, applied_at)`, `startup_sql_migrations(filename, checksum, applied_at)`.
+* **Refuses (exit 3, nothing uploaded)**, at column 0 where pg_dump writes top-level statements: CREATE
+  SERVER / USER [MAPPING] / GROUP / ROLE / DATABASE / SUBSCRIPTION / PUBLICATION / FOREIGN TABLE / EVENT
+  TRIGGER, ALTER ROLE / USER / GROUP / SYSTEM / SERVER / DATABASE / DEFAULT PRIVILEGES / FOREIGN TABLE,
+  GRANT, REVOKE, SET ROLE / SESSION, DO, COPY, INSERT, SECURITY LABEL; psql meta-commands but
+  `\restrict`/`\unrestrict`; any literal that looks like a secret or a person (email-shaped,
+  `sk_/rk_/ak_/pk_` live/test keys, `shpat_`, `ghp_`, `xox?-`, 32+ hex, 40+ base64) outside comments and
+  pg_dump's own `\restrict` key; a ledger line that is not an explicit-column INSERT; a missing trailer;
+  fewer tables than the live source. `dump_prod_schema.sh check <schema.sql> <ledgers.sql>` runs only these
+  checks (tests; the human read of the first dump).
+* **The first dump gets a human read before its upload is approved** (controller + the owner).
 
 ## 10a-sandbox: `jobs/sandbox_schema_apply.py`
 
-* Env: `PIVOTA_ENV=sandbox` + the full sandbox profile (the startup guard runs), `DATABASE_URL`
-  (must be in the sandbox's private range, held only as a hash, or the `pivota-sandbox` Cloud SQL socket:
-  `config.sandbox_identity.sandbox_database_refusal`, the single source for project and range),
-  `SANDBOX_SCHEMA_GCS_URI`. SA: `objectViewer` on the drop, the DB secret.
+* Env: `PIVOTA_ENV=sandbox` + the full sandbox profile (the startup guard runs), `DATABASE_URL` (every
+  address asyncpg would connect to must be in the sandbox's private range, held only as a hash, or exactly
+  `/cloudsql/pivota-sandbox:<region>:<instance>/.s.PGSQL.<port>`: `config/sandbox_identity.py`, the single
+  source), `SANDBOX_SCHEMA_GCS_URI` (bucket pinned). SA: `objectViewer` on the drop, the DB secret.
 * Refuses unless the database is **empty** (no table in any non-system schema).
-* Re-checks the manifest, sha256 per file, and the same statement rules, ignoring dollar-quoted
-  function bodies and string literals; strips `\restrict`/`\unrestrict`.
-* One transaction: schema, then ledger rows; then the base-table count must equal the source's live
-  count and the ledger rows the manifest's, or everything rolls back. `search_path` is restored.
+* Re-checks the manifest (format 2), sha256 per file, and every statement with a real tokenizer (line and
+  nested block comments, `'...'` with `''`, `"..."`, `$tag$` bodies, top-level psql meta lines; refuses
+  `E'...'`, `U&'...'`, unterminated anything, trailing text without `;`). Each statement's skeleton must be a
+  kind pg_dump --schema-only emits (SET, set_config, CREATE SCHEMA/EXTENSION/TYPE/DOMAIN/FUNCTION/PROCEDURE/
+  AGGREGATE/SEQUENCE/TABLE/VIEW/INDEX/TRIGGER/RULE/POLICY/..., ALTER TABLE/SEQUENCE/INDEX/TYPE/DOMAIN);
+  refused even then: SET ROLE / SESSION, `standard_conforming_strings` other than on, OWNER TO, untrusted
+  languages, extensions that connect out or run jobs (dblink, *_fdw, pg_cron, ...), and secret-shaped
+  literals. Ledger statements must be exactly the two explicit-column INSERT shapes.
+* One transaction (`standard_conforming_strings` forced on): schema, then ledger rows; then the
+  base-table count must equal the source's live count and the ledger rows the manifest's, or everything
+  rolls back. `search_path` is restored.
 * Exit 0 = `DONE {...}`, exit 2 = `REFUSED: <rule>`.
 
 ## Residual

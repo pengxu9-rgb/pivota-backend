@@ -41,79 +41,190 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from jobs.sandbox_catalog_copy import CopyRefused, GcsStore, LocalDirStore, newest_complete_stamp  # noqa: F401
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_NAME = "_MANIFEST.json"
 _STAMP_RE = re.compile(r"^\d{8}T\d{4}Z$")
 LEDGER_TABLES = ("startup_sql_migrations", "schema_migrations")
-
-#: Statement starts that can hold a credential, a role, or rows. Checked at the start of each line,
-#: case-insensitively (pg_dump writes keywords upper-case at column 0).
-_FORBIDDEN = re.compile(
-    r"^\s*(CREATE\s+(SERVER|USER\s+MAPPING|SUBSCRIPTION|PUBLICATION|ROLE|USER|GROUP|DATABASE)\b"
-    r"|ALTER\s+(ROLE|USER|GROUP|SYSTEM|SERVER|USER\s+MAPPING|DATABASE)\b"
-    r"|GRANT\b|REVOKE\b|SECURITY\s+LABEL\b|COPY\b|INSERT\b)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_META_OK = re.compile(r"^\\(restrict|unrestrict) [A-Za-z0-9]+$")
-_LEDGER_LINE_OK = re.compile(
-    r"^(--.*|"
-    r"SET [a-z_]+ = .*;|"
-    r"SELECT pg_catalog\.set_config\('search_path', '', false\);|"
-    r"SELECT pg_catalog\.setval\('public\.(startup_sql_migrations|schema_migrations)_[a-z_]*seq', \d+, (true|false)\);|"
-    # One statement per line: no ';' before the final one (ledger values are file ids, checksums, times).
-    r"INSERT INTO public\.(startup_sql_migrations|schema_migrations) \([^;]*\) VALUES \([^;]*\);)$"
-)
+LEDGER_TRAILER = "-- sandbox ledger dump complete"
 
 
 class SchemaRefused(RuntimeError):
-    """The schema apply will not run. Messages name rules and stamps, never row values."""
+    """The schema apply will not run. Messages name rules and stamps, never values."""
 
 
-def _strip_meta(text: str, what: str) -> str:
-    out: List[str] = []
-    for line in text.splitlines():
-        if line.startswith("\\"):
-            if not _META_OK.match(line):
+# --- a real tokenizer -------------------------------------------------------------------------------
+#
+# One pass over the text, tracking line comments, nested block comments, '...' literals ('' escapes),
+# "..." identifiers, $tag$...$tag$ bodies and psql meta lines (top level, line start). Statements split
+# at top-level ';' only. Each statement also gets a SKELETON: comments removed, every literal replaced
+# by '?', every body by $$, whitespace collapsed, upper-cased; the allowlist below reads the skeleton.
+# Refused while scanning: E'...' and U&'...' literals (backslash escapes can desync a naive reader),
+# an unterminated literal/identifier/body/comment, trailing text with no ';',
+# and a psql meta-command other than \restrict / \unrestrict.
+
+_META_OK = re.compile(r"\\(restrict|unrestrict) [A-Za-z0-9]+\Z")
+_DOLLAR_TAG = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def split_statements(text: str, what: str) -> List[Tuple[str, str]]:
+    """``[(statement, skeleton)]`` for every top-level statement in ``text``."""
+    out: List[Tuple[str, str]] = []
+    i, n, start = 0, len(text), 0
+    skel: List[str] = []
+
+    def finish(end: int) -> None:
+        nonlocal start, skel
+        sk = " ".join("".join(skel).split()).upper()
+        if sk:
+            out.append((text[start:end], sk))
+        start, skel = end + 1, []
+
+    while i < n:
+        c = text[i]
+        if c == "\\" and (i == 0 or text[i - 1] == "\n"):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            if not _META_OK.match(text[i:j]):
                 raise SchemaRefused("%s carries a psql meta-command other than \\restrict/\\unrestrict" % what)
+            if "".join(skel).strip():
+                raise SchemaRefused("%s has a psql meta-command inside a statement" % what)
+            i, start, skel = j + 1, j + 1, []
             continue
-        out.append(line)
-    return "\n".join(out) + "\n"
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            skel.append(" ")
+            continue
+        if text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while depth:
+                a, b = text.find("/*", j), text.find("*/", j)
+                if b < 0:
+                    raise SchemaRefused("%s has an unterminated block comment" % what)
+                if 0 <= a < b:
+                    depth, j = depth + 1, a + 2
+                else:
+                    depth, j = depth - 1, b + 2
+            i = j
+            skel.append(" ")
+            continue
+        if c == "'":
+            before = text[i - 2:i] if i >= 2 else text[:i]
+            if before[-1:] in ("e", "E") and not (before[:-1].isalnum() or before[:-1] == "_"):
+                raise SchemaRefused("%s has an E'...' literal" % what)
+            if before.upper().endswith("U&"):
+                raise SchemaRefused("%s has a U&'...' literal" % what)
+            j = i + 1
+            while True:
+                k = text.find("'", j)
+                if k < 0:
+                    raise SchemaRefused("%s has an unterminated literal" % what)
+                if text.startswith("''", k):
+                    j = k + 2
+                    continue
+                break
+            # A '$' inside a standard literal is ordinary text to Postgres and to this scanner (literals
+            # are consumed before $-tags are looked for), so it is not refused: regex CHECKs such as
+            # '^[A-Z]{3}$' are common. What would desync both is standard_conforming_strings=off, which
+            # the allowlist refuses and the apply forces on.
+            skel.append("'?'")
+            i = k + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while True:
+                k = text.find('"', j)
+                if k < 0:
+                    raise SchemaRefused("%s has an unterminated identifier" % what)
+                if text.startswith('""', k):
+                    j = k + 2
+                    continue
+                break
+            skel.append(text[i:k + 1])
+            i = k + 1
+            continue
+        if c == "$":
+            m = _DOLLAR_TAG.match(text, i)
+            prev = text[i - 1] if i else " "
+            if m and not (prev.isalnum() or prev == "_"):
+                close = text.find(m.group(0), m.end())
+                if close < 0:
+                    raise SchemaRefused("%s has an unterminated $-quoted body" % what)
+                skel.append(" $$ ")
+                i = close + len(m.group(0))
+                continue
+        if c == ";":
+            finish(i)
+            i += 1
+            continue
+        skel.append(c)
+        i += 1
+    if "".join(skel).strip():
+        raise SchemaRefused("%s ends with a statement that has no ';'" % what)
+    return out
 
 
-# The tag group always participates (possibly empty): a backreference to an unmatched optional
-# group never matches in Python, which would leave every plain $$ body unstripped.
-_DOLLAR_BODY = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|)\$.*?\$\1\$", re.DOTALL)
-_QUOTED = re.compile(r"'(?:[^']|'')*'")
-_LINE_COMMENT = re.compile(r"--[^\n]*")
-
-
-def _top_level(text: str) -> str:
-    """``text`` without dollar-quoted bodies, string literals and comments: what is left is statement
-    structure, so a trigger function whose body says INSERT or GRANT is not read as one."""
-    return _LINE_COMMENT.sub("", _QUOTED.sub("''", _DOLLAR_BODY.sub("$$$$", text)))
+# --- what pg_dump --schema-only emits, and nothing else ----------------------------------------------
+_ALLOWED_SCHEMA = re.compile(
+    r"^(SET [A-Z_][A-Z0-9_.]* = .*"
+    r"|SELECT PG_CATALOG\.SET_CONFIG\('\?', '\?', FALSE\)"
+    r"|CREATE SCHEMA .*|CREATE EXTENSION .*|CREATE TYPE .*|CREATE DOMAIN .*"
+    r"|CREATE (OR REPLACE )?(FUNCTION|PROCEDURE|AGGREGATE) .*"
+    r"|CREATE SEQUENCE .*|CREATE (UNLOGGED )?TABLE .*|CREATE (MATERIALIZED )?VIEW .*"
+    r"|CREATE (UNIQUE )?INDEX .*|CREATE (CONSTRAINT )?TRIGGER .*|CREATE RULE .*|CREATE POLICY .*"
+    r"|CREATE TEXT SEARCH .*|CREATE COLLATION .*|CREATE STATISTICS .*|CREATE OPERATOR .*|CREATE CAST .*"
+    r"|ALTER (TABLE|SEQUENCE|INDEX|TYPE|DOMAIN) .*)$"
+)
+#: Never, even inside an allowed kind.
+_REFUSED_IN_SCHEMA = (
+    (re.compile(r"^SET (ROLE|SESSION)\b"), "SET ROLE / SESSION AUTHORIZATION"),
+    # The scanner reads '...' as standard-conforming; turning it off would let '\'' desync it.
+    (re.compile(r"^SET STANDARD_CONFORMING_STRINGS = (?!ON$)"), "standard_conforming_strings other than on"),
+    (re.compile(r"^ALTER TABLE .*\bOWNER TO\b"), "an ownership change"),
+    (re.compile(r"\bLANGUAGE '?\??'? ?(C|INTERNAL|PLPYTHONU|PLPYTHON3U|PLPERLU|PLTCLU)\b"), "an untrusted language"),
+    (re.compile(r"^CREATE EXTENSION .*\b(DBLINK|POSTGRES_FDW|[A-Z_]*_FDW|PG_CRON|PGLOGICAL|PLPYTHON3U|PLPERLU|PLTCLU)\b"),
+     "an extension that connects out or runs jobs"),
+)
+_ALLOWED_LEDGER = (
+    "INSERT INTO PUBLIC.SCHEMA_MIGRATIONS (ID, APPLIED_AT) VALUES ('?', '?')",
+    "INSERT INTO PUBLIC.STARTUP_SQL_MIGRATIONS (FILENAME, CHECKSUM, APPLIED_AT) VALUES ('?', '?', '?')",
+)
+#: Literals that look like a secret or a person (the same rule as the dump's; comments excluded).
+_SECRET_LITERAL = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[A-Za-z]{2,}|\b(sk|rk|ak|pk)_(live|test)_[A-Za-z0-9]"
+    r"|shpat_|ghp_|xox[abposr]-|[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}"
+)
 
 
 def validate_schema_sql(text: str) -> str:
-    """The schema file as it may be executed, or SchemaRefused."""
+    """The schema file as it may be executed (meta lines removed), or SchemaRefused."""
     if "PostgreSQL database dump complete" not in text[-400:]:
         raise SchemaRefused("schema file has no completion trailer")
-    match = _FORBIDDEN.search(_top_level(text))
-    if match:
-        raise SchemaRefused("schema file carries a forbidden statement (%s)" % " ".join(match.group(1).split()[:2]).upper())
-    return _strip_meta(text, "schema file")
+    kept: List[str] = []
+    for statement, skeleton in split_statements(text, "schema file"):
+        for pattern, label in _REFUSED_IN_SCHEMA:
+            if pattern.search(skeleton):
+                raise SchemaRefused("schema file carries %s" % label)
+        if not _ALLOWED_SCHEMA.match(skeleton):
+            raise SchemaRefused("schema file carries a statement pg_dump --schema-only does not emit (%s)"
+                                % " ".join(skeleton.split()[:3]))
+        body = "\n".join(line for line in statement.splitlines() if not line.lstrip().startswith("--"))
+        if _SECRET_LITERAL.search(body):
+            raise SchemaRefused("schema file carries a literal that looks like a secret or a person")
+        kept.append(statement.strip())
+    return ";\n".join(kept) + ";\n"
 
 
 def validate_ledgers_sql(text: str) -> Tuple[str, int]:
     """(executable ledger SQL, INSERT count), or SchemaRefused."""
-    cleaned = _strip_meta(text, "ledger file")
-    rows = 0
-    for line in cleaned.splitlines():
-        if not line.strip():
-            continue
-        if not _LEDGER_LINE_OK.match(line):
-            raise SchemaRefused("ledger file carries a statement other than a ledger INSERT")
-        rows += line.startswith("INSERT INTO ")
-    return cleaned, rows
+    if text.rstrip("\n").splitlines()[-1:] != [LEDGER_TRAILER]:
+        raise SchemaRefused("ledger file has no completion trailer")
+    kept: List[str] = []
+    for statement, skeleton in split_statements(text, "ledger file"):
+        if skeleton not in _ALLOWED_LEDGER:
+            raise SchemaRefused("ledger file carries a statement other than an explicit-column ledger INSERT")
+        kept.append(statement.strip())
+    return (";\n".join(kept) + ";\n") if kept else "", len(kept)
 
 
 async def _user_table_count(conn) -> int:
@@ -166,6 +277,8 @@ async def apply_schema(conn, store, *, stamp: Optional[str] = None) -> Dict[str,
 
 async def _apply_in_one_transaction(conn, stamp, manifest, schema_sql, ledger_sql, ledger_rows) -> Dict[str, Any]:
     async with conn.transaction():
+        # The tokenizer's reading of '...' literals is the standard-conforming one; make the server's agree.
+        await conn.execute("SET LOCAL standard_conforming_strings = on")
         await conn.execute(schema_sql)
         if ledger_rows:
             await conn.execute(ledger_sql)
