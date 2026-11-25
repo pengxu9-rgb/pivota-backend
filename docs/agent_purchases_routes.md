@@ -119,13 +119,31 @@ does not exist. Turning it on needs a restart.
   `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
   when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
   field.
-- Either rail's body carries `"agent_display_name": "<name>"` only when Pivota has reviewed a name for the
-  purchase's agent (`agents.buyer_display_name`, migration 297, set by hand as a gated one-off; NULL for
-  every agent until then). Never `agents.agent_name`, which the agent's developer typed. No field when no
-  name is reviewed, the stored one fails the shape check (`db/agents.clean_buyer_display_name`: 1-64
-  characters, NFC, no control or format characters, at least one letter or digit) or the read fails (the
-  body is still served). No dial: a NULL column is the off position. Never in the public route or the
-  webhooks.
+- Either rail's body carries `"agent_display_name": "<name>"`, the name the page shows as "Requested by":
+  - a name set by hand in `agents.buyer_display_name` (migration 297, a gated one-off) when that column
+    is not NULL. It wins over the portal name, and it never falls through to it: `''` hides a portal name
+    without the developer;
+  - otherwise the name the purchase's agent registered with in the developer portal (`agents.agent_name`,
+    the agent the API key belongs to), unless it is blocked (`db/agents.portal_name_is_blocked`): it
+    contains a term of `PORTAL_NAME_BLOCKED_TERMS` (payment brands, "bank", "secure", Pivota, AgenPaz)
+    after case, spaces, punctuation and accents are dropped and Cyrillic or Greek lookalike letters and
+    digit or symbol stand-ins (0 o, 3 e, 4 a, 5 s, 7 t, $ s, @ a) are read as the Latin letter they
+    imitate, and shapes that read alike match each other (i, l, capital I and 1 are one letter; rn is
+    m, cl is d, vv is w), the terms reduced the same way; it has a letter outside the allowlist (after NFKD, a Latin letter must be ASCII a-z or
+    A-Z, so small capitals, IPA, stroke or hook letters, ø, ß and ł refuse it; any other letter must be
+    Han/CJK, Hiragana, Katakana, Hangul, Cyrillic, Greek, Arabic, Hebrew, Thai or Devanagari); it mixes
+    Latin letters with Cyrillic or Greek ones (a name wholly in one script, or Latin with another allowed
+    script, passes); or it is a placeholder ("Agent", "Unknown").
+  - a rename hides it until checked again: `PUT /agents/{agent_id}`, the one path that changes
+    `agents.agent_name`, sets `buyer_display_name = ''` in the same transaction when the name changes and
+    the column is NULL. A gated one-off sets it back to NULL (or to a name) after a check. A hand-set
+    value is left as it is.
+  Never a fallback: not the user's full name, a legacy `name` column, "Agent" or "Unknown". No field when
+  neither gives a name, the name fails the shape check (`db/agents.clean_buyer_display_name`: 1-64
+  characters, NFC, no control or format characters, at least one letter or digit; never repaired) or the
+  read fails (the body is still served). No dial: every clean portal name shows on deploy. Never in the
+  public route or the webhooks. Accepted residual risk: a generic name that names no blocked term
+  ("Fraud Prevention Team", "Apple", a bank's own name) still shows.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 

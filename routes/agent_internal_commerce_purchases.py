@@ -93,12 +93,15 @@ before the checkout exists, never on the A2A rail (its rail does not hand us the
 public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
 shows no card), never the body. Off: the body is byte for byte what it was.
 
-THE AGENT'S NAME. A GET body, either rail, carries a top-level `agent_display_name` (a string) only when
-Pivota has REVIEWED a name for the purchase's agent: agents.buyer_display_name (migration 297), set by hand as a
-gated one-off, NULL for every agent until then. Never agents.agent_name, which the agent's developer typed and
-nobody checked. No reviewed name, a stored one without a name's shape (db/agents.clean_buyer_display_name) or a
-failed read: no field (the page shows no "Requested by" line), never a 503. No dial: the column being NULL is
-the off position, per agent. Not in the public route or the webhooks: the agent knows its own name.
+THE AGENT'S NAME. A GET body, either rail, carries a top-level `agent_display_name` (a string), the page's
+"Requested by" line: the name set by hand in agents.buyer_display_name (migration 297, a gated one-off) when that
+column is not NULL (it wins, and never falls through: '' hides a portal name), else the name the purchase's agent
+registered with in the developer portal (agents.agent_name) unless db/agents.portal_name_is_blocked (a payment
+brand, a bank, "secure", Pivota or AgenPaz in a common lookalike spelling, a non-ASCII Latin letter or a letter of
+a script outside the allowlist, Latin mixed with Cyrillic or Greek, or a placeholder). A rename hides it until checked again (PUT /agents/{agent_id}). Never a fallback (the user's full name, a legacy
+`name`, "Agent", "Unknown"). No name, one without a name's shape (db/agents.clean_buyer_display_name, never
+repaired) or a failed read: no field, never a 503. No dial. Not in the public route or the webhooks: the agent
+knows its own name.
 """
 
 from __future__ import annotations
@@ -178,7 +181,8 @@ async def _product_image(parent: Dict[str, Any], agent_id: str, owner: str) -> O
 
 
 async def _agent_display_name(agent_id: str) -> Optional[str]:
-    """The agent's reviewed buyer-facing name, or None (none reviewed, a bad shape, or a failed read: never a 503)."""
+    """The agent's buyer-facing name (db/agents.get_buyer_display_name), or None: none, a bad shape, a blocked
+    portal name, or a failed read (never a 503)."""
     try:
         return await agents_db.get_buyer_display_name(agent_id)
     except Exception as exc:  # noqa: BLE001 - the name is decoration: its fault drops it, never the body

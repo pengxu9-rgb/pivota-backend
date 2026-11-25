@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -92,11 +92,17 @@ async def test_default_funnel_excludes_ops_canary_but_explicit_surface_can_read_
     await test_database.connect()
     monkeypatch.setattr(module, "database", test_database)
     try:
+        # The day the two rows sit on (fixed 2026-09-02 stamps). With no since/until the read asks
+        # for the DEFAULT_WINDOW_DAYS before the live clock, which these rows leave on 2026-12-01.
+        window = {
+            "since": datetime(2026, 9, 2, tzinfo=timezone.utc),
+            "until": datetime(2026, 9, 3, tzinfo=timezone.utc),
+        }
         default_result = await module.get_merchant_commerce_event_funnel(
-            merchant_id="merch_1", group_by="store"
+            merchant_id="merch_1", group_by="store", **window
         )
         canary_result = await module.get_merchant_commerce_event_funnel(
-            merchant_id="merch_1", group_by="store", surface="ops_canary"
+            merchant_id="merch_1", group_by="store", surface="ops_canary", **window
         )
 
         assert default_result.payload["summary"]["events_total"] == 1
