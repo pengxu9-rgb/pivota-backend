@@ -103,10 +103,16 @@ does not exist. Turning it on needs a restart.
 - With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
   is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
   checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
-  two display attributes, the card the checkout was created with. `network` is the partner's word or
-  `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
-  when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
-  field.
+  two display attributes, the card the checkout was created with. An A2A-rail body carries the same field
+  once the token is minted on the card (`awaiting_buyer_authorization`, `placing`, `completed`): the network
+  and last four from the rail's own card list, recorded for that card as the token is minted (migration 298),
+  shown only while the row still names that card; never the checkout answer's `cardLast4`, which is the
+  token's. The worker records it whether or not the dial is on (the dial gates only the read), and the
+  columns are not cleared by a terminal state or the contact purge (display attributes, not cardholder data).
+  The worker trusts the rail to mint the token on the card it named: if the rail's own approval page ever let
+  the buyer switch cards, the page would still name the earlier one. `network` is the partner's word or `null`; there is no field without exactly four digits, before
+  the card is bound, or when the card read fails (the body is still served). Never in the public route or
+  the webhooks. Off: no field.
 - Either rail's body carries `"agent_display_name": "<name>"` only when Pivota has reviewed a name for the
   purchase's agent (`agents.buyer_display_name`, migration 297, set by hand as a gated one-off; NULL for
   every agent until then). Never `agents.agent_name`, which the agent's developer typed. No field when no
