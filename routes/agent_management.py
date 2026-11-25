@@ -13,7 +13,8 @@ from db.agents import (
     create_agent,
     get_agent,
     get_agent_analytics,
-    agents
+    agents,
+    portal_name_rename_hide,
 )
 from db.database import database
 from utils.auth import AGENT_OR_EMPLOYEE_ROLES, AGENT_OR_EMPLOYEE_STAFF_ROLES, EMPLOYEE_ROLES, EMPLOYEE_STAFF_ROLES, can_access_agent, get_current_employee, get_current_user, require_admin, verify_jwt_token
@@ -287,7 +288,13 @@ async def update_agent(
         
         # 执行更新
         query = agents.update().where(agents.c.agent_id == agent_id).values(**update_data)
-        await database.execute(query)
+        async with database.transaction():
+            if "agent_name" in update_data:
+                # The buyer page shows the portal name (db/agents.get_buyer_display_name): a rename is hidden
+                # until a gated check, in the same transaction, so the new name never shows unchecked. A fault
+                # fails the whole update.
+                await database.execute(*portal_name_rename_hide(agent_id, update_data["agent_name"]))
+            await database.execute(query)
         
         logger.info(f"Agent {agent_id} updated by {current_user.get('email') or current_user.get('user_id')}")
         
