@@ -187,7 +187,9 @@ _REFUSALS = [
     ("prod_apex_in_list", {"CORS_ORIGINS": "https://sandbox.mcp.pivota.cc,https://pivota.cc"}, "CORS_ORIGINS"),
     ("prod_agenpaz", {"AGENPAS_PUBLIC_BASE_URL": "https://pay.agenpaz.com"}, "AGENPAS_PUBLIC_BASE_URL"),
     ("prod_reap_other_var", {"REAP_HOSTED_BASE": "https://prod.api.reap.global"}, "REAP_HOSTED_BASE"),
-    ("railway_host", {"UPSTREAM": "https://web-production-fedb.up.railway.app"}, "UPSTREAM"),
+    # Any *.railway.app host is refused; not the legacy prod URL itself, which
+    # tests/test_legacy_backend_url_guard.py keeps out of the tree.
+    ("railway_host", {"UPSTREAM": "https://some-service-production.up.railway.app"}, "UPSTREAM"),
     ("railway_proxy", {"DATABASE_URL": "postgresql://u:%s@switchback.proxy.rlwy.net:1/db" % SECRET}, "DATABASE_URL"),
     ("stripe_live", {"STRIPE_SECRET_KEY": "sk_live_" + SECRET}, "STRIPE_SECRET_KEY"),
     ("agent_live_key", {"SHOP_GATEWAY_AGENT_API_KEY": "ak_live_" + SECRET}, "SHOP_GATEWAY_AGENT_API_KEY"),
