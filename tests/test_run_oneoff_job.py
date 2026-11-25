@@ -58,14 +58,27 @@ case "$1 $2" in
         exit "$STUB_JOB_EXECUTE_RC" ;;
       delete) exit 0 ;;
     esac ;;
-  "logging read") printf '%s' "$STUB_LOG_OUTPUT"; exit 0 ;;
+  # STUB_LOG_SEQ_DIR holds reads 1, 2, 3, ... served in turn, the last one repeating: Cloud
+  # Logging filling in as ingestion catches up. Without it every read returns STUB_LOG_OUTPUT.
+  "logging read")
+    if [ -n "${STUB_LOG_SEQ_DIR-}" ]; then
+      k=$(cat "$STUB_LOG_SEQ_DIR/counter" 2>/dev/null || echo 0); k=$((k + 1))
+      echo "$k" > "$STUB_LOG_SEQ_DIR/counter"
+      while [ "$k" -gt 1 ] && [ ! -e "$STUB_LOG_SEQ_DIR/$k" ]; do k=$((k - 1)); done
+      [ "$(cat "$STUB_LOG_SEQ_DIR/$k")" = "STUB_READ_FAILS" ] && exit 1
+      cat "$STUB_LOG_SEQ_DIR/$k"
+    else
+      printf '%s' "$STUB_LOG_OUTPUT"
+    fi
+    exit 0 ;;
 esac
 exit 0
 """
 
-# The helper sleeps 5s between log-read attempts; six of those would make the
-# empty-log cases take 30s of pure wall clock.
-SLEEP_STUB = "#!/bin/sh\nexit 0\n"
+# The helper sleeps between log-read attempts; real sleeps would make the empty-log
+# cases take 30s of pure wall clock. Each requested nap is recorded instead, so the
+# tests can read the schedule the script would have kept.
+SLEEP_STUB = '#!/bin/sh\necho "$1" >> "$STUB_SLEEPS"\nexit 0\n'
 
 
 class Run:
@@ -113,11 +126,14 @@ def run(tmp_path: Path, args: list[str], **env_overrides: str) -> Run:
 
     calls_file = tmp_path / "calls.tsv"
     calls_file.touch()
+    sleeps_file = tmp_path / "sleeps.txt"
+    sleeps_file.touch()
 
     env = {
         **os.environ,
         "PATH": f"{stub_dir}:{os.environ['PATH']}",
         "STUB_CALLS": str(calls_file),
+        "STUB_SLEEPS": str(sleeps_file),
         "STUB_JOB_CREATE_RC": "0",
         "STUB_JOB_EXECUTE_RC": "0",
         "STUB_LOG_OUTPUT": "",
@@ -131,7 +147,9 @@ def run(tmp_path: Path, args: list[str], **env_overrides: str) -> Run:
         for line in calls_file.read_text().splitlines()
         if line.strip()
     ]
-    return Run(proc, calls)
+    r = Run(proc, calls)
+    r.sleeps = [int(x) for x in sleeps_file.read_text().split()]
+    return r
 
 
 def test_success_exits_zero_and_mounts_the_database_secret(tmp_path: Path) -> None:
@@ -277,7 +295,10 @@ def test_the_log_read_is_scoped_to_this_job_and_to_stdout(tmp_path: Path) -> Non
     r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="line\n")
 
     assert r.rc == 0
-    read = r.call("logging", "read")
+    # The read repeats until the log is complete; EVERY read must carry the scoping.
+    reads = [c for c in r.calls if c[:2] == ["logging", "read"]]
+    assert reads and all(c == reads[0] for c in reads), reads
+    read = reads[0]
     filt = read[2]
     # Someone else's job output presented as yours is worse than no output.
     job = r.call("run", "jobs", "create")[3]
@@ -299,7 +320,8 @@ def test_the_log_window_is_wider_than_the_task_can_run(tmp_path: Path) -> None:
     r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="line\n", TASK_TIMEOUT="3600s")
 
     assert r.rc == 0
-    freshness = r.flag(r.call("logging", "read"), "--freshness")
+    reads = [c for c in r.calls if c[:2] == ["logging", "read"]]
+    freshness = r.flag(reads[0], "--freshness")
     assert int(freshness.rstrip("s")) > 3600
 
 
@@ -309,7 +331,10 @@ def test_retries_run_lost_to_ingestion_lag_are_retried(tmp_path: Path) -> None:
 
     assert r.rc == 0
     reads = [c for c in r.calls if c[:2] == ["logging", "read"]]
-    assert len(reads) == 6, f"want 6 attempts, got {len(reads)}"
+    # Every 5s inside the 30s budget, the last read landing ON the deadline (the old
+    # loop slept a final 5s after its sixth read and never looked again).
+    assert len(reads) == 7, f"want 7 attempts, got {len(reads)}"
+    assert r.sleeps == [5] * 6
 
 
 def test_the_job_does_not_silently_rerun_a_failing_apply(tmp_path: Path) -> None:
@@ -421,3 +446,175 @@ def test_a_failed_create_says_why(tmp_path: Path) -> None:
     assert r.rc != 0
     assert "PERMISSION_DENIED" in r.err
     assert not r.has("run", "jobs", "execute")
+
+
+# ---------------------------------------------------------------------------
+# The first non-empty read can be PARTIAL.
+#
+# 2026-11-24 ~17:51Z, the migration 296 verification read (job oneoff-10927-24436):
+# the fetched job.log lacked the DEFS and PROBES lines, which were in Cloud Logging a
+# minute later. The loop stopped at the first non-empty read. Exit codes were right;
+# the risk is an operator or a waiter reading a truncated verdict line as the whole.
+# Reads below are NEWEST-FIRST, as Cloud Logging returns them.
+# ---------------------------------------------------------------------------
+
+
+def seq(tmp_path: Path, *reads: str) -> str:
+    d = tmp_path / "logseq"
+    d.mkdir()
+    for i, body in enumerate(reads, 1):
+        (d / str(i)).write_text(body)
+    return str(d)
+
+
+def body_lines(r: Run) -> list[str]:
+    return [ln for ln in r.out.splitlines() if ln.strip()]
+
+
+def test_a_partial_first_read_is_not_taken_as_the_whole_log(tmp_path: Path) -> None:
+    """MUTANT: break on the first non-empty read again. The DEFS and PROBES lines vanish."""
+    partial = "HEADER mig 296\n"
+    full = "VERIFY_DONE\nPROBES ok\nDEFS ok\nHEADER mig 296\n"
+    r = run(tmp_path, ["scripts/x.py"], STUB_LOG_SEQ_DIR=seq(tmp_path, partial, full))
+
+    assert r.rc == 0
+    assert body_lines(r) == ["HEADER mig 296", "DEFS ok", "PROBES ok", "VERIFY_DONE"]
+    assert "log complete" in r.err and "WARNING" not in r.err
+    # read 1 partial -> 15s -> read 2 full (4 lines) -> 15s -> read 3 still 4 lines: stable.
+    assert r.sleeps == [15, 15]
+    assert len([c for c in r.calls if c[:2] == ["logging", "read"]]) == 3
+
+
+def test_stability_needs_reads_at_least_15s_apart(tmp_path: Path) -> None:
+    """Two reads 5s apart can agree while the tail is still in flight."""
+    r = run(tmp_path, ["scripts/x.py"], STUB_LOG_OUTPUT="a\nb\n")
+
+    assert r.rc == 0
+    assert r.sleeps == [15]
+    assert all(n >= 15 for n in r.sleeps)
+    assert "two reads 15s apart both held 2 lines" in r.err
+
+
+def test_a_log_still_growing_at_the_deadline_is_printed_with_a_warning(tmp_path: Path) -> None:
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        STUB_LOG_SEQ_DIR=seq(tmp_path, "a\n", "b\na\n", "c\nb\na\n", "d\nc\nb\na\n"),
+    )
+
+    assert r.rc == 0, "an incomplete log must not change the verdict"
+    # Reads at 0s, 15s, 30s; nothing after the deadline.
+    assert r.sleeps == [15, 15] and sum(r.sleeps) == 30
+    assert body_lines(r) == ["a", "b", "c"], "the newest read is the one printed"
+    assert "WARNING" in r.err and "INCOMPLETE" in r.err
+    assert "succeeded" in r.err
+
+
+def test_the_last_sleep_is_clamped_so_a_read_lands_on_the_deadline(tmp_path: Path) -> None:
+    """First lines at 20s: a 15s nap would overshoot, so it is cut to 10s and the
+    final read happens at 30s. 10s apart is too close to call it complete."""
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        STUB_LOG_SEQ_DIR=seq(tmp_path, "", "", "", "", "a\n", "a\n"),
+    )
+
+    assert r.sleeps == [5, 5, 5, 5, 10]
+    assert body_lines(r) == ["a"]
+    assert "WARNING" in r.err
+
+
+def test_done_marker_ends_the_wait_as_soon_as_a_line_matches(tmp_path: Path) -> None:
+    partial = "DEFS ok\nHEADER\n"
+    full = "APPLY_DONE\nPROBES ok\nDEFS ok\nHEADER\n"
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        DONE_MARKER="_DONE$|STOP",
+        STUB_LOG_SEQ_DIR=seq(tmp_path, partial, partial, full),
+    )
+
+    assert r.rc == 0
+    assert body_lines(r) == ["HEADER", "DEFS ok", "PROBES ok", "APPLY_DONE"]
+    # With a marker there is no stability gap to wait out: poll every 5s, stop on the match.
+    assert r.sleeps == [5, 5]
+    assert "matched DONE_MARKER" in r.err and "WARNING" not in r.err
+
+
+def test_done_marker_anchors_at_end_of_line_despite_the_value_tab(tmp_path: Path) -> None:
+    """value(textPayload,jsonPayload.message) emits a trailing tab for the empty half,
+    so `_DONE$` against the raw read could never match."""
+    r = run(tmp_path, ["scripts/x.py"], DONE_MARKER="_DONE$", STUB_LOG_OUTPUT="VERIFY_DONE\t\nHEADER\t\n")
+
+    assert r.sleeps == []
+    assert "matched DONE_MARKER" in r.err
+
+
+def test_done_marker_overrides_stability(tmp_path: Path) -> None:
+    """A stable count is not completion when the caller named the line that is.
+    MUTANT: accept stability in marker mode -> stops at 5s on two equal partial reads."""
+    r = run(tmp_path, ["scripts/x.py"], DONE_MARKER="_DONE$", STUB_LOG_OUTPUT="HEADER\nDEFS ok\n")
+
+    assert r.rc == 0
+    assert sum(r.sleeps) == 30 and r.sleeps == [5] * 6
+    assert "WARNING" in r.err and "DONE_MARKER" in r.err
+    assert body_lines(r) == ["DEFS ok", "HEADER"]
+
+
+def test_done_marker_missing_on_a_failed_job_keeps_the_failure_verdict(tmp_path: Path) -> None:
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        DONE_MARKER="_DONE$",
+        STUB_JOB_EXECUTE_RC="1",
+        STUB_LOG_OUTPUT="Traceback\n",
+    )
+
+    assert r.rc == 1
+    assert "WARNING" in r.err and "FAILED" in r.err and "succeeded" not in r.err
+
+
+def test_a_failed_read_after_a_good_one_keeps_the_good_one_and_restarts_stability(tmp_path: Path) -> None:
+    """A blip must neither blank the log nor count as agreement with the read before it."""
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        STUB_LOG_SEQ_DIR=seq(tmp_path, "b\na\n", "STUB_READ_FAILS", "b\na\n", "b\na\n"),
+    )
+
+    assert r.rc == 0
+    assert body_lines(r) == ["a", "b"]
+    # 0s good (2) -> 15s FAILED -> 30s good (2): the 0s read is not compared across the blip.
+    assert r.sleeps == [15, 15]
+    assert "WARNING" in r.err
+
+
+def test_log_wait_seconds_extends_the_deadline(tmp_path: Path) -> None:
+    r = run(
+        tmp_path,
+        ["scripts/x.py"],
+        LOG_WAIT_SECONDS="90",
+        STUB_LOG_SEQ_DIR=seq(tmp_path, "a\n", "b\na\n", "c\nb\na\n", "c\nb\na\n"),
+    )
+
+    assert r.sleeps == [15, 15, 15]
+    assert body_lines(r) == ["a", "b", "c"]
+    assert "log complete" in r.err
+
+
+@pytest.mark.parametrize(
+    "env, needle",
+    [
+        ({"DONE_MARKER": "(unclosed"}, "not a valid extended regex"),
+        ({"LOG_WAIT_SECONDS": "30s"}, "not a whole number"),
+        ({"LOG_WAIT_SECONDS": "-5"}, "not a whole number"),
+    ],
+)
+def test_bad_wait_settings_are_refused_before_the_job_is_created(tmp_path: Path, env, needle) -> None:
+    """Found out only after the read, a bad setting would mean a production job ran
+    and its log could never be judged complete."""
+    r = run(tmp_path, ["scripts/x.py"], **env)
+
+    assert r.rc == 2
+    assert needle in r.err
+    assert not r.has("run", "jobs", "create")
