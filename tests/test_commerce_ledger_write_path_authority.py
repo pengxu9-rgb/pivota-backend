@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import databases
@@ -31,6 +32,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _MIGRATION = REPO_ROOT / "db" / "migrations" / "213_commerce_ledger_write_path_authority.sql"
 _INDEX_MIGRATION = REPO_ROOT / "db" / "migrations" / "214_commerce_ledger_synthetic_index.sql"
 _PROVENANCE_COLUMNS = ("write_path", "authority", "agent_identity_confidence", "synthetic")
+# The day the funnel tests' events sit on (their fixed 2026-09-04T10:00Z stamps). A funnel read
+# with no since/until asks for the DEFAULT_WINDOW_DAYS before the live clock, which these dates
+# leave on 2026-12-03; an explicit window keeps the read on them whatever day the test runs.
+_FIXTURE_WINDOW = {
+    "since": datetime(2026, 9, 4, tzinfo=timezone.utc),
+    "until": datetime(2026, 9, 5, tzinfo=timezone.utc),
+}
 
 
 # ---- 1. the three schema homes must agree ----------------------------------
@@ -378,7 +386,7 @@ async def test_funnel_refund_authority_reads_the_stamp_over_the_source_string(tm
         assert authorities == {"merchant", "psp"}
 
         result = await funnel_module.get_merchant_commerce_event_funnel(
-            merchant_id="merchant-a", group_by="store"
+            merchant_id="merchant-a", group_by="store", **_FIXTURE_WINDOW
         )
         assert result.payload["available"] is True
         # max(merchant=900, psp=500) per order, not a single "psp" bucket of 900.
@@ -464,7 +472,7 @@ async def test_synthetic_batches_are_stamped_and_excluded_from_the_default_funne
         assert by_order == {"ORDER_REAL": False, "ORDER_PROBE": True, "ORDER_LEGACY": True}
 
         result = await funnel_module.get_merchant_commerce_event_funnel(
-            merchant_id="merchant-a", group_by="store"
+            merchant_id="merchant-a", group_by="store", **_FIXTURE_WINDOW
         )
         summary = result.payload["summary"]
         assert summary["events_total"] == 1
