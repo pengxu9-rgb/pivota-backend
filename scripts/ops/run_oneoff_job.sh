@@ -31,6 +31,15 @@
 # on 2026-08-25. `--wait` already carries pass/fail out; the log is fetched for DETAIL only, behind
 # a retry, and its emptiness is reported as such instead of being read as a result.
 #
+# THE FIRST NON-EMPTY READ CAN BE PARTIAL. Cloud Logging ingests a job's lines with a lag, so a read
+# can hold the first half of a report and not the rest: on 2026-11-24 the migration 296 verification
+# read lacked its DEFS and PROBES lines, which were in Cloud Logging a minute later. The read
+# therefore keeps polling until the log is COMPLETE, by one of two signals, inside the same deadline:
+#   DONE_MARKER set  -> until a line matches that extended regex (e.g. '_DONE$|APPLY_DONE|STOP').
+#   DONE_MARKER unset -> until two consecutive reads at least 15s apart return the same line count.
+# If the deadline (LOG_WAIT_SECONDS, default 30) passes first, the newest read is printed with a
+# WARNING that it may be incomplete. Either way the exit code is unchanged and remains the verdict.
+#
 # Precisely what this script's exit status means: 0 = the job's container exited 0. Non-zero = it
 # did not, OR gcloud itself failed. It is NOT the container's own exit code - `gcloud run jobs
 # execute` raises ExecutionFailedError, which carries no exit_code, so calliope exits 1 for every
@@ -50,8 +59,9 @@
 #     scripts/ops/run_oneoff_job.sh scripts/some-script.js --market US
 #
 # Environment overrides: PROJECT, REGION, IMAGE, COMMAND, SERVICE_ACCOUNT, SECRETS, ENV_VARS,
-# TASK_TIMEOUT, JOB_PREFIX, NETWORK, SUBNET. SECRETS and ENV_VARS are passed to gcloud verbatim and
-# are themselves comma-separated, so no name or value in them may contain a comma.
+# TASK_TIMEOUT, JOB_PREFIX, NETWORK, SUBNET, DONE_MARKER, LOG_WAIT_SECONDS. SECRETS and ENV_VARS are
+# passed to gcloud verbatim and are themselves comma-separated, so no name or value in them may
+# contain a comma.
 #
 # SUBNET=pivota-crawl IS REQUIRED FOR ANYTHING THAT FETCHES FROM A MERCHANT. See the note beside
 # the variable: the default subnet's NAT address is the one payment partners allowlist.
@@ -125,6 +135,19 @@ case "$COMMAND" in
   *,*) echo "run_oneoff_job: COMMAND '$COMMAND' contains a comma; gcloud --command splits on commas and would build a multi-token entrypoint" >&2; exit 2 ;;
 esac
 
+# Checked BEFORE the job is created: a bad value here would otherwise surface only after a
+# production job had already run, as a log read that can never complete. grep -E exits 2 on a
+# malformed pattern and 1 on no match, so only 2 is a refusal.
+DONE_MARKER="${DONE_MARKER-}"
+LOG_WAIT_SECONDS="${LOG_WAIT_SECONDS:-30}"
+case "$LOG_WAIT_SECONDS" in
+  ''|*[!0-9]*) echo "run_oneoff_job: LOG_WAIT_SECONDS '$LOG_WAIT_SECONDS' is not a whole number of seconds" >&2; exit 2 ;;
+esac
+if [ -n "$DONE_MARKER" ]; then
+  mrc=0; grep -E -- "$DONE_MARKER" </dev/null >/dev/null 2>&1 || mrc=$?
+  [ "$mrc" != 2 ] || { echo "run_oneoff_job: DONE_MARKER '$DONE_MARKER' is not a valid extended regex" >&2; exit 2; }
+fi
+
 # An empty argument cannot be expressed: gcloud drops it at either end of the list and shifts argv
 # for everything after it. Refusing is the only honest option — an unset shell variable reaching
 # here would otherwise run a DIFFERENT command than the one written down.
@@ -193,28 +216,69 @@ gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
 RC=0
 gcloud run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --wait --quiet >/dev/null 2>"$ERRLOG" || RC=$?
 
-# Detail only. Six tries at 5s: enough for the usual lag, and its failure is reported as a failure
-# to READ rather than as an empty result.
+# Detail only, and never a verdict. Polls every 5s while nothing is readable, for at most
+# LOG_WAIT_SECONDS (default 30 - the same budget as the old six tries at 5s), and stops early only
+# once the log is COMPLETE (see the header): a DONE_MARKER line, or without one, two reads >=15s
+# apart with the same line count. A failure to read is reported as such, not as an empty result.
+#
+# The deadline counts the seconds slept, not the wall clock, so it is exact under a stubbed `sleep`;
+# the real run takes a little longer by the time the reads themselves take. The last sleep is
+# clamped so one final read lands ON the deadline: if the log is still incomplete then, that newest
+# read is the most complete one there is.
+#
+# The marker is matched against lines with value()'s trailing tab stripped, or `_DONE$` could never
+# match. Here-strings, not `printf | grep -q`: under pipefail grep -q exits on the first match, the
+# writer takes SIGPIPE, and the pipeline reads as "no match".
 #
 # The logName filter is load-bearing. Without it the read also returns cloudaudit system_event
 # entries, which carry no textPayload and render as blank lines interleaved through the output.
 # jsonPayload.message is included because a structured logger writes there instead.
 FRESHNESS="${FRESHNESS:-$(( ${TASK_TIMEOUT%s} + 600 ))s}"
 FILTER="resource.labels.job_name=\"$JOB\" AND logName=~\"run.googleapis.com%2F(stdout|stderr)\$\""
+POLL_SECONDS=5
+STABLE_GAP_SECONDS=15
 OUT=""
-for _ in 1 2 3 4 5 6; do
-  OUT=$(gcloud logging read "$FILTER" --project "$PROJECT" \
-    --limit 5000 --format='value(textPayload,jsonPayload.message)' --freshness="$FRESHNESS" 2>/dev/null) || OUT=""
-  [ -n "$OUT" ] && break
-  sleep 5
+COMPLETE=""
+elapsed=0
+prev_n=-1
+prev_at=0
+while :; do
+  READ=$(gcloud logging read "$FILTER" --project "$PROJECT" \
+    --limit 5000 --format='value(textPayload,jsonPayload.message)' --freshness="$FRESHNESS" 2>/dev/null) || READ=""
+  if [ -n "$READ" ]; then
+    OUT=$(awk '{sub(/\t+$/,""); print}' <<<"$READ")
+    n=$(awk 'END {print NR}' <<<"$OUT")
+    if [ -n "$DONE_MARKER" ]; then
+      if grep -Eq -- "$DONE_MARKER" <<<"$OUT"; then COMPLETE="a line matched DONE_MARKER"; break; fi
+    elif [ "$n" = "$prev_n" ] && [ $((elapsed - prev_at)) -ge "$STABLE_GAP_SECONDS" ]; then
+      COMPLETE="two reads $((elapsed - prev_at))s apart both held $n lines"; break
+    else
+      prev_n="$n"; prev_at="$elapsed"
+    fi
+  else
+    # An empty or failed read after a good one says nothing about completeness: keep the good OUT,
+    # and make stability start over rather than compare against a read that never happened.
+    prev_n=-1
+  fi
+  [ "$elapsed" -lt "$LOG_WAIT_SECONDS" ] || break
+  if [ -n "$OUT" ] && [ -z "$DONE_MARKER" ]; then nap="$STABLE_GAP_SECONDS"; else nap="$POLL_SECONDS"; fi
+  [ $((elapsed + nap)) -le "$LOG_WAIT_SECONDS" ] || nap=$((LOG_WAIT_SECONDS - elapsed))
+  sleep "$nap"
+  elapsed=$((elapsed + nap))
 done
 
 if [ -n "$OUT" ]; then
-  # Cloud Logging returns newest-first; replay in the order the script actually printed. The sub()
-  # strips the trailing tab that value() emits for the absent half of the payload pair.
-  printf '%s\n' "$OUT" | awk '{sub(/\t+$/,""); L[NR]=$0} END {for(i=NR;i>=1;i--) print L[i]}'
+  # Cloud Logging returns newest-first; replay in the order the script actually printed.
+  printf '%s\n' "$OUT" | awk '{L[NR]=$0} END {for(i=NR;i>=1;i--) print L[i]}'
+  if [ -n "$COMPLETE" ]; then
+    echo "==> log complete: $COMPLETE" >&2
+  elif [ -n "$DONE_MARKER" ]; then
+    echo "==> WARNING: the log above may be INCOMPLETE - no line matched DONE_MARKER '$DONE_MARKER' within ${LOG_WAIT_SECONDS}s (ingestion lag, or the script never printed it). Re-read Cloud Logging for job $JOB before trusting any detail in it; the exit code below is still the verdict." >&2
+  else
+    echo "==> WARNING: the log above may be INCOMPLETE - its line count was still changing at the ${LOG_WAIT_SECONDS}s deadline (ingestion lag). Re-read Cloud Logging for job $JOB before trusting any detail in it; the exit code below is still the verdict." >&2
+  fi
 else
-  echo "(no log entries readable after 30s - ingestion lag, not a verdict; the exit code below is the verdict)" >&2
+  echo "(no log entries readable after ${LOG_WAIT_SECONDS}s - ingestion lag, not a verdict; the exit code below is the verdict)" >&2
 fi
 
 if [ "$RC" = 0 ]; then
