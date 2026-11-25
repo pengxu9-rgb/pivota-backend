@@ -275,6 +275,9 @@ def test_every_secret_kind_is_refused_by_the_dump_and_by_the_apply(harness, samp
 @pytest.mark.parametrize("answer,match", [
     ("role", "superuser or can create roles"),
     ("table", "owns or may write a table"),
+    ("member", "member of another role"),
+    ("create", "may CREATE in the database or a schema"),
+    ("definer", "SECURITY DEFINER function"),
     ("", "could not check the credential"),
     ("something else", "could not check the credential"),
 ])
@@ -292,6 +295,8 @@ def test_the_privilege_check_runs_before_the_dump_and_is_read_only(harness):
     calls = (harness.log / "psql.argv").read_text()
     check = next(line for line in calls.splitlines() if "has_table_privilege" in line)
     assert all(word not in check.lower() for word in ("insert into", "update ", "delete from", "truncate ", "grant", "create "))
-    for kind in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+    for kind in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "USAGE", "CREATE", "EXECUTE"):
         assert "'%s'" % kind in calls
-    assert "relowner" in calls and "rolsuper" in calls
+    for needle in ("relowner", "rolsuper", "pg_auth_members", "has_any_column_privilege", "has_sequence_privilege",
+                   "has_schema_privilege", "has_database_privilege", "prosecdef", "'S', 'v', 'f', 'm'"):
+        assert needle in calls, needle

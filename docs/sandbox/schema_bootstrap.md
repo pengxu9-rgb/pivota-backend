@@ -48,6 +48,13 @@ plus prod's two migration ledgers. Code: `scripts/sandbox/dump_prod_schema.sh` (
   outside comments and pg_dump's own `\restrict` key; a ledger line that is not an explicit-column INSERT;
   a missing trailer; fewer tables than the live source; and a pg_dump whose major version is not the
   server's (checked before dumping; the manifest records `pg_dump_version` and `server_version_num`).
+* The credential (RUNBOOK 10a-role's read-only `sandbox_schema_dump`) is checked before any pg_dump, exit 3:
+  not a superuser and no CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS; a member of NO role (NOINHERIT does
+  not stop SET ROLE; pg_write_all_data included); it owns nothing and may not INSERT/UPDATE (any column)/
+  DELETE/TRUNCATE any table, view, foreign table or materialized view, nor USAGE/UPDATE a sequence; no
+  CREATE on the database or any schema; no EXECUTE on a SECURITY DEFINER function outside pg_catalog.
+  NOTE: if prod's `public` schema still grants CREATE to PUBLIC (a pre-15 default carried by a restore),
+  this refuses even the right role; the fix is a gated prod REVOKE, never a weaker check.
 * These are a COARSE line-based filter. `dump_prod_schema.sh check <schema.sql> <ledgers.sql>` runs only
   them; the authoritative offline check is `python -m jobs.sandbox_schema_apply check` (below).
 * **The first dump gets a human read before its upload is approved** (controller + the owner).
@@ -98,16 +105,24 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
   zero timeouts and `standard_conforming_strings` are checked, never executed); functions in plpgsql or
   sql only; no ownership change of any kind; CREATE SCHEMA without elements or AUTHORIZATION; no CREATE
   TABLE AS; a materialized view only WITH NO DATA; no rule; no trigger on a ledger table; ALTER TABLE
-  subcommands from a fixed list; no literal that looks like a secret or a person (in the parser's own
+  subcommands from a fixed list; no SECURITY DEFINER function; partition bounds constants only (PostgreSQL
+  evaluates a bound at CREATE / ATTACH); no dump-defined function, operator or cast on constants in an
+  index, partition-key, statistics or partial/exclusion predicate expression (PostgreSQL constant-folds,
+  i.e. runs, those at create time; with `search_path` pinned to '' an unqualified name is pg_catalog's); no literal that looks like a secret or a person (in the parser's own
   printout, so no comment). Ledger statements must be exactly the two explicit-column INSERT shapes,
   one row of plain literals each, no quote, semicolon or backslash in a value.
-* One transaction with the apply's own `lock_timeout` 10s, `statement_timeout` 120s, idle 60s and
-  `standard_conforming_strings` on (checked unchanged after the schema). Each statement runs ALONE through
+* One transaction with the apply's own `lock_timeout` 10s, `statement_timeout` 120s, idle 60s,
+  `standard_conforming_strings` on and `search_path` '' (checked unchanged after the schema), plus
+  CLIENT-side deadlines a statement cannot change: 120s per statement and 900s for the whole apply. Each statement runs ALONE through
   the extended protocol (the server refuses a string with two commands). Then: no ledger table may run
   code on INSERT (trigger, rule, expression/partial index, CHECK/FK, domain or generated column, row
   security, a default other than now()/nextval()); `standard_conforming_strings` re-asserted; the
-  ledger rows; the base-table count must equal the source's live count and the ledger rows the
-  manifest's, or everything rolls back. `search_path` is restored.
+  ledger rows; then a POST-APPLY AUDIT, the catch-all behind the parser: no rows in any table but the
+  ledgers; no GRANT on any table, column, function, type or schema the role owns; no default privileges;
+  no SECURITY DEFINER function; no large object; no rule but views' `_RETURN`; exactly the dump's
+  triggers and policies; no populated materialized view; no advanced sequence. Then the base-table count
+  must equal the source's live count and the ledger rows the manifest's, or everything rolls back.
+  `search_path` is restored. A server newer than the parser's major version (17) is refused.
 * Exit 0 = `DONE {...}`, exit 2 = `REFUSED: <rule>`.
 * Offline: `python -m jobs.sandbox_schema_apply check <schema.sql> <ledgers.sql>` runs the same parser
   and allowlist with no database (exit 0 = `OK {...}`). **The human read of the first dump runs it**;

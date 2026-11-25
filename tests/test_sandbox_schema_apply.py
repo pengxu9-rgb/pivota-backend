@@ -411,3 +411,73 @@ def test_the_offline_check_reports_ok_and_refusals(tmp_path, capsys):
     assert A.main(["check", str(schema), str(ledgers)]) == 2
     assert "REFUSED" in capsys.readouterr().err
     assert A.main(["check", str(schema)]) == 2
+
+
+# --- the rework's re-review (controller B1, B3) ----------------------------------------------------
+B1_FUNCTION = ("CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $$BEGIN EXECUTE 'GRANT ALL ON TABLE "
+               "public.victim TO PUBLIC'; RETURN 1; END$$;\n")
+
+
+@pytest.mark.parametrize("statement", [
+    # The reviewer's reproduction: a partition bound runs the dump's function at create time.
+    B1_FUNCTION + "CREATE TABLE public.p (a int) PARTITION BY LIST (a);\n"
+    "CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES IN (public.f());",
+    B1_FUNCTION + "ALTER TABLE ONLY public.p ATTACH PARTITION public.p1 FOR VALUES IN (public.f());",
+    "CREATE TABLE public.r1 PARTITION OF public.r FOR VALUES FROM (pg_catalog.now()) TO (MAXVALUE);",
+    "CREATE TABLE public.r1 PARTITION OF public.r FOR VALUES FROM ((SELECT 1)) TO (2);",
+    "CREATE TABLE public.r1 PARTITION OF public.r FOR VALUES FROM (1 + 1) TO (5);",
+])
+def test_a_partition_bound_must_be_a_constant(statement):
+    with pytest.raises(A.SchemaRefused, match="partition bound that is not a constant"):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE TABLE public.l1 PARTITION OF public.l FOR VALUES IN ('a', 'b');",
+    "CREATE TABLE public.l2 PARTITION OF public.l FOR VALUES IN (-5, 7);",
+    "CREATE TABLE public.l3 PARTITION OF public.l DEFAULT;",
+    "CREATE TABLE public.r1 PARTITION OF public.r FOR VALUES FROM (MINVALUE) TO ('2024-01-01'::date);",
+    "CREATE TABLE public.r2 PARTITION OF public.r FOR VALUES FROM ('2024-01-01') TO (MAXVALUE);",
+    "ALTER TABLE ONLY public.p ATTACH PARTITION public.p1 FOR VALUES IN (true);",
+    "CREATE TABLE public.h1 PARTITION OF public.h FOR VALUES WITH (modulus 4, remainder 0);",
+])
+def test_the_bounds_pg_dump_writes_are_kept(statement):
+    assert A.validate_schema_sql(_schema(statement)).statements
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE INDEX i ON public.t ((public.f()));",
+    "CREATE INDEX i ON public.t (a) WHERE (public.g() > 1);",
+    "CREATE INDEX i ON public.t ((1 OPERATOR(public.===) 2));",
+    "CREATE INDEX i ON public.t (((public.f())::public.k));",
+    "CREATE TABLE public.q (a int) PARTITION BY RANGE ((public.f()));",
+    "CREATE STATISTICS s ON (public.f()), (a) FROM public.t;",
+    "ALTER TABLE public.t ADD CONSTRAINT x EXCLUDE USING gist (a WITH =) WHERE ((public.g() > 1));",
+])
+def test_a_dump_function_on_constants_in_a_folded_expression_is_refused(statement):
+    with pytest.raises(A.SchemaRefused, match="folded, i.e. run, at create time"):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE INDEX i ON public.t USING btree (public.f(a));",                     # a column: not folded
+    "CREATE INDEX i ON public.t USING btree (lower(b)) WHERE (state = 'live'::public.offer_state);",
+    "CREATE INDEX i ON public.t USING gin (b public.gin_trgm_ops);",
+    "CREATE TABLE public.q (a int) PARTITION BY RANGE (a);",
+    "CREATE TABLE public.d (a int DEFAULT public.f(), b text DEFAULT gen_random_uuid()::text);",  # runs at INSERT
+    "CREATE TABLE public.c (a int CHECK (public.positive(a)));",
+])
+def test_column_expressions_and_insert_time_defaults_are_kept(statement):
+    assert A.validate_schema_sql(_schema(statement)).statements
+
+
+def test_a_security_definer_function_is_refused_and_invoker_is_kept():
+    with pytest.raises(A.SchemaRefused, match="SECURITY DEFINER"):
+        A.validate_schema_sql(_schema("CREATE FUNCTION public.h() RETURNS int LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;"))
+    A.validate_schema_sql(_schema("CREATE FUNCTION public.h() RETURNS int LANGUAGE sql SECURITY INVOKER AS $$ SELECT 1 $$;"))
+
+
+def test_the_plan_counts_the_kinds_the_audit_expects():
+    plan = A.validate_schema_sql(_schema("CREATE TRIGGER t BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.f();\n"
+                                         "CREATE POLICY p ON public.t USING (true);"))
+    assert plan.count("CreateTrigStmt") == 1 and plan.count("CreatePolicyStmt") == 1 and plan.count("RuleStmt") == 0

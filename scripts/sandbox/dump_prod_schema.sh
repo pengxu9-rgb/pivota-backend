@@ -32,8 +32,10 @@
 # not carried): schema_migrations(id, applied_at) and startup_sql_migrations(filename, checksum, applied_at).
 #
 # CREDENTIAL: RUNBOOK 10a-role's read-only sandbox_schema_dump. Refused before any pg_dump (exit 3): a
-# superuser, a role that can create roles or databases, or one that owns or may INSERT/UPDATE/DELETE/TRUNCATE
-# any table.
+# superuser or a role that can create roles or databases; a member of ANY role (NOINHERIT does not stop
+# SET ROLE, pg_write_all_data included); a role that owns, or may INSERT/UPDATE (any column)/DELETE/TRUNCATE,
+# any table, view, foreign table or materialized view, or may USAGE/UPDATE (nextval/setval) a sequence; CREATE
+# on the database or any schema; EXECUTE on a SECURITY DEFINER function outside pg_catalog.
 #
 # REFUSED (exit 3, nothing uploaded): CREATE SERVER / USER MAPPING / SUBSCRIPTION / PUBLICATION / ROLE /
 # USER / GROUP / DATABASE / FOREIGN TABLE / EVENT TRIGGER, ALTER ROLE / USER / SYSTEM / SERVER / DATABASE /
@@ -154,17 +156,34 @@ echo "dump_prod_schema: pg_dump $PG_DUMP_VERSION server_version_num=$SERVER_NUM 
 WRITABLE=$(capped psql -XAtc "select case
     when (select rolsuper or rolcreaterole or rolcreatedb or rolreplication or rolbypassrls
             from pg_roles where rolname = current_user) then 'role'
-    when exists (select 1 from pg_class c where c.relkind in ('r', 'p')
+    when exists (select 1 from pg_auth_members m join pg_roles r on r.oid = m.member
+                  where r.rolname = current_user) then 'member'
+    when exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  where c.relkind in ('r', 'p', 'S', 'v', 'f', 'm')
+                   -- system schemas excluded: PUBLIC may UPDATE pg_catalog.pg_settings (that is how SET works)
+                   and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'
                    and (c.relowner = (select oid from pg_roles where rolname = current_user)
-                        or has_table_privilege(current_user, c.oid, 'INSERT')
-                        or has_table_privilege(current_user, c.oid, 'UPDATE')
-                        or has_table_privilege(current_user, c.oid, 'DELETE')
-                        or has_table_privilege(current_user, c.oid, 'TRUNCATE'))) then 'table'
+                        or case when c.relkind = 'S'
+                                then has_sequence_privilege(current_user, c.oid, 'UPDATE')
+                                     or has_sequence_privilege(current_user, c.oid, 'USAGE')
+                                else has_any_column_privilege(current_user, c.oid, 'INSERT')
+                                     or has_any_column_privilege(current_user, c.oid, 'UPDATE')
+                                     or has_table_privilege(current_user, c.oid, 'DELETE')
+                                     or has_table_privilege(current_user, c.oid, 'TRUNCATE') end)) then 'table'
+    when has_database_privilege(current_database(), 'CREATE')
+      or exists (select 1 from pg_namespace n where n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast%'
+                   and has_schema_privilege(current_user, n.oid, 'CREATE')) then 'create'
+    when exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                  where p.prosecdef and n.nspname not in ('pg_catalog', 'information_schema')
+                    and has_function_privilege(current_user, p.oid, 'EXECUTE')) then 'definer'
     else 'none' end") || die "could not check the credential's privileges" 3
 case "$WRITABLE" in
   none) ;;
   role) die "the dump credential is a superuser or can create roles/databases; use RUNBOOK 10a-role's read-only role" 3 ;;
-  table) die "the dump credential owns or may write a table; use RUNBOOK 10a-role's read-only role" 3 ;;
+  member) die "the dump credential is a member of another role (SET ROLE would lend it that role's rights); use RUNBOOK 10a-role's read-only role" 3 ;;
+  table) die "the dump credential owns or may write a table, view, sequence or column; use RUNBOOK 10a-role's read-only role" 3 ;;
+  create) die "the dump credential may CREATE in the database or a schema; use RUNBOOK 10a-role's read-only role" 3 ;;
+  definer) die "the dump credential may EXECUTE a SECURITY DEFINER function; use RUNBOOK 10a-role's read-only role" 3 ;;
   *) die "could not check the credential's privileges" 3 ;;
 esac
 

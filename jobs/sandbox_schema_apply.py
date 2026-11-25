@@ -195,6 +195,76 @@ def _parse(text: str, what: str):
     return out
 
 
+def _walk(node):
+    """``node`` and every parse-tree node under it."""
+    from pglast import ast
+
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Node):
+            yield current
+            stack.extend(getattr(current, name, None) for name in type(current).__slots__)
+        elif isinstance(current, (tuple, list)):
+            stack.extend(current)
+
+
+def _qualified_outside_catalog(names) -> bool:
+    parts = [getattr(n, "sval", None) for n in (names or ())]
+    return len(parts) > 1 and parts[0] != "pg_catalog"
+
+
+def _create_time_refusal(stmt) -> Optional[str]:
+    """Why ``stmt`` would run dump-defined code WHILE it is being created, or None (controller B1).
+
+    PostgreSQL evaluates a partition bound at CREATE / ATTACH, and constant-folds index, partition-key,
+    statistics and partial/exclusion predicate expressions (eval_const_expressions), which CALLS an
+    immutable function whose arguments are constants. pg_dump emits only constants in a bound, and only
+    column expressions there. With search_path pinned to '' an unqualified name is pg_catalog's."""
+    kinds = type(stmt).__name__
+    if kinds == "CreateFunctionStmt":
+        return None  # a body is a string; parameter defaults run at call time
+    for node in _walk(stmt):
+        name = type(node).__name__
+        if name == "PartitionBoundSpec":
+            for datum in (node.listdatums or ()) + (node.lowerdatums or ()) + (node.upperdatums or ()):
+                if not _constant_datum(datum):
+                    return "a partition bound that is not a constant (it is evaluated at create time)"
+        roots = []
+        if name in ("IndexElem", "PartitionElem", "StatsElem") and node.expr is not None:
+            roots.append(node.expr)
+        if name == "IndexStmt" and node.whereClause is not None:
+            roots.append(node.whereClause)
+        if name == "Constraint" and getattr(node, "where_clause", None) is not None:
+            roots.append(node.where_clause)
+        for root in roots:
+            for sub in _walk(root):
+                sub_kind = type(sub).__name__
+                names = {"FuncCall": "funcname", "A_Expr": "name"}.get(sub_kind)
+                # A literal cast to a type ('live'::public.offer_state) runs the type's INPUT function, which
+                # is built in for every type a dump may create (enum, domain, composite, range; base types
+                # need C and are refused). Only a cast of a non-literal can reach a dump-defined cast function.
+                qualified = (_qualified_outside_catalog(getattr(sub, names)) if names else
+                             sub_kind == "TypeCast" and type(sub.arg).__name__ != "A_Const"
+                             and _qualified_outside_catalog(sub.typeName.names))
+                if qualified and not any(type(x).__name__ == "ColumnRef" for x in _walk(sub)):
+                    return ("a dump-defined function, operator or cast on constants in an index, partition "
+                            "or statistics expression (it is folded, i.e. run, at create time)")
+    return None
+
+
+def _constant_datum(datum) -> bool:
+    kind = type(datum).__name__
+    if kind == "A_Const":
+        return True
+    if kind == "TypeCast":
+        return type(datum.arg).__name__ == "A_Const" and not _qualified_outside_catalog(datum.typeName.names)
+    if kind == "ColumnRef":  # MINVALUE / MAXVALUE
+        fields = [getattr(f, "sval", None) for f in datum.fields]
+        return fields in (["minvalue"], ["maxvalue"])
+    return False
+
+
 def _refusal(node, enums) -> Optional[str]:
     """Why ``node`` may not be in a schema-only dump, or None."""
     kind = type(node).__name__
@@ -214,6 +284,10 @@ def _refusal(node, enums) -> Optional[str]:
             language = "sql"
         if language not in _TRUSTED_LANGUAGES:
             return "a function in a language other than plpgsql or sql"
+        if any(o.defname == "security" and getattr(o.arg, "boolval", False) for o in (node.options or ())):
+            # After REASSIGN OWNED it would run as the app owner, EXECUTE-able by PUBLIC (--no-privileges
+            # dropped prod's REVOKEs). Neither repo has one (controller B3).
+            return "a SECURITY DEFINER function"
         return None
     if kind == "DefineStmt":
         return None if enums.ObjectType(node.kind).name in _DEFINE_KINDS else "a CREATE TYPE / %s needing C code" % (
@@ -246,6 +320,10 @@ class SchemaPlan:
     statements: Tuple[str, ...]  # executed in order, each alone
     extensions: FrozenSet[str]   # must already be installed by the admin: the dump never creates one
     checked: int                 # statements read, executed or not
+    kinds: Tuple[Tuple[str, int], ...] = ()  # executed statements per node type (the post-apply audit's expectations)
+
+    def count(self, kind: str) -> int:
+        return dict(self.kinds).get(kind, 0)
 
 
 def validate_schema_sql(text: str) -> SchemaPlan:
@@ -256,11 +334,12 @@ def validate_schema_sql(text: str) -> SchemaPlan:
     executed, skipped = _preamble()
     keep: List[str] = []
     extensions = set()
+    kinds: Dict[str, int] = {}
     parsed = _parse(text, "schema file")
     for node, sql in parsed:
         kind = type(node).__name__
         if kind not in ("VariableSetStmt", "SelectStmt"):
-            why = _refusal(node, enums)  # by type first: a refused kind need not be printable
+            why = _refusal(node, enums) or _create_time_refusal(node)  # by type first: a refused kind need not be printable
             if why:
                 raise SchemaRefused("schema file carries %s" % why)
         printed = _deparse(node)
@@ -274,8 +353,9 @@ def validate_schema_sql(text: str) -> SchemaPlan:
             raise SchemaRefused("schema file carries a literal that looks like a secret or a person")
         if kind == "CreateExtensionStmt":
             extensions.add(node.extname)
+        kinds[kind] = kinds.get(kind, 0) + 1
         keep.append(sql)
-    return SchemaPlan(tuple(keep), frozenset(extensions), len(parsed))
+    return SchemaPlan(tuple(keep), frozenset(extensions), len(parsed), tuple(sorted(kinds.items())))
 
 
 def validate_ledgers_sql(text: str) -> Tuple[Tuple[str, ...], int]:
@@ -349,9 +429,13 @@ def _load(store, stamp: Optional[str]) -> Tuple[str, Dict[str, Any], str, str]:
 APPLY_LOCK_TIMEOUT = "10s"
 APPLY_STATEMENT_TIMEOUT = "120s"
 APPLY_IDLE_TIMEOUT = "60s"
+#: CLIENT-side caps too (controller B2): the server-side ones live in GUCs a statement could change and
+#: change back between two snapshots. Each statement, and the whole apply, has a deadline of its own.
+APPLY_STATEMENT_SECONDS = 120.0
+APPLY_DEADLINE_SECONDS = 900.0
 _CAPS_SQL = ("SELECT current_setting('lock_timeout') AS lock_timeout, current_setting('statement_timeout') AS st, "
              "current_setting('idle_in_transaction_session_timeout') AS idle, "
-             "current_setting('standard_conforming_strings') AS scs")
+             "current_setting('standard_conforming_strings') AS scs, current_setting('search_path') AS search_path")
 
 _ROLE_SQL = """
 SELECT r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
@@ -389,6 +473,12 @@ async def role_refusal(conn) -> Optional[str]:
     return None
 
 
+def _parser_major() -> int:
+    from pglast.parser import get_postgresql_version
+
+    return int(get_postgresql_version()[0])
+
+
 def _major(version: Any) -> Optional[int]:
     m = re.match(r"\s*([0-9]+)", str(version or ""))
     return int(m.group(1)) if m else None
@@ -406,6 +496,9 @@ async def apply_schema(conn, store, *, stamp: Optional[str] = None) -> Dict[str,
     server = int(await conn.fetchval("SHOW server_version_num")) // 10000
     if _major(manifest.get("pg_dump_version")) != server:
         raise SchemaRefused("the dump's pg_dump major version is not this server's (%s)" % server)
+    if server > _parser_major():
+        raise SchemaRefused("this server (%d) is newer than the parser the dump is checked with (%d)"
+                            % (server, _parser_major()))
     if await _user_table_count(conn) != 0:
         raise SchemaRefused("the sandbox database is not empty; this job only creates a schema once")
     installed = {r["extname"] for r in await conn.fetch("SELECT extname FROM pg_extension")}
@@ -417,9 +510,15 @@ async def apply_schema(conn, store, *, stamp: Optional[str] = None) -> Dict[str,
     # so the connection is handed back as it was found, whatever happens.
     search_path = await conn.fetchval("SELECT current_setting('search_path')")
     try:
-        return await _apply_in_one_transaction(conn, stamp, manifest, plan, ledger_sql, ledger_rows)
+        return await asyncio.wait_for(_apply_in_one_transaction(conn, stamp, manifest, plan, ledger_sql, ledger_rows),
+                                      timeout=APPLY_DEADLINE_SECONDS)
+    except asyncio.TimeoutError:
+        raise SchemaRefused("the apply passed a client-side deadline; nothing was committed") from None
     finally:
-        await conn.execute("SELECT pg_catalog.set_config('search_path', $1, false)", search_path)
+        try:  # best effort: after a cancelled statement the connection may be unusable; never mask the refusal
+            await conn.execute("SELECT pg_catalog.set_config('search_path', $1, false)", search_path, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 _LEDGER_TABLE_SQL = """
@@ -458,16 +557,73 @@ async def _ledger_tables_refusal(conn) -> Optional[str]:
     return None
 
 
+_AUDIT_SQL = """
+WITH me AS (SELECT oid FROM pg_roles WHERE rolname = current_user)
+SELECT
+  (SELECT count(*) FROM pg_class c, me WHERE c.relowner = me.oid AND c.relacl IS NOT NULL) AS table_grants,
+  (SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid, me
+    WHERE c.relowner = me.oid AND a.attacl IS NOT NULL) AS column_grants,
+  (SELECT count(*) FROM pg_proc p, me WHERE p.proowner = me.oid AND p.proacl IS NOT NULL) AS function_grants,
+  (SELECT count(*) FROM pg_type t, me WHERE t.typowner = me.oid AND t.typacl IS NOT NULL) AS type_grants,
+  (SELECT count(*) FROM pg_namespace n, me WHERE n.nspowner = me.oid AND n.nspacl IS NOT NULL) AS schema_grants,
+  (SELECT count(*) FROM pg_default_acl d, me WHERE d.defaclrole = me.oid) AS default_privileges,
+  (SELECT count(*) FROM pg_proc p, me WHERE p.proowner = me.oid AND p.prosecdef) AS security_definers,
+  (SELECT count(*) FROM pg_largeobject_metadata l, me WHERE l.lomowner = me.oid) AS large_objects,
+  (SELECT count(*) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class, me
+    WHERE c.relowner = me.oid AND r.rulename <> '_RETURN') AS rules,
+  (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid, me
+    WHERE c.relowner = me.oid AND NOT t.tgisinternal AND t.tgparentid = 0) AS triggers,
+  (SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid, me WHERE c.relowner = me.oid) AS policies,
+  (SELECT count(*) FROM pg_class c, me WHERE c.relowner = me.oid AND c.relkind = 'm' AND c.relispopulated)
+    AS populated_matviews,
+  (SELECT count(*) FROM pg_sequences s WHERE s.sequenceowner = current_user AND s.last_value IS NOT NULL)
+    AS used_sequences
+"""
+_AUDIT_ZERO = (
+    ("table_grants", "a GRANT on a table"), ("column_grants", "a column-level GRANT"),
+    ("function_grants", "a GRANT on a function"), ("type_grants", "a GRANT on a type"),
+    ("schema_grants", "a GRANT on a schema"), ("default_privileges", "ALTER DEFAULT PRIVILEGES"),
+    ("security_definers", "a SECURITY DEFINER function"), ("large_objects", "a large object"),
+    ("rules", "a rule"), ("populated_matviews", "a populated materialized view"),
+    ("used_sequences", "a sequence that was advanced"),
+)
+_OWNED_TABLES_SQL = """
+SELECT format('%I.%I', n.nspname, c.relname) AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND c.relkind = 'r'
+   AND NOT (n.nspname = 'public' AND c.relname = ANY($1::text[]))
+"""
+
+
+async def _audit_refusal(conn, plan: SchemaPlan) -> Optional[str]:
+    """What the apply left that the dump did not declare, or None (controller B1). The catch-all behind
+    the parser: whatever ran, the transaction commits only a schema with no rows outside the ledgers,
+    no privileges, no rules, and exactly the dump's triggers and policies."""
+    row = await conn.fetchrow(_AUDIT_SQL, timeout=APPLY_STATEMENT_SECONDS)
+    for column, what in _AUDIT_ZERO:
+        if row[column]:
+            return "the apply left %s the dump does not declare; rolled back" % what
+    if row["triggers"] != plan.count("CreateTrigStmt"):
+        return "the apply left %d triggers, the dump declares %d; rolled back" % (row["triggers"], plan.count("CreateTrigStmt"))
+    if row["policies"] != plan.count("CreatePolicyStmt"):
+        return "the apply left %d policies, the dump declares %d; rolled back" % (row["policies"], plan.count("CreatePolicyStmt"))
+    for table in await conn.fetch(_OWNED_TABLES_SQL, list(_LEDGER_COLUMNS), timeout=APPLY_STATEMENT_SECONDS):
+        if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM ONLY %s)" % table["name"], timeout=APPLY_STATEMENT_SECONDS):
+            return "the apply left rows in a table that is not a ledger; rolled back"
+    return None
+
+
 async def _apply_in_one_transaction(conn, stamp, manifest, plan: SchemaPlan, ledger_sql, ledger_rows) -> Dict[str, Any]:
     async with conn.transaction():
         await conn.execute("SET LOCAL standard_conforming_strings = on")
         await conn.execute("SET LOCAL lock_timeout = '%s'" % APPLY_LOCK_TIMEOUT)
         await conn.execute("SET LOCAL statement_timeout = '%s'" % APPLY_STATEMENT_TIMEOUT)
         await conn.execute("SET LOCAL idle_in_transaction_session_timeout = '%s'" % APPLY_IDLE_TIMEOUT)
+        # Only pg_catalog resolves an unqualified name: the create-time checks rely on it.
+        await conn.execute("SELECT pg_catalog.set_config('search_path', '', true)")  # as pg_dump spells it
         caps = await conn.fetchrow(_CAPS_SQL)
         for statement in plan.statements:
             # fetch(): the extended protocol, ONE command per call, or the server refuses the string.
-            await conn.fetch(statement)
+            await conn.fetch(statement, timeout=APPLY_STATEMENT_SECONDS)
         if await conn.fetchrow(_CAPS_SQL) != caps:
             raise SchemaRefused("the schema changed the apply's own timeouts or standard_conforming_strings")
         refusal = await _ledger_tables_refusal(conn)
@@ -476,7 +632,10 @@ async def _apply_in_one_transaction(conn, stamp, manifest, plan: SchemaPlan, led
         # Re-asserted right before the ledger: nothing in the schema may have turned it off.
         await conn.execute("SET LOCAL standard_conforming_strings = on")
         for statement in ledger_sql:
-            await conn.fetch(statement)
+            await conn.fetch(statement, timeout=APPLY_STATEMENT_SECONDS)
+        refusal = await _audit_refusal(conn, plan)
+        if refusal:
+            raise SchemaRefused(refusal)
         tables = await _user_table_count(conn)
         if tables != manifest.get("tables_live"):
             raise SchemaRefused("%d tables after apply, the source had %s" % (tables, manifest.get("tables_live")))
