@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -433,6 +434,15 @@ def test_woocommerce_full_refund_with_only_malformed_entries_falls_back_to_legac
     )
 
 
+# The day the fixture's orders sit on (_order_payload's fixed 2026-08-27 stamps). A funnel read
+# with no since/until asks for the DEFAULT_WINDOW_DAYS before the live clock, which these dates
+# left on 2026-11-25; an explicit window keeps the read on them whatever day the test runs.
+_FIXTURE_WINDOW = {
+    "since": datetime(2026, 8, 27, tzinfo=timezone.utc),
+    "until": datetime(2026, 8, 28, tzinfo=timezone.utc),
+}
+
+
 def _partially_refunded_order(refunds):
     """A wc/v3 order whose only stitch key across deliveries is its order id."""
     payload = _order_payload("processing")
@@ -599,6 +609,7 @@ async def test_funnel_sums_both_woocommerce_partial_refunds(tmp_path, monkeypatc
         result = await funnel_service.get_merchant_commerce_event_funnel(
             merchant_id="merchant-woo",
             group_by="store",
+            **_FIXTURE_WINDOW,
         )
         assert result.payload["available"] is True
         summary = result.payload["summary"]
