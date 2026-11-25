@@ -13,11 +13,13 @@ Three things are pinned here:
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
 from config import platform as P
 from config import sandbox_guard as G
+from tests.sandbox_test_addresses import stand_in_addresses  # noqa: F401 (autouse: hashed addresses -> RFC 5737 stand-ins)
 
 # A value that must never appear in a refusal message. Used as a password / key in the cases below.
 SECRET = "s3cr3t-value-never-printed"
@@ -28,7 +30,7 @@ GOOD = {
     "K_SERVICE": "web",
     "K_REVISION": "web-00001-abc",
     "GOOGLE_CLOUD_PROJECT": "pivota-sandbox",
-    "DATABASE_URL": "postgresql://pivota:%s@10.61.0.3:5432/pivota" % SECRET,
+    "DATABASE_URL": "postgresql://pivota:%s@198.51.100.5:5432/pivota" % SECRET,
     "REAP_API_BASE_URL": "https://sandbox.api.reap.global",
     "REAP_API_KEY": SECRET,
     "REAP_AGENTIC_SIMULATE_CHECKOUT": "COMPLETED",
@@ -179,9 +181,9 @@ _REFUSALS = [
     ("prod_project", {"GOOGLE_CLOUD_PROJECT": "pivota-prod"}, "GOOGLE_CLOUD_PROJECT"),
     ("prod_sql_socket", {"DATABASE_URL": "postgresql://u:%s@/pivota?host=/cloudsql/pivota-prod:us-west1:pivota-pg" % SECRET}, "DATABASE_URL"),
     ("staging_project", {"SOME_BUCKET": "gs://pivota-staging-exports/x"}, "SOME_BUCKET"),
-    ("prod_db_ip", {"DATABASE_URL": "postgresql://u:%s@10.25.0.2:5432/pivota" % SECRET}, "DATABASE_URL"),
-    ("prod_redis_ip", {"REDIS_URL": "redis://:%s@10.25.7.196:6379" % SECRET}, "REDIS_URL"),
-    ("staging_db_ip", {"DATABASE_URL": "postgresql://u:%s@10.122.0.3/pivota" % SECRET}, "DATABASE_URL"),
+    ("prod_db_ip", {"DATABASE_URL": "postgresql://u:%s@192.0.2.25:5432/pivota" % SECRET}, "DATABASE_URL"),
+    ("prod_redis_ip", {"REDIS_URL": "redis://:%s@192.0.2.196:6379" % SECRET}, "REDIS_URL"),
+    ("staging_db_ip", {"DATABASE_URL": "postgresql://u:%s@192.0.2.3/pivota" % SECRET}, "DATABASE_URL"),
     ("prod_api_host", {"PIVOTA_API_BASE": "https://api.pivota.cc"}, "PIVOTA_API_BASE"),
     ("prod_mcp_host", {"PUBLIC_MCP_URL": "https://mcp.pivota.cc/mcp"}, "PUBLIC_MCP_URL"),
     ("prod_apex_in_list", {"CORS_ORIGINS": "https://sandbox.mcp.pivota.cc,https://pivota.cc"}, "CORS_ORIGINS"),
@@ -360,3 +362,57 @@ def test_the_lifespan_calls_the_guard_right_after_the_platform_check():
 
 def test_this_file_does_not_leak_platform_env():
     assert "PIVOTA_ENV" not in os.environ or os.environ["PIVOTA_ENV"] != "sandbox"
+
+
+# --- hashed addresses (the repo is public) -------------------------------------------------------
+def test_the_prod_ips_are_held_only_as_three_sha256_digests():
+    from tests.sandbox_test_addresses import REAL_PROD_IP_SHA256
+
+    assert len(REAL_PROD_IP_SHA256) == 3
+    assert all(re.fullmatch(r"[0-9a-f]{64}", d) for d in REAL_PROD_IP_SHA256)
+    assert not hasattr(G, "_PROD_PRIVATE_IPS") and not hasattr(G, "_PROD_IP_RE")
+
+
+@pytest.mark.parametrize("value,hit", [
+    ("postgresql://u@192.0.2.25/db", True),
+    ("redis://192.0.2.196:6379", True),
+    ("host=192.0.2.3", True),
+    ("::ffff:192.0.2.25", True),
+    ("192.0.2.25.nip.io", True),
+    ("192.0.2.250", False),      # a longer last octet is another address
+    ("192.0.2.1960", False),     # a 4-digit last octet is no address, not 192.0.2.196
+    ("1192.0.2.25", False),      # the token is 1192.0.2.25: not an address
+    ("203.192.0.2.25", False),   # the token is 203.192.0.2: another address
+    ("999.0.2.25 010.0.2.25", False),  # not addresses: ignored, never raises
+    ("198.51.100.5", False),
+])
+def test_a_prod_ip_is_found_by_its_normalized_hash(value, hit):
+    assert G._names_a_prod_ip(value) is hit
+
+
+def test_no_sandbox_file_holds_a_real_prod_ip_or_the_real_sandbox_range():
+    """Assert by hash: every dotted quad in the sandbox's code, docs and tests is hashed and compared
+    with the real digests (the stand-in fixture does not touch these)."""
+    import ipaddress
+    from pathlib import Path
+
+    from config.sandbox_identity import _masked_sha256
+    from tests.sandbox_test_addresses import REAL_PROD_IP_SHA256, REAL_SANDBOX_DB_NETWORKS_SHA256, ip_sha256
+
+    root = Path(__file__).resolve().parents[1]
+    files = [p for pattern in ("config/sandbox_*.py", "config/platform.py", "jobs/sandbox_*.py", "scripts/sandbox/*",
+                               "docs/sandbox/*", "tests/test_sandbox_*.py", "tests/test_register_gateway_service_agent*.py",
+                               "tests/sandbox_test_addresses.py")
+             for p in sorted(root.glob(pattern)) if p.is_file()]
+    assert len(files) >= 15
+    found = []
+    for path in files:
+        for token in G._IPV4_TOKEN_RE.findall(path.read_text(encoding="utf-8")):
+            try:
+                ip = ipaddress.ip_address(token)
+            except ValueError:
+                continue
+            if ip_sha256(token) in REAL_PROD_IP_SHA256 or any(
+                    _masked_sha256(ip, prefix) == digest for prefix, digest in REAL_SANDBOX_DB_NETWORKS_SHA256):
+                found.append(path.relative_to(root).as_posix())  # the file, never the address
+    assert not found, found

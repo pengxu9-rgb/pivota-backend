@@ -11,6 +11,7 @@ import pytest
 from jobs import sandbox_schema_apply as A
 from jobs.sandbox_catalog_copy import LocalDirStore
 from tests.test_sandbox_guard import GOOD, _clean_platform_env  # noqa: F401 (autouse fixture)
+from tests.sandbox_test_addresses import stand_in_addresses  # noqa: F401 (autouse: hashed addresses -> RFC 5737 stand-ins)
 
 TRAILER = "\n--\n-- PostgreSQL database dump complete\n--\n"
 OK_SCHEMA = (
@@ -140,7 +141,7 @@ def test_no_dump_at_all_is_refused(tmp_path):
 
 
 def _env(**changes):
-    env = dict(GOOD, DATABASE_URL="postgresql://u:pw@10.61.0.5:5432/pivota", CLOUD_RUN_JOB="sandbox-schema-apply",
+    env = dict(GOOD, DATABASE_URL="postgresql://u:pw@198.51.100.5:5432/pivota", CLOUD_RUN_JOB="sandbox-schema-apply",
                SANDBOX_SCHEMA_GCS_URI="gs://pivota-sandbox-catalog-drop/schema")
     env.pop("K_SERVICE", None)
     env.update({k: v for k, v in changes.items() if v is not None})
@@ -157,8 +158,8 @@ def test_the_sandbox_with_its_own_db_passes():
 @pytest.mark.parametrize("changes,match", [
     ({"PIVOTA_ENV": "production"}, "only in the sandbox"),
     ({"PIVOTA_ENV": "staging"}, "only in the sandbox"),
-    ({"DATABASE_URL": "postgresql://u:pw@10.25.0.2/pivota"}, "sandbox guard"),
-    ({"DATABASE_URL": "postgresql://u:pw@10.99.0.2/pivota"}, "private range"),
+    ({"DATABASE_URL": "postgresql://u:pw@192.0.2.25/pivota"}, "sandbox guard"),
+    ({"DATABASE_URL": "postgresql://u:pw@203.0.113.70/pivota"}, "private range"),
     ({"GOOGLE_CLOUD_PROJECT": "pivota-staging-x"}, "sandbox guard"),
     ({"GOOGLE_CLOUD_PROJECT": "other-project"}, "GOOGLE_CLOUD_PROJECT"),
 ])

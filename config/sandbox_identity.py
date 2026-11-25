@@ -14,13 +14,16 @@ a sandbox address. If asyncpg's private parser changes shape, the answer is a re
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 from typing import List, Mapping, Optional, Tuple, Union
 
 #: The sandbox's GCP project.
 SANDBOX_PROJECT = "pivota-sandbox"
-#: The sandbox Cloud SQL private range (sandbox-infra pins 10.61.0.0/20).
-SANDBOX_DB_NETWORKS = ("10.61.0.0/20",)
+#: The sandbox Cloud SQL private range (sandbox-infra pins it), as (prefix length, sha256 of the masked
+#: network string str(ipaddress.ip_network("<addr>/<prefix>", strict=False))). The repo is public, so
+#: the range is not written here; an address is in it when its own masked network hashes the same.
+SANDBOX_DB_NETWORKS_SHA256 = ((20, "447f3aded69332bf20f941cf9f6eae4edcac48e2988f89b1da7a23d806a6404a"),)
 #: The sandbox Cloud SQL Auth Proxy socket directory prefix.
 SANDBOX_SQL_SOCKET_PREFIX = "/cloudsql/%s:" % SANDBOX_PROJECT
 
@@ -55,7 +58,15 @@ def _address_ok(addr: Address) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False  # a hostname resolves to anything; only an address in the range is the sandbox's
-    return any(ip in ipaddress.ip_network(net) for net in SANDBOX_DB_NETWORKS)
+    return any(_masked_sha256(ip, prefix) == digest for prefix, digest in SANDBOX_DB_NETWORKS_SHA256)
+
+
+def _masked_sha256(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address], prefix: int) -> str:
+    try:
+        network = ipaddress.ip_network("%s/%d" % (ip, prefix), strict=False)
+    except ValueError:  # a prefix longer than this address family allows: not the range
+        return ""
+    return hashlib.sha256(str(network).encode("ascii")).hexdigest()
 
 
 def sandbox_database_refusal(env: Mapping[str, str]) -> Optional[str]:

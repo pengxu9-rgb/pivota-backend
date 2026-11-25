@@ -52,6 +52,8 @@ allowlist exist to stop.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import re
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Tuple
@@ -138,11 +140,15 @@ _PROD_PROJECT_TOKENS = ("pivota-prod", "pivota-staging")
 _PROD_PROJECT_RE = re.compile(
     r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in _PROD_PROJECT_TOKENS) + r")(?![a-z0-9])"
 )
-#: Private IPs of prod's Cloud SQL and Redis and staging's Cloud SQL (infra/gcp/README.md).
-_PROD_PRIVATE_IPS = ("10.25.0.2", "10.25.7.196", "10.122.0.3")
-_PROD_IP_RE = re.compile(
-    r"(?<![0-9.])(" + "|".join(re.escape(ip) for ip in _PROD_PRIVATE_IPS) + r")(?![0-9])"
-)
+#: Private IPs of prod's Cloud SQL and Redis and staging's Cloud SQL, as sha256 of the normalized
+#: address (str(ipaddress.ip_address(...))): the repo is public, so the addresses are not written here.
+_PROD_PRIVATE_IP_SHA256 = frozenset({
+    "4bffbd8da0d2a6414d0b853c39a53edc9b4afab5f48bc34402ec123de51b9549",  # prod Cloud SQL
+    "7d34656101ab6b67ef3f9662be01e73cd2b048037baa6ac1f7e6fb5f67212c2e",  # prod Redis
+    "f60ccb8adcd36703f02206ceb1b62ef031c07c21950aa06c789a735bd122606b",  # staging Cloud SQL
+})
+#: Every dotted-quad token in a value; each is normalized and hashed before the compare.
+_IPV4_TOKEN_RE = re.compile(r"(?<![0-9.])([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?![0-9])")
 #: Domains whose hosts must be sandbox hosts (some label contains "sandbox").
 _GUARDED_ZONES = ("pivota.cc", "agenpaz.com", "agenpas.com", "reap.global")
 #: Railway was prod's platform; the sandbox never runs there or talks to it.
@@ -198,12 +204,23 @@ def _host_in(host: str, zones: Tuple[str, ...]) -> Optional[str]:
     return None
 
 
+def _ip_sha256(token: str) -> Optional[str]:
+    try:
+        return hashlib.sha256(str(ipaddress.ip_address(token)).encode("ascii")).hexdigest()
+    except ValueError:  # 999.1.1.1, 010.0.0.1: not an address
+        return None
+
+
+def _names_a_prod_ip(value: str) -> bool:
+    return any(_ip_sha256(t) in _PROD_PRIVATE_IP_SHA256 for t in _IPV4_TOKEN_RE.findall(value))
+
+
 def _prod_reference_rule(value: str) -> Optional[str]:
     """Which prod-reference rule ``value`` breaks, or None. The rule text never quotes the value."""
     low = value.lower()
     if _PROD_PROJECT_RE.search(low):
         return "names a prod or staging GCP project"
-    if _PROD_IP_RE.search(low):
+    if _names_a_prod_ip(low):
         return "names a prod or staging database/Redis private IP"
     if _LIVE_KEY_RE.search(low):
         return "holds a live payment or agent key"

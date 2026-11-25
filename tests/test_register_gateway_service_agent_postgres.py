@@ -23,6 +23,7 @@ if _IS_PG:
         pytest.skip("throwaway database only", allow_module_level=True)
 
 from scripts.sandbox import register_gateway_service_agent as R  # noqa: E402
+from tests.sandbox_test_addresses import stand_in_addresses  # noqa: F401 (autouse: hashed addresses -> RFC 5737 stand-ins)
 
 S = "reg_agent_test"
 KEY = "ak_test_" + "a1b2c3d4" * 8
@@ -143,7 +144,7 @@ async def test_a_malformed_agent_id_is_refused(conn, agent_id):
 async def test_run_reads_the_key_only_after_the_environment_passes(conn, monkeypatch):
     from tests.test_sandbox_guard import GOOD
 
-    env = dict(GOOD, DATABASE_URL="postgresql://pivota:pw@10.61.0.5:5432/pivota",
+    env = dict(GOOD, DATABASE_URL="postgresql://pivota:pw@198.51.100.5:5432/pivota",
                ISSUING_AGENT_EXCLUDED_AGENT_IDS=AGENT, ISSUING_ASSERTION_VOUCHER_AGENT_IDS=AGENT)
     reads = []
 
@@ -162,7 +163,7 @@ async def test_run_reads_the_key_only_after_the_environment_passes(conn, monkeyp
             pass
 
     async def connect(dsn):
-        assert "10.61.0.5" in dsn
+        assert "198.51.100.5" in dsn
         return _Conn(conn)
 
     real_register = R.register

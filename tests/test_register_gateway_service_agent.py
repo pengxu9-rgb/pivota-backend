@@ -6,8 +6,9 @@ import pytest
 
 from scripts.sandbox import register_gateway_service_agent as R
 from tests.test_sandbox_guard import GOOD, _clean_platform_env  # noqa: F401 (autouse fixture)
+from tests.sandbox_test_addresses import stand_in_addresses  # noqa: F401 (autouse: hashed addresses -> RFC 5737 stand-ins)
 
-SANDBOX_DB = "postgresql://pivota:pw@10.61.0.5:5432/pivota"
+SANDBOX_DB = "postgresql://pivota:pw@198.51.100.5:5432/pivota"
 
 
 AGENT = "agent_0123456789abcdef"
@@ -36,8 +37,8 @@ def test_the_sandbox_with_its_own_db_passes():
     ({"PIVOTA_ENV": "staging"}, "only in the sandbox"),
     ({"PIVOTA_ENV": "production"}, "only in the sandbox"),
     ({"PIVOTA_ENV": None}, "only in the sandbox"),
-    ({"DATABASE_URL": "postgresql://u:p@10.25.0.2:5432/pivota"}, "sandbox guard"),
-    ({"DATABASE_URL": "postgresql://u:p@10.70.0.5:5432/pivota"}, "private range"),
+    ({"DATABASE_URL": "postgresql://u:p@192.0.2.25:5432/pivota"}, "sandbox guard"),
+    ({"DATABASE_URL": "postgresql://u:p@203.0.113.70:5432/pivota"}, "private range"),
     ({"DATABASE_URL": "postgresql://u:p@db.example.com:5432/pivota"}, "private range"),
     ({"DATABASE_URL": "postgresql://u:p@/pivota?host=/cloudsql/other-project:us-west1:pg"}, "socket"),
     ({"DATABASE_URL": None}, "no host"),

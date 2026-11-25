@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from jobs import sandbox_catalog_copy as C
+from tests.sandbox_test_addresses import stand_in_addresses  # noqa: F401 (autouse: hashed addresses -> RFC 5737 stand-ins)
 
 _PLATFORM_KEYS = ("PIVOTA_PLATFORM", "PIVOTA_ENV", "RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME",
                   "K_SERVICE", "K_REVISION", "K_CONFIGURATION", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION")
@@ -119,7 +120,7 @@ def test_the_import_runs_only_in_a_sandbox_that_passes_the_guard(clean_env):
     good = dict(GOOD, CLOUD_RUN_JOB="sandbox-catalog-import")
     C.check_import_environment(good)
     with pytest.raises(SandboxGuardRefused, match="DATABASE_URL"):
-        C.check_import_environment(dict(good, DATABASE_URL="postgresql://u:p@10.25.0.2/pivota"))
+        C.check_import_environment(dict(good, DATABASE_URL="postgresql://u:p@192.0.2.25/pivota"))
 
 
 def test_main_reports_a_refusal_with_exit_code_2(clean_env, capsys, monkeypatch):
@@ -199,7 +200,7 @@ def test_the_import_refuses_a_target_that_is_not_positively_the_sandbox_s(clean_
 
     good = dict(GOOD, CLOUD_RUN_JOB="sandbox-catalog-import")
     for dsn in ("postgresql://u:p@203.0.113.7/pivota?host=/cloudsql/pivota-sandbox:us-west1:pg",
-                "postgresql://u:p@10.70.0.3/pivota", "postgresql://u:p@db.internal/pivota"):
+                "postgresql://u:p@203.0.113.70/pivota", "postgresql://u:p@db.internal/pivota"):
         with pytest.raises(C.CopyRefused, match="private range"):
             C.check_import_environment(dict(good, DATABASE_URL=dsn))
 
