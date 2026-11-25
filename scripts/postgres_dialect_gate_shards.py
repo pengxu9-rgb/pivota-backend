@@ -14,7 +14,8 @@ HOW A FILE IS ASSIGNED.
 
     shard = sha256(path) mod N, plus 1
 
-over the path the discover glob emits (`tests/test_x_postgres.py`). A pure function
+(N is the HASHED shard count; SOLO FILES below take the last shards) over the
+path the discover glob emits (`tests/test_x_postgres.py`). A pure function
 of the path: adding, removing or renaming a file never moves ANY other file to a
 different shard. That stability is the point. Hashing FILES rather than test node
 ids (which is what the Backend Test Sweep does, tests/sweep_shard.py) is forced by
@@ -32,6 +33,27 @@ how this gate works:
 A position-based split (round-robin, chunks) would reshuffle every file after an
 inserted one and give a new file's PR a different set of neighbours for every file
 behind it; a cross-file dependency would surface on an unrelated change.
+
+SOLO FILES (since 2026-11-23). A file is the unit, so one file the size of a shard
+cannot be balanced by any hash or shard count: it makes whichever shard draws it
+the long one. tests/test_a2a_rail_checkout_postgres.py re-collects the whole SQLite
+suite of the rail checkout on Postgres -- 2,387 of the gate's ~9,100 tests, 383-578 s
+of pytest on its own -- and hashed to shard 2, next to 103 other files and the
+ride-alongs. Shard 2 then ran 4,863 tests in 947-1,441 s while shards 1 and 3 ran
+~2,100 in 470-620 s, and run 45127613858 (2fa0c64f3, #2892) was cancelled at the
+25-minute job timeout. A fourth HASHED shard does not fix that: counted over that
+checkout, mod 4 leaves the file's shard at 3,223 tests and mod 5 at 3,686.
+
+So a SOLO file gets a shard of its own, and the hash runs over the others only:
+
+    hashed shards  1 .. N-S      shard = sha256(path) mod (N-S), plus 1
+    solo shard     N-S+i         runs solo[i] and nothing else
+
+where S = len(solo). Raising N by one for each solo file keeps N-S, so naming a
+solo file moves no other file. A solo shard is the gate's premise with one file:
+ONE database, its own. A solo file must be a discovered gate file (so its shard's
+coverage check has a module to require) and the ride-alongs stay in a hashed shard.
+Make a file solo only when it alone is a shard's worth of time; measure first.
 
 WHAT PROVES THE SPLIT IS COMPLETE. `plan` writes a manifest per shard; `verify`
 (run by the final `execute real routes on real Postgres` job, after every shard)
@@ -80,15 +102,44 @@ def module_of(path: str) -> str:
     return Path(path).stem
 
 
+def solo_problems(gate_files: Sequence[str], ride_alongs: Sequence[str],
+                  solo: Sequence[str], num_shards: int, ride_along_shard: int) -> List[str]:
+    """Every reason `solo` cannot be planned (empty = ok). A solo file that was renamed
+    or deleted must turn the gate red by name, not leave its shard running nothing."""
+    problems: List[str] = []
+    hashed = num_shards - len(solo)
+    if hashed < 1:
+        problems.append(f"{len(solo)} solo file(s) need more than {num_shards} shard(s): "
+                        "at least one shard must be hashed")
+    if len(set(solo)) != len(solo):
+        problems.append("a solo file is listed twice: " + " ".join(solo))
+    for f in solo:
+        if f not in gate_files:
+            problems.append(f"solo file {f} is not a {GATE_GLOB} file in this checkout")
+        if f in ride_alongs:
+            problems.append(f"solo file {f} is also a ride-along")
+    if hashed >= 1 and not 1 <= ride_along_shard <= hashed:
+        problems.append(f"ride-along shard {ride_along_shard} must be a hashed shard "
+                        f"(1..{hashed}); shards {hashed + 1}..{num_shards} are solo")
+    return problems
+
+
 def plan(gate_files: Sequence[str], ride_alongs: Sequence[str], shard: int,
-         num_shards: int, ride_along_shard: int) -> List[str]:
-    """The files shard `shard` runs, in run order: its gate files in discovery order,
-    then -- in the ride-along shard only -- the ride-alongs in their declared order."""
+         num_shards: int, ride_along_shard: int, solo: Sequence[str] = ()) -> List[str]:
+    """The files shard `shard` runs, in run order. A solo shard runs its one file. A
+    hashed shard runs its gate files in discovery order, then -- in the ride-along
+    shard only -- the ride-alongs in their declared order."""
     if not 1 <= shard <= num_shards:
         raise ValueError(f"shard {shard} is not in 1..{num_shards}")
     if not 1 <= ride_along_shard <= num_shards:
         raise ValueError(f"ride-along shard {ride_along_shard} is not in 1..{num_shards}")
-    files = [f for f in gate_files if shard_of(f, num_shards) == shard]
+    problems = solo_problems(gate_files, ride_alongs, solo, num_shards, ride_along_shard)
+    if problems:
+        raise ValueError("; ".join(problems))
+    hashed = num_shards - len(solo)
+    if shard > hashed:
+        return [solo[shard - hashed - 1]]
+    files = [f for f in gate_files if f not in solo and shard_of(f, hashed) == shard]
     if shard == ride_along_shard:
         files += list(ride_alongs)
     return files
@@ -111,7 +162,15 @@ def cmd_plan(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     ride_alongs = present(root, args.ride_alongs.split())
-    files = plan(gate_files, ride_alongs, args.shard, args.num_shards, args.ride_along_shard)
+    solo = args.solo.split()
+    problems = solo_problems(gate_files, ride_alongs, solo, args.num_shards,
+                             args.ride_along_shard)
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        return 1
+    files = plan(gate_files, ride_alongs, args.shard, args.num_shards, args.ride_along_shard,
+                 solo)
     gate_modules = [module_of(f) for f in files if f in gate_files]
     # A shard with no gate file would pass its own coverage check vacuously at best,
     # and only fail later on an empty GATE_MODULES. Say what happened instead.
@@ -167,7 +226,7 @@ def _junit_counts(path: Path) -> Dict[str, object]:
 
 def verify(shards_dir: Path, root: Path, num_shards: int, ride_alongs: Sequence[str],
            ride_along_shard: int, recovery_shard: int,
-           needs_result: Optional[str]) -> List[str]:
+           needs_result: Optional[str], solo: Sequence[str] = ()) -> List[str]:
     """Every reason the shards do not add up to one complete gate run (empty = ok)."""
     errors: List[str] = []
     if needs_result is not None and needs_result != "success":
@@ -179,6 +238,9 @@ def verify(shards_dir: Path, root: Path, num_shards: int, ride_alongs: Sequence[
         errors.append(f"no {GATE_GLOB} files in this checkout")
         return errors
     ride = present(root, ride_alongs)
+    problems = solo_problems(gate_files, ride, solo, num_shards, ride_along_shard)
+    if problems:
+        return errors + problems
     owner: Dict[str, int] = {}
 
     for k in range(1, num_shards + 1):
@@ -190,7 +252,7 @@ def verify(shards_dir: Path, root: Path, num_shards: int, ride_alongs: Sequence[
                           "the shard never reported")
             continue
         manifest = json.loads(manifest_path.read_text())
-        expected = plan(gate_files, ride, k, num_shards, ride_along_shard)
+        expected = plan(gate_files, ride, k, num_shards, ride_along_shard, solo)
         if manifest.get("files") != expected:
             errors.append(f"shard {k} ran {manifest.get('files')!r} but this checkout "
                           f"plans {expected!r}")
@@ -248,7 +310,7 @@ def verify(shards_dir: Path, root: Path, num_shards: int, ride_alongs: Sequence[
 def cmd_verify(args: argparse.Namespace) -> int:
     errors = verify(Path(args.shards_dir), Path(args.root), args.num_shards,
                     args.ride_alongs.split(), args.ride_along_shard, args.recovery_shard,
-                    args.needs_result)
+                    args.needs_result, args.solo.split())
     if errors:
         for e in errors:
             print(f"::error::{e}")
@@ -267,6 +329,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--num-shards", type=int, required=True)
         p.add_argument("--ride-alongs", default="")
         p.add_argument("--ride-along-shard", type=int, required=True)
+        p.add_argument("--solo", default="",
+                       help="space-separated gate files that each run alone, in the last shards")
 
     p_plan = sub.add_parser("plan", help="list this shard's files; write its manifest")
     common(p_plan)

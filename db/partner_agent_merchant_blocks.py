@@ -34,8 +34,9 @@ db/merchant_agent_checkout_facts):
      reported as recorded.
   7. A NAME AND AN EVIDENCE REFERENCE ARE PLAIN TEXT. No control or format character (a
      right-to-left override hides what a reader sees). `cleared_evidence` says WHERE the evidence
-     is kept and never carries it: a query string, a labelled credential (`token: ...`) and text
-     shaped like a secret are refused. This is a guard against a pasted link or key, not a
+     is kept and never carries it: a query string, a link with a user name or password in it, a
+     labelled credential (`token: ...`) and text shaped like a secret (a key's armour line
+     included) are refused. This is a guard against a pasted link or key, not a
      detector of every secret: prose that mentions a password is not refused.
   8. A REFUSAL NAMES THE PART THAT FAILED AND NEVER ECHOES ITS VALUE (`event_problem`,
      `clearance_problem`).
@@ -44,7 +45,9 @@ WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run a
 A partner's worker will, for the purchase that met the event, in a later change. No request
 writes here.
 
-FOR A CALLER ON A REQUEST PATH (none exists yet): as db/merchant_agent_checkout_facts says, read
+FOR A CALLER ON A REQUEST PATH (services/payment_orchestration/agent_run_condition.py is the one: it
+calls `is_clear` on the create path, only for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS, and never
+writes): as db/merchant_agent_checkout_facts says, read
 outside any transaction or under a savepoint (a swallowed missing-table error still aborts a
 surrounding Postgres transaction), and before the request fans out (the read's timeout cancels a
 query on a connection the request's tasks may share).
@@ -132,6 +135,10 @@ _EVIDENCE_CREDENTIAL_LABEL_RE = re.compile(
 _EVIDENCE_SECRET_PREFIX_RE = re.compile(
     r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.")
 _EVIDENCE_RUN_RE = re.compile(r"[A-Za-z0-9_-]{24,}")
+#: A link that carries a user name or a password before its host (`https://user:pass@host/...`).
+_EVIDENCE_URL_USERINFO_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s?#@]+@")
+#: The armour line of a pasted key or certificate (`-----BEGIN ... PRIVATE KEY-----`).
+_EVIDENCE_PEM_RE = re.compile(r"(?i)-{5}\s*BEGIN\b")
 
 
 # ── statements (module-level literals, passed by name) ───────────────────────────────────────
@@ -272,16 +279,19 @@ def _plain_problem(value: Any, max_chars: int) -> Optional[str]:
 
 def _reference_problem(value: Any) -> Optional[str]:
     """Why a value is not a reference to where evidence is kept, or None when it is. Besides
-    `_plain_problem`'s answers: `query_string`, `credential_label`, `looks_like_a_secret`."""
+    `_plain_problem`'s answers: `query_string`, `url_credentials`, `credential_label`,
+    `looks_like_a_secret`."""
     problem = _plain_problem(value, EVIDENCE_MAX_CHARS)
     if problem is not None:
         return problem
     text = value.strip()
     if _EVIDENCE_QUERY_CHARS.intersection(text):
         return "query_string"
+    if _EVIDENCE_URL_USERINFO_RE.search(text):
+        return "url_credentials"
     if _EVIDENCE_CREDENTIAL_LABEL_RE.search(text):
         return "credential_label"
-    if _EVIDENCE_SECRET_PREFIX_RE.search(text) or any(
+    if _EVIDENCE_PEM_RE.search(text) or _EVIDENCE_SECRET_PREFIX_RE.search(text) or any(
             re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run) for run in _EVIDENCE_RUN_RE.findall(text)):
         return "looks_like_a_secret"
     return None

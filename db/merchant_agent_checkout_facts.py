@@ -52,8 +52,8 @@ THE READ. `meets_run_condition(domain)` is True only while `negative_at` is NULL
 row, an old positive, a negative, an unusable domain, a slow or failed read, and a table that
 does not exist. It never raises.
 
-FOR A CALLER ON A REQUEST PATH (none exists yet; the filter is its own change). "Never raises" has
-two side effects on Postgres that such a caller must plan for:
+FOR A CALLER ON A REQUEST PATH (services/payment_orchestration/agent_run_condition.py is the one).
+"Never raises" has two side effects on Postgres that such a caller must plan for:
 
   * INSIDE `database.transaction()`, a statement that fails (the table does not exist) aborts the
     surrounding transaction even though the error is swallowed here. Read the fact OUTSIDE any
@@ -62,8 +62,9 @@ two side effects on Postgres that such a caller must plan for:
     one connection, so a cancelled read can disturb a sibling query on it. Read it before the
     request fans out, as the worker-heartbeat read is done.
 
-NOTHING READS THIS YET. No route, router or worker calls `meets_run_condition` in this change; the
-filter that will is its own change behind its own flag.
+ONE READER. services/payment_orchestration/agent_run_condition.py calls `meets_run_condition` on the
+create path, only for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS (unset: nothing reads this). No
+worker reads it.
 
 NO STARTUP HEAL. Migration 294 is applied in production once, by hand, as a gated one-off. Nothing
 in db/schema_guard creates the table, so the code can be deployed before the table exists; that

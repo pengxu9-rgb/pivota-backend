@@ -28,8 +28,8 @@
 # until that list and this file are updated, so a new CI check cannot go silently unrun.
 #
 # STANDING DIFFERENCES FROM CI (a difference found at run time is printed in the summary instead):
-#   * Timeouts. CI's per-job `timeout-minutes` (30 sweep shard, 25 gate shard) are not applied; only
-#     this build's own 3000 s limit is. A hang that CI would cut at 25 min is cut later here.
+#   * Timeouts. CI's per-job `timeout-minutes` (30 sweep shard, 35 gate shard) are not applied; only
+#     this build's own 3000 s limit is. A hang that CI would cut at 35 min is cut later here.
 #   * The floor's CAP is advisory. The executed-test assert runs as a pull request does
 #     (SWEEP_EVENT=pull_request): an under-floor count is red, but "the floor has decayed" only
 #     warns. On a push to main CI makes that a failure, and it blocks the deploy.
@@ -187,17 +187,18 @@ steps:
         exit 0
   - {<<: *postgres, id: postgres-2, env: ['CI=true', 'SHARD=2']}
   - {<<: *postgres, id: postgres-3, env: ['CI=true', 'SHARD=3']}
+  - {<<: *postgres, id: postgres-4, env: ['CI=true', 'SHARD=4']}
 
   - id: summary
     name: mirror.gcr.io/library/python:3.11-trixie
     waitFor: ['sqlite-1', 'sqlite-2', 'sqlite-3', 'sqlite-4', 'sqlite-5', 'sqlite-6', 'sqlite-7',
-              'sqlite-8', 'postgres-1', 'postgres-2', 'postgres-3']
+              'sqlite-8', 'postgres-1', 'postgres-2', 'postgres-3', 'postgres-4']
     entrypoint: bash
     args:
       - -c
       - |
         . /workspace/.ci-venv/bin/activate
-        python scripts/ops/cloud_build_tests.py summary --ci-dir /workspace/ci --sqlite-shards 8 --pg-shards 3
+        python scripts/ops/cloud_build_tests.py summary --ci-dir /workspace/ci --sqlite-shards 8 --pg-shards 4
 
 options:
   machineType: E2_HIGHCPU_32

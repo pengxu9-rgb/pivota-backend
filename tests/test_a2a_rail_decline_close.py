@@ -609,6 +609,24 @@ async def test_the_close_refuses_while_the_audit_trigger_is_missing():
     assert await ledger.manual_resolution_audit_ready()
 
 
+async def test_the_audit_gate_reads_false_for_each_missing_trigger_and_for_a_missing_table():
+    """Every append-only trigger is required: dropping any ONE of them (SQLite has two) reads not ready, and so
+    does a missing table. A disabled trigger (Postgres only) is pinned in the _postgres file."""
+    triggers = (("a2a_rail_manual_resolution_audit_immutable",) if IS_POSTGRES else
+                ("a2a_rail_manual_resolution_audit_immutable_no_update",
+                 "a2a_rail_manual_resolution_audit_immutable_no_delete"))
+    for name in triggers:
+        await _apply_migration_296()
+        assert await ledger.manual_resolution_audit_ready()
+        await database.execute(f"DROP TRIGGER {name} ON a2a_rail_manual_resolution_audit" if IS_POSTGRES
+                               else f"DROP TRIGGER {name}")
+        assert not await ledger.manual_resolution_audit_ready(), name
+    await _apply_migration_296()
+    assert await ledger.manual_resolution_audit_ready()
+    await database.execute("DROP TABLE a2a_rail_manual_resolution_audit")
+    assert not await ledger.manual_resolution_audit_ready()
+
+
 async def test_the_audit_is_append_only():
     pid = await _declined()
     assert (await _apply(pid))[1]["outcome"] == "resolved"

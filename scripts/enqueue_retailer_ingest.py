@@ -8,7 +8,12 @@ optional: market (ISO alpha-2, default US; allowed US and SG as served markets, 
 markets whose rows are stored but not served), require_currency (default and only allowed value: the market's
 currency, USD for US, SGD for SG, AUD for AU, JPY for JP), source (storefront | affiliate_feed | shopify_markets), category_path,
 only_category, only_resolved_category, lip_title_evidence, lash_nail_title_evidence, exclude_handles,
-max_scan_products, max_products, retailer_name, require_ships_to_market.
+max_scan_products, max_products, retailer_name, require_ships_to_market, hold_after_dry_run.
+
+hold_after_dry_run (bool) holds the job after its dry run even when the dry run is clean (one acceptable flag,
+review_requested); release it with the approve route, accepting review_requested. Like require_ships_to_market it
+is a gate, not part of the cohort: re-enqueueing an open job WITH it answers `exists` and the open job runs
+without the hold -- cancel the open job first.
 
 A Shopify-Markets brand store (AUD base, quotes USD to US buyers) is TWO jobs, in this order:
   1. {"domain": "aud-brand.example.com", "brand": "Example AUD Brand", "vendors": ["Example AUD Brand"],

@@ -14,7 +14,9 @@ calling the Reap route directly). It takes the Reap route's create body plus an 
   1. normalises the request exactly as the Reap route's cart-link lane does and looks the
      idempotency key up FIRST, in the one key table both rails share: a retry replays the original
      purchase on its original rail, whatever the router would answer today;
-  2. asks services/payment_orchestration/router.py which rail takes a new request;
+  2. asks services/payment_orchestration/router.py which rail takes a new request (for a request the
+     A2A rail would take, after reading ADR-030 D11's run condition for it while that is enforced:
+     services/payment_orchestration/agent_run_condition.py);
   3. Reap: hands the request to the Reap route unchanged (its gates, its body). A2A: opens the
      purchase here, through the same checked pieces the Reap cart-link lane uses (consent, the
      merchant's disabled row, the Tier B verdict, OUR catalog price, the attribution cart link), plus
@@ -51,7 +53,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
-from services.payment_orchestration import a2a_purchase_view, purchase_consent, purchase_view
+from services.payment_orchestration import a2a_purchase_view, agent_run_condition, purchase_consent, purchase_view
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import router as rail_router
 from services.payment_orchestration.rails import A2A_STATE_MAP, RAIL_ID_PREFIX
@@ -324,6 +326,18 @@ async def _a2a_worker_alive(*, agent_id: str, preferred: Optional[str]) -> bool:
         return False
 
 
+async def _a2a_agent_may_run(route_facts: Mapping[str, Any], *, merchant_host: str, preferred: Optional[str]) -> bool:
+    """ADR-030 D11's run condition for the token rail's agent (services/payment_orchestration/agent_run_condition.py),
+    read only while it is enforced for that rail AND the rail would otherwise take this request: Reap not chosen
+    explicitly and every other filter passing. Otherwise True, with nothing read, so a create the filter cannot
+    change pays for no read and its answer cannot be told apart by timing. Keyed by the host the request names."""
+    if not rail_router.run_condition_enforced("a2a") or preferred == "reap":
+        return True
+    if rail_router.a2a_unavailable_reason(**route_facts) is not None:
+        return True
+    return await agent_run_condition.agent_may_run("a2a", merchant_host, agent_id=str(route_facts["agent_id"]))
+
+
 @router.post("")
 async def create_purchase(
     request: Request,
@@ -417,11 +431,15 @@ async def create_purchase(
             raise reap_svc.PurchaseRefused(
                 "invalid_request", "expected_unit_price_minor and expected_currency are required")
         preferred = req.payment_preference.rail if req.payment_preference else None
-        choice = rail_router.choose_rail(
+        route_facts = dict(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country,
             item_source=req.item_source, currency=str(req.expected_currency or ""),
             worker_alive=await _a2a_worker_alive(agent_id=agent_id, preferred=preferred),
-            has_offer_code=offer_code is not None, preferred=preferred,
+            has_offer_code=offer_code is not None,
+        )
+        choice = rail_router.choose_rail(
+            **route_facts, preferred=preferred,
+            agent_may_run=await _a2a_agent_may_run(route_facts, merchant_host=merchant_host, preferred=preferred),
         )
         if choice.rail == "reap":
             # The Reap route writes this purchase's parent row. The decision travels to it on the

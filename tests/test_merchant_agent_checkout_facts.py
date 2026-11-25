@@ -769,8 +769,15 @@ def test_the_migration_is_one_plain_create_and_its_down_one_drop():
     assert down == [f"DROP TABLE IF EXISTS {TABLE};"]
 
 
-def test_nothing_reads_the_fact_on_a_request_path_yet():
-    """This change stores the fact. The filter that reads it is its own change, behind a flag."""
-    for folder in ("routes", "services"):
-        for path in (_REPO / folder).rglob("*.py"):
-            assert "merchant_agent_checkout_facts" not in path.read_text("utf-8", errors="ignore"), path
+_RUN_CONDITION_READER = _REPO / "services/payment_orchestration/agent_run_condition.py"
+
+
+def test_one_request_path_module_reads_the_fact_and_it_only_reads():
+    """The run-condition filter is the one request-path reader, and it calls the read, never a write."""
+    readers = [
+        path for folder in ("routes", "services") for path in (_REPO / folder).rglob("*.py")
+        if "merchant_agent_checkout_facts" in path.read_text("utf-8", errors="ignore")
+    ]
+    assert readers == [_RUN_CONDITION_READER]
+    source = _RUN_CONDITION_READER.read_text("utf-8")
+    assert set(re.findall(r"checkout_facts\.([a-z_]+)", source)) == {"meets_run_condition"}
