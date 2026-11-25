@@ -191,3 +191,51 @@ def test_introspect_outside_the_sandbox_is_unchanged(env, monkeypatch, label):
     env(label)
     assert _introspect(monkeypatch, "ak_test_" + HEX)["auth_source"] == "format_invalid"
     assert _introspect(monkeypatch, "ak_live_" + HEX)["valid"] is True
+
+
+def _key_corpus():
+    """Every single-character substitution of valid keys, plus prefixes, suffixes and edge cases."""
+    import random
+    import string
+
+    valid = ["ak_" + HEX, "ak_live_" + HEX, "ak_test_" + HEX]
+    alphabet = string.printable + "٠０é​\x00"
+    out = set(valid)
+    for key in valid:
+        for i in range(len(key)):
+            for ch in alphabet:
+                out.add(key[:i] + ch + key[i + 1:])
+        for n in range(len(key) + 1):
+            out.add(key[:n])
+        for tail in ("\n", " ", "0", "\r\n", "\x00", "a"):
+            out.add(key + tail)
+            out.add(tail + key)
+    rng = random.Random(20261125)
+    for _ in range(2000):
+        out.add("".join(rng.choice("ak_livetsx0123456789abcdefABCDEF\n ") for _ in range(rng.randint(0, 80))))
+    return sorted(out)
+
+
+@pytest.mark.parametrize("label", ["production", "prod", "staging", "preview", "development", "test", "bogus", None])
+def test_outside_the_sandbox_key_acceptance_is_byte_identical_to_the_old_rule(env, label, monkeypatch):
+    """The exact expression every reader used before agent_api_key_format_ok existed, compared on
+    every string of the corpus. Includes an unresolvable label on a managed host (fail closed)."""
+    import re
+
+    env(label)
+    monkeypatch.setenv("K_SERVICE", "web")
+    old = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")
+    corpus = _key_corpus()
+    assert len(corpus) > 4000
+    diffs = [k for k in corpus if bool(old.match(k)) != agent_auth.agent_api_key_format_ok(k)]
+    assert diffs == []
+    # The inline get_agent_context form (re.match with the pattern string) is the same rule.
+    assert all(bool(re.match(r"^ak_(live_)?[0-9a-f]{64}$", k)) == bool(old.match(k)) for k in corpus)
+
+
+def test_in_the_sandbox_exactly_the_test_shape_passes_on_the_corpus(env):
+    import re
+
+    env("sandbox")
+    test_shape = re.compile(r"^ak_test_[0-9a-f]{64}$")
+    assert [k for k in _key_corpus() if agent_auth.agent_api_key_format_ok(k) != bool(test_shape.match(k))] == []
