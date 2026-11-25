@@ -95,7 +95,7 @@ async def _columns(database, table: str):
         "SELECT column_name, data_type, is_nullable, column_default, character_maximum_length "
         "FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = :t "
         "ORDER BY ordinal_position", {"t": table})
-    return [tuple(r) for r in rows]
+    return [tuple(r._mapping.values()) for r in rows]
 
 
 async def _checks(database, table: str):
@@ -103,7 +103,7 @@ async def _checks(database, table: str):
         "SELECT replace(c.conname, :t, 'T') AS name, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
         "JOIN pg_class r ON r.oid = c.conrelid WHERE r.relname = :t AND r.relnamespace = current_schema()::regnamespace "
         "ORDER BY 1", {"t": table})
-    return [tuple(r) for r in rows]
+    return [tuple(r._mapping.values()) for r in rows]
 
 
 async def test_the_migration_and_the_module_build_the_same_table(_db):

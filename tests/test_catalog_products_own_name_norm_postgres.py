@@ -223,7 +223,7 @@ async def test_rows_that_predate_the_trigger_are_backfilled_by_the_script_in_bou
     before = await scoped.fetch_all("SELECT product_key, name_norm, own_name_norm FROM catalog_products ORDER BY 1")
     await _apply_260(scoped)  # idempotent: CREATE OR REPLACE, IF NOT EXISTS, DROP TRIGGER IF EXISTS
     after = await scoped.fetch_all("SELECT product_key, name_norm, own_name_norm FROM catalog_products ORDER BY 1")
-    assert [tuple(r) for r in before] == [tuple(r) for r in after]
+    assert [tuple(r._mapping.values()) for r in before] == [tuple(r._mapping.values()) for r in after]
     triggers = await scoped.fetch_val(
         "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE t.tgname IN ('trg_catalog_products_stamp_name_norm_insert', 'trg_catalog_products_stamp_name_norm_update') "

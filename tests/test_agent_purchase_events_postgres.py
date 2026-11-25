@@ -70,7 +70,7 @@ async def _a2a_child(agent_id: str, n: int) -> str:
 async def _fingerprint():
     from db.database import database
 
-    columns = [tuple(r) for r in await database.fetch_all(
+    columns = [tuple(r._mapping.values()) for r in await database.fetch_all(
         "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default "
         "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'agent_purchase_events' "
         "ORDER BY column_name")]
