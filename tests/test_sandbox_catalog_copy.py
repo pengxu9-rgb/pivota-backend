@@ -192,3 +192,65 @@ def test_the_staff_and_free_text_columns_found_in_review_stay_dropped():
     assert "audit_notes" in spec["product_beauty_attributes"].drop
     assert "verified_by" in spec["aurora_dupe_kb"].drop
     assert "updated_by" in spec["merchant_category_mapping"].drop and "updated_by" in spec["ops_category_override"].drop
+
+
+def test_the_import_refuses_a_target_that_is_not_positively_the_sandbox_s(clean_env):
+    from tests.test_sandbox_guard import GOOD
+
+    good = dict(GOOD, CLOUD_RUN_JOB="sandbox-catalog-import")
+    for dsn in ("postgresql://u:p@203.0.113.7/pivota?host=/cloudsql/pivota-sandbox:us-west1:pg",
+                "postgresql://u:p@10.70.0.3/pivota", "postgresql://u:p@db.internal/pivota"):
+        with pytest.raises(C.CopyRefused, match="private range"):
+            C.check_import_environment(dict(good, DATABASE_URL=dsn))
+
+
+async def test_the_export_never_lists_the_drop(tmp_path):
+    """S2: the export's SA holds objectCreator only; a list would be a 403. Create-only uploads are the
+    overwrite guard."""
+    class CreateOnly(C.LocalDirStore):
+        def list(self, prefix=""):
+            raise AssertionError("the export listed the bucket")
+
+    class FakeConn:
+        def transaction(self, **kw):
+            class T:
+                async def __aenter__(self): return None
+                async def __aexit__(self, *a): return False
+            return T()
+
+        async def execute(self, *a): return "SET"
+
+        async def fetch(self, *a): return [{"column_name": "merchant_id"}]
+
+        async def fetchval(self, *a): return 1
+
+        async def copy_from_query(self, query, output, format):
+            output.write(b"m1\n")
+
+    spec = (C.TableSpec("catalog_merchants", "x"),)
+    manifest = await C.export_catalog(FakeConn(), CreateOnly(tmp_path), stamp="20261125T0100Z", specs=spec)
+    assert manifest["tables"][0]["rows"] == 1
+    with pytest.raises(C.CopyRefused, match="never overwrites"):
+        await C.export_catalog(FakeConn(), CreateOnly(tmp_path), stamp="20261125T0100Z", specs=spec)
+
+
+def test_gcs_errors_are_refusals_with_the_status_only(monkeypatch):
+    import httpx
+
+    class R:
+        def __init__(self, code):
+            self.status_code = code
+            self.content = b"secret body"
+
+        def json(self):
+            return {"access_token": "t"}
+
+    store = C.GcsStore("gs://pivota-sandbox-catalog-drop/catalog")
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: R(200))
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: R(403))
+    with pytest.raises(C.CopyRefused, match="HTTP 403 for create") as excinfo:
+        store.put("20261125T0100Z/x.csv.gz", b"data")
+    assert "secret body" not in str(excinfo.value)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: R(412))
+    with pytest.raises(C.CopyRefused, match="never overwrites"):
+        store.put("20261125T0100Z/x.csv.gz", b"data")

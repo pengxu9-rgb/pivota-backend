@@ -23,9 +23,8 @@ be) done.
 REFUSES TO RUN unless:
   * PIVOTA_ENV=sandbox and config.sandbox_guard passes on this environment (which also refuses a
     DATABASE_URL naming a prod/staging host, project or IP);
-  * DATABASE_URL's host is the sandbox's: an address in SANDBOX_DB_NETWORKS, or a Cloud SQL socket
-    under /cloudsql/pivota-sandbox:;
-  * GOOGLE_CLOUD_PROJECT, when set, is pivota-sandbox.
+  * every address asyncpg would connect to for DATABASE_URL is the sandbox's, and GOOGLE_CLOUD_PROJECT
+    (when set) is the sandbox's project (config/sandbox_identity.sandbox_database_refusal);
 
   * --agent-id is listed in BOTH ISSUING_AGENT_EXCLUDED_AGENT_IDS and ISSUING_ASSERTION_VOUCHER_AGENT_IDS
     of this job's environment (the same values web and worker carry). The gateway's service agent
@@ -40,18 +39,15 @@ import argparse
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import os
 import re
 import sys
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Sequence
-from urllib.parse import parse_qs, urlsplit
 
-SANDBOX_PROJECT = "pivota-sandbox"
-#: The sandbox Cloud SQL private range (sandbox-infra pins 10.61.0.0/20).
-SANDBOX_DB_NETWORKS = ("10.61.0.0/20",)
-SANDBOX_SQL_SOCKET_PREFIX = "/cloudsql/%s:" % SANDBOX_PROJECT
+# Single source for the sandbox's project and DB range: a rename is one edit in config/sandbox_identity.py.
+from config.sandbox_identity import SANDBOX_PROJECT, sandbox_database_refusal
+
 SECRET_NAME = "PIVOTA_API_KEY"
 _AGENT_ID_RE = re.compile(r"^agent_[0-9a-z_]{4,40}$")
 _TEST_KEY_RE = re.compile(r"^ak_test_[0-9a-f]{64}$")
@@ -59,12 +55,6 @@ _TEST_KEY_RE = re.compile(r"^ak_test_[0-9a-f]{64}$")
 
 class Refused(RuntimeError):
     """The registration will not run. Messages never hold the key, its hash or its prefix."""
-
-
-def _db_host(dsn: str) -> str:
-    parts = urlsplit(dsn.replace("postgresql+asyncpg://", "postgresql://"))
-    socket_host = (parse_qs(parts.query).get("host") or [""])[0]
-    return socket_host or (parts.hostname or "")
 
 
 def check_environment(env: Mapping[str, str]) -> None:
@@ -77,22 +67,9 @@ def check_environment(env: Mapping[str, str]) -> None:
         enforce_sandbox_guard(env)
     except SandboxGuardRefused as exc:
         raise Refused(str(exc)) from None
-    project = (env.get("GOOGLE_CLOUD_PROJECT") or "").strip()
-    if project and project != SANDBOX_PROJECT:
-        raise Refused("GOOGLE_CLOUD_PROJECT is not %s" % SANDBOX_PROJECT)
-    host = _db_host((env.get("DATABASE_URL") or "").strip())
-    if not host:
-        raise Refused("DATABASE_URL names no host")
-    if host.startswith("/"):
-        if not host.startswith(SANDBOX_SQL_SOCKET_PREFIX):
-            raise Refused("DATABASE_URL's socket is not the sandbox's Cloud SQL instance")
-        return
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        raise Refused("DATABASE_URL's host is not an address in the sandbox's private range") from None
-    if not any(address in ipaddress.ip_network(net) for net in SANDBOX_DB_NETWORKS):
-        raise Refused("DATABASE_URL's host is not in the sandbox's private range")
+    refusal = sandbox_database_refusal(env)
+    if refusal:
+        raise Refused(refusal)
 
 
 _ID_LIST_ENVS = ("ISSUING_AGENT_EXCLUDED_AGENT_IDS", "ISSUING_ASSERTION_VOUCHER_AGENT_IDS")

@@ -289,8 +289,11 @@ class LocalDirStore:
     def put(self, name: str, data: bytes) -> None:
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "xb") as handle:  # x: never overwrite
-            handle.write(data)
+        try:
+            with open(path, "xb") as handle:  # x: never overwrite, as ifGenerationMatch=0 on GCS
+                handle.write(data)
+        except FileExistsError:
+            raise CopyRefused("object already exists; an export never overwrites (%s)" % name) from None
 
     def get(self, name: str) -> bytes:
         return (self.root / name).read_bytes()
@@ -324,11 +327,17 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
     def _name(self, name: str) -> str:
         return "%s/%s" % (self.prefix, name) if self.prefix else name
 
+    @staticmethod
+    def _ok(response, what: str) -> None:
+        """A refusal naming the operation and the HTTP status, never a traceback or a body."""
+        if response.status_code != 200:
+            raise CopyRefused("GCS answered HTTP %d for %s" % (response.status_code, what))
+
     def _token(self) -> str:
         import httpx
 
         response = httpx.get(self._TOKEN_URL, headers={"Metadata-Flavor": "Google"}, timeout=10)
-        response.raise_for_status()
+        self._ok(response, "the metadata token")
         return response.json()["access_token"]
 
     def put(self, name: str, data: bytes) -> None:
@@ -343,7 +352,7 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
         )
         if response.status_code == 412:
             raise CopyRefused("object already exists; an export never overwrites (%s)" % name)
-        response.raise_for_status()
+        self._ok(response, "create %s" % name)
 
     def get(self, name: str) -> bytes:
         import urllib.parse
@@ -357,7 +366,7 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
             headers={"Authorization": "Bearer " + self._token()},
             timeout=300,
         )
-        response.raise_for_status()
+        self._ok(response, "read %s" % name)
         return response.content
 
     def list(self, prefix: str = "") -> List[str]:
@@ -374,7 +383,7 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
                 "https://storage.googleapis.com/storage/v1/b/%s/o" % self.bucket,
                 params=params, headers={"Authorization": "Bearer " + self._token()}, timeout=60,
             )
-            response.raise_for_status()
+            self._ok(response, "list")
             body = response.json()
             for item in body.get("items", []):
                 n = item["name"]
@@ -431,8 +440,6 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
                          statement_timeout: str = "15min") -> Dict[str, Any]:
     if not _STAMP_RE.match(stamp):
         raise CopyRefused("stamp must look like YYYYmmddTHHMMZ")
-    if store.list("%s/" % stamp):
-        raise CopyRefused("stamp %s already has objects; an export never overwrites" % stamp)
     tables: List[Dict[str, Any]] = []
     absent: List[str] = []
     files: List[Tuple[str, bytes]] = []
@@ -710,12 +717,19 @@ def check_export_environment(env: Mapping[str, str]) -> None:
 
 
 def check_import_environment(env: Mapping[str, str]) -> None:
+    """The import is destructive on its target (delete-missing with the FKs' cascades, placeholder
+    overwrites), so beyond the guard's refusal of prod names the target must POSITIVELY be the
+    sandbox's database (config.sandbox_identity)."""
     from config.platform import is_sandbox
     from config.sandbox_guard import enforce_sandbox_guard
+    from config.sandbox_identity import sandbox_database_refusal
 
     if not is_sandbox(env):
         raise CopyRefused("the import runs only in the sandbox (PIVOTA_ENV=sandbox)")
     enforce_sandbox_guard(env)
+    refusal = sandbox_database_refusal(env)
+    if refusal:
+        raise CopyRefused(refusal)
 
 
 async def _run(mode: str, env: Mapping[str, str]) -> Dict[str, Any]:

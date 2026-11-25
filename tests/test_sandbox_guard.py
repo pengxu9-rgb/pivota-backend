@@ -28,7 +28,7 @@ GOOD = {
     "K_SERVICE": "web",
     "K_REVISION": "web-00001-abc",
     "GOOGLE_CLOUD_PROJECT": "pivota-sandbox",
-    "DATABASE_URL": "postgresql://pivota:%s@10.60.0.3:5432/pivota" % SECRET,
+    "DATABASE_URL": "postgresql://pivota:%s@10.61.0.3:5432/pivota" % SECRET,
     "REAP_API_BASE_URL": "https://sandbox.api.reap.global",
     "REAP_API_KEY": SECRET,
     "REAP_AGENTIC_SIMULATE_CHECKOUT": "COMPLETED",
