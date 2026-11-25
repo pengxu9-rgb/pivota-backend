@@ -11,6 +11,14 @@
 #   SANDBOX_SCHEMA_GCS_URI        gs://<bucket>/<prefix>, e.g. gs://pivota-sandbox-catalog-drop/schema
 #   STAMP                         optional, YYYYmmddTHHMMZ (default: now, UTC)
 #   SCHEMA_DUMP_LOCAL_OUT_DIR     tests only: write <dir>/<stamp>/... instead of uploading
+#   SCHEMA_DUMP_LOCK_WAIT         optional, default 5s: pg_dump --lock-wait-timeout
+#   SCHEMA_DUMP_DEADLINE_SECONDS  optional, default 600: hard cap on each pg_dump / psql call
+#
+# PROD IMPACT. Schema-only reads the catalogs and takes ACCESS SHARE on every table it dumps (no rows
+# are read). ACCESS SHARE conflicts only with ACCESS EXCLUSIVE, but a dump that WAITS behind a pending
+# DDL lock makes every later query queue behind it; --lock-wait-timeout makes it fail fast instead.
+# Each call has a hard deadline (coreutils `timeout`, required outside tests), and the session is
+# named sandbox-schema-dump in pg_stat_activity.
 #
 # Writes <prefix>/<stamp>/schema.sql.gz, ledgers.sql.gz, then _MANIFEST.json LAST, each create-only
 # (ifGenerationMatch=0: objectCreator is enough, nothing is overwritten, nothing read back).
@@ -40,23 +48,35 @@ else
   BUCKET="${BASH_REMATCH[1]}"; PREFIX="${BASH_REMATCH[3]%/}"
 fi
 DSN="${DATABASE_URL/postgresql+asyncpg:\/\//postgresql://}"
+LOCK_WAIT="${SCHEMA_DUMP_LOCK_WAIT:-5s}"
+DEADLINE="${SCHEMA_DUMP_DEADLINE_SECONDS:-600}"
+[[ "$LOCK_WAIT" =~ ^[0-9]+(ms|s)$ ]] || die "SCHEMA_DUMP_LOCK_WAIT must look like 5s or 500ms"
+[[ "$DEADLINE" =~ ^[0-9]+$ ]] || die "SCHEMA_DUMP_DEADLINE_SECONDS must be a whole number"
+export PGAPPNAME=sandbox-schema-dump
+if command -v timeout >/dev/null; then
+  capped() { timeout --signal=TERM "$DEADLINE" "$@"; }
+elif [ "$MODE" = local ]; then
+  capped() { "$@"; }  # tests on a laptop without coreutils
+else
+  die "coreutils timeout is required: every prod call has a deadline"
+fi
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 echo "dump_prod_schema: pg_dump $(pg_dump --version | awk '{print $NF}') stamp=$STAMP mode=$MODE"
 
 # --- the schema ------------------------------------------------------------------------------------
-pg_dump "$DSN" --schema-only --no-owner --no-privileges --no-comments --no-publications \
+capped pg_dump "$DSN" --lock-wait-timeout="$LOCK_WAIT" --schema-only --no-owner --no-privileges --no-comments --no-publications \
   --no-subscriptions --no-security-labels --no-tablespaces --format=plain > "$WORK/schema.sql"
 tail -5 "$WORK/schema.sql" | grep -q 'PostgreSQL database dump complete' || die "schema dump has no completion trailer" 3
 
 # --- the two ledgers, only those that exist (pg_dump -t on a missing table fails) -------------------
-LEDGERS=$(psql "$DSN" -Atc "select string_agg(c.relname, ' ' order by c.relname) from pg_class c
+LEDGERS=$(capped psql "$DSN" -Atc "select string_agg(c.relname, ' ' order by c.relname) from pg_class c
   join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'
   and c.relname in ('startup_sql_migrations', 'schema_migrations')")
 TARGS=()
 for t in $LEDGERS; do TARGS+=(-t "public.$t"); done
 if [ "${#TARGS[@]}" -gt 0 ]; then
-  pg_dump "$DSN" --data-only --column-inserts --no-owner --no-privileges --no-comments --format=plain \
+  capped pg_dump "$DSN" --lock-wait-timeout="$LOCK_WAIT" --data-only --column-inserts --no-owner --no-privileges --no-comments --format=plain \
     "${TARGS[@]}" > "$WORK/ledgers.sql"
   tail -5 "$WORK/ledgers.sql" | grep -q 'PostgreSQL database dump complete' || die "ledger dump has no completion trailer" 3
 else
@@ -78,7 +98,7 @@ BAD=$( { grep -Ev '^(--|$|SET |SELECT pg_catalog\.set_config\(|SELECT pg_catalog
 
 # --- completeness: no fewer tables than the live source ---------------------------------------------
 DUMPED=$(grep -c '^CREATE TABLE ' "$WORK/schema.sql" || true)
-LIVE=$(psql "$DSN" -Atc "select count(*) from information_schema.tables where table_schema not in
+LIVE=$(capped psql "$DSN" -Atc "select count(*) from information_schema.tables where table_schema not in
   ('pg_catalog','information_schema') and table_schema not like 'pg_toast%' and table_type='BASE TABLE'")
 [ "$DUMPED" -ge "$LIVE" ] || die "schema dump has fewer tables ($DUMPED) than the source ($LIVE)" 3
 LEDGER_ROWS=$(grep -c '^INSERT INTO ' "$WORK/ledgers.sql" || true)

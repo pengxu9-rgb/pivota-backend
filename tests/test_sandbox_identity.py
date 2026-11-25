@@ -39,6 +39,10 @@ def test_the_sandbox_database_passes(dsn):
     ("postgresql://u:pw@/pivota", "socket"),  # no host: libpq's default sockets / localhost
     ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-prod:us-west1:pivota-pg", "socket"),
     ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox-evil:x", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:x/../../../tmp", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pg/../../pivota-prod:us-west1:pivota-pg", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pivota-pg/sub", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:US-WEST1:pg", "socket"),
     ("", "no host"),
     ("not a dsn", "could not be parsed"),
 ])

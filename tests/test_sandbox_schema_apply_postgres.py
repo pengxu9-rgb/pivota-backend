@@ -274,3 +274,32 @@ async def test_a_dump_never_overwrites_a_stamp(dbs, tmp_path):
     assert _dump(tmp_path).returncode == 0
     again = _dump(tmp_path)
     assert again.returncode != 0 and "never overwrites" in again.stderr
+
+
+async def test_the_dump_fails_fast_instead_of_queueing_behind_a_ddl_lock(dbs, tmp_path):
+    """A pending ACCESS EXCLUSIVE (a migration) must not get a dump queued behind it, with prod's later
+    queries queued behind the dump: --lock-wait-timeout makes the dump give up."""
+    import asyncio
+    import time
+
+    import asyncpg
+
+    holder = await asyncpg.connect(SRC)
+    tx = holder.transaction()
+    await tx.start()
+    await holder.execute("LOCK TABLE offers IN ACCESS EXCLUSIVE MODE")
+    try:
+        started = time.monotonic()
+        done = await asyncio.to_thread(_dump, tmp_path, env_extra={"SCHEMA_DUMP_LOCK_WAIT": "1s"})
+        elapsed = time.monotonic() - started
+    finally:
+        await tx.rollback()
+        await holder.close()
+    assert done.returncode != 0 and elapsed < 30
+    assert not (tmp_path / "drop" / STAMP / "_MANIFEST.json").exists()
+
+
+async def test_a_malformed_lock_wait_or_deadline_is_refused(dbs, tmp_path):
+    for extra in ({"SCHEMA_DUMP_LOCK_WAIT": "forever"}, {"SCHEMA_DUMP_DEADLINE_SECONDS": "10m"}):
+        done = _dump(tmp_path, env_extra=extra)
+        assert done.returncode == 2 and "SCHEMA_DUMP_" in done.stderr

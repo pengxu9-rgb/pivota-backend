@@ -221,6 +221,36 @@ EXCLUDED_TABLES: Mapping[str, str] = {
     "relationship_graph_anchor_attempts": "gateway runtime state",
 }
 
+#: NEVER copied, whatever a spec or a manifest names: identity, keys, issuers, orders, buyers, consents,
+#: ledgers and money. Besides personal data, a copied prod `agents`/`api_keys` row would make a prod key
+#: authenticate in the sandbox, and prod's gateway agent is a trusted voucher there (routes/agent_auth.py).
+#: An explicit list AND a name pattern (a new `*_tokens` or `buyer_*` table is refused without an edit).
+#: Checked when this module loads (a spec naming one cannot exist), by the export before it reads, and
+#: by the importer on the manifest.
+NEVER_COPY_TABLES = frozenset({
+    "agents", "api_keys", "agent_api_keys", "agent_identity_issuers", "agent_oauth_clients",
+    "agent_issued_cards", "ap2_trusted_issuers", "orders", "order_events", "buyer_identity_links",
+    "shop_users", "shop_user_memberships", "shop_login_otps", "reap_agentic_buyer_refs",
+    "reap_agentic_purchases", "agent_purchase_consents", "agent_purchase_ledger", "agent_purchase_events",
+    "a2a_rail_ledger", "merchant_psps", "commissions", "users", "employees",
+})
+_NEVER_COPY_NAME = re.compile(
+    r"(^|_)(agents|api_keys?|keys|secrets?|tokens?|credentials?|auth|issuers?|buyers?|orders?|consents?|"
+    r"ledgers?|purchases|sessions?|users?|oauth|otps?|cards?|psps?|wallets?|payouts?|refunds?|"
+    r"commissions?|bookings?|vault)(_|$)"
+)
+
+
+def never_copy(name: str) -> bool:
+    return name in NEVER_COPY_TABLES or bool(_NEVER_COPY_NAME.search(name or ""))
+
+
+def _assert_no_never_copy(names: Iterable[str], where: str) -> None:
+    bad = sorted(n for n in names if never_copy(n))
+    if bad:
+        raise CopyRefused("%s names table(s) that are never copied: %s" % (where, ",".join(bad)))
+
+
 #: A column whose name has one of these tokens (split on "_") is refused unless dropped or
 #: classified in allow_risky. "_by" anywhere (created_by, decided_by_*) is staff identity.
 RISKY_COLUMN_TOKENS = frozenset({
@@ -230,6 +260,9 @@ RISKY_COLUMN_TOKENS = frozenset({
 })
 RISKY_COLUMN_PAIRS = frozenset({("api", "key"), ("private", "key"), ("user", "id"), ("first", "name"),
                                 ("last", "name"), ("full", "name"), ("account", "number")})
+
+
+_assert_no_never_copy((s.name for s in CATALOG_TABLES), "CATALOG_TABLES")
 
 
 def column_is_risky(column: str) -> bool:
@@ -440,6 +473,7 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
                          statement_timeout: str = "15min") -> Dict[str, Any]:
     if not _STAMP_RE.match(stamp):
         raise CopyRefused("stamp must look like YYYYmmddTHHMMZ")
+    _assert_no_never_copy((s.name for s in specs), "the export's table list")
     tables: List[Dict[str, Any]] = []
     absent: List[str] = []
     files: List[Tuple[str, bytes]] = []
@@ -507,6 +541,8 @@ def validate_manifest(manifest: Mapping[str, Any], specs: Sequence[TableSpec] = 
     if manifest.get("format_version") != FORMAT_VERSION:
         raise CopyRefused("manifest format_version is not %d" % FORMAT_VERSION)
     by_name = _spec_by_name(specs)
+    _assert_no_never_copy((s.name for s in specs), "the import's table list")
+    _assert_no_never_copy((str(e.get("name") or "") for e in manifest.get("tables") or []), "the manifest")
     seen = set()
     for entry in manifest.get("tables") or []:
         name = entry.get("name")
