@@ -133,3 +133,13 @@ def test_gcs_store_parses_the_uri():
     assert store.bucket == "pivota-sandbox-catalog-drop" and store.prefix == "catalog"
     with pytest.raises(C.CopyRefused):
         C.GcsStore("s3://x")
+
+
+@pytest.mark.parametrize("name", ["catalog_row_trust", "catalog_offers", "catalog_products", "external_product_seeds",
+                                  "agent_pdp_view", "merchant_onboarding"])
+def test_the_tables_the_serving_lanes_join_are_copied_whole_and_required(name):
+    """catalog_row_trust above all: the gateway's lanes INNER JOIN it on serving_decision='public', so
+    without it the sandbox serves an empty catalog. Required (not optional): a prod export without
+    it must fail, not ship an empty sandbox."""
+    spec = next(s for s in C.CATALOG_TABLES if s.name == name)
+    assert spec.optional is False

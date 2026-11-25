@@ -107,6 +107,8 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     TableSpec("product_group_members", "product grouping get_offers expands"),
     TableSpec("identity_resolution_proposals", "applied identity merges get_offers honours",
               drop=("decided_by",), optional=True),
+    TableSpec("catalog_row_trust", "the serving verdict (serving_decision='public') the gateway's catalog, "
+              "seed-fastpath and canonical-PDP lanes INNER JOIN; without it the sandbox serves nothing"),
     TableSpec("agent_pdp_view", "the denormalised product view search serves"),
     TableSpec("index_pipeline_state", "search index readiness per product"),
     TableSpec("x402_exchange_rates", "FX reference rates for budget conversion", optional=True),

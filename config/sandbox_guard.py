@@ -152,6 +152,15 @@ _LIVE_KEY_PREFIXES = ("sk_live_", "rk_live_", "ak_live_")
 _LIVE_KEY_RE = re.compile(
     r"(?<![a-z0-9])(" + "|".join(re.escape(p) for p in _LIVE_KEY_PREFIXES) + r")"
 )
+#: (setting, exact value) pairs exempt from the prod-reference rule: the buyer consent links. The
+#: backend only validates, stores and SHOWS them (services/payment_orchestration/purchase_consent.py
+#: config()); nothing fetches them, and the sandbox buyer agrees to the real legal text, which a
+#: sandbox copy could drift from. Exact match only: another path, a query string, or the same URL
+#: in any other setting is still refused.
+_DISPLAY_ONLY_LINKS = {
+    "AGENPAS_TERMS_URL": "https://pivota.cc/terms",
+    "AGENPAS_PRIVACY_URL": "https://merchant.pivota.cc/privacy",
+}
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
 
 
@@ -282,6 +291,8 @@ def sandbox_violations(env: Mapping[str, str]) -> List[Violation]:
     for name in sorted(env):
         value = env.get(name) or ""
         if not value.strip():
+            continue
+        if _DISPLAY_ONLY_LINKS.get(name) == value.strip():
             continue
         rule = _prod_reference_rule(value)
         if rule:

@@ -241,6 +241,24 @@ def test_an_inverse_polarity_flag_does_not_match_the_pattern():
     assert G.sandbox_violations(_with(IDENTITY_LIVE_READ_DISABLED="true")) == []
 
 
+def test_the_two_consent_links_are_allowed_exactly():
+    env = _with(AGENPAS_TERMS_URL="https://pivota.cc/terms",
+                AGENPAS_PRIVACY_URL="https://merchant.pivota.cc/privacy")
+    assert G.sandbox_violations(env) == []
+
+
+@pytest.mark.parametrize("name,value", [
+    ("AGENPAS_TERMS_URL", "https://pivota.cc/terms?x=1"),
+    ("AGENPAS_TERMS_URL", "https://pivota.cc/terms/other"),
+    ("AGENPAS_TERMS_URL", "https://api.pivota.cc/terms"),
+    ("AGENPAS_PRIVACY_URL", "https://pivota.cc/terms"),
+    ("SOME_OTHER_URL", "https://pivota.cc/terms"),
+    ("AGENPAS_PRIVACY_URL", "https://merchant.pivota.cc/privacy,https://api.pivota.cc"),
+])
+def test_anything_but_the_exact_consent_pair_is_still_refused(name, value):
+    assert name in [v.setting for v in G.sandbox_violations(_with(**{name: value}))]
+
+
 def test_a_web_process_needs_no_allowlist():
     env = _with(AUDIT_WORKER_ENABLED=None, SCHEDULER_JOB_ALLOWLIST=None)
     assert G.sandbox_violations(env) == []

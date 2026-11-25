@@ -20,7 +20,7 @@ python -m jobs.sandbox_catalog_copy      gs://pivota-sandbox-catalog-drop/  pyth
 * Prices keep their values. The gateway marks sandbox answers `sandbox: true` and treats copied
   prices as fresh (decision 4).
 
-## Tables copied (29)
+## Tables copied (30)
 
 Whole rows, minus the dropped columns. The export reads prod's own column list at run time and
 **refuses** any column whose name looks like personal data or a secret (email, phone, token, secret,
@@ -42,6 +42,7 @@ leaking.
 | products_cache | search and get_product | |
 | product_group_members | grouping get_offers expands | |
 | identity_resolution_proposals (optional) | applied identity merges | drops `decided_by` |
+| catalog_row_trust | the serving verdict the gateway's catalog, seed-fastpath and canonical-PDP lanes INNER JOIN on `serving_decision='public'` (empty = the sandbox serves nothing); keys, states, timestamps only | |
 | agent_pdp_view | the view search serves | |
 | index_pipeline_state | index readiness | |
 | x402_exchange_rates (optional) | FX reference rates | |
