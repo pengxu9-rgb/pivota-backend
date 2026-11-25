@@ -20,7 +20,7 @@ python -m jobs.sandbox_catalog_copy      gs://pivota-sandbox-catalog-drop/  pyth
 * Prices keep their values. The gateway marks sandbox answers `sandbox: true` and treats copied
   prices as fresh (decision 4).
 
-## Tables copied (30)
+## Tables copied (52)
 
 Whole rows, minus the dropped columns. The export reads prod's own column list at run time and
 **refuses** any column whose name looks like personal data or a secret (email, phone, token, secret,
@@ -56,8 +56,30 @@ leaking.
 | merchant_onboarding | ids, names, domains, status | **keep-list only**: `id, merchant_id, business_name, store_url, operating_mode, website, region, status, psp_connected, psp_type, mcp_connected, mcp_platform, mcp_shop_domain, created_at, updated_at, verified_at, is_test`; `contact_email` (NOT NULL) = `sandbox-merchant@example.invalid`. Never `mcp_access_token, api_key, api_key_hash, psp_sandbox_key, contact_phone, kyc_documents, rejection_reason, signup_source` |
 | merchant_stores | ids, platforms, domains | **keep-list only**: `store_id, merchant_id, platform, name, domain, status, connected_at, last_sync, product_count, is_primary, created_at, query_ttl_seconds`; `realtime_enabled` forced false. Never `api_key` (the store credential), `api_endpoint`, `support_email`, writeback order ids |
 
-"Optional" = created at runtime by a schema guard in prod; absent is recorded in the manifest
-instead of failing.
+### Read directly by the gateway (22, from the sandbox gateway session's list, 25 Nov)
+
+| table | why | dropped / classified |
+|---|---|---|
+| content_canonical_election | canonical listing per content key | |
+| catalog_source_quarantine | quarantined sources stay hidden | drops `created_by`, `revoked_by` |
+| merchant_product_overlay | approved PDP content overlays | drops `approved_by` |
+| product_evidence | claims and required disclaimers | |
+| pdp_identity_listing (optional) | the PDP identity graph | `matched_by_rule` classified (a rule name) |
+| pdp_identity_override (optional) | identity overrides | drops `created_by` |
+| product_beauty_attributes (optional) | beauty attributes | drops `audit_notes` |
+| product_relationship_edges, relationship_candidate_labels, relgraph_reviewed_ingredient_evidence, relgraph_reviewed_seller_evidence (optional) | the relationship graph | |
+| aurora_product_intel_kb, aurora_ingredient_research_kb, aurora_travel_context_kb (optional) | product KBs | |
+| aurora_dupe_kb (optional) | dupe KB | drops `verified_by` |
+| taxonomy_view, taxonomy_view_category, canonical_category, category_localization (optional) | category taxonomy | `replaced_by_id` classified |
+| merchant_category_mapping, ops_category_override (optional) | category mapping and ops pins | drops `updated_by` |
+| brands (optional) | brands | |
+
+`agent_pdp_view.refreshed_by_proposal_id` is classified (a proposal id); a DDL-wide check found it.
+
+"Optional" = created at runtime (a backend schema guard or the gateway's own migrations); absent in
+prod is recorded in the manifest instead of failing. **Present in the export but absent in the
+sandbox DB fails the import**, so the gateway's migrations (`node src/db/cli.js migrate`) must run
+on the sandbox DB before the first import.
 
 ## Not copied (read on the serving path, excluded on purpose)
 
@@ -67,6 +89,14 @@ reap_agentic_buyer_refs (buyers), reap_agentic_purchases, agent_purchase_ledger,
 (ledgers), agent_purchase_consents (consents), commerce_attribution_edges and conversion_click_claims
 (buyer-linked), merchant_psps (PSP secret keys), merchant_tasks (internal ops), creator_picks
 (creators are real people), product_reviews, media_assets, commissions.
+
+Read by the gateway but not copied: pdp_identity_review_queue (free-text reviewer notes),
+reco_label_suggestions (session ids), creator_category_override (keyed by creator), external_seed_corrections
+(ops ledger), external_offers_cache (a cache of live store reads), external_offer_snapshots (ops
+inspector only), products_cache_embeddings and its fallback (pgvector, size; vector lane is a
+follow-up), every aurora_* consumer table and the services/bookings tables (people). The gateway's
+runtime tables (commerce_kv, gateway_caller_limit_*, external_seed_image_cache_jobs,
+relationship_graph_anchor_attempts) start empty and are never copied; they must exist.
 
 ## Import semantics
 

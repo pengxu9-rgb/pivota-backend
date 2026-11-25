@@ -143,3 +143,52 @@ def test_the_tables_the_serving_lanes_join_are_copied_whole_and_required(name):
     it must fail, not ship an empty sandbox."""
     spec = next(s for s in C.CATALOG_TABLES if s.name == name)
     assert spec.optional is False
+
+
+def _backend_ddl_columns():
+    """Column names per table from this repo's own DDL: migrations, db/*.py Table(...) and CREATE TABLE
+    strings, main.py. A parse, not a database: good enough to catch a risky NAME the spec misses."""
+    import glob
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    files = sorted(glob.glob(str(root / "db/migrations/*.sql"))) + glob.glob(str(root / "db/*.py")) + [str(root / "main.py")]
+    cols = {}
+    for path in files:
+        text = Path(path).read_text(errors="ignore")
+        for m in re.finditer(r'CREATE TABLE(?: IF NOT EXISTS)?\s+(?:public\.)?"?([a-z_][a-z0-9_]*)"?\s*\((.*?)\n\s*\)\s*;?', text, re.S | re.I):
+            for line in m.group(2).split("\n"):
+                mm = re.match(r'\s*"?([a-z_][a-z0-9_]*)"?\s+[A-Za-z]', line)
+                if mm and mm.group(1).upper() not in ("PRIMARY", "UNIQUE", "CONSTRAINT", "FOREIGN", "CHECK", "EXCLUDE"):
+                    cols.setdefault(m.group(1).lower(), set()).add(mm.group(1))
+        for m in re.finditer(r'ALTER TABLE(?: IF EXISTS)?\s+(?:public\.)?([a-z_][a-z0-9_]*)\b(.*?);', text, re.S | re.I):
+            for mm in re.finditer(r'ADD COLUMN(?: IF NOT EXISTS)?\s+([a-z_][a-z0-9_]*)', m.group(2), re.I):
+                cols.setdefault(m.group(1).lower(), set()).add(mm.group(1))
+        for m in re.finditer(r'Table\(\s*["\']([a-z_0-9]+)["\'](.*?)\n\)', text, re.S):
+            for mm in re.finditer(r'Column\(\s*["\']([a-z_0-9]+)["\']', m.group(2)):
+                cols.setdefault(m.group(1), set()).add(mm.group(1))
+    return cols
+
+
+def test_every_copied_table_s_known_columns_pass_the_export_rules():
+    """The export refuses a risky-looking column the spec has not classified. Run that rule now on
+    every column this repo's DDL declares, so a gap shows up in review, not on the prod export."""
+    ddl = _backend_ddl_columns()
+    checked = 0
+    for spec in C.CATALOG_TABLES:
+        columns = sorted(ddl.get(spec.name, ()))
+        if columns:
+            C.plan_columns(spec, columns)
+            checked += 1
+    assert checked >= 25  # most copied tables have backend DDL; the gateway-created ones may not
+
+
+def test_the_staff_and_free_text_columns_found_in_review_stay_dropped():
+    spec = {s.name: s for s in C.CATALOG_TABLES}
+    assert {"created_by", "revoked_by"} <= set(spec["catalog_source_quarantine"].drop)
+    assert "approved_by" in spec["merchant_product_overlay"].drop
+    assert "created_by" in spec["pdp_identity_override"].drop
+    assert "audit_notes" in spec["product_beauty_attributes"].drop
+    assert "verified_by" in spec["aurora_dupe_kb"].drop
+    assert "updated_by" in spec["merchant_category_mapping"].drop and "updated_by" in spec["ops_category_override"].drop
