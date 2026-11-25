@@ -31,6 +31,10 @@
 # or tablespaces; and the ledgers' rows as INSERTs over EXPLICIT columns only (a future ledger column is
 # not carried): schema_migrations(id, applied_at) and startup_sql_migrations(filename, checksum, applied_at).
 #
+# CREDENTIAL: RUNBOOK 10a-role's read-only sandbox_schema_dump. Refused before any pg_dump (exit 3): a
+# superuser, a role that can create roles or databases, or one that owns or may INSERT/UPDATE/DELETE/TRUNCATE
+# any table.
+#
 # REFUSED (exit 3, nothing uploaded): CREATE SERVER / USER MAPPING / SUBSCRIPTION / PUBLICATION / ROLE /
 # USER / GROUP / DATABASE / FOREIGN TABLE / EVENT TRIGGER, ALTER ROLE / USER / SYSTEM / SERVER / DATABASE /
 # DEFAULT PRIVILEGES / FOREIGN TABLE, GRANT / REVOKE, SET ROLE / SESSION AUTHORIZATION, DO, row data, psql
@@ -142,6 +146,27 @@ SERVER_NUM=$(capped psql -XAtc "SHOW server_version_num")
 [ "${PG_DUMP_VERSION%%.*}" = "$((SERVER_NUM / 10000))" ] \
   || die "pg_dump ${PG_DUMP_VERSION%%.*} is not the server's major version $((SERVER_NUM / 10000))" 3
 echo "dump_prod_schema: pg_dump $PG_DUMP_VERSION server_version_num=$SERVER_NUM stamp=$STAMP mode=$MODE lock_wait=$LOCK_WAIT deadline=${DEADLINE}s"
+
+# --- the credential must be READ-ONLY (infra T6: the second lock behind the dedicated role) ------------------
+# RUNBOOK 10a-role's sandbox_schema_dump has SELECT only. default_transaction_read_only is only a default and
+# TEMP comes in via PUBLIC, so THIS check is what makes a wrong credential (prod's full DATABASE_URL, say)
+# fail closed: a superuser, or a role that owns or may write any table, never dumps. Read-only query.
+WRITABLE=$(capped psql -XAtc "select case
+    when (select rolsuper or rolcreaterole or rolcreatedb or rolreplication or rolbypassrls
+            from pg_roles where rolname = current_user) then 'role'
+    when exists (select 1 from pg_class c where c.relkind in ('r', 'p')
+                   and (c.relowner = (select oid from pg_roles where rolname = current_user)
+                        or has_table_privilege(current_user, c.oid, 'INSERT')
+                        or has_table_privilege(current_user, c.oid, 'UPDATE')
+                        or has_table_privilege(current_user, c.oid, 'DELETE')
+                        or has_table_privilege(current_user, c.oid, 'TRUNCATE'))) then 'table'
+    else 'none' end") || die "could not check the credential's privileges" 3
+case "$WRITABLE" in
+  none) ;;
+  role) die "the dump credential is a superuser or can create roles/databases; use RUNBOOK 10a-role's read-only role" 3 ;;
+  table) die "the dump credential owns or may write a table; use RUNBOOK 10a-role's read-only role" 3 ;;
+  *) die "could not check the credential's privileges" 3 ;;
+esac
 
 # --- the schema --------------------------------------------------------------------------------------------
 capped pg_dump --lock-wait-timeout="$LOCK_WAIT" --schema-only --no-owner --no-privileges --no-comments \

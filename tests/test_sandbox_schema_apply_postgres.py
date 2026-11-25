@@ -156,6 +156,29 @@ def _dsn_as(user, password, db):
 
 
 APPLY = _dsn_as(APPLY_ROLE, APPLY_PASSWORD, DST_DB)
+#: The dump's credential, as RUNBOOK 10a-role has infra create it: read-only, SELECT only.
+DUMP_ROLE, DUMP_PASSWORD = "sandbox_schema_dump_test", "dump-test-pw"
+DUMPER = _dsn_as(DUMP_ROLE, DUMP_PASSWORD, SRC_DB)
+
+
+async def _bootstrap_dump_role(admin):
+    import asyncpg
+
+    await admin.execute("CREATE ROLE \"%s\" LOGIN NOINHERIT PASSWORD '%s'" % (DUMP_ROLE, DUMP_PASSWORD))
+    await admin.execute('ALTER ROLE "%s" SET default_transaction_read_only = on' % DUMP_ROLE)
+    await admin.execute('GRANT CONNECT ON DATABASE "%s" TO "%s"' % (SRC_DB, DUMP_ROLE))
+    src_admin = await asyncpg.connect(SRC)
+    try:
+        await src_admin.execute('GRANT USAGE ON SCHEMA public TO "%s"' % DUMP_ROLE)
+        await src_admin.execute('GRANT SELECT ON ALL TABLES IN SCHEMA public TO "%s"' % DUMP_ROLE)
+        await src_admin.execute('GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "%s"' % DUMP_ROLE)
+    finally:
+        await src_admin.close()
+
+
+async def _drop_role(admin, name):
+    if await admin.fetchval("SELECT 1 FROM pg_roles WHERE rolname = $1", name):
+        await admin.execute('DROP ROLE "%s"' % name)
 
 
 async def _drop_apply_role(admin):
@@ -191,22 +214,25 @@ async def dbs():
     for name in (SRC_DB, DST_DB):
         await admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
     await _drop_apply_role(admin)
+    await _drop_role(admin, DUMP_ROLE)
     for name in (SRC_DB, DST_DB):
         await _recreate(admin, name)
     src = await asyncpg.connect(SRC)
     await src.execute(SOURCE_DDL)
     await src.close()
     await _bootstrap_apply_role(admin)
+    await _bootstrap_dump_role(admin)
     try:
         yield admin
     finally:
         for name in (SRC_DB, DST_DB):
             await admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
         await _drop_apply_role(admin)
+        await _drop_role(admin, DUMP_ROLE)
         await admin.close()
 
 
-def _dump(tmp_path, *, dsn=SRC, env_extra=None):
+def _dump(tmp_path, *, dsn=DUMPER, env_extra=None):
     env = {"PATH": "%s:%s" % (os.path.dirname(PG_DUMP), os.environ.get("PATH", "")), "HOME": str(tmp_path),
            "PIVOTA_ENV": "production", "DATABASE_URL": dsn, "STAMP": STAMP,
            "SCHEMA_DUMP_LOCAL_OUT_DIR": str(tmp_path / "drop")}
@@ -566,3 +592,36 @@ async def test_each_statement_runs_alone_so_two_harmless_commands_in_one_string_
         assert await A._user_table_count(dst) == 0
     finally:
         await dst.close()
+
+
+
+# --- infra T6: the dump's credential must be read-only -------------------------------------------------
+async def test_prods_full_credential_supplied_by_mistake_never_dumps(dbs, tmp_path):
+    done = _dump(tmp_path, dsn=SRC)  # the superuser
+    assert done.returncode == 3 and "superuser" in done.stderr, done.stderr
+    assert not (tmp_path / "drop").exists()
+
+
+@pytest.mark.parametrize("grant", [
+    'GRANT INSERT ON public.offer_audit TO "%s"', 'GRANT UPDATE ON public.merchants TO "%s"',
+    'GRANT DELETE ON public.offers TO "%s"', 'GRANT TRUNCATE ON public.schema_migrations TO "%s"',
+    'ALTER TABLE public.offer_audit OWNER TO "%s"',
+    # An owner that revoked its own write privileges can grant them back: ownership alone is refused.
+    'ALTER TABLE public.offer_audit OWNER TO "{0}"; '
+    'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.offer_audit FROM "{0}"',
+])
+async def test_a_dump_role_that_may_write_any_table_never_dumps(dbs, tmp_path, grant):
+    import asyncpg
+
+    src_admin = await asyncpg.connect(SRC)
+    try:
+        await src_admin.execute(grant.format(DUMP_ROLE) if "{0}" in grant else grant % DUMP_ROLE)
+    finally:
+        await src_admin.close()
+    done = _dump(tmp_path)
+    assert done.returncode == 3 and "owns or may write a table" in done.stderr, done.stderr
+    assert not (tmp_path / "drop").exists()
+    if "OWNER" in grant:  # give it back, so the role can be dropped with the database
+        src_admin = await asyncpg.connect(SRC)
+        await src_admin.execute("ALTER TABLE public.offer_audit OWNER TO CURRENT_USER")
+        await src_admin.close()

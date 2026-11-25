@@ -37,6 +37,7 @@ cat "$FAKE_SCHEMA"
 FAKE_PSQL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_LOG/psql.argv"
 case "$*" in
+  *has_table_privilege*) echo "$FAKE_WRITABLE" ;;
   *server_version_num*) echo "$FAKE_SERVER_NUM" ;;
   *string_agg*) echo "$FAKE_LEDGERS" ;;
   *"from public.schema_migrations"*) cat "$FAKE_LEDGER_ROWS" ;;
@@ -65,7 +66,7 @@ def harness(tmp_path):
                "FAKE_LOG": str(log), "FAKE_SCHEMA": str(tmp_path / "schema.sql"),
                "FAKE_LEDGER_ROWS": str(tmp_path / "rows.sql"), "FAKE_LIVE": live, "FAKE_LEDGERS": ledgers,
                "FAKE_PG_DUMP_VERSION": "pg_dump (PostgreSQL) 17.6 (Debian 17.6-1.pgdg120+1)",
-               "FAKE_SERVER_NUM": "170006"}
+               "FAKE_SERVER_NUM": "170006", "FAKE_WRITABLE": "none"}
         env.update(env_extra)
         return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
 
@@ -269,3 +270,28 @@ def test_every_secret_kind_is_refused_by_the_dump_and_by_the_apply(harness, samp
     assert sample not in done.stdout + done.stderr
     with pytest.raises(A.SchemaRefused, match="secret or a person"):
         A.validate_schema_sql(GOOD_SCHEMA.replace("\\unrestrict k1", statement + "\n\\unrestrict k1"))
+
+
+@pytest.mark.parametrize("answer,match", [
+    ("role", "superuser or can create roles"),
+    ("table", "owns or may write a table"),
+    ("", "could not check the credential"),
+    ("something else", "could not check the credential"),
+])
+def test_a_credential_that_could_write_never_dumps(harness, answer, match):
+    """infra T6: prod's full DATABASE_URL supplied by mistake must fail closed, before any pg_dump."""
+    done = harness(FAKE_WRITABLE=answer)
+    assert done.returncode == 3 and match in done.stderr, done.stderr
+    assert not (harness.log / "pg_dump.argv").read_text().replace("--version\n", "").strip()  # never dumped
+    assert not harness.drop.exists()
+
+
+def test_the_privilege_check_runs_before_the_dump_and_is_read_only(harness):
+    done = harness()
+    assert done.returncode == 0, done.stderr
+    calls = (harness.log / "psql.argv").read_text()
+    check = next(line for line in calls.splitlines() if "has_table_privilege" in line)
+    assert all(word not in check.lower() for word in ("insert into", "update ", "delete from", "truncate ", "grant", "create "))
+    for kind in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+        assert "'%s'" % kind in calls
+    assert "relowner" in calls and "rolsuper" in calls
