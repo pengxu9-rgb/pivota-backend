@@ -40,13 +40,16 @@ from tests.test_test_traffic_money_postgres import (  # noqa: E402
     _gmv_by_merchant,
     _order_md,
     _place,
+    _edge_days,
     _shopify_close,
     _statement_gmv,
     db,  # noqa: F401 - the harness's autouse fixture: builds and drops the money tables
 )
 
 FLAGGED = "merch_flagged_shop_c"
-# This file's own day, as it was imported before be#2794 took TODAY out of the test-traffic harness.
+# The day this file was imported. Only PERIOD uses it, and PERIOD's day either side covers an
+# edge stamped after one midnight crossing (every billing read is BETWEEN, inclusive). Nothing
+# that has to equal a day the code read off its own clock may use it: see _statement_month.
 TODAY = datetime.now(timezone.utc).date()
 _MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/282_merchant_onboarding_is_test.sql"
 _OWN_TABLES = ("merchant_onboarding", "merchant_stores", "employee_audit_logs")
@@ -118,6 +121,13 @@ async def _other_reasons_edges(db):
             f"VALUES (:e, :m, :e, :g, '{md}', now(), now(), '[]', 0, 0)",
             {"e": edge_id, "m": FLAGGED, "g": gross},
         )
+
+
+async def _statement_month(db):
+    """The month a statement drop line names (`ref=statement:{merchant}:{month}`): the period_start
+    _statement_gmv passed, i.e. the first day the edges were stamped on, less one. Read off the rows,
+    never TODAY: a shard can import before 00:00Z and place the orders after it."""
+    return ((await _edge_days(db))[0] - timedelta(days=1)).isoformat()
 
 
 async def _mark_flagged():
@@ -328,7 +338,7 @@ async def test_history_leaves_the_statement_at_lock_only_with_the_filter_on(
     assert await _statement_gmv(db, REAL) == 10_000
     # P3-B: the drop is recorded, once, for the dropped merchant only; nothing with the filter off
     if filter_flag == "true":
-        month = (TODAY - timedelta(days=1)).isoformat()
+        month = await _statement_month(db)
         assert drop_lines == [(
             logging.WARNING,
             f"is_test_lock_drop site=monthly_statement ref=statement:{FLAGGED}:{month} "
@@ -336,6 +346,30 @@ async def test_history_leaves_the_statement_at_lock_only_with_the_filter_on(
         )]
     else:
         assert drop_lines == []
+
+
+@pytest.mark.parametrize("shift_days", [1, -1], ids=["rows_after_midnight", "rows_before_midnight"])
+async def test_the_statement_drop_line_names_the_month_the_rows_were_stamped_in_across_midnight(
+    db, monkeypatch, drop_lines, shift_days
+):
+    # A PG gate shard runs ~12 minutes: it can import this file before 00:00Z and place the orders
+    # after it (seen on a shard that started 23:56Z). Move every edge a UTC day off the day they
+    # were placed on: the drop line follows the rows, so the expected month must too, not TODAY.
+    await _history(db)
+    placed_on = (await _edge_days(db))[0]
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET created_at = created_at + make_interval(days => :n)",
+        {"n": shift_days},
+    )
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    assert await _statement_gmv(db, FLAGGED) == 0
+    month = (placed_on + timedelta(days=shift_days - 1)).isoformat()
+    assert await _statement_month(db) == month
+    assert drop_lines == [(
+        logging.WARNING,
+        f"is_test_lock_drop site=monthly_statement ref=statement:{FLAGGED}:{month} "
+        f"merchant_id={FLAGGED} gmv_cents=4000 rows=1",
+    )]
 
 
 class _Stripe:
@@ -600,7 +634,7 @@ async def test_a_failing_drop_count_never_fails_the_lock(db, billing, stripe_fak
     await ps.run_settlement(run)
     assert seen == [8]
     # P3-1: the lost audit line still says where to look: site, run or statement, merchant, error type
-    month = (TODAY - timedelta(days=1)).isoformat()
+    month = await _statement_month(db)
     assert drop_lines == [
         (logging.WARNING, f"is_test_lock_drop_count_failed site=invoice_run ref=billing_run:{run} "
                           f"merchant_id={FLAGGED} error=UndefinedTableError"),
