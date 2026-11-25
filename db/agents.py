@@ -6,7 +6,7 @@ Agent 管理数据库模型
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Boolean, Numeric
 from sqlalchemy.sql import func
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from collections import OrderedDict
 import asyncio
 import contextvars
@@ -869,7 +869,7 @@ async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================================
-# The agent's buyer-facing name (migration 297)
+# The agent's buyer-facing name (agents.buyer_display_name by hand, else the portal name with checks)
 # ============================================================================
 
 #: The width of agents.buyer_display_name (migration 297).
@@ -877,7 +877,63 @@ BUYER_DISPLAY_NAME_MAX_LENGTH = 64
 
 # Not on the `agents` Table on purpose: a model column is named by every model SELECT, and one boot whose heal
 # lost the lock race would then break every agent read. Only this query names the column.
-_SELECT_BUYER_DISPLAY_NAME_SQL = "SELECT buyer_display_name FROM agents WHERE agent_id = :agent_id LIMIT 1"
+_SELECT_BUYER_DISPLAY_NAME_SQL = (
+    "SELECT buyer_display_name, agent_name FROM agents WHERE agent_id = :agent_id LIMIT 1"
+)
+
+#: THE one list of what a portal-registered name (agents.agent_name) may not contain, matched against every
+#: `_name_skeleton` (case, spaces, punctuation and accents dropped; Cyrillic and Greek lookalike letters and
+#: digit/symbol stand-ins read as the Latin letter they imitate): a name that looks like a payment brand, a bank
+#: or Pivota itself is a phishing lever on a payment page, so it shows nothing. A substring match on purpose:
+#: over-blocking costs a missing line; under-blocking puts "Visa Secure" on the page a buyer pays from.
+#: Each term is matched by its own skeleton (`_BLOCKED_TERM_SKELETONS`), reduced exactly as a name is.
+PORTAL_NAME_BLOCKED_TERMS = (
+    "visa", "mastercard", "amex", "americanexpress", "discover", "applepay", "googlepay", "paypal", "stripe",
+    "pivota", "agenpaz", "agenpas", "bank", "secure",
+)
+
+# What other code paths show for an agent with no name ("Agent", "Unknown"): placeholders, never a name.
+_PORTAL_NAME_PLACEHOLDERS = frozenset({"agent", "unknown", "unknownagent"})
+
+# Letters of other scripts that read as a Latin letter, both cases, applied BEFORE case folding (a capital and its
+# small form can imitate different Latin letters: Greek capital NU is "N", small nu is "v"), and the digit and
+# symbol stand-ins. "1" is
+# not here: `_name_skeleton` puts it in the i/l class.
+_CONFUSABLE_FOLD = str.maketrans({
+    # Cyrillic capitals, then small letters.
+    "А": "a", "В": "b", "Е": "e", "К": "k", "М": "m", "Н": "h", "О": "o", "Р": "p", "С": "c", "Т": "t",
+    "У": "y", "Х": "x", "І": "i", "Ј": "j", "Ѕ": "s", "Ԛ": "q", "Ԝ": "w", "Һ": "h", "Ӏ": "l", "Ү": "y",
+    "а": "a", "в": "b", "е": "e", "к": "k", "м": "m", "н": "h", "о": "o", "р": "p", "с": "c", "т": "t",
+    "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s", "ԁ": "d", "ԛ": "q", "ԝ": "w", "һ": "h", "ӏ": "l",
+    "ү": "y",
+    # Cyrillic letters shaped like a Greek lookalike capital or a Latin letter turned (both cases).
+    "Л": "l", "л": "l", "П": "n", "п": "n", "Г": "r", "г": "r", "И": "n", "Ш": "w", "ш": "w", "Ь": "b", "ь": "b",
+    # Greek capitals, then small letters.
+    "Α": "a", "Β": "b", "Ε": "e", "Ζ": "z", "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ο": "o",
+    "Ρ": "p", "Τ": "t", "Υ": "y", "Χ": "x", "Ϲ": "c", "Ϳ": "j", "Λ": "l", "Π": "n", "Σ": "e", "Δ": "a",
+    "α": "a", "β": "b", "γ": "y", "ε": "e", "ζ": "z", "η": "n", "ι": "i", "κ": "k", "μ": "m", "ν": "v",
+    "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "ω": "w", "ϲ": "c", "ϳ": "j", "λ": "l", "π": "n",
+    # Latin letters that read as another Latin letter.
+    "ı": "i", "ɡ": "g", "ɩ": "i",
+    # Digit and symbol stand-ins.
+    "0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "$": "s", "@": "a", "!": "i", "|": "l",
+})
+
+# The scripts whose letters pass for Latin ones: a portal name mixing Latin letters with either is refused.
+_LOOKALIKE_SCRIPTS = ("CYRILLIC", "GREEK")
+
+# THE allowlist of scripts a portal name's letters may come from, by the first word of each letter's Unicode name
+# after NFKD (`_letter_script`): a letter of any other script refuses the name, so a lookalike from a script the
+# fold has never heard of (Cherokee, Armenian, Lisu, Canadian syllabics, ...) never shows. How they resolve:
+# Han ideographs are "CJK UNIFIED IDEOGRAPH-xxxx" (compatibility ideographs and Kangxi radicals decompose to them)
+# -> "CJK"; the iteration mark 々 -> "IDEOGRAPHIC"; kana -> "HIRAGANA" / "KATAKANA" (halfwidth kana decompose to
+# KATAKANA), the long-vowel mark ー -> "KATAKANA-HIRAGANA"; Hangul syllables decompose to jamo "HANGUL CHOSEONG /
+# JUNGSEONG / JONGSEONG ..." and compatibility jamo to the same -> "HANGUL". LATIN letters pass only as ASCII a-z
+# or A-Z (`_portal_name_letters_allowed`).
+_PORTAL_NAME_SCRIPTS = frozenset({
+    "LATIN", "CJK", "IDEOGRAPHIC", "HIRAGANA", "KATAKANA", "KATAKANA-HIRAGANA", "HANGUL", "CYRILLIC", "GREEK",
+    "ARABIC", "HEBREW", "THAI", "DEVANAGARI",
+})
 
 # Control, format (bidi overrides, zero-width), surrogate, private-use and unassigned code points, and line or
 # paragraph separators: none belongs in a name a buyer reads, and several can make one read as another.
@@ -907,14 +963,113 @@ def clean_buyer_display_name(raw: Any) -> Optional[str]:
     return name if has_letter_or_digit else None
 
 
+# Letter shapes that read as one another in common sans-serif fonts. Expanded the SAME way in a name and in each
+# term ("m" -> "rn", so "Arnex" and "Amex" share "arnex"; a plain "vv" -> "w" would instead turn "VVisa" into
+# "wisa" and miss "visa"), then i, l, capital I and 1 are one letter ("PayPaI" reads as "paypal").
+_SKELETON_EXPANSIONS = (("m", "rn"), ("d", "cl"), ("w", "vv"))
+_SKELETON_I_CLASS = str.maketrans({"l": "i", "1": "i"})
+
+
+def _name_skeleton(name: str) -> str:
+    """The name as the block list reads it: compatibility forms folded (fullwidth, ligatures), accents dropped,
+    lookalike letters and stand-ins read as the Latin letter they imitate (`_CONFUSABLE_FOLD`), case folded, only
+    letters and digits kept, then `_SKELETON_EXPANSIONS` and the i/l class (capital I is already i after case
+    folding). "Ｐаy-PaI", "V1sa" and "Arnex" read as the skeletons of "paypal", "visa" and "amex"."""
+    folded = unicodedata.normalize("NFKD", name).translate(_CONFUSABLE_FOLD).casefold()
+    key = "".join(ch for ch in folded if ch.isalnum())
+    for shape, expanded in _SKELETON_EXPANSIONS:
+        key = key.replace(shape, expanded)
+    return key.translate(_SKELETON_I_CLASS)
+
+
+_BLOCKED_TERM_SKELETONS = tuple(_name_skeleton(term) for term in PORTAL_NAME_BLOCKED_TERMS)
+_PLACEHOLDER_SKELETONS = frozenset(_name_skeleton(placeholder) for placeholder in _PORTAL_NAME_PLACEHOLDERS)
+
+
+def _letter_script(ch: str) -> str:
+    """The script a letter belongs to, as its Unicode name starts ("LATIN", "CYRILLIC", "GREEK", "CJK", ...)."""
+    return unicodedata.name(ch, "").split(" ", 1)[0]
+
+
+def portal_name_mixes_lookalike_scripts(name: str) -> bool:
+    """True when the name has Latin letters AND Cyrillic or Greek ones: the shape of a lookalike spelling. A name
+    wholly in Cyrillic or Greek, or Latin mixed with any other script ("Meitu 美图"), is not refused here."""
+    scripts = {_letter_script(ch) for ch in unicodedata.normalize("NFKD", name) if ch.isalpha()}
+    return "LATIN" in scripts and any(script in scripts for script in _LOOKALIKE_SCRIPTS)
+
+
+def _portal_name_letters_allowed(name: str) -> bool:
+    """True when every letter of the name, after NFKD with combining marks dropped, is ASCII a-z / A-Z or a letter
+    of an allowed script (`_PORTAL_NAME_SCRIPTS`). Any other Latin letter (small capitals, IPA, stroke or hook
+    letters, ø, ß, ł) and any letter of another script refuses the name: an allowlist, not a table of lookalikes
+    that would keep leaking. Over-blocks a few real names; a name set by hand is the way to show one."""
+    for ch in unicodedata.normalize("NFKD", name):
+        if not ch.isalpha():  # digits, spaces, punctuation, and combining marks (never letters) are not judged
+            continue
+        script = _letter_script(ch)
+        if script == "LATIN":
+            if not ("a" <= ch <= "z" or "A" <= ch <= "Z"):
+                return False
+        elif script not in _PORTAL_NAME_SCRIPTS:
+            return False
+    return True
+
+
+def portal_name_is_blocked(name: str) -> bool:
+    """True when a portal-registered name must never show: a letter outside the allowlist, a placeholder, a
+    blocked term in any fold, or Latin mixed with a lookalike script. Never applied to a name set by hand."""
+    if not _portal_name_letters_allowed(name):
+        return True
+    skeleton = _name_skeleton(name)
+    # Placeholders also against the unfolded key: "Agent!" is "agent", not the "agenti" its "!" folds to.
+    plain = "".join(ch for ch in unicodedata.normalize("NFKD", name).casefold() if ch.isalnum())
+    if plain in _PORTAL_NAME_PLACEHOLDERS or skeleton in _PLACEHOLDER_SKELETONS:
+        return True
+    if any(term in skeleton for term in _BLOCKED_TERM_SKELETONS):
+        return True
+    return portal_name_mixes_lookalike_scripts(name)
+
+
 async def get_buyer_display_name(agent_id: str) -> Optional[str]:
-    """The name Pivota reviewed for this agent (agents.buyer_display_name, set by hand), cleaned, or None: no
-    agent, no reviewed name, or one without a name's shape. NEVER agents.agent_name, which the agent's own
-    developer typed. Raises on a read fault; the caller decides what a fault means."""
+    """The name the buyer page shows for this agent, or None (no "Requested by" line).
+
+    1. A name set by hand (agents.buyer_display_name, migration 297) decides whenever it is not NULL: shown if it
+       has a name's shape, else nothing. It never falls through to the portal name, so storing '' hides a portal
+       name without the developer.
+    2. Otherwise the name the agent registered with in the developer portal (agents.agent_name, this agent's row
+       only), when it has a name's shape and `portal_name_is_blocked` is False. A rename hides it until checked
+       again (`portal_name_rename_hide`).
+    Nothing else, ever: not the user's full_name, not a legacy `name` column, not "Agent" or "Unknown".
+    Raises on a read fault; the caller decides what a fault means."""
     row = await database.fetch_one(_SELECT_BUYER_DISPLAY_NAME_SQL, {"agent_id": agent_id})
     if row is None:
         return None
-    return clean_buyer_display_name(dict(row).get("buyer_display_name"))
+    data = dict(row)
+    reviewed = data.get("buyer_display_name")
+    if reviewed is not None:
+        return clean_buyer_display_name(reviewed)
+    registered = clean_buyer_display_name(data.get("agent_name"))
+    if registered is None or portal_name_is_blocked(registered):
+        return None
+    return registered
+
+
+# A rename of a name the page shows from the portal: hidden ('') in the same transaction as the rename, until a
+# gated one-off checks the new name and sets the column back to NULL (or to a name). Only while the column is NULL:
+# a name set by hand (or '') already decides and does not depend on agent_name. Raw SQL: not a model column.
+_HIDE_PORTAL_NAME_ON_RENAME_SQL = (
+    "UPDATE agents SET buyer_display_name = '' "
+    "WHERE agent_id = :agent_id AND buyer_display_name IS NULL "
+    "AND (agent_name <> :new_name OR agent_name IS NULL)"
+)
+
+
+def portal_name_rename_hide(agent_id: str, new_name: str) -> Tuple[str, Dict[str, Any]]:
+    """The statement (sql, values) that hides the portal name of an agent renamed to new_name. Run it with the
+    writer's own `database`, inside the transaction that writes agents.agent_name, BEFORE that write; a fault
+    must fail the rename, never let it land unhidden. A no-op when the name is unchanged or a name set by hand
+    decides."""
+    return _HIDE_PORTAL_NAME_ON_RENAME_SQL, {"agent_id": agent_id, "new_name": new_name}
 
 
 async def update_agent_stats(

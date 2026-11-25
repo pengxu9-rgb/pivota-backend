@@ -116,5 +116,46 @@ async def test_unknown_ids_and_the_wrong_rail_are_none():
     assert await purchases.get_by_rail_id_for_agent("reap", rail_id, AGENT) is None
 
 
+async def test_the_agent_name_read_and_the_rename_hide_run_on_postgres():
+    """db/agents.get_buyer_display_name's SELECT and portal_name_rename_hide's UPDATE are raw SQL on a column
+    the model does not have: here they run on the production dialect, on the table the model builds plus the
+    column the boot heal adds."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    import db.agents as agents_db
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await database.execute(str(CreateTable(agents_db.agents, if_not_exists=True).compile(dialect=postgresql.dialect())))
+    await ensure_required_schema_light()  # the heal adds buyer_display_name now that agents exists
+    await database.execute("DELETE FROM agents WHERE agent_id = :a", {"a": AGENT})
+    try:
+        await database.execute(
+            "INSERT INTO agents (agent_id, agent_name, agent_type, api_key, api_key_hash, is_active) "
+            "VALUES (:a, 'Example Assistant', 'custom', :k, :h, TRUE)",
+            {"a": AGENT, "k": f"redacted:{AGENT}", "h": "0" * 64})
+        assert await agents_db.get_buyer_display_name(AGENT) == "Example Assistant"
+        # The same name: nothing hidden.
+        await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Example Assistant"))
+        assert await agents_db.get_buyer_display_name(AGENT) == "Example Assistant"
+        # A rename, as PUT /agents/{agent_id} runs it: the hide, then the write, in one transaction.
+        async with database.transaction():
+            await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Renamed Assistant"))
+            await database.execute("UPDATE agents SET agent_name = 'Renamed Assistant' WHERE agent_id = :a",
+                                   {"a": AGENT})
+        row = await database.fetch_one("SELECT buyer_display_name FROM agents WHERE agent_id = :a", {"a": AGENT})
+        assert dict(row)["buyer_display_name"] == ""
+        assert await agents_db.get_buyer_display_name(AGENT) is None
+        # A hand-set name is left as it is by a later rename, and decides.
+        await database.execute("UPDATE agents SET buyer_display_name = 'Hand Set Name' WHERE agent_id = :a",
+                               {"a": AGENT})
+        await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Third Name"))
+        assert await agents_db.get_buyer_display_name(AGENT) == "Hand Set Name"
+        assert await agents_db.get_buyer_display_name(OTHER_AGENT) is None
+    finally:
+        await database.execute("DELETE FROM agents WHERE agent_id = :a", {"a": AGENT})
+
+
 def test_this_module_does_not_import_main():
     assert "main" not in sys.modules
