@@ -1336,6 +1336,13 @@ async def ensure_required_schema_light() -> None:
                 await _heal_add_columns("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;")
             except Exception:  # noqa: BLE001
                 pass
+            # mig 297: the agent's buyer-facing name, reviewed by Pivota and set by hand (NULL = no name shown).
+            # Its own try. agents is read on every authenticated request: the guarded heal takes the lock only
+            # while the column is missing, under the heal lock_timeout (a busy table = one retry next boot).
+            try:
+                await _heal_add_columns("ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS buyer_display_name VARCHAR(64);")
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -4134,6 +4141,11 @@ async def ensure_required_schema_light() -> None:
             # mig 254: SQLite twin; duplicate column is the idempotent no-op.
             try:
                 await database.execute(text("ALTER TABLE reap_agentic_enrollments ADD COLUMN hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 297: SQLite twin; a duplicate column (or no agents table) is the idempotent no-op.
+            try:
+                await database.execute(text("ALTER TABLE agents ADD COLUMN buyer_display_name VARCHAR(64);"))
             except Exception:  # noqa: BLE001
                 pass
             # mig 225: the resolver's three hint columns, SQLite twin.

@@ -520,3 +520,135 @@ async def test_a_stored_last4_that_is_not_four_digits_shows_no_card(monkeypatch,
     rail_id = await _reap(state="awaiting_approval", **_bound(enrollment_id))
     answer = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
     assert answer.status_code == 200 and "payment_card" not in answer.json()
+
+
+# ── the agent's reviewed name (agents.buyer_display_name, migration 297) ─────────────────────────
+
+
+async def _agent_row(agent_id: str = AGENT, *, agent_name: str = "Self Declared Name",
+                     reviewed: Optional[str] = None) -> None:
+    """One agents row for this file's agent id, built from the model when the table is missing, with the
+    column the boot heal adds (re-run here: the fixture's heal ran before this table may have existed)."""
+    from sqlalchemy.dialects import postgresql, sqlite
+    from sqlalchemy.schema import CreateTable
+
+    import db.agents as agents_db
+
+    dialect = postgresql.dialect() if IS_POSTGRES else sqlite.dialect()
+    await database.execute(str(CreateTable(agents_db.agents, if_not_exists=True).compile(dialect=dialect)))
+    await ensure_required_schema_light()
+    await database.execute("DELETE FROM agents WHERE agent_id = :a", {"a": agent_id})
+    await database.execute(
+        "INSERT INTO agents (agent_id, agent_name, agent_type, api_key, api_key_hash, is_active, buyer_display_name) "
+        "VALUES (:a, :n, 'custom', :k, :h, TRUE, :r)",
+        {"a": agent_id, "n": agent_name, "k": f"redacted:{agent_id}", "h": "0" * 64, "r": reviewed})
+
+
+@pytest.fixture
+async def _agent_rows():
+    yield
+    await database.execute("DELETE FROM agents WHERE agent_id IN (:a, :b)", {"a": AGENT, "b": OTHER_AGENT})
+
+
+async def test_a_reviewed_name_is_on_the_body_for_either_rail_and_never_on_the_public_route(_agent_rows):
+    await _agent_row(reviewed="Example Assistant")
+    for rail_id in (await _reap(), await _a2a()):
+        internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+        assert internal.status_code == 200, internal.text
+        assert internal.json()["agent_display_name"] == "Example Assistant"
+        public = await _public(f"{PUBLIC}/{rail_id}")
+        assert public.status_code == 200 and "agent_display_name" not in public.json()
+        assert "Example Assistant" not in public.text
+        # Nothing else changed: the body is the public one plus the name.
+        assert {k: v for k, v in internal.json().items() if k != "agent_display_name"} == public.json()
+
+
+async def test_the_self_declared_agent_name_is_never_shown(_agent_rows):
+    await _agent_row(agent_name="Your Bank", reviewed=None)
+    rail_id = await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
+    assert "Your Bank" not in internal.text
+    assert internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+
+
+async def test_no_agent_row_means_no_name():
+    rail_id = await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
+
+
+async def test_another_agents_reviewed_name_is_never_used(_agent_rows):
+    await _agent_row(OTHER_AGENT, reviewed="Other Assistant")
+    await _agent_row(AGENT, reviewed=None)
+    rail_id = await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
+
+
+@pytest.mark.parametrize("stored", ["   ", "‮knaB ruoY", "Example​Assistant", "Line\nBreak", "Two  Spaces",
+                                    "!!!", "Tab\tName"])
+async def test_a_stored_name_without_a_names_shape_is_not_shown(_agent_rows, stored):
+    await _agent_row(reviewed=stored)
+    rail_id = await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
+
+
+async def test_a_stored_name_is_trimmed(_agent_rows):
+    await _agent_row(reviewed="  Example Assistant ")
+    internal = await _get(f"{INTERNAL}/{await _reap()}", headers=_headers())
+    assert internal.json()["agent_display_name"] == "Example Assistant"
+
+
+async def test_a_name_read_fault_drops_the_name_never_the_body(monkeypatch, _agent_rows):
+    import db.agents as agents_db
+
+    await _agent_row(reviewed="Example Assistant")
+
+    async def boom(agent_id):
+        raise RuntimeError("agents read down")
+
+    monkeypatch.setattr(agents_db, "get_buyer_display_name", boom)
+    rail_id = await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
+    assert internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+
+
+def test_the_reviewed_name_column_is_not_on_the_agents_model():
+    # Every model SELECT names every model column: one boot whose heal lost the lock race would then break
+    # every agent read. Only db/agents.get_buyer_display_name names it.
+    import db.agents as agents_db
+
+    assert "buyer_display_name" not in agents_db.agents.c
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Example Assistant", "Example Assistant"),
+    ("  Example Assistant\t", "Example Assistant"),
+    ("Agent Ñandú", "Agent Ñandú"),
+    ("示例助手", "示例助手"),
+    ("Assistant 2", "Assistant 2"),
+    ("A", "A"),
+    ("x" * 64, "x" * 64),
+    ("x" * 65, None),
+    ("", None),
+    ("   ", None),
+    (None, None),
+    (42, None),
+    ("Agent Ñandu", None),  # not NFC: refused, never normalised
+    ("Two  Spaces", None),
+    ("Line\nBreak", None),
+    ("No Break", None),
+    ("‮knaB", None),
+    ("Zero​Width", None),
+    ("Bom﻿", None),
+    ("Para Sep", None),
+    ("Private", None),
+    ("!!! ---", None),
+])
+def test_clean_buyer_display_name(raw, expected):
+    import db.agents as agents_db
+
+    assert agents_db.clean_buyer_display_name(raw) == expected
