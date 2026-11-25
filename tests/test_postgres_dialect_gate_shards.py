@@ -49,6 +49,10 @@ def _ride_alongs() -> list:
     return _env()["RIDE_ALONGS"].split()
 
 
+def _solo() -> list:
+    return (_env().get("SOLO_FILES") or "").split()
+
+
 # ── the workflow's shape ──────────────────────────────────────────────────────
 
 
@@ -94,7 +98,7 @@ def test_every_gate_file_and_ride_along_runs_in_exactly_one_shard():
     assert gate and len(ride) == len(_ride_alongs())
     seen = []
     for k in range(1, _num_shards() + 1):
-        planned = shards.plan(gate, ride, k, _num_shards(), _ride_along_shard())
+        planned = shards.plan(gate, ride, k, _num_shards(), _ride_along_shard(), _solo())
         assert any(f in gate for f in planned), f"shard {k} has no gate file"
         seen += planned
     assert sorted(seen) == sorted(gate + ride)
@@ -104,7 +108,8 @@ def test_every_gate_file_and_ride_along_runs_in_exactly_one_shard():
 def test_a_shard_keeps_the_unsharded_order_and_ends_with_the_ride_alongs():
     gate = shards.discover(ROOT)
     ride = shards.present(ROOT, _ride_alongs())
-    planned = shards.plan(gate, ride, _ride_along_shard(), _num_shards(), _ride_along_shard())
+    planned = shards.plan(gate, ride, _ride_along_shard(), _num_shards(), _ride_along_shard(),
+                          _solo())
     head, tail = planned[: -len(ride)], planned[-len(ride):]
     assert tail == ride
     assert head == [f for f in gate if f in head]
@@ -119,6 +124,46 @@ def test_adding_a_file_moves_no_other_file():
     assert sum(len(shards.plan(grown, [], k, 3, 1)) for k in (1, 2, 3)) == 61
 
 
+def test_every_solo_file_runs_alone_in_one_of_the_last_shards():
+    gate = shards.discover(ROOT)
+    ride = shards.present(ROOT, _ride_alongs())
+    solo, n = _solo(), _num_shards()
+    assert shards.solo_problems(gate, ride, solo, n, _ride_along_shard()) == []
+    hashed = n - len(solo)
+    for i, f in enumerate(solo):
+        assert shards.plan(gate, ride, hashed + 1 + i, n, _ride_along_shard(), solo) == [f]
+    for k in range(1, hashed + 1):
+        assert not set(solo) & set(shards.plan(gate, ride, k, n, _ride_along_shard(), solo))
+
+
+def test_naming_a_solo_file_moves_no_other_file():
+    """Solo shards are appended, so the hashed shards keep their modulus and every other
+    file stays in the shard it was in -- it only loses the solo file as a neighbour."""
+    gate = [f"tests/test_f{i}_postgres.py" for i in range(60)]
+    heavy = gate[17]
+    for k in (1, 2, 3):
+        before = shards.plan(gate, [], k, 3, 1)
+        after = shards.plan(gate, [], k, 4, 1, [heavy])
+        assert after == [f for f in before if f != heavy]
+    assert shards.plan(gate, [], 4, 4, 1, [heavy]) == [heavy]
+
+
+@pytest.mark.parametrize("solo, num_shards, ride_shard, needle", [
+    (["tests/test_gone_postgres.py"], 4, 1, "is not a"),
+    (["tests/test_ride_a.py"], 4, 1, "also a ride-along"),
+    (["tests/test_m1_postgres.py", "tests/test_m1_postgres.py"], 5, 1, "listed twice"),
+    (["tests/test_m1_postgres.py"], 4, 4, "must be a hashed shard"),
+    (["tests/test_m1_postgres.py"], 1, 1, "at least one shard must be hashed"),
+])
+def test_a_bad_solo_list_is_refused_by_name(solo, num_shards, ride_shard, needle):
+    gate = sorted(f"tests/test_m{i}_postgres.py" for i in range(12))
+    ride = ["tests/test_ride_a.py"]
+    problems = shards.solo_problems(gate, ride, solo, num_shards, ride_shard)
+    assert any(needle in p for p in problems), problems
+    with pytest.raises(ValueError, match=needle):
+        shards.plan(gate, ride, 1, num_shards, ride_shard, solo)
+
+
 @pytest.mark.parametrize("bad", [0, 4])
 def test_a_shard_out_of_range_is_an_error(bad):
     with pytest.raises(ValueError):
@@ -129,6 +174,8 @@ def test_a_shard_out_of_range_is_an_error(bad):
 
 GATE = sorted(f"tests/test_m{i}_postgres.py" for i in range(12))
 RIDE = ["tests/test_ride_a.py", "tests/test_ride_b.py"]
+# Two hashed shards and one solo shard: the shape the workflow runs (3 hashed + 1 solo).
+SOLO = ["tests/test_m5_postgres.py"]
 N, RIDE_SHARD = 3, 2
 
 
@@ -153,7 +200,7 @@ def _write_shards(repo, out, *, drop=None, skip_in=None, mute=None, recovery_in=
             continue
         d = out / f"postgres-dialect-gate-1-shard-{k}"
         d.mkdir(parents=True)
-        files = shards.plan(GATE, RIDE, k, N, RIDE_SHARD)
+        files = shards.plan(GATE, RIDE, k, N, RIDE_SHARD, SOLO)
         if manifest_files and k in manifest_files:
             files = manifest_files[k]
         modules = [shards.module_of(f) for f in files if f in GATE]
@@ -166,13 +213,27 @@ def _write_shards(repo, out, *, drop=None, skip_in=None, mute=None, recovery_in=
             (d / f"pytest-recovery-postgres-shard-{k}.xml").write_text(_junit(["recovery"]))
 
 
-def _verify(repo, out, needs="success"):
-    return shards.verify(out, repo, N, RIDE, RIDE_SHARD, RIDE_SHARD, needs)
+def _verify(repo, out, needs="success", solo=SOLO):
+    return shards.verify(out, repo, N, RIDE, RIDE_SHARD, RIDE_SHARD, needs, solo)
 
 
 def test_a_complete_run_verifies(repo, tmp_path):
     _write_shards(repo, tmp_path / "s")
     assert _verify(repo, tmp_path / "s") == []
+
+
+def test_verify_checks_the_solo_shard_against_the_solo_list(repo, tmp_path):
+    """Shards planned with one solo list do not verify against another: the hashed
+    shards' lists differ, and the solo file's shard ran something verify did not plan."""
+    _write_shards(repo, tmp_path / "s")
+    errors = _verify(repo, tmp_path / "s", solo=[])
+    assert any(f"shard {N} ran" in e for e in errors)
+
+
+def test_verify_refuses_a_solo_file_that_is_gone(repo, tmp_path):
+    _write_shards(repo, tmp_path / "s")
+    (repo / SOLO[0]).unlink()
+    assert any("is not a" in e for e in _verify(repo, tmp_path / "s"))
 
 
 @pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
@@ -194,13 +255,13 @@ def test_any_skip_fails(repo, tmp_path):
 
 
 def test_a_gate_module_that_ran_nothing_fails(repo, tmp_path):
-    victim = shards.module_of(shards.plan(GATE, RIDE, 1, N, RIDE_SHARD)[0])
+    victim = shards.module_of(shards.plan(GATE, RIDE, 1, N, RIDE_SHARD, SOLO)[0])
     _write_shards(repo, tmp_path / "s", mute=victim)
     assert any(victim in e and "executed no tests" in e for e in _verify(repo, tmp_path / "s"))
 
 
 def test_a_shard_that_ran_a_different_list_fails(repo, tmp_path):
-    files = shards.plan(GATE, RIDE, 1, N, RIDE_SHARD)
+    files = shards.plan(GATE, RIDE, 1, N, RIDE_SHARD, SOLO)
     _write_shards(repo, tmp_path / "s", manifest_files={1: files[1:]})
     errors = _verify(repo, tmp_path / "s")
     assert any("shard 1 ran" in e for e in errors)
@@ -222,9 +283,10 @@ def test_plan_writes_the_step_outputs_and_manifest(repo, tmp_path, monkeypatch):
     manifest = tmp_path / "m.json"
     code = shards.main(["plan", "--root", str(repo), "--num-shards", str(N), "--shard",
                         str(RIDE_SHARD), "--ride-along-shard", str(RIDE_SHARD),
-                        "--ride-alongs", " ".join(RIDE), "--manifest", str(manifest)])
+                        "--ride-alongs", " ".join(RIDE), "--solo", " ".join(SOLO),
+                        "--manifest", str(manifest)])
     assert code == 0
-    files = shards.plan(GATE, RIDE, RIDE_SHARD, N, RIDE_SHARD)
+    files = shards.plan(GATE, RIDE, RIDE_SHARD, N, RIDE_SHARD, SOLO)
     lines = out.read_text().splitlines()
     assert lines[0] == "files=" + " ".join(files)
     assert lines[1] == "gate_modules=" + " ".join(
@@ -236,6 +298,16 @@ def test_verify_exits_nonzero_on_a_violation(repo, tmp_path):
     _write_shards(repo, tmp_path / "s", skip_in=2)
     code = shards.main(["verify", "--root", str(repo), "--shards-dir", str(tmp_path / "s"),
                         "--num-shards", str(N), "--ride-along-shard", str(RIDE_SHARD),
-                        "--ride-alongs", " ".join(RIDE), "--recovery-shard", str(RIDE_SHARD),
-                        "--needs-result", "success"])
+                        "--ride-alongs", " ".join(RIDE), "--solo", " ".join(SOLO),
+                        "--recovery-shard", str(RIDE_SHARD), "--needs-result", "success"])
     assert code == 1
+
+
+def test_plan_names_a_bad_solo_file_and_exits_nonzero(repo, tmp_path, capsys):
+    code = shards.main(["plan", "--root", str(repo), "--num-shards", str(N), "--shard", "1",
+                        "--ride-along-shard", str(RIDE_SHARD), "--ride-alongs", " ".join(RIDE),
+                        "--solo", "tests/test_gone_postgres.py", "--manifest",
+                        str(tmp_path / "m.json")])
+    assert code == 1
+    assert "tests/test_gone_postgres.py" in capsys.readouterr().err
+    assert not (tmp_path / "m.json").exists()
