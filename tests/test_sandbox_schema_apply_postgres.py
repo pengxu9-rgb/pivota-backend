@@ -143,21 +143,66 @@ async def _recreate(admin, name):
     await admin.execute('CREATE DATABASE "%s"' % name)
 
 
+#: The apply role, as docs/sandbox/schema_bootstrap.md has infra create it (a test-only name and password).
+APPLY_ROLE, APPLY_PASSWORD = "sandbox_schema_apply_test", "apply-test-pw"
+APPLY_ATTRS = "LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS"
+
+
+def _dsn_as(user, password, db):
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(BASE)
+    return "postgresql://%s:%s@%s/%s" % (user, password, parts.netloc.rsplit("@", 1)[-1], db)
+
+
+APPLY = _dsn_as(APPLY_ROLE, APPLY_PASSWORD, DST_DB)
+
+
+async def _drop_apply_role(admin):
+    if await admin.fetchval("SELECT 1 FROM pg_roles WHERE rolname = $1", APPLY_ROLE):
+        await admin.execute('DROP ROLE "%s"' % APPLY_ROLE)
+
+
+async def _bootstrap_apply_role(admin, attrs=APPLY_ATTRS):
+    """The admin's bootstrap SQL: the role, CONNECT, USAGE+CREATE on public, the extensions pre-created."""
+    import asyncpg
+
+    await admin.execute("CREATE ROLE \"%s\" %s PASSWORD '%s'" % (APPLY_ROLE, attrs, APPLY_PASSWORD))
+    await admin.execute('GRANT CONNECT ON DATABASE "%s" TO "%s"' % (DST_DB, APPLY_ROLE))
+    dst_admin = await asyncpg.connect(DST)
+    try:
+        await dst_admin.execute('GRANT USAGE, CREATE ON SCHEMA public TO "%s"' % APPLY_ROLE)
+        await dst_admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
+    finally:
+        await dst_admin.close()
+
+
+async def _as_apply_role():
+    import asyncpg
+
+    return await asyncpg.connect(APPLY, statement_cache_size=0)  # as _run connects
+
+
 @pytest.fixture
 async def dbs():
     import asyncpg
 
     admin = await _admin()
     for name in (SRC_DB, DST_DB):
+        await admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
+    await _drop_apply_role(admin)
+    for name in (SRC_DB, DST_DB):
         await _recreate(admin, name)
     src = await asyncpg.connect(SRC)
     await src.execute(SOURCE_DDL)
     await src.close()
+    await _bootstrap_apply_role(admin)
     try:
-        yield
+        yield admin
     finally:
         for name in (SRC_DB, DST_DB):
             await admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
+        await _drop_apply_role(admin)
         await admin.close()
 
 
@@ -188,7 +233,7 @@ async def test_the_sandbox_gets_prods_schema_exactly_and_no_rows(dbs, tmp_path):
     assert ROW_SECRET.encode() not in blob and b"owner@person.example" not in blob
     assert b"comment-that-must-never-leave" not in blob and b"GRANT " not in blob
 
-    dst = await asyncpg.connect(DST)
+    dst = await _as_apply_role()
     try:
         report = await A.apply_schema(dst, LocalDirStore(tmp_path / "drop"))
         assert report["stamp"] == STAMP and report["ledger_rows"] == 5
@@ -214,9 +259,11 @@ async def test_a_populated_sandbox_is_never_touched(dbs, tmp_path):
     import asyncpg
 
     assert _dump(tmp_path).returncode == 0
-    dst = await asyncpg.connect(DST)
+    dst_admin = await asyncpg.connect(DST)
+    await dst_admin.execute("CREATE TABLE already_here (id int)")  # the admin's, not the apply role's
+    await dst_admin.close()
+    dst = await _as_apply_role()
     try:
-        await dst.execute("CREATE TABLE already_here (id int)")
         with pytest.raises(A.SchemaRefused, match="not empty"):
             await A.apply_schema(dst, LocalDirStore(tmp_path / "drop"))
         assert await dst.fetchval("SELECT to_regclass('public.offers')") is None
@@ -228,7 +275,7 @@ async def test_a_failing_apply_leaves_the_sandbox_empty(dbs, tmp_path):
     import asyncpg
 
     assert _dump(tmp_path).returncode == 0
-    dst = await asyncpg.connect(DST)
+    dst = await _as_apply_role()
     try:
         # A table count the source never had: the post-check fails and everything rolls back.
         import json
@@ -305,29 +352,38 @@ async def test_a_malformed_lock_wait_or_deadline_is_refused(dbs, tmp_path):
         assert done.returncode == 2 and "SCHEMA_DUMP_" in done.stderr
 
 
-async def test_literals_are_read_standard_conforming_even_if_the_session_is_not(dbs, tmp_path):
-    """The tokenizer reads '...' as standard-conforming. The apply forces the server to agree, so a file
-    without pg_dump's own SET (and a session left with it off) still means what the tokenizer read."""
-    import gzip
+TRAILER = "\n--\n-- PostgreSQL database dump complete\n--\n"
+
+
+async def _server_major(conn):
+    return int(await conn.fetchval("SHOW server_version_num")) // 10000
+
+
+def _hand_drop(tmp_path, schema, *, ledgers="", tables_live=1, ledger_rows=0, pg_dump_version, folder="drop2"):
+    """A drop written by hand, for the apply-side checks (the dump script never writes these shapes)."""
     import hashlib
     import json
 
-    import asyncpg
-
     stamp = "20261125T2359Z"
-    schema = "CREATE TABLE public.bs (a text DEFAULT 'C:\\temp');\n--\n-- PostgreSQL database dump complete\n--\n"
-    ledgers = A.LEDGER_TRAILER + "\n"
-    store = LocalDirStore(tmp_path / "drop2")
+    store = LocalDirStore(tmp_path / folder)
     files = {}
-    for part, text in (("schema", schema), ("ledgers", ledgers)):
+    for part, text in (("schema", schema + TRAILER), ("ledgers", ledgers + A.LEDGER_TRAILER + "\n")):
         data = gzip.compress(text.encode())
         store.put("%s/%s.sql.gz" % (stamp, part), data)
         files[part] = {"file": "%s/%s.sql.gz" % (stamp, part), "sha256": hashlib.sha256(data).hexdigest()}
     store.put("%s/_MANIFEST.json" % stamp, json.dumps({
-        "format_version": A.FORMAT_VERSION, "kind": "schema", "stamp": stamp, "tables_live": 1, "ledger_rows": 0,
-        "files": files}).encode())
-    dst = await asyncpg.connect(DST)
+        "format_version": A.FORMAT_VERSION, "kind": "schema", "stamp": stamp, "tables_live": tables_live,
+        "ledger_rows": ledger_rows, "pg_dump_version": pg_dump_version, "files": files}).encode())
+    return store
+
+
+async def test_literals_are_read_standard_conforming_even_if_the_session_is_not(dbs, tmp_path):
+    """The parser reads '...' as standard-conforming. The apply forces the server to agree, so a session
+    left with it off still means what the parser read."""
+    dst = await _as_apply_role()
     try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.bs (a text DEFAULT 'C:\\temp');",
+                           pg_dump_version="%d.1" % await _server_major(dst))
         await dst.execute("SET standard_conforming_strings = off")
         await A.apply_schema(dst, store)
         await dst.execute("INSERT INTO public.bs DEFAULT VALUES")
@@ -335,3 +391,178 @@ async def test_literals_are_read_standard_conforming_even_if_the_session_is_not(
     finally:
         await dst.close()
     assert value == "C:\\temp"  # a backslash and a t, not a tab
+
+
+# --- THE gate: the apply role (the 77a881c7f review, fix direction (i)) ------------------------------
+async def test_a_superuser_is_refused_before_anything_runs(dbs, tmp_path):
+    import asyncpg
+
+    admin_dst = await asyncpg.connect(DST)
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(admin_dst))
+        with pytest.raises(A.SchemaRefused, match="is a superuser"):
+            await A.apply_schema(admin_dst, store)
+        assert await A._user_table_count(admin_dst) == 0
+    finally:
+        await admin_dst.close()
+
+
+@pytest.mark.parametrize("attrs,setup,match", [
+    (APPLY_ATTRS.replace("NOCREATEROLE", "CREATEROLE"), None, "can create roles"),
+    (APPLY_ATTRS.replace("NOCREATEDB", "CREATEDB"), None, "can create databases"),
+    (APPLY_ATTRS.replace("NOBYPASSRLS", "BYPASSRLS"), None, "bypasses row security"),
+    (APPLY_ATTRS, 'GRANT pg_monitor TO "%s"' % APPLY_ROLE, "member of another role"),
+    (APPLY_ATTRS, 'GRANT CREATE ON DATABASE "%s" TO "%s"' % (DST_DB, APPLY_ROLE), "CREATE on the database"),
+])
+async def test_an_apply_role_with_any_extra_power_is_refused(dbs, tmp_path, attrs, setup, match):
+    admin = dbs
+    await admin.execute('REVOKE ALL ON DATABASE "%s" FROM "%s"' % (DST_DB, APPLY_ROLE))
+    import asyncpg
+
+    dst_admin = await asyncpg.connect(DST)
+    await dst_admin.execute('REVOKE ALL ON SCHEMA public FROM "%s"' % APPLY_ROLE)
+    await dst_admin.close()
+    await _drop_apply_role(admin)
+    await _bootstrap_apply_role(admin, attrs)
+    if setup:
+        await admin.execute(setup)
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(dst))
+        with pytest.raises(A.SchemaRefused, match=match):
+            await A.apply_schema(dst, store)
+        assert await A._user_table_count(dst) == 0
+    finally:
+        await dst.close()
+        await admin.execute('REVOKE pg_monitor FROM "%s"' % APPLY_ROLE)
+
+
+async def test_a_rerun_is_refused_never_merged_into(dbs, tmp_path):
+    assert _dump(tmp_path).returncode == 0
+    dst = await _as_apply_role()
+    try:
+        await A.apply_schema(dst, LocalDirStore(tmp_path / "drop"))
+        with pytest.raises(A.SchemaRefused, match="already owns objects"):
+            await A.apply_schema(dst, LocalDirStore(tmp_path / "drop"))
+    finally:
+        await dst.close()
+
+
+async def test_a_dump_from_another_major_version_is_refused(dbs, tmp_path):
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % (await _server_major(dst) + 1))
+        with pytest.raises(A.SchemaRefused, match="major version"):
+            await A.apply_schema(dst, store)
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version=None, folder="drop3")
+        with pytest.raises(A.SchemaRefused, match="major version"):
+            await A.apply_schema(dst, store)
+    finally:
+        await dst.close()
+
+
+async def test_an_extension_the_admin_did_not_install_is_refused_even_u_escaped(dbs, tmp_path):
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, 'CREATE EXTENSION U&"dbl\\0069nk";\nCREATE TABLE public.x (a int);',
+                           pg_dump_version="%d.1" % await _server_major(dst))
+        with pytest.raises(A.SchemaRefused, match="missing: dblink"):
+            await A.apply_schema(dst, store)
+        assert await dst.fetchval("SELECT count(*) FROM pg_extension WHERE extname = 'dblink'") == 0
+    finally:
+        await dst.close()
+
+
+MARK = "rv_pwned_role"
+#: With the parser's allowlist SWITCHED OFF, each bypass's statements are executed as the apply role.
+#: None of them may create a role or change who the session is: the role is the gate on its own.
+RAW_BYPASSES = {
+    "cr_line_comment": ["CREATE TABLE t1 (a int)", "CREATE ROLE %s" % MARK],
+    "ctas_runs_function": [
+        "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $$BEGIN EXECUTE 'CREATE ROLE %s'; RETURN 1; END$$" % MARK,
+        "CREATE TABLE public.t AS SELECT public.f() AS x"],
+    "matview_runs_function": [
+        "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $$BEGIN EXECUTE 'CREATE ROLE %s'; RETURN 1; END$$" % MARK,
+        "CREATE MATERIALIZED VIEW public.mv AS SELECT public.f() AS x"],
+    "create_schema_grant": ["CREATE SCHEMA s1 GRANT ALL ON SCHEMA public TO PUBLIC"],
+    "set_config_role": ["SELECT pg_catalog.set_config('role', 'pg_monitor', false)"],
+    "set_session_authorization": ["SET session_authorization = 'postgres'"],
+    "language_c": ["CREATE FUNCTION public.g(int) RETURNS int LANGUAGE \"c\" AS 'int4inc', 'int4inc'"],
+    "language_internal": ["CREATE FUNCTION public.g(int) RETURNS int LANGUAGE \"internal\" AS 'int4inc'"],
+    "extension_dblink": ['CREATE EXTENSION U&"dbl\\0069nk"'],
+    "alter_sequence_owner": ["CREATE SEQUENCE public.s", "ALTER SEQUENCE public.s OWNER TO pg_monitor"],
+    "two_commands_in_one": ["CREATE TABLE a1 (x int); CREATE ROLE %s" % MARK],
+}
+
+
+@pytest.mark.parametrize("name", sorted(RAW_BYPASSES))
+async def test_with_the_parser_switched_off_the_role_still_stops_every_bypass(dbs, tmp_path, monkeypatch, name):
+    import asyncpg
+
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(dst))
+        monkeypatch.setattr(A, "validate_schema_sql",
+                            lambda text: A.SchemaPlan(tuple(RAW_BYPASSES[name]), frozenset(), len(RAW_BYPASSES[name])))
+        with pytest.raises((asyncpg.exceptions.PostgresError, A.SchemaRefused)):
+            await A.apply_schema(dst, store)
+        assert await dst.fetchval("SELECT current_user") == APPLY_ROLE
+        assert await A._user_table_count(dst) == 0  # all of it rolled back
+    finally:
+        await dst.close()
+    assert await dbs.fetchval("SELECT count(*) FROM pg_roles WHERE rolname = $1", MARK) == 0
+
+
+async def test_the_schema_cannot_reset_the_apply_s_timeouts(dbs, tmp_path, monkeypatch):
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(dst))
+        monkeypatch.setattr(A, "validate_schema_sql", lambda text: A.SchemaPlan(
+            ("CREATE TABLE public.x (a int)", "SET lock_timeout = 0"), frozenset(), 2))
+        with pytest.raises(A.SchemaRefused, match="timeouts"):
+            await A.apply_schema(dst, store)
+        assert await A._user_table_count(dst) == 0
+    finally:
+        await dst.close()
+
+
+@pytest.mark.parametrize("ledger_ddl,match", [
+    ("CREATE TABLE public.schema_migrations (id text PRIMARY KEY, applied_at text CHECK (public.f(id)));", "CHECK"),
+    ("CREATE TABLE public.schema_migrations (id text PRIMARY KEY, applied_at text DEFAULT public.g());", "column default"),
+    ("CREATE TABLE public.schema_migrations (id text PRIMARY KEY, applied_at text);\n"
+     "CREATE INDEX sm_f ON public.schema_migrations (public.f(id));", "expression or partial index"),
+    ("CREATE DOMAIN public.d AS text CHECK (public.f(VALUE));\n"
+     "CREATE TABLE public.schema_migrations (id public.d PRIMARY KEY, applied_at text);", "domain"),
+    ("CREATE TABLE public.schema_migrations (id text PRIMARY KEY, applied_at text);\n"
+     "ALTER TABLE public.schema_migrations ENABLE ROW LEVEL SECURITY;", "row security"),
+])
+async def test_a_ledger_table_that_could_run_code_on_insert_is_refused(dbs, tmp_path, ledger_ddl, match):
+    functions = ("CREATE FUNCTION public.f(text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;\n"
+                 "CREATE FUNCTION public.g() RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$;\n")
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, functions + ledger_ddl, tables_live=1, ledger_rows=1,
+                           ledgers="INSERT INTO public.schema_migrations (id, applied_at) VALUES ('001_a.sql', 'x');\n",
+                           pg_dump_version="%d.1" % await _server_major(dst))
+        with pytest.raises(A.SchemaRefused, match=match):
+            await A.apply_schema(dst, store)
+        assert await A._user_table_count(dst) == 0
+    finally:
+        await dst.close()
+
+
+async def test_each_statement_runs_alone_so_two_harmless_commands_in_one_string_are_refused(dbs, tmp_path, monkeypatch):
+    """The extended protocol takes ONE command per call: had the parser and the server split a string
+    differently, the server could not run the extra statement."""
+    import asyncpg
+
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(dst))
+        monkeypatch.setattr(A, "validate_schema_sql", lambda text: A.SchemaPlan(
+            ("CREATE TABLE public.x (a int); CREATE TABLE public.y (b int)",), frozenset(), 1))
+        with pytest.raises(asyncpg.exceptions.PostgresSyntaxError, match="multiple commands"):
+            await A.apply_schema(dst, store)
+        assert await A._user_table_count(dst) == 0
+    finally:
+        await dst.close()

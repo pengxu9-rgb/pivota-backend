@@ -31,12 +31,13 @@ FAKE_PG_DUMP = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_LOG/pg_dump.argv"
 env | grep -E '^PG' | sort >> "$FAKE_LOG/pg_dump.env"
 [ -n "${PGPASSFILE:-}" ] && cat "$PGPASSFILE" >> "$FAKE_LOG/pgpass"
-if [ "$1" = "--version" ]; then echo "pg_dump (PostgreSQL) 17.6"; exit 0; fi
+if [ "$1" = "--version" ]; then echo "$FAKE_PG_DUMP_VERSION"; exit 0; fi
 cat "$FAKE_SCHEMA"
 """
 FAKE_PSQL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_LOG/psql.argv"
 case "$*" in
+  *server_version_num*) echo "$FAKE_SERVER_NUM" ;;
   *string_agg*) echo "$FAKE_LEDGERS" ;;
   *"from public.schema_migrations"*) cat "$FAKE_LEDGER_ROWS" ;;
   *"from public.startup_sql_migrations"*) : ;;
@@ -62,7 +63,9 @@ def harness(tmp_path):
         env = {"PATH": "%s:/usr/bin:/bin" % bin_dir, "HOME": str(tmp_path), "PIVOTA_ENV": "production",
                "DATABASE_URL": DSN, "STAMP": STAMP, "SCHEMA_DUMP_LOCAL_OUT_DIR": str(tmp_path / "drop"),
                "FAKE_LOG": str(log), "FAKE_SCHEMA": str(tmp_path / "schema.sql"),
-               "FAKE_LEDGER_ROWS": str(tmp_path / "rows.sql"), "FAKE_LIVE": live, "FAKE_LEDGERS": ledgers}
+               "FAKE_LEDGER_ROWS": str(tmp_path / "rows.sql"), "FAKE_LIVE": live, "FAKE_LEDGERS": ledgers,
+               "FAKE_PG_DUMP_VERSION": "pg_dump (PostgreSQL) 17.6 (Debian 17.6-1.pgdg120+1)",
+               "FAKE_SERVER_NUM": "170006"}
         env.update(env_extra)
         return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
 
@@ -204,3 +207,65 @@ def test_pg_dumps_own_restrict_key_is_not_a_secret(harness):
     key = "F3TsolvOl5pCPhpgaXeCjBbfIaJ7fz6kwAb6nHRoD5BbjffG0OGvUuCamceG4Nh"
     done = harness(schema=GOOD_SCHEMA.replace("k1", key))
     assert done.returncode == 0, done.stderr
+
+
+def test_the_manifest_records_pg_dump_s_version_and_the_server_s(harness):
+    import gzip  # noqa: F401
+    import json
+
+    done = harness()
+    assert done.returncode == 0, done.stderr
+    manifest = json.loads((harness.drop / STAMP / "_MANIFEST.json").read_text())
+    assert manifest["pg_dump_version"] == "17.6" and manifest["server_version_num"] == 170006
+
+
+@pytest.mark.parametrize("version,server", [
+    ("pg_dump (PostgreSQL) 18.1", "170006"),   # newer pg_dump than the server: its SETs would not apply
+    ("pg_dump (PostgreSQL) 16.9", "170006"),
+    ("pg_dump (PostgreSQL) 17.6", "160004"),
+])
+def test_a_pg_dump_of_another_major_version_never_dumps(harness, version, server):
+    done = harness(FAKE_PG_DUMP_VERSION=version, FAKE_SERVER_NUM=server)
+    assert done.returncode == 3 and "is not the server's major version" in done.stderr, done.stderr
+    assert not (harness.log / "pg_dump.argv").read_text().replace("--version\n", "").strip()  # never dumped
+    assert not harness.drop.exists()
+
+
+def test_an_unreadable_server_version_never_dumps(harness):
+    done = harness(FAKE_SERVER_NUM="")
+    assert done.returncode == 3 and "server's version" in done.stderr
+    assert not harness.drop.exists()
+
+
+def test_a_bare_carriage_return_never_leaves_prod(harness):
+    done = harness(schema=GOOD_SCHEMA.replace("\\unrestrict k1", "-- note\rCREATE ROLE x;\n\\unrestrict k1"))
+    assert done.returncode == 3 and "carriage return" in done.stderr
+    assert not harness.drop.exists()
+
+
+def test_a_refusal_message_does_not_carry_the_exit_code(harness):
+    done = harness(schema=GOOD_SCHEMA.replace("\\unrestrict k1", "GRANT SELECT ON public.a TO r;\n\\unrestrict k1"))
+    assert done.returncode == 3
+    assert done.stderr.strip().endswith("GRANT ,") and ", 3" not in done.stderr
+
+
+#: One sample per secret kind; the dump (bash) and the apply (Python) must each refuse every one.
+SECRET_SAMPLES = (
+    "owner@person.example", "sk_live_abc", "sk-ant-api03-abcdefghijklmnopqrstu", "sk-proj-abcdefghijklmnopqr",
+    "shpat_x", "ghp_abc", "github_pat_11ABCDEFG", "xoxb-123", "whsec_abc",
+    "AKIA" + "ABCDEFGHIJKLMNOP", "AIza" + "B" * 35, "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.sig",
+    "postgresql://u:hunter2@db/x", "host=db password=hunter2", "+14155550123", "415-555-0123",
+    "ab" * 16, "QUJD" * 11,
+)
+
+
+@pytest.mark.parametrize("sample", SECRET_SAMPLES)
+def test_every_secret_kind_is_refused_by_the_dump_and_by_the_apply(harness, sample):
+    from jobs import sandbox_schema_apply as A
+
+    statement = "CREATE TABLE public.c (a text DEFAULT '%s');" % sample
+    done = harness(schema=GOOD_SCHEMA.replace("\\unrestrict k1", statement + "\n\\unrestrict k1"))
+    assert done.returncode == 3 and "looks like a secret or a person" in done.stderr, (sample, done.stderr)
+    assert sample not in done.stdout + done.stderr
+    with pytest.raises(A.SchemaRefused, match="secret or a person"):
+        A.validate_schema_sql(GOOD_SCHEMA.replace("\\unrestrict k1", statement + "\n\\unrestrict k1"))

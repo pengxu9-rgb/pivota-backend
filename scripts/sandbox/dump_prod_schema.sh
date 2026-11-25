@@ -3,8 +3,10 @@
 #
 # Runs IN PROD as a gated one-off Cloud Run job (VPC egress to the private Cloud SQL), on an image that has
 # pg_dump/psql matching the server's major version, coreutils `timeout` and curl, e.g. FROM postgres:17 +
-# curl. The backend image has neither. The sandbox half is jobs/sandbox_schema_apply.py, which re-checks
-# everything below with a real tokenizer. The FIRST dump also gets a human read before its upload is
+# curl. The backend image has neither. The checks below are a COARSE first
+# filter (line-based, no SQL parser). The authoritative check is the sandbox half's parser,
+# jobs/sandbox_schema_apply.py, also offline: `python -m jobs.sandbox_schema_apply check <schema.sql>
+# <ledgers.sql>` (the human read of the first dump runs it). The FIRST dump also gets a human read before its upload is
 # approved (controller + the owner).
 #
 # Env:
@@ -32,26 +34,36 @@
 # REFUSED (exit 3, nothing uploaded): CREATE SERVER / USER MAPPING / SUBSCRIPTION / PUBLICATION / ROLE /
 # USER / GROUP / DATABASE / FOREIGN TABLE / EVENT TRIGGER, ALTER ROLE / USER / SYSTEM / SERVER / DATABASE /
 # DEFAULT PRIVILEGES / FOREIGN TABLE, GRANT / REVOKE, SET ROLE / SESSION AUTHORIZATION, DO, row data, psql
-# meta-commands but \restrict/\unrestrict, a missing completion trailer, fewer tables than the source,
-# and any literal that looks like a secret or a person (email-shaped, sk_/rk_/ak_/pk_/shpat_/ghp_/xox
-# prefixes, a 32+ hex run, a 40+ base64 run) anywhere in the schema: function bodies, defaults, CHECKs,
-# views, policies.
+# meta-commands but \restrict/\unrestrict, a carriage return, a missing completion trailer, fewer tables
+# than the source, a pg_dump whose major version is not the server's, and any literal that looks like a
+# secret or a person (email, key and token prefixes, DSN/password= passwords, phone numbers, long hex or
+# base64) anywhere in the schema: function bodies, defaults, CHECKs, views, policies.
 set -euo pipefail
 
 SANDBOX_DROP_BUCKET="pivota-sandbox-catalog-drop"   # == config.sandbox_identity.SANDBOX_DROP_BUCKET (tested)
 
-die() { echo "dump_prod_schema REFUSED: $*" >&2; exit "${2:-2}"; }
+die() { echo "dump_prod_schema REFUSED: $1" >&2; exit "${2:-2}"; }  # $1 = the message, $2 = the exit code
 
 # --- the refusals, shared by the dump and by `check` -----------------------------------------------------
 # At COLUMN 0, where pg_dump writes every top-level statement (USER MAPPING and SERVER included). A function
 # body's indented INSERT/GRANT is body text, not a statement; a body line at column 0 that starts with one
 # is refused too (fail closed, a human reads it). The sandbox half re-checks with a real tokenizer.
 FORBIDDEN='^(CREATE[[:space:]]+(SERVER|USER|GROUP|ROLE|DATABASE|SUBSCRIPTION|PUBLICATION|FOREIGN[[:space:]]+TABLE|EVENT[[:space:]]+TRIGGER)|ALTER[[:space:]]+(ROLE|USER|GROUP|SYSTEM|SERVER|DATABASE|DEFAULT[[:space:]]+PRIVILEGES|FOREIGN[[:space:]]+TABLE)|GRANT[[:space:]]|REVOKE[[:space:]]|SET[[:space:]]+(ROLE|SESSION)|DO[[:space:]]|DO$|COPY[[:space:]]|INSERT[[:space:]]|SECURITY[[:space:]]+LABEL)'
-SECRETS='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[A-Za-z]{2,}|(sk|rk|ak|pk)_(live|test)_[A-Za-z0-9]|shpat_|ghp_|xox[abposr]-|[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}'
+# The same kinds as jobs/sandbox_schema_apply._SECRET_LITERAL (a test feeds both the same samples).
+SECRETS='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[A-Za-z]{2,}|(sk|rk|ak|pk)_(live|test)_[A-Za-z0-9]|sk-[A-Za-z0-9_-]{16,}|shpat_|ghp_|github_pat_|xox[abposr]-|whsec_|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.|://[^/[:space:]:@'"'"']+:[^@[:space:]/'"'"']+@|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*=[[:space:]]*[^[:space:],;'"'"')]|\+[1-9][0-9]{7,14}|[0-9]{3}[ .-][0-9]{3}[ .-][0-9]{4}|[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}'
 LEDGER_LINE="^(-- .*|INSERT INTO public\\.schema_migrations \\(id, applied_at\\) VALUES \\('[^';\\\\]*', '[^';\\\\]*'\\);|INSERT INTO public\\.startup_sql_migrations \\(filename, checksum, applied_at\\) VALUES \\('[^';\\\\]*', '[^';\\\\]*', '[^';\\\\]*'\\);)$"
 
 check_files() {  # check_files <schema.sql> <ledgers.sql>; dies with exit 3 on a refusal
-  local schema="$1" ledgers="$2" hits meta bad
+  local schema="$1" ledgers="$2" hits meta bad rc=0
+  # A bare CR ends a -- comment for PostgreSQL but not for a line-based reader: refused outright. A plain
+  # command with its status kept, no pipeline: bash 5.3's `$( { grep || true; } | awk )` under pipefail
+  # failed 5% of runs here (measured), which set -e turns into a silent exit.
+  LC_ALL=C grep -q $'\r' "$schema" "$ledgers" || rc=$?
+  case "$rc" in
+    0) die "dump carries a carriage return" 3 ;;
+    1) ;;
+    *) die "could not scan the dump for carriage returns" 3 ;;
+  esac
   tail -5 "$schema" | grep -q 'PostgreSQL database dump complete' || die "schema dump has no completion trailer" 3
   tail -1 "$ledgers" | grep -qx -- '-- sandbox ledger dump complete' || die "ledger dump has no completion trailer" 3
   # Case-insensitive: a hand-written `create user mapping` is as forbidden as pg_dump's upper-case one.
@@ -64,7 +76,7 @@ check_files() {  # check_files <schema.sql> <ledgers.sql>; dies with exit 3 on a
   # Literal secrets: the kind of the hit only, never the hit.
   # Comments and pg_dump's own \restrict/\unrestrict lines (a random 64-character key) are not scanned.
   hits=$( { grep -Ev '^(--|\\(restrict|unrestrict) )' "$schema" || true; } | { grep -Eo "$SECRETS" || true; } | head -c 1 )
-  [ -z "$hits" ] || die "schema dump carries a literal that looks like a secret or a person (email, key prefix, long hex/base64); a human must read it" 3
+  [ -z "$hits" ] || die "schema dump carries a literal that looks like a secret or a person (email, key, token, password, phone, long hex/base64); a human must read it" 3
   bad=$( { grep -Ev "$LEDGER_LINE" "$ledgers" || true; } )
   [ -z "$bad" ] || die "ledger dump carries a line that is not an explicit-column ledger INSERT" 3
 }
@@ -121,7 +133,15 @@ PASSWORD_RAW="${BASH_REMATCH[4]:-}"
 unset DATABASE_URL DSN PASSWORD_RAW
 export PGAPPNAME=sandbox-schema-dump
 export PGOPTIONS="-c statement_timeout=120s -c idle_in_transaction_session_timeout=60s"
-echo "dump_prod_schema: pg_dump $(pg_dump --version | awk '{print $NF}') stamp=$STAMP mode=$MODE lock_wait=$LOCK_WAIT deadline=${DEADLINE}s"
+# The dump must come from pg_dump of the SERVER's major version: a newer pg_dump writes settings an older
+# server rejects (pg_dump 17: SET transaction_timeout), and the sandbox apply refuses a mismatch too.
+PG_DUMP_VERSION=$(pg_dump --version | sed -nE 's/^pg_dump \(PostgreSQL\) ([0-9]+(\.[0-9]+)*).*/\1/p')
+[[ "$PG_DUMP_VERSION" =~ ^[0-9]+ ]] || die "could not read pg_dump's version"
+SERVER_NUM=$(capped psql -XAtc "SHOW server_version_num")
+[[ "$SERVER_NUM" =~ ^[0-9]+$ ]] || die "could not read the server's version" 3
+[ "${PG_DUMP_VERSION%%.*}" = "$((SERVER_NUM / 10000))" ] \
+  || die "pg_dump ${PG_DUMP_VERSION%%.*} is not the server's major version $((SERVER_NUM / 10000))" 3
+echo "dump_prod_schema: pg_dump $PG_DUMP_VERSION server_version_num=$SERVER_NUM stamp=$STAMP mode=$MODE lock_wait=$LOCK_WAIT deadline=${DEADLINE}s"
 
 # --- the schema --------------------------------------------------------------------------------------------
 capped pg_dump --lock-wait-timeout="$LOCK_WAIT" --schema-only --no-owner --no-privileges --no-comments \
@@ -159,7 +179,7 @@ SHA_L=$(sha256 "$WORK/ledgers.sql.gz")
 cat > "$WORK/_MANIFEST.json" <<EOF
 {"format_version": 2, "kind": "schema", "stamp": "$STAMP",
  "exported_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
- "pg_dump_version": "$(pg_dump --version | awk '{print $NF}')",
+ "pg_dump_version": "$PG_DUMP_VERSION", "server_version_num": $SERVER_NUM,
  "tables_in_dump": $DUMPED, "tables_live": $LIVE, "ledger_tables": "$LEDGERS", "ledger_rows": $LEDGER_ROWS,
  "files": {"schema": {"file": "$STAMP/schema.sql.gz", "sha256": "$SHA_S"},
            "ledgers": {"file": "$STAMP/ledgers.sql.gz", "sha256": "$SHA_L"}}}

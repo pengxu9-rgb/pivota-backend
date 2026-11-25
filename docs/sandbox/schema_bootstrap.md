@@ -42,32 +42,76 @@ plus prod's two migration ledgers. Code: `scripts/sandbox/dump_prod_schema.sh` (
   SERVER / USER [MAPPING] / GROUP / ROLE / DATABASE / SUBSCRIPTION / PUBLICATION / FOREIGN TABLE / EVENT
   TRIGGER, ALTER ROLE / USER / GROUP / SYSTEM / SERVER / DATABASE / DEFAULT PRIVILEGES / FOREIGN TABLE,
   GRANT, REVOKE, SET ROLE / SESSION, DO, COPY, INSERT, SECURITY LABEL; psql meta-commands but
-  `\restrict`/`\unrestrict`; any literal that looks like a secret or a person (email-shaped,
-  `sk_/rk_/ak_/pk_` live/test keys, `shpat_`, `ghp_`, `xox?-`, 32+ hex, 40+ base64) outside comments and
-  pg_dump's own `\restrict` key; a ledger line that is not an explicit-column INSERT; a missing trailer;
-  fewer tables than the live source. `dump_prod_schema.sh check <schema.sql> <ledgers.sql>` runs only these
-  checks (tests; the human read of the first dump).
+  `\restrict`/`\unrestrict`; a carriage return; any literal that looks like a secret or a person
+  (email-shaped; `sk_/rk_/ak_/pk_` live/test keys, `sk-…`, `shpat_`, `ghp_`, `github_pat_`, `xox?-`,
+  `whsec_`, `AKIA…`, `AIza…`, JWTs, DSN or `password=` passwords, phone numbers, 32+ hex, 40+ base64)
+  outside comments and pg_dump's own `\restrict` key; a ledger line that is not an explicit-column INSERT;
+  a missing trailer; fewer tables than the live source; and a pg_dump whose major version is not the
+  server's (checked before dumping; the manifest records `pg_dump_version` and `server_version_num`).
+* These are a COARSE line-based filter. `dump_prod_schema.sh check <schema.sql> <ledgers.sql>` runs only
+  them; the authoritative offline check is `python -m jobs.sandbox_schema_apply check` (below).
 * **The first dump gets a human read before its upload is approved** (controller + the owner).
 
 ## 10a-sandbox: `jobs/sandbox_schema_apply.py`
 
-* Env: `PIVOTA_ENV=sandbox` + the full sandbox profile (the startup guard runs), `DATABASE_URL` (every
-  address asyncpg would connect to must be in the sandbox's private range, held only as a hash, or exactly
-  `/cloudsql/pivota-sandbox:<region>:<instance>/.s.PGSQL.<port>`: `config/sandbox_identity.py`, the single
-  source), `SANDBOX_SCHEMA_GCS_URI` (bucket pinned). SA: `objectViewer` on the drop, the DB secret.
-* Refuses unless the database is **empty** (no table in any non-system schema).
-* Re-checks the manifest (format 2), sha256 per file, and every statement with a real tokenizer (line and
-  nested block comments, `'...'` with `''`, `"..."`, `$tag$` bodies, top-level psql meta lines; refuses
-  `E'...'`, `U&'...'`, unterminated anything, trailing text without `;`). Each statement's skeleton must be a
-  kind pg_dump --schema-only emits (SET, set_config, CREATE SCHEMA/EXTENSION/TYPE/DOMAIN/FUNCTION/PROCEDURE/
-  AGGREGATE/SEQUENCE/TABLE/VIEW/INDEX/TRIGGER/RULE/POLICY/..., ALTER TABLE/SEQUENCE/INDEX/TYPE/DOMAIN);
-  refused even then: SET ROLE / SESSION, `standard_conforming_strings` other than on, OWNER TO, untrusted
-  languages, extensions that connect out or run jobs (dblink, *_fdw, pg_cron, ...), and secret-shaped
-  literals. Ledger statements must be exactly the two explicit-column INSERT shapes.
-* One transaction (`standard_conforming_strings` forced on): schema, then ledger rows; then the
-  base-table count must equal the source's live count and the ledger rows the manifest's, or everything
-  rolls back. `search_path` is restored.
+### The apply role: THE gate (infra bootstrap, as SQL, before the first apply)
+
+A statement-kind check cannot limit what executes at apply time (a materialized view WITH DATA or a
+trigger calls a function), so the apply runs as a role that can do nothing but create objects in
+`public`. Create it with SQL as the admin, NOT with `gcloud sql users create` (that grants
+cloudsqlsuperuser, which the job refuses):
+
+```sql
+CREATE ROLE sandbox_schema_apply LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB
+  NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2 PASSWORD '<from its own secret>';
+GRANT CONNECT ON DATABASE <sandbox db> TO sandbox_schema_apply;
+GRANT USAGE, CREATE ON SCHEMA public TO sandbox_schema_apply;   -- NOT CREATE ON DATABASE
+-- Extensions: the admin pre-creates the fixed list; the dump never creates one.
+CREATE EXTENSION IF NOT EXISTS pg_trgm  WITH SCHEMA public;   -- backend migrations
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;   -- backend migrations
+CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrations
+```
+
+* Schemas: prod is expected to have **only `public`** (no other is known). A dump with another
+  `CREATE SCHEMA` fails under this role (no CREATE on the database) and the whole apply rolls back. That
+  is a stop for a new decision (controller + the owner), never a wider grant to the role.
+* After `DONE`, **as the admin** (never as the apply role, and never by granting it a membership to
+  make this work): `REASSIGN OWNED BY sandbox_schema_apply TO <app owner role>;` then
+  `ALTER ROLE sandbox_schema_apply NOLOGIN;`.
+* The job's own check, before anything runs (`role_refusal`): the connected role is not a superuser,
+  cannot create roles or databases, has no REPLICATION or BYPASSRLS, is the session user, is a member of
+  NO role, has no CREATE on the database, and owns nothing yet (a rerun is refused, never merged into).
+
+### The job
+
+* Env: `PIVOTA_ENV=sandbox` + the full sandbox profile (the startup guard runs), `DATABASE_URL` = the
+  APPLY ROLE's DSN from its own secret (every address asyncpg would connect to must be in the sandbox's
+  private range, held only as a hash, or exactly `/cloudsql/pivota-sandbox:<region>:<instance>/.s.PGSQL.<port>`:
+  `config/sandbox_identity.py`, the single source), `SANDBOX_SCHEMA_GCS_URI` (bucket pinned).
+  SA: `objectViewer` on the drop, that one secret.
+* Refuses unless: the role passes the check above; the dump's `pg_dump_version` major equals this
+  server's; the database is **empty** (no table in any non-system schema, read from `pg_class`); every
+  `CREATE EXTENSION` in the dump names an extension the admin already installed.
+* Re-checks the manifest (format 2), sha256 per file, and every statement with **PostgreSQL's own
+  parser** (`pglast` 7.22 = the PostgreSQL 17 parser, imported lazily by this job only). The allowlist
+  is over parse-tree node types with their fields checked: pg_dump's exact preamble SETs only (the
+  zero timeouts and `standard_conforming_strings` are checked, never executed); functions in plpgsql or
+  sql only; no ownership change of any kind; CREATE SCHEMA without elements or AUTHORIZATION; no CREATE
+  TABLE AS; a materialized view only WITH NO DATA; no rule; no trigger on a ledger table; ALTER TABLE
+  subcommands from a fixed list; no literal that looks like a secret or a person (in the parser's own
+  printout, so no comment). Ledger statements must be exactly the two explicit-column INSERT shapes,
+  one row of plain literals each, no quote, semicolon or backslash in a value.
+* One transaction with the apply's own `lock_timeout` 10s, `statement_timeout` 120s, idle 60s and
+  `standard_conforming_strings` on (checked unchanged after the schema). Each statement runs ALONE through
+  the extended protocol (the server refuses a string with two commands). Then: no ledger table may run
+  code on INSERT (trigger, rule, expression/partial index, CHECK/FK, domain or generated column, row
+  security, a default other than now()/nextval()); `standard_conforming_strings` re-asserted; the
+  ledger rows; the base-table count must equal the source's live count and the ledger rows the
+  manifest's, or everything rolls back. `search_path` is restored.
 * Exit 0 = `DONE {...}`, exit 2 = `REFUSED: <rule>`.
+* Offline: `python -m jobs.sandbox_schema_apply check <schema.sql> <ledgers.sql>` runs the same parser
+  and allowlist with no database (exit 0 = `OK {...}`). **The human read of the first dump runs it**;
+  `dump_prod_schema.sh check` is only the coarse line-based filter.
 
 ## Residual
 

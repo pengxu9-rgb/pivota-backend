@@ -1,7 +1,7 @@
 """jobs/sandbox_schema_apply.py: the checks that need no database.
 
-Includes every bypass the controller reproduced against the first (regex) re-check (D-3), each of
-which must now be REFUSED by the tokenizer + statement allowlist.
+Includes every bypass the controller reproduced against the regex re-check (D-3) and against the text
+tokenizer (the 77a881c7f review): each must be REFUSED by PostgreSQL's own parser + the node allowlist.
 """
 
 from __future__ import annotations
@@ -37,26 +37,32 @@ def _schema(statement: str) -> str:
     return OK_SCHEMA.replace("\\unrestrict abc123", statement + "\n\\unrestrict abc123")
 
 
-def test_a_clean_schema_passes_and_loses_only_the_meta_lines():
-    sql = A.validate_schema_sql(OK_SCHEMA)
+def test_a_clean_schema_passes_and_loses_only_the_meta_lines_and_the_skipped_sets():
+    plan = A.validate_schema_sql(OK_SCHEMA)
+    sql = "\n".join(plan.statements)
     assert "\\restrict" not in sql and "\\unrestrict" not in sql
     assert "INSERT INTO public.audit" in sql  # inside a function body: kept, and not a refusal
     assert "'^[A-Z]{3}$'" in sql and "it''s; fine" in sql
+    # pg_dump's zero timeouts and scs=on are checked, never executed: the apply sets its own.
+    assert "statement_timeout" not in sql and "standard_conforming_strings" not in sql
+    assert "set_config('search_path', '', false)" in sql
+    assert plan.extensions == frozenset({"pgcrypto"}) and plan.checked == len(plan.statements) + 2
 
 
 def test_statements_split_only_at_top_level_semicolons():
-    parts = A.split_statements("CREATE TABLE a (x text DEFAULT ';');\nCREATE FUNCTION f() AS $$ a; b; $$;", "t")
-    assert [sk.split()[1] for _, sk in parts] == ["TABLE", "FUNCTION"]
+    parts = A._parse("CREATE TABLE a (x text DEFAULT ';');\nCREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ a; b; $$;", "t")
+    assert [type(node).__name__ for node, _ in parts] == ["CreateStmt", "CreateFunctionStmt"]
+    assert parts[1][1].endswith("$$ a; b; $$")
 
 
 @pytest.mark.parametrize("statement,match", [
     # Each of these was ACCEPTED by the first re-check (controller, D-3).
-    ("SELECT '$$';\nGRANT ALL ON t TO r;", "does not emit"),
-    ("CREATE TABLE x (a text DEFAULT E'\\'');\nGRANT ALL ON t TO r;", "E'...'"),
-    ("CREATE TABLE y (id int); GRANT ALL ON y TO r;", "does not emit"),
-    ("DO $$ BEGIN EXECUTE 'CREATE USER MAPPING FOR u SERVER s'; END $$;", "does not emit"),
-    ("SET ROLE postgres;", "SET ROLE"),
-    ("SET SESSION AUTHORIZATION postgres;", "SET ROLE"),
+    ("SELECT '$$';\nGRANT ALL ON t TO r;", "outside pg_dump's preamble"),
+    ("CREATE TABLE x (a text DEFAULT E'\\'');\nGRANT ALL ON t TO r;", "does not emit \\(GrantStmt\\)"),
+    ("CREATE TABLE y (id int); GRANT ALL ON y TO r;", "does not emit \\(GrantStmt\\)"),
+    ("DO $$ BEGIN EXECUTE 'CREATE USER MAPPING FOR u SERVER s'; END $$;", "does not emit \\(DoStmt\\)"),
+    ("SET ROLE postgres;", "outside pg_dump's preamble"),
+    ("SET SESSION AUTHORIZATION postgres;", "outside pg_dump's preamble"),
     ("ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO r;", "does not emit"),
     ("CREATE FOREIGN TABLE ft (a int) SERVER s OPTIONS (password 'p');", "does not emit"),
     # And the rest of the never-list.
@@ -73,16 +79,25 @@ def test_statements_split_only_at_top_level_semicolons():
     ("INSERT INTO public.t VALUES (1);", "does not emit"),
     ("COMMENT ON TABLE public.t IS 'x';", "does not emit"),
     ("create database other;", "does not emit"),
+    ("CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION f();", "does not emit"),
+    ("CREATE RULE r AS ON INSERT TO public.t DO INSTEAD NOTHING;", "does not emit \\(RuleStmt\\)"),
+    ("SECURITY LABEL ON TABLE public.t IS 'x';", "does not emit"),
     ("ALTER TABLE public.t OWNER TO someone;", "ownership"),
-    ("SET standard_conforming_strings = off;", "standard_conforming_strings"),
-    ("CREATE EXTENSION dblink;", "connects out"),
-    ("CREATE EXTENSION postgres_fdw;", "connects out"),
-    ("CREATE EXTENSION pg_cron;", "connects out"),
-    ("CREATE FUNCTION h() RETURNS int LANGUAGE plpython3u AS $$ return 1 $$;", "untrusted language"),
-    ("CREATE TABLE z (a text DEFAULT U&'\\0041');", "U&"),
-    ("CREATE TABLE z (a text DEFAULT 'unterminated);", "unterminated literal"),
-    ("CREATE FUNCTION k() AS $x$ never closed;", "unterminated"),
-    ("CREATE TABLE z (a int)", "no ';'|meta-command inside a statement"),
+    ("ALTER TYPE public.k OWNER TO someone;", "ownership"),
+    ("ALTER DOMAIN public.currency_code OWNER TO someone;", "ownership"),
+    ("ALTER FUNCTION public.f() OWNER TO someone;", "ownership"),
+    ("ALTER FOREIGN TABLE ft ADD COLUMN b int;", "ALTER of a OBJECT_FOREIGN_TABLE"),
+    ("ALTER TABLE public.t SET TABLESPACE other;", "ALTER TABLE AT_SetTableSpace"),
+    ("SET standard_conforming_strings = off;", "outside pg_dump's preamble"),
+    ("SET check_function_bodies = true;", "outside pg_dump's preamble"),
+    ("SET search_path = evil, public;", "outside pg_dump's preamble"),
+    ("SET LOCAL lock_timeout = 0;", "outside pg_dump's preamble"),
+    ("RESET ALL;", "outside pg_dump's preamble"),
+    ("CREATE FUNCTION h() RETURNS int LANGUAGE plpython3u AS $$ return 1 $$;", "language other than"),
+    ("CREATE TYPE public.b (INPUT = f, OUTPUT = g);", "needing C code"),
+    ("CREATE TABLE z (a text DEFAULT 'unterminated);", "does not (scan|parse)"),
+    ("CREATE FUNCTION k() AS $x$ never closed;", "does not (scan|parse)"),
+    ("CREATE TABLE z (a int)", "no ';'"),
 ])
 def test_every_known_bypass_and_forbidden_kind_is_refused(statement, match):
     with pytest.raises(A.SchemaRefused, match=match):
@@ -111,6 +126,25 @@ def test_a_backslash_line_inside_a_function_body_is_body_text_not_a_meta_command
     A.validate_schema_sql(_schema("CREATE FUNCTION r() RETURNS text LANGUAGE sql AS $$\n\\d\nSELECT 1 $$;"))
 
 
+def test_a_restrict_line_inside_a_body_is_refused_never_blanked():
+    with pytest.raises(A.SchemaRefused, match="inside a statement"):
+        A.validate_schema_sql("CREATE FUNCTION r() RETURNS text LANGUAGE sql AS $$\n\\restrict zz\nSELECT 1 $$;" + TRAILER)
+    with pytest.raises(A.SchemaRefused, match="more than one"):  # and with pg_dump's own pair around it
+        A.validate_schema_sql(_schema("CREATE FUNCTION r() RETURNS text LANGUAGE sql AS $$\n\\restrict zz\nSELECT 1 $$;"))
+
+
+@pytest.mark.parametrize("key", ["9abc", "0x1F", "1e5x", "abc9", "7"])
+def test_pg_dumps_random_restrict_key_never_breaks_the_scan(key):
+    # The key is random per dump; a digit-led one is "trailing junk" to the scanner if left in place.
+    text = OK_SCHEMA.replace("\\restrict abc123", "\\restrict " + key).replace("\\unrestrict abc123", "\\unrestrict " + key)
+    assert A.validate_schema_sql(text).statements
+
+
+def test_more_than_one_restrict_pair_is_refused():
+    with pytest.raises(A.SchemaRefused, match="more than one"):
+        A.validate_schema_sql(_schema("\\restrict k2\nCREATE TABLE q (a int);\n\\unrestrict k2"))
+
+
 def test_a_truncated_schema_is_refused():
     with pytest.raises(A.SchemaRefused, match="trailer"):
         A.validate_schema_sql("CREATE TABLE a (id int);\n")
@@ -125,7 +159,14 @@ LEDGERS = (
 
 def test_ledger_inserts_pass_and_are_counted():
     sql, rows = A.validate_ledgers_sql(LEDGERS)
-    assert rows == 2 and "schema_migrations" in sql
+    assert rows == 2 and len(sql) == 2 and "schema_migrations" in sql[0]
+
+
+def test_a_null_ledger_value_is_accepted_and_an_empty_ledger_is_zero_rows():
+    sql, rows = A.validate_ledgers_sql("INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', NULL);\n"
+                                       + A.LEDGER_TRAILER + "\n")
+    assert rows == 1
+    assert A.validate_ledgers_sql(A.LEDGER_TRAILER + "\n") == ((), 0)
 
 
 @pytest.mark.parametrize("bad", [
@@ -138,6 +179,15 @@ def test_ledger_inserts_pass_and_are_counted():
     "INSERT INTO public.schema_migrations (id) VALUES ('a'); DROP TABLE orders;",
     "DELETE FROM public.schema_migrations;",
     "SELECT pg_catalog.setval('public.orders_id_seq', 4, true);",
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', 'b'), ('c', 'd');",
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', 'b') ON CONFLICT DO NOTHING;",
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', 'b') RETURNING id;",
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', now());",
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', 'b'::text);",
+    "INSERT INTO other.schema_migrations (id, applied_at) VALUES ('a', 'b');",
+    "WITH x AS (DELETE FROM public.agents) INSERT INTO public.schema_migrations (id, applied_at) VALUES ('a', 'b');",
+    # The controller's scs-off desync: with the parser this is one INSERT whose values are not two literals.
+    "INSERT INTO public.schema_migrations (id, applied_at) VALUES ('\\', ', now()); CREATE ROLE x; SELECT ') -- '\n;",
 ])
 def test_anything_else_in_the_ledger_file_is_refused(bad):
     with pytest.raises(A.SchemaRefused, match="ledger"):
@@ -157,7 +207,7 @@ def _drop(tmp_path, *, schema=OK_SCHEMA, ledgers=LEDGERS, folder="20261125T2300Z
         store.put("%s/%s.sql.gz" % (stamp, part), data)
         files[part] = {"file": "%s/%s.sql.gz" % (stamp, part), "sha256": hashlib.sha256(data).hexdigest()}
     manifest = {"format_version": A.FORMAT_VERSION, "kind": "schema", "stamp": stamp, "tables_live": 1,
-                "ledger_rows": 2, "files": files}
+                "ledger_rows": 2, "pg_dump_version": "17.6", "server_version_num": 170006, "files": files}
     manifest.update(manifest_changes)
     store.put("%s/_MANIFEST.json" % stamp, json.dumps(manifest).encode())
     return store
@@ -252,5 +302,112 @@ def test_a_statement_with_no_semicolon_at_the_very_end_is_refused():
 
 
 def test_a_doubled_quote_stays_inside_its_literal():
-    parts = A.split_statements("CREATE TABLE a (x text DEFAULT 'it''s; GRANT'); CREATE TABLE b (y int);", "t")
-    assert [sk for _, sk in parts] == ["CREATE TABLE A (X TEXT DEFAULT '?')", "CREATE TABLE B (Y INT)"]
+    parts = A._parse("CREATE TABLE a (x text DEFAULT 'it''s; GRANT'); CREATE TABLE b (y int);", "t")
+    assert [sql for _, sql in parts] == ["CREATE TABLE a (x text DEFAULT 'it''s; GRANT')", "CREATE TABLE b (y int)"]
+
+
+# --- the 77a881c7f review: nine bypasses of the text tokenizer, now read by PostgreSQL's parser -------
+MARK = "rv_pwned_role"
+NINE_BYPASSES = [
+    # 1. \r ends a -- comment for PostgreSQL.
+    ("cr_line_comment", "CREATE TABLE t1 (a int);\n-- note\rCREATE ROLE %s;\nCREATE TABLE t2 (b int);" % MARK,
+     "carriage return"),
+    # 2. `$` and bytes >= 0x80 are identifier characters.
+    ("dollar_in_identifier", "CREATE TABLE t1 (c$$$ int);\nCREATE ROLE %s;\nCREATE TABLE t2 (d$$ int);" % MARK,
+     "CreateRoleStmt"),
+    ("dollar_tag_in_identifier", "CREATE TABLE t1 (c$$q$ int);\nCREATE ROLE %s;\nCREATE TABLE t2 (d$q$ int);" % MARK,
+     "CreateRoleStmt"),
+    ("nonascii_before_dollar", "CREATE TABLE t1 (c€$$ int);\nCREATE ROLE %s;\nCREATE TABLE t2 (d$$ int);" % MARK,
+     "CreateRoleStmt"),
+    # 3. A non-ASCII dollar tag.
+    ("nonascii_dollar_tag", "SET check_function_bodies = false;\nCREATE FUNCTION public.h() RETURNS int LANGUAGE sql "
+     "AS $é$ SELECT 1 /* $é$; CREATE ROLE %s; -- */ $é$;\nCREATE TABLE t2 (b int);" % MARK, "CreateRoleStmt"),
+    # 5. CREATE SCHEMA with schema elements.
+    ("create_schema_grant", "CREATE SCHEMA s1 GRANT ALL ON SCHEMA public TO PUBLIC;", "carries elements"),
+    ("create_schema_table", "CREATE SCHEMA s1 CREATE TABLE x (a int);", "carries elements"),
+    ("create_schema_authorization", "CREATE SCHEMA s1 AUTHORIZATION postgres;", "AUTHORIZATION"),
+    # 6. set_config hiding the setting name; SET session_authorization.
+    ("set_config_role", "SELECT pg_catalog.set_config('role', 'pg_monitor', false);", "outside pg_dump's preamble"),
+    ("set_config_scs_off", "SELECT pg_catalog.set_config('standard_conforming_strings', 'off', false);",
+     "outside pg_dump's preamble"),
+    ("set_session_authorization_guc", "SET session_authorization = 'postgres';", "outside pg_dump's preamble"),
+    # 7. Code that runs at apply time.
+    ("ctas_runs_function", "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $$BEGIN EXECUTE "
+     "'CREATE ROLE %s'; RETURN 1; END$$;\nCREATE TABLE public.t AS SELECT public.f() AS x;" % MARK, "CREATE TABLE AS"),
+    ("matview_runs_function", "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $$BEGIN EXECUTE "
+     "'CREATE ROLE %s'; RETURN 1; END$$;\nCREATE MATERIALIZED VIEW public.mv AS SELECT public.f() AS x;" % MARK,
+     "WITH DATA"),
+    ("ledger_trigger", "CREATE TABLE public.schema_migrations (id text, applied_at text);\nCREATE FUNCTION public.trg() "
+     "RETURNS trigger LANGUAGE plpgsql AS $$BEGIN EXECUTE 'CREATE ROLE %s'; RETURN NEW; END$$;\nCREATE TRIGGER x "
+     "BEFORE INSERT ON public.schema_migrations FOR EACH ROW EXECUTE FUNCTION public.trg();" % MARK, "ledger table"),
+    ("rule", "CREATE TABLE public.t9 (a int);\nCREATE RULE r AS ON INSERT TO public.t9 DO ALSO SELECT 1;", "RuleStmt"),
+    # 8. Quoted language names.
+    ("language_quoted_c", "CREATE FUNCTION public.g(int) RETURNS int LANGUAGE \"c\" AS 'int4inc', 'int4inc';",
+     "language other than"),
+    ("language_string_c", "CREATE FUNCTION public.g(int) RETURNS int LANGUAGE 'c' AS 'int4inc', 'int4inc';",
+     "language other than"),
+    ("language_internal_quoted", "CREATE FUNCTION public.g(int) RETURNS int LANGUAGE \"internal\" AS 'int4inc';",
+     "language other than"),
+    # 9. OWNER TO on any kind.
+    ("alter_sequence_owner", "CREATE SEQUENCE public.s;\nALTER SEQUENCE public.s OWNER TO pg_monitor;", "ownership"),
+    ("alter_view_owner", "ALTER VIEW public.v OWNER TO pg_monitor;", "ownership"),
+    ("alter_index_owner", "ALTER INDEX public.i OWNER TO pg_monitor;", "ownership"),
+    # And the reviewer's extras.
+    ("nul_byte", "CREATE TABLE t1 (a int);\x00CREATE ROLE %s;" % MARK, "NUL byte"),
+    ("bom", "﻿CREATE TABLE t1 (a int);", "byte-order mark"),
+    ("digit_before_dollar", "CREATE TABLE t1 (a int DEFAULT 1$a$);", "does not (scan|parse)"),
+]
+
+
+@pytest.mark.parametrize("name,statement,match", NINE_BYPASSES, ids=[c[0] for c in NINE_BYPASSES])
+def test_every_tokenizer_bypass_is_refused_by_the_parser(name, statement, match):
+    with pytest.raises(A.SchemaRefused, match=match):
+        A.validate_schema_sql(_schema(statement))
+
+
+def test_a_u_escaped_extension_name_is_read_as_the_server_reads_it():
+    # 4. U&"dbl\0069nk" is dblink. The parser names it; the apply then refuses it, because extensions are
+    # pre-created by the admin and dblink is not one of them (tested against Postgres).
+    plan = A.validate_schema_sql(_schema('CREATE EXTENSION U&"dbl\\0069nk";'))
+    assert plan.extensions == frozenset({"pgcrypto", "dblink"})
+
+
+def test_the_dumps_zero_timeouts_are_checked_but_never_executed():
+    plan = A.validate_schema_sql(_schema("SET lock_timeout = 0;\nSET idle_in_transaction_session_timeout = 0;\n"
+                                         "SET transaction_timeout = 0;"))
+    assert not any("timeout" in statement for statement in plan.statements)
+
+
+def test_a_create_table_as_is_refused_but_a_matview_with_no_data_is_kept():
+    plan = A.validate_schema_sql(_schema("CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS x WITH NO DATA;"))
+    assert any("WITH NO DATA" in statement for statement in plan.statements)
+
+
+def test_a_trigger_on_a_table_that_is_not_a_ledger_is_kept():
+    plan = A.validate_schema_sql(_schema("CREATE TRIGGER t BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.f();"))
+    assert any(statement.startswith("CREATE TRIGGER") for statement in plan.statements)
+
+
+def test_importing_the_web_worker_and_the_copy_job_does_not_load_the_parser():
+    """pglast is for this job only (controller): main (web and worker run `uvicorn main:app`), the catalog
+    copy and this module itself import without it; only validating a dump loads it."""
+    import subprocess
+    import sys as _sys
+
+    code = ("import sys, main, jobs.sandbox_catalog_copy, jobs.sandbox_schema_apply, config.sandbox_guard; "
+            "assert 'pglast' not in sys.modules, sorted(m for m in sys.modules if m.startswith('pglast'))")
+    done = subprocess.run([_sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stderr[-2000:]
+
+
+def test_the_offline_check_reports_ok_and_refusals(tmp_path, capsys):
+    schema, ledgers = tmp_path / "schema.sql", tmp_path / "ledgers.sql"
+    schema.write_text(OK_SCHEMA)
+    ledgers.write_text(LEDGERS)
+    assert A.main(["check", str(schema), str(ledgers)]) == 0
+    out = capsys.readouterr().out
+    assert "OK" in out and '"ledger_rows": 2' in out and '"pgcrypto"' in out
+    schema.write_text(_schema("GRANT ALL ON t TO r;"))
+    assert A.main(["check", str(schema), str(ledgers)]) == 2
+    assert "REFUSED" in capsys.readouterr().err
+    assert A.main(["check", str(schema)]) == 2
