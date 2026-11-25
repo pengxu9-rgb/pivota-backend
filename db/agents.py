@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import time
+import unicodedata
 
 from db.database import metadata, database, IS_POSTGRES
 from services.synthetic_call import is_synthetic_call
@@ -865,6 +866,55 @@ async def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"Error in get_agent: {e}")
         return None
+
+
+# ============================================================================
+# The agent's buyer-facing name (migration 297)
+# ============================================================================
+
+#: The width of agents.buyer_display_name (migration 297).
+BUYER_DISPLAY_NAME_MAX_LENGTH = 64
+
+# Not on the `agents` Table on purpose: a model column is named by every model SELECT, and one boot whose heal
+# lost the lock race would then break every agent read. Only this query names the column.
+_SELECT_BUYER_DISPLAY_NAME_SQL = "SELECT buyer_display_name FROM agents WHERE agent_id = :agent_id LIMIT 1"
+
+# Control, format (bidi overrides, zero-width), surrogate, private-use and unassigned code points, and line or
+# paragraph separators: none belongs in a name a buyer reads, and several can make one read as another.
+_REFUSED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+
+def clean_buyer_display_name(raw: Any) -> Optional[str]:
+    """The stored buyer-facing name if it has a name's shape, else None. Never repairs one: a name that fails
+    is not shown at all (the page shows no "Requested by" line), so the buyer never reads an altered name.
+
+    Shape: a string, surrounding whitespace dropped, NFC, 1-64 characters, the only space U+0020 and never two
+    in a row, no code point of a refused category, at least one letter or digit."""
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not name or len(name) > BUYER_DISPLAY_NAME_MAX_LENGTH:
+        return None
+    if unicodedata.normalize("NFC", name) != name or "  " in name:
+        return None
+    has_letter_or_digit = False
+    for ch in name:
+        category = unicodedata.category(ch)
+        if category in _REFUSED_NAME_CATEGORIES or (ch.isspace() and ch != " "):
+            return None
+        if category[0] in ("L", "N"):
+            has_letter_or_digit = True
+    return name if has_letter_or_digit else None
+
+
+async def get_buyer_display_name(agent_id: str) -> Optional[str]:
+    """The name Pivota reviewed for this agent (agents.buyer_display_name, set by hand), cleaned, or None: no
+    agent, no reviewed name, or one without a name's shape. NEVER agents.agent_name, which the agent's own
+    developer typed. Raises on a read fault; the caller decides what a fault means."""
+    row = await database.fetch_one(_SELECT_BUYER_DISPLAY_NAME_SQL, {"agent_id": agent_id})
+    if row is None:
+        return None
+    return clean_buyer_display_name(dict(row).get("buyer_display_name"))
 
 
 async def update_agent_stats(

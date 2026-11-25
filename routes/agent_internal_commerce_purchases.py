@@ -84,6 +84,13 @@ db/reap_agentic_ledger.get_payment_card_for_owner says why that row's enrollment
 before the checkout exists, never on the A2A rail (its rail does not hand us the last four yet), never in the
 public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
 shows no card), never the body. Off: the body is byte for byte what it was.
+
+THE AGENT'S NAME. A GET body, either rail, carries a top-level `agent_display_name` (a string) only when
+Pivota has REVIEWED a name for the purchase's agent: agents.buyer_display_name (migration 297), set by hand as a
+gated one-off, NULL for every agent until then. Never agents.agent_name, which the agent's developer typed and
+nobody checked. No reviewed name, a stored one without a name's shape (db/agents.clean_buyer_display_name) or a
+failed read: no field (the page shows no "Requested by" line), never a 503. No dial: the column being NULL is
+the off position, per agent. Not in the public route or the webhooks: the agent knows its own name.
 """
 
 from __future__ import annotations
@@ -101,6 +108,7 @@ from fastapi.responses import JSONResponse
 
 import db.a2a_rail_ledger as a2a_ledger
 import db.agent_purchase_consents as consents_db
+import db.agents as agents_db
 import db.agent_purchase_ledger as purchases
 import db.reap_agentic_ledger as reap_ledger
 import db.reap_continuation as continuation
@@ -141,6 +149,15 @@ async def _payment_card(parent: Dict[str, Any], agent_id: str, owner: str) -> Op
         return await reap_ledger.get_payment_card_for_owner(str(parent["rail_purchase_id"]), agent_id, owner)
     except Exception as exc:  # noqa: BLE001 - the card is decoration: its fault drops it, never the body
         logger.warning("agent_internal_purchases: card read failed error_type=%s", type(exc).__name__)
+        return None
+
+
+async def _agent_display_name(agent_id: str) -> Optional[str]:
+    """The agent's reviewed buyer-facing name, or None (none reviewed, a bad shape, or a failed read: never a 503)."""
+    try:
+        return await agents_db.get_buyer_display_name(agent_id)
+    except Exception as exc:  # noqa: BLE001 - the name is decoration: its fault drops it, never the body
+        logger.warning("agent_internal_purchases: agent name read failed error_type=%s", type(exc).__name__)
         return None
 
 
@@ -259,6 +276,9 @@ async def get_purchase_for_gateway(
         card = await _payment_card(parent, agent_id, owner)
         if card is not None:
             body["payment_card"] = card
+    name = await _agent_display_name(agent_id)
+    if name is not None:
+        body["agent_display_name"] = name
     return body
 
 
