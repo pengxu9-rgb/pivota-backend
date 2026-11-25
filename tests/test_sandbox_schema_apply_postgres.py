@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gzip
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,16 +25,68 @@ import pytest
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 _IS_PG = DATABASE_URL.startswith(("postgresql://", "postgres://"))
 BIN = (os.getenv("PG_BIN_DIR") or "").strip()
-PG_DUMP = os.path.join(BIN, "pg_dump") if BIN else shutil.which("pg_dump")
-PSQL = os.path.join(BIN, "psql") if BIN else shutil.which("psql")
-pytestmark = pytest.mark.skipif(
-    not (_IS_PG and PG_DUMP and os.path.exists(PG_DUMP) and PSQL and os.path.exists(PSQL)),
-    reason="needs a Postgres DATABASE_URL and pg_dump/psql (PG_BIN_DIR)",
-)
+
+
+def _major(program):
+    """17 for 'pg_dump (PostgreSQL) 17.2 (Ubuntu 17.2-1)', or None."""
+    try:
+        out = subprocess.run([program, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"\(PostgreSQL\) ([0-9]+)", out)
+    return int(m.group(1)) if m else None
+
+
+def _any_psql():
+    """Any psql can read the server's version."""
+    import glob
+
+    found = [os.path.join(BIN, "psql")] if BIN else [shutil.which("psql") or ""]
+    for pattern in ("/usr/lib/postgresql/*/bin/psql", "/opt/homebrew/opt/postgresql@*/bin/psql",
+                    "/usr/local/opt/postgresql@*/bin/psql"):
+        found += sorted(glob.glob(pattern))
+    return next((p for p in found if p and os.path.exists(p)), None)
+
+
+def _server_major():
+    psql = _any_psql()
+    if not (_IS_PG and psql):
+        return None
+    try:
+        out = subprocess.run([psql, DATABASE_URL, "-XAtc", "SHOW server_version_num"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) // 10000 if out.isdigit() else None
+
+
+def _matching_bin(major):
+    """The pg_dump/psql pair of the SERVER's major version (the runbook's contract: a newer pg_dump
+    writes settings an older server rejects, e.g. pg_dump 17's `SET transaction_timeout`)."""
+    if major is None:
+        return None, None
+    which = shutil.which("pg_dump")
+    dirs = [BIN] if BIN else ["/usr/lib/postgresql/%d/bin" % major, "/opt/homebrew/opt/postgresql@%d/bin" % major,
+                              "/usr/local/opt/postgresql@%d/bin" % major] + ([os.path.dirname(which)] if which else [])
+    for d in dirs:
+        dump, psql = os.path.join(d, "pg_dump"), os.path.join(d, "psql")
+        if os.path.exists(dump) and os.path.exists(psql) and _major(dump) == major:
+            return dump, psql
+    return None, None
+
+
 if _IS_PG:
     _db = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
     if not any(m in _db for m in ("dialect_check", "_test", "test_")):
         pytest.skip("throwaway database only", allow_module_level=True)
+
+SERVER_MAJOR = _server_major()
+PG_DUMP, PSQL = _matching_bin(SERVER_MAJOR)
+pytestmark = pytest.mark.skipif(
+    not (_IS_PG and PG_DUMP and PSQL),
+    reason="needs a Postgres DATABASE_URL and pg_dump/psql of the server's major version (%s); "
+           "set PG_BIN_DIR" % SERVER_MAJOR,
+)
 
 from jobs import sandbox_schema_apply as A  # noqa: E402
 from jobs.sandbox_catalog_copy import LocalDirStore  # noqa: E402
