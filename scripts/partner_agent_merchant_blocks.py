@@ -11,9 +11,11 @@ about, and clears a merchant once the evidence exists. It is run as a gated one-
     python -m scripts.partner_agent_merchant_blocks clear --rail R --domain D \
         --basis verified_recognition|written_permission --by "name" --evidence "where it is kept" \
         [--ids pab_...,pab_... --apply]
+    python -m scripts.partner_agent_merchant_blocks backfill-captcha --by "name" \
+        [--purchase-ids ap_...,ap_... --apply]
 
-DRY-RUN BY DEFAULT. `record` and `clear` write only with `--apply`. Without it they print what
-they would do and write nothing.
+DRY-RUN BY DEFAULT. `record`, `clear` and `backfill-captcha` write only with `--apply`. Without it
+they print what they would do and write nothing.
 
 CLEARING IS TWO STEPS, AND THE SECOND NAMES WHAT THE FIRST SHOWED. A dry run prints the open
 events of that rail and domain and their ids. `--apply` needs `--ids` and clears exactly those
@@ -31,6 +33,27 @@ credential and text shaped like a secret (a key's armour line included) are refu
 names the part that failed (`part=evidence_query_string`, `part=by_missing`, `part=domain`, ...)
 and never repeats what was typed.
 
+`backfill-captcha` IS FOR THE DAY THE TOKEN RAIL'S FILTER GOES ON. Before then the worker records
+nothing, so a token rail purchase whose checkout met a CAPTCHA ended `failed` with the code
+`checkout_captcha_failed` and left no event. The command finds those purchases in the token rail's
+ledger and records one `captcha` event for each, on rail `a2a`, source `operator`, by `--by`, with
+the purchase's id: the same event the worker records now, so a purchase the worker has already
+recorded is a duplicate, never a second event. Like `clear` it is two steps. A dry run prints each
+candidate (`PABLOCK_CANDIDATE`) and the ids it would record; `--apply` needs `--purchase-ids` and
+records exactly those, after checking that every listed id is still such a purchase with a usable
+merchant domain and no clearance since (below). If one is not, nothing is recorded. An event's
+`observed_at` is when it is recorded; the purchase id is the link to when the CAPTCHA was met. A
+dry run reads at most 500 candidates (unrecorded first, then oldest) and says so when there are
+more. One `--apply` records at most 500 and reads exactly the ids it lists, so a rerun after a
+partial apply records the rest.
+
+A CLEARANCE SINCE STANDS. An operator who cleared the merchant for the token rail after the
+CAPTCHA was met did so on D11's evidence, which is newer than that CAPTCHA. Such a candidate is
+shown with the latest clearance (`cleared_at`) and `held_back: "cleared_since"`. It is not among
+the ids a dry run would record, and `--apply` refuses it (nothing is recorded). A candidate whose
+time cannot be compared with a clearance on its merchant is held back the same way. A CAPTCHA met
+after the latest clearance is recorded as usual.
+
 BEFORE ANYTHING ELSE the tool checks that the table exists and answers. If it does not (migration
 295 has not been applied, or the database is unreachable) it prints
 `PABLOCK_REFUSED store_unavailable` and exits 2.
@@ -43,10 +66,18 @@ OUTPUT (stdout, one JSON object per line after the prefix):
                                               carries "would_clear":n and "ids":"a,b" for --ids
     PABLOCK_RECORDED {"rail":..,"domain":..,"kind":..,"result":"recorded"|"duplicate"}
     PABLOCK_CLEARED {"rail":..,"domain":..,"basis":..,"cleared":n}
+    PABLOCK_CANDIDATE {"purchase_id":..,"domain":..,"failed_at":..,"recorded":bool,"usable":bool,
+                       "cleared_at":..|null,"held_back":null|"unusable_domain"|"cleared_since"}
+                                              `backfill-captcha`: one failed purchase; `recorded`
+                                              when an event already names it; `usable` when
+                                              nothing holds it back
+    PABLOCK_BACKFILLED {"recorded":n,"duplicate":n,"failed":n}
     PABLOCK_REFUSED <reason>
 
 Exit 0 when the command did what it said (a `clear` dry run that finds nothing open is 0 with
-`"would_clear":0`); 2 for a refusal or a failed read or write.
+`"would_clear":0`); 2 for a refusal or a failed read or write (a `backfill-captcha --apply` with
+any event not recorded included: the others stay recorded, and a rerun with the same ids records
+the rest).
 """
 
 from __future__ import annotations
@@ -55,10 +86,11 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from db import partner_agent_merchant_blocks as blocks
-from db.database import database
+from db.database import IS_POSTGRES, database
 from db.merchant_purchasability import normalize_domain
 from services.payment_orchestration.router import RAILS
 from utils.database_readiness import connect_database_with_timeout
@@ -72,7 +104,78 @@ LIST_PREFIX = "PABLOCK_LIST "
 DRY_RUN_PREFIX = "PABLOCK_DRY_RUN "
 RECORDED_PREFIX = "PABLOCK_RECORDED "
 CLEARED_PREFIX = "PABLOCK_CLEARED "
+CANDIDATE_PREFIX = "PABLOCK_CANDIDATE "
+BACKFILLED_PREFIX = "PABLOCK_BACKFILLED "
 REFUSED_PREFIX = "PABLOCK_REFUSED "
+
+#: The token rail, and the code its worker ends a purchase with when the checkout met a CAPTCHA
+#: (services/payment_orchestration/a2a_rail_worker: `checkout_` + the status `captcha-failed`). A
+#: test drives the worker to that code and runs the backfill over the row it left.
+BACKFILL_RAIL = "a2a"
+BACKFILL_KIND = "captcha"
+CAPTCHA_FAILURE_CODE = "checkout_captcha_failed"
+BACKFILL_MAX = blocks.LIST_MAX
+
+# Read-only: the token rail's purchases that ended on a CAPTCHA, the ones no event names yet first
+# (so a run past the cap reaches the rest), then oldest first. `recorded` is any event naming the
+# purchase, whatever its rail: `record_block` refuses a purchase id recorded against another rail or
+# domain. One more than the cap is asked for, to say whether there are more.
+_CAPTCHA_FAILURES_SQL = """
+SELECT p.id, p.merchant_domain, p.terminal_at,
+       CASE WHEN EXISTS (SELECT 1 FROM partner_agent_merchant_blocks AS b WHERE b.purchase_id = p.id)
+            THEN 1 ELSE 0 END AS recorded
+  FROM a2a_rail_purchases AS p
+ WHERE p.state = 'failed'
+   AND p.last_error_code = :code
+ ORDER BY recorded, p.terminal_at, p.id
+ LIMIT :limit
+"""
+
+# The same purchases, only the listed ids (an `--apply`, which must not depend on where its ids
+# fall in the dry run's order).
+_CAPTCHA_FAILURES_BY_ID_SQL = """
+SELECT p.id, p.merchant_domain, p.terminal_at,
+       CASE WHEN EXISTS (SELECT 1 FROM partner_agent_merchant_blocks AS b WHERE b.purchase_id = p.id)
+            THEN 1 ELSE 0 END AS recorded
+  FROM a2a_rail_purchases AS p
+ WHERE p.state = 'failed'
+   AND p.last_error_code = :code
+   AND p.id IN (SELECT jsonb_array_elements_text(CAST(:ids AS JSONB)))
+ ORDER BY p.terminal_at, p.id
+"""
+
+_CAPTCHA_FAILURES_BY_ID_SQL_SQLITE = """
+SELECT p.id, p.merchant_domain, p.terminal_at,
+       CASE WHEN EXISTS (SELECT 1 FROM partner_agent_merchant_blocks AS b WHERE b.purchase_id = p.id)
+            THEN 1 ELSE 0 END AS recorded
+  FROM a2a_rail_purchases AS p
+ WHERE p.state = 'failed'
+   AND p.last_error_code = :code
+   AND p.id IN (SELECT value FROM json_each(:ids))
+ ORDER BY p.terminal_at, p.id
+"""
+
+# The latest clearance per merchant on the token rail (a clearance since a CAPTCHA stands).
+_LATEST_CLEARANCES_SQL = """
+SELECT merchant_domain, MAX(cleared_at) AS last_cleared
+  FROM partner_agent_merchant_blocks
+ WHERE rail = :rail
+   AND cleared_at IS NOT NULL
+ GROUP BY merchant_domain
+"""
+
+
+def _instant(value: Any) -> Optional[datetime]:
+    """A stored time as an aware instant (a naive one is UTC, as both dialects store it), or None."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace(" ", "T", 1).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _line(prefix: str, payload: Dict[str, Any]) -> str:
@@ -177,7 +280,105 @@ async def _clear(args: Any, out: Callable[[str], None]) -> int:
     return EXIT_OK
 
 
-_COMMANDS = {"list": _list, "record": _record, "clear": _clear}
+async def _captcha_candidates(ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """The failed purchases (at most BACKFILL_MAX, or exactly the listed `ids`) and whether there
+    were more, or None when a read failed."""
+    try:
+        if ids:
+            statement = _CAPTCHA_FAILURES_BY_ID_SQL if IS_POSTGRES else _CAPTCHA_FAILURES_BY_ID_SQL_SQLITE
+            values: Dict[str, Any] = {"code": CAPTCHA_FAILURE_CODE, "ids": json.dumps(ids)}
+        else:
+            statement, values = _CAPTCHA_FAILURES_SQL, {"code": CAPTCHA_FAILURE_CODE, "limit": BACKFILL_MAX + 1}
+        records = await asyncio.wait_for(database.fetch_all(statement, values), blocks.READ_TIMEOUT_SECONDS * 5)
+        clearances = await asyncio.wait_for(
+            database.fetch_all(_LATEST_CLEARANCES_SQL, {"rail": BACKFILL_RAIL}), blocks.READ_TIMEOUT_SECONDS * 5)
+    except Exception:  # noqa: BLE001 - a missing ledger table and timeouts included
+        return None
+    last_cleared = {str(row["merchant_domain"]): row["last_cleared"] for row in clearances}
+    rows = []
+    for record in records[:BACKFILL_MAX]:
+        purchase_id = str(record["id"])
+        domain = normalize_domain(record["merchant_domain"])
+        problem = blocks.event_problem(
+            BACKFILL_RAIL, record["merchant_domain"], BACKFILL_KIND,
+            source=blocks.SOURCE_OPERATOR, purchase_id=purchase_id, recorded_by="backfill")
+        cleared = last_cleared.get(domain) if domain else None
+        held_back = None
+        if problem is not None:
+            held_back = "unusable_domain"
+        elif cleared is not None:
+            failed, since = _instant(record["terminal_at"]), _instant(cleared)
+            if failed is None or since is None or failed <= since:
+                held_back = "cleared_since"
+        rows.append({
+            "purchase_id": purchase_id, "domain": domain, "raw_domain": record["merchant_domain"],
+            "failed_at": record["terminal_at"], "recorded": int(record["recorded"]) == 1,
+            "usable": held_back is None, "cleared_at": cleared, "held_back": held_back,
+        })  # fmt: skip
+    return {"rows": rows, "more": len(records) > BACKFILL_MAX}
+
+
+def _candidate_line(row: Dict[str, Any]) -> str:
+    keys = ("purchase_id", "domain", "failed_at", "recorded", "usable", "cleared_at", "held_back")
+    return _line(CANDIDATE_PREFIX, {key: row[key] for key in keys})
+
+
+async def _backfill_captcha(args: Any, out: Callable[[str], None]) -> int:
+    nothing = "nothing was written" if args.apply else "nothing would be written"
+    by_problem = blocks.event_problem(
+        BACKFILL_RAIL, "merchant.example", BACKFILL_KIND, source=blocks.SOURCE_OPERATOR, recorded_by=args.by)
+    if by_problem is not None:
+        out(f"{REFUSED_PREFIX}backfill_refused part={by_problem}; {nothing}")
+        return EXIT_REFUSED
+    listed = _listed_ids(args.purchase_ids)
+    if args.apply and not listed:
+        out(f"{REFUSED_PREFIX}purchase_ids_required run without --apply first, then pass the ids it printed "
+            "with --purchase-ids")
+        return EXIT_REFUSED
+    if len(set(listed)) != len(listed) or len(listed) > BACKFILL_MAX:
+        out(f"{REFUSED_PREFIX}purchase_ids_invalid a listed id repeats, or more than {BACKFILL_MAX} are listed; "
+            f"{nothing}")
+        return EXIT_REFUSED
+    found = await _captcha_candidates(listed or None)
+    if found is None:
+        out(f"{REFUSED_PREFIX}read_failed the ledger or the record could not be read; {nothing}")
+        return EXIT_REFUSED
+    rows = found["rows"]
+    usable = {row["purchase_id"]: row for row in rows if row["usable"]}
+    if listed and not set(listed) <= set(usable):
+        out(f"{REFUSED_PREFIX}ids_not_candidates a listed id is not a token rail purchase that failed on a CAPTCHA "
+            f"with a usable merchant domain and no clearance since; {nothing}")
+        return EXIT_REFUSED
+    if not args.apply:
+        for row in rows:
+            out(_candidate_line(row))
+        would = [row["purchase_id"] for row in rows if row["usable"] and not row["recorded"]]
+        out(_line(DRY_RUN_PREFIX, {
+            "action": "backfill-captcha", "rail": BACKFILL_RAIL, "kind": BACKFILL_KIND, "by": args.by.strip(),
+            "candidates": len(rows), "more": found["more"], "would_record": len(would),
+            "purchase_ids": ",".join(would),
+        }))  # fmt: skip
+        return EXIT_OK
+    counts = {blocks.RECORDED: 0, blocks.DUPLICATE: 0, "failed": 0}
+    for purchase_id in listed:
+        row = usable[purchase_id]
+        result = await blocks.record_block(
+            BACKFILL_RAIL, row["raw_domain"], BACKFILL_KIND,
+            source=blocks.SOURCE_OPERATOR, purchase_id=purchase_id, recorded_by=args.by)
+        if result is None:
+            counts["failed"] += 1
+            out(f"{REFUSED_PREFIX}record_failed purchase_id={purchase_id} nothing was written for it")
+            continue
+        counts[result] += 1
+        out(_line(RECORDED_PREFIX, {
+            "rail": BACKFILL_RAIL, "domain": row["domain"], "kind": BACKFILL_KIND, "purchase_id": purchase_id,
+            "result": result,
+        }))  # fmt: skip
+    out(_line(BACKFILLED_PREFIX, counts))
+    return EXIT_OK if counts["failed"] == 0 else EXIT_REFUSED
+
+
+_COMMANDS = {"list": _list, "record": _record, "clear": _clear, "backfill-captcha": _backfill_captcha}
 
 
 async def amain(args: Any, *, out: Callable[[str], None]) -> int:
@@ -230,6 +431,13 @@ def build_parser() -> argparse.ArgumentParser:
     clear.add_argument("--ids", default=None,
                        help="comma-separated event ids to clear, as the dry run printed them (required with --apply)")
     clear.add_argument("--apply", action="store_true", help="clear the events (default: dry run)")
+
+    backfill = commands.add_parser(
+        "backfill-captcha", help="record the CAPTCHAs token rail purchases met before the worker recorded them")
+    backfill.add_argument("--by", required=True, help="the member of staff entering them")
+    backfill.add_argument("--purchase-ids", default=None,
+                          help="comma-separated purchase ids, as the dry run printed them (required with --apply)")
+    backfill.add_argument("--apply", action="store_true", help="record the events (default: dry run)")
     return parser
 
 

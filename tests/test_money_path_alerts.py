@@ -115,16 +115,36 @@ def test_every_event_has_exactly_the_metric_meant_for_it(defs):
     assert _hits(defs, beat) == ["freshness_directory_check_heartbeat"]
     down = '[ts] WARNING - freshness_directory_check_unavailable: {"pairs":null,"reason":"read_failed","unavailable":1}'
     assert _hits(defs, down) == ["freshness_directory_check_unavailable"], "an unavailable tick is no heartbeat"
+    purge = '[ts] INFO - a2a_rail_contact_purge: {"batches":1,"contact_purged":0}'
+    assert _hits(defs, purge) == ["a2a_rail_contact_purge_heartbeat"]
+    failed = "[ts] WARNING - a2a_rail_contact_purge: heartbeat write failed error_type=RuntimeError"
+    assert _hits(defs, failed) == [], "a run that could not stamp is no heartbeat"
     assert set(expected) == set(money_alerts.EVENTS)
 
 
-def test_the_file_holds_only_the_directory_freshness_definitions(defs):
+def test_the_file_holds_only_the_directory_freshness_and_contact_purge_definitions(defs):
     assert sorted(m["name"] for m in defs["log_metrics"]) == [
+        "a2a_rail_contact_purge_heartbeat",
         "freshness_directory_check_heartbeat", "freshness_directory_check_unavailable",
         "freshness_directory_missing", "freshness_directory_past_limit"]
     assert sorted(p["displayName"] for p in defs["alert_policies"]) == [
+        "prod: A2A contact purge went silent",
         "prod: directory freshness check cannot read its population", "prod: directory freshness check went silent",
         "prod: directory merchant fact past its limit"]
+
+
+def test_the_contact_purge_policy_fires_when_the_create_route_closes(defs):
+    """Silent for 50 min = the create route's purge window (CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS):
+    the page and the closed rail start together. Present in the 24 h before, so it pages on a stop."""
+    import db.a2a_rail_ledger as ledger
+
+    [policy] = [p for p in defs["alert_policies"] if p["displayName"] == "prod: A2A contact purge went silent"]
+    [condition] = policy["conditions"]
+    query = condition["conditionPrometheusQueryLanguage"]["query"]
+    metric = "logging_googleapis_com:user_a2a_rail_contact_purge_heartbeat"
+    assert query.count(metric) == 2
+    assert "[23h10m] offset 50m" in query and "[50m]" in query and " unless " in query
+    assert ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS == 50 * 60
 
 
 def test_an_unrelated_line_feeds_no_metric(defs):

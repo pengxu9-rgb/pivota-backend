@@ -948,8 +948,9 @@ async def test_off_nothing_is_read_before_the_quote(a2a, fake, monkeypatch):
     async def _no(*a, **k):
         raise AssertionError("a run-condition record was read")
 
-    monkeypatch.setattr(d11_facts, "meets_run_condition", _no)
-    monkeypatch.setattr(d11_blocks, "is_clear", _no)
+    for module, name in ((d11_facts, "meets_run_condition"), (d11_facts, "run_condition_answer"),
+                         (d11_blocks, "is_clear"), (d11_blocks, "clear_answer")):
+        monkeypatch.setattr(module, name, _no)
     pid = await _quoting()
     assert await _step(a2a, fake, pid) == "approval_page_issued"
 
@@ -962,8 +963,9 @@ async def test_an_order_already_out_at_the_rail_is_never_re_checked(a2a, fake, d
     async def _no(*a, **k):
         raise AssertionError("a run-condition record was read")
 
-    monkeypatch.setattr(d11_facts, "meets_run_condition", _no)
-    monkeypatch.setattr(d11_blocks, "is_clear", _no)
+    for module, name in ((d11_facts, "meets_run_condition"), (d11_facts, "run_condition_answer"),
+                         (d11_blocks, "is_clear"), (d11_blocks, "clear_answer")):
+        monkeypatch.setattr(module, name, _no)
     await _ago("next_poll_at", 1, pid)
     outcome = await _step(a2a, fake, pid)
     assert outcome != "refused" and (await _row(pid))["state"] == "awaiting_authorization"

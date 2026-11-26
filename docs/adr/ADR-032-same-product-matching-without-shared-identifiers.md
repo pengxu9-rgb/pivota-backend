@@ -4,6 +4,57 @@
 
 **Decision owner:** Founder. **Runtime owners:** the backend owner (identity engine, records, evaluation), the gateway owner (lane field mapping, request-time lookup).
 
+## Amendment 1 (owner, 2026-11-26): agents judge, inside the request
+
+*Decided by the owner on 2026-11-26; this ADR stays Proposed. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-031 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
+
+1. **A request may judge (M8 amended).** For candidates that a lane returns at request time, the request runs:
+   1. the deterministic normalisation;
+   2. every veto of M5 and M6;
+   3. a matcher and a sceptic, on two different models, each given both listings and both images.
+
+   All of it runs under a hard deadline inside the request's budget (ADR-031 Amendment 1). The result is one of three:
+   - **`confirmed`:** both agents agree, no veto fires, and every required variant field (M3) is known on both sides from a strong source and is equal;
+   - **`likely`:** both agree on the family, but a required variant field is unknown on one side, or a check that is not a veto (the image read, say) could not run;
+   - **not shown:** anything else. A veto that cannot run means the candidate is not shown, because a `likely` offer can be bought (ADR-029 Amendment 2).
+
+   Model-filled fields stay weak evidence (M3): they can veto or hold, and never create agreement.
+2. **Agents accept (M5, M9 and M13; the 2026-10-16 direction).** The owner's answer of 2026-11-26 is that matching is done by agents checking each other, with no human audit.
+   - The 600-pair audit gate is withdrawn.
+   - Stage D (the matcher and the sceptic) may accept. Stage C stays a score that orders work; it accepts nothing.
+   - The deterministic verifier still checks that every field an agent cites exists in its input.
+   - Vetoes still run before every acceptance, and no model overrides one.
+   - The image gate's contradiction, or a missing image, now makes a pair `likely` at most, instead of sending it to a person.
+3. **Safeguards that need no person.** These are proposed with this amendment; the owner may strike them.
+   - An independent third model re-judges a random sample of `confirmed` matches each day.
+   - The M9 monitors raise alarms on a price outlier inside a variant, an image disagreement, a checkout variant mismatch, returns and complaints.
+   - One confirmed wrong item drops that lane's automatic `confirmed` to `likely`. It stays there until the cause is fixed and the rule or model version changes.
+4. **Shades open now** (owner, 2026-11-26). The 2026-11-23 answer to question 1 is changed. Shades across stores are matched under the same rules: a price is compared only when the shade agrees exactly.
+5. **What is compared.** Comparability is defined once, in ADR-034 Amendment 1 item 1. A `likely` or family-grain match is never comparable: it is listed and labelled, and never priced side by side.
+6. **Unchanged in M7:** star clusters, cannot-links and undo. A reverted pair is not proposed again until its cause is cleared and the rule or model version has changed; a person is no longer required to clear it.
+7. **Write-back.** A decision made in a request is recorded as an M7 membership with its stage, models and fingerprints. M3's storage rule applies to it.
+8. **M11's five fix-first items** all land before any of this is switched on.
+9. **Switches (M13).**
+   - A new `IDENTITY_REQUEST_JUDGE` (off, shadow, on) runs the judge in requests. It may be on only while `IDENTITY_LANE_INTAKE` is on, because the write-back of item 7 uses its pointers.
+   - `IDENTITY_STAGE_D` gains an `auto` value.
+   - `IDENTITY_STAGE_A_AUTO` and `IDENTITY_STAGE_B`'s `auto` no longer wait for a gate. Each still opens only by an owner decision, recorded in the change that sets it.
+10. **Open, the owner's to decide:** whether request-time judging runs in shadow on live asks before it serves.
+11. **Text below that this amendment overrides:**
+    - the 600-pair and operator-approval lines of "Direction already decided", and its line that a person decides where the agents disagree (they now disagree: not shown);
+    - the ADR-010 amendment that Tiers 2 and 3 run in shadow and propose mode only and never accept;
+    - M2's rule that a provisional anchor without a hub needs a person's approval (the exact tiers and both agents now suffice);
+    - M9's suspension "for that slice" after a gate: the unit is the lane, as in item 3;
+    - the consequence that coverage grows slowly and under audit;
+    - M5's table, where stages C and D accept nothing, and its image-gate line;
+    - M7's "until a person clears the cause";
+    - M8;
+    - M9's gate for automatic acceptance (the labelled gold table stays, for measurement);
+    - M10's rule that a pair in two scripts goes to a person;
+    - M13's "no `auto` value exists", and its "only after its gate" on stages A and B;
+    - phase 2's shade wait and the order of phases 3 and 4;
+    - the answer to question 1;
+    - the rejected alternative "accept stages A and B inline at request time".
+
 **Companion:** ADR-031 decides how supply is read through lanes. This ADR decides when two listings, from any lanes, are the same sellable item.
 
 **Direction already decided by the owner (2026-10-16 to 2026-10-19):**
