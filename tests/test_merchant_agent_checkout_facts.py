@@ -387,6 +387,7 @@ async def test_a_missing_table_is_no_fact_and_never_an_error(_facts_db):
     await database.execute(f"DROP TABLE {TABLE}")
     assert await facts.table_is_readable() is False
     assert await facts.meets_run_condition("brand-a.example") is False
+    assert await facts.run_condition_answer("brand-a.example") is None, "cannot tell, which is not a definite no"
     assert await facts.get_fact("brand-a.example") is None
     assert await facts.record_check("brand-a.example", POSITIVE_UCP) is False
 
@@ -406,6 +407,7 @@ async def test_a_slow_read_is_no_fact(_facts_db, monkeypatch):
     monkeypatch.setattr(facts, "READ_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(database, "fetch_one", slow)
     assert await facts.meets_run_condition("brand-a.example") is False
+    assert await facts.run_condition_answer("brand-a.example") is None, "a slow read cannot tell: it is not a no"
     assert await facts.table_is_readable() is False
     assert await facts.get_fact("brand-a.example") is None
 
@@ -780,4 +782,4 @@ def test_one_request_path_module_reads_the_fact_and_it_only_reads():
     ]
     assert readers == [_RUN_CONDITION_READER]
     source = _RUN_CONDITION_READER.read_text("utf-8")
-    assert set(re.findall(r"checkout_facts\.([a-z_]+)", source)) == {"meets_run_condition"}
+    assert set(re.findall(r"checkout_facts\.([a-z_]+)", source)) == {"run_condition_answer"}

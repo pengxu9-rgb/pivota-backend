@@ -477,10 +477,16 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
      worker reads the same two records again right before each send to the merchant (the VIC quote,
      the token request, the relay that carries the token into the checkout). Not met: nothing is
      sent, and the purchase ends with `merchant_not_eligible`: `refused` before the quote or the
-     token, `failed` at the relay (a token was minted). A checkout answered with a
+     token, `failed` at the relay (a token was minted). At the relay, a record that cannot be read
+     (and no definite no from the other) is not a failure: the purchase stays
+     `awaiting_authorization`, its code ends `:merchant_check_unavailable`, the worker asks again
+     on the next tick, and the approval page's deadline ends it (`expired`, `buyer_action_expired`)
+     if the record stays unreadable. A checkout answered with a
      definite `captcha-failed` records a challenge for this rail and merchant (source `worker`)
      before the purchase fails, which closes the merchant to the A2A agent until an operator clears
-     it on ADR-030 D11's evidence (`scripts/partner_agent_merchant_blocks.py`).
+     it on ADR-030 D11's evidence (`scripts/partner_agent_merchant_blocks.py`). The CAPTCHAs
+     purchases met before the setting named `a2a` are recorded once, by an operator, with that
+     tool's `backfill-captcha` (a gated one-off).
    - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
      refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
      that reason. It is never retried on Reap: the router decides once, before anything is written.

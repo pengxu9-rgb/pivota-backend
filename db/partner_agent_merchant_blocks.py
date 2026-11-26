@@ -26,6 +26,8 @@ db/merchant_agent_checkout_facts):
      `written_permission`. A later order, a later census and time do not.
   4. CLEAR IS A POSITIVE ANSWER. `is_clear` is True only when the read worked and found no open
      event. A failed or slow read, a missing table and an unusable key all answer False.
+     `clear_answer` is the same read with "cannot tell" (a failed or slow read, a missing table)
+     answered None instead, for the one caller that may wait it out.
   5. THE KEY IS THE RAIL AND THE DOMAIN, NOT THE MARKET. The merchant challenged the agent,
      wherever the buyer was. An event on one rail says nothing about the other.
   6. ONE PURCHASE RECORDS ONE EVENT. A worker that retries after a crash writes nothing new. The
@@ -41,14 +43,15 @@ db/merchant_agent_checkout_facts):
   8. A REFUSAL NAMES THE PART THAT FAILED AND NEVER ECHOES ITS VALUE (`event_problem`,
      `clearance_problem`).
 
-WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run as a gated one-off.
-The token rail worker, for the purchase whose checkout met a CAPTCHA (source `worker`, only while
-PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`; services/payment_orchestration/a2a_rail_worker). No
-request writes here.
+WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run as a gated one-off
+(`record` for one event; `backfill-captcha` for the CAPTCHAs token rail purchases met before the
+worker recorded them). The token rail worker, for the purchase whose checkout met a CAPTCHA (source
+`worker`, only while PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`;
+services/payment_orchestration/a2a_rail_worker). No request writes here.
 
 FOR A CALLER ON A REQUEST PATH (services/payment_orchestration/agent_run_condition.py is the one: it
-calls `is_clear` on the create path, only for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS, and never
-writes): as db/merchant_agent_checkout_facts says, read
+reads `clear_answer`, on the create path and for the token rail worker's re-check, only for a rail on
+PARTNER_AGENT_RUN_CONDITION_RAILS, and never writes): as db/merchant_agent_checkout_facts says, read
 outside any transaction or under a savepoint (a swallowed missing-table error still aborts a
 surrounding Postgres transaction), and before the request fans out (the read's timeout cancels a
 query on a connection the request's tasks may share).
@@ -92,6 +95,7 @@ __all__ = [
     "clearance_values",
     "record_block",
     "clear_blocks",
+    "clear_answer",
     "is_clear",
     "list_blocks",
 ]
@@ -474,19 +478,27 @@ async def _clear_all_or_nothing(values: Dict[str, Any]) -> int:
 # ── reads ────────────────────────────────────────────────────────────────────────────────────
 
 
-async def is_clear(rail: Any, domain: Any) -> bool:
-    """True only when the read worked and this rail has no open event on this merchant.
-
-    False for an open event, an unusable rail or domain, a slow or failed read and a missing
-    table. Never raises."""
+async def clear_answer(rail: Any, domain: Any) -> Optional[bool]:
+    """The read, with "cannot tell" kept apart. True when the read worked and this rail has no open
+    event on this merchant. False for a DEFINITE no: an open event, an unusable rail or domain. None
+    when the record could not be read: a slow or failed read, a missing table. Never raises. Only a
+    caller that may wait out a None reads this; every other caller reads `is_clear`."""
     key = _key(rail, domain)
     if key is None:
         return False
     try:
         record = await asyncio.wait_for(database.fetch_one(_OPEN_SQL, key), READ_TIMEOUT_SECONDS)
-    except Exception:  # noqa: BLE001 - cannot tell is not clear
-        return False
+    except Exception:  # noqa: BLE001 - timeouts and a missing table included: cannot tell
+        return None
     return record is None
+
+
+async def is_clear(rail: Any, domain: Any) -> bool:
+    """True only when the read worked and this rail has no open event on this merchant.
+
+    False for an open event, an unusable rail or domain, a slow or failed read and a missing
+    table. Never raises."""
+    return await clear_answer(rail, domain) is True
 
 
 async def list_blocks(

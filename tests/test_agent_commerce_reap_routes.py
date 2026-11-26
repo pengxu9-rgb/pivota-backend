@@ -5361,7 +5361,7 @@ class _RunConditionReads:
     """Stand-ins for the two record reads (the readers' own suites own what they read), recording
     every call. `fact` and `clear` are the answers."""
 
-    def __init__(self, monkeypatch, *, fact: bool = True, clear: bool = True):
+    def __init__(self, monkeypatch, *, fact: Optional[bool] = True, clear: Optional[bool] = True):
         import db.merchant_agent_checkout_facts as checkout_facts
         import db.partner_agent_merchant_blocks as agent_blocks
 
@@ -5375,8 +5375,8 @@ class _RunConditionReads:
             self.calls.append(("clear", rail, domain))
             return self.clear
 
-        monkeypatch.setattr(checkout_facts, "meets_run_condition", _fact)
-        monkeypatch.setattr(agent_blocks, "is_clear", _clear)
+        monkeypatch.setattr(checkout_facts, "run_condition_answer", _fact)
+        monkeypatch.setattr(agent_blocks, "clear_answer", _clear)
 
 
 async def _seed_lane(lane: str, monkeypatch) -> Dict[str, Any]:
@@ -5397,15 +5397,18 @@ async def _reap_writes() -> Dict[str, int]:
 
 
 @pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
-@pytest.mark.parametrize("unmet", ["no_fact", "open_block"])
+@pytest.mark.parametrize("unmet", ["no_fact", "open_block", "fact_unreadable", "block_unreadable"])
 async def test_reaps_agent_is_refused_where_the_run_condition_fails_with_the_lanes_own_code(
     client, monkeypatch, lane, unmet
 ):
     """The existing `merchant_not_eligible`, never a code of its own, and nothing is written: no buyer,
-    no key, no purchase. On the cart-link lane it is answered before the catalog read."""
+    no key, no purchase. On the cart-link lane it is answered before the catalog read. A record that cannot
+    be read is refused the same way: Reap's purchases are never re-checked after create."""
     request = await _seed_lane(lane, monkeypatch)
     monkeypatch.setenv("PARTNER_AGENT_RUN_CONDITION_RAILS", "reap")
-    reads = _RunConditionReads(monkeypatch, fact=unmet != "no_fact", clear=unmet != "open_block")
+    reads = _RunConditionReads(
+        monkeypatch, fact={"no_fact": False, "fact_unreadable": None}.get(unmet, True),
+        clear={"open_block": False, "block_unreadable": None}.get(unmet, True))
     loaded = []
     real_load = routes_reap._load_cart_link_item
 
@@ -5420,7 +5423,7 @@ async def test_reaps_agent_is_refused_where_the_run_condition_fails_with_the_lan
         assert word not in resp.text
     assert await _reap_writes() == {name: 0 for name in await _reap_writes()}
     assert loaded == []
-    # The fact first; with no fact the challenge record is not asked.
+    # The fact first; with a definite no there the challenge record is not asked.
     expected = [("fact", DOMAIN)] if unmet == "no_fact" else [("fact", DOMAIN), ("clear", "reap", DOMAIN)]
     assert reads.calls == expected
 

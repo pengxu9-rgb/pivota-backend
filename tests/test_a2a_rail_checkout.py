@@ -4207,7 +4207,8 @@ def _d11_reads_forbidden(monkeypatch):
             return answer
         return _note
 
-    for module, name, answer in ((d11_facts, "meets_run_condition", False), (d11_blocks, "is_clear", False),
+    for module, name, answer in ((d11_facts, "meets_run_condition", False), (d11_facts, "run_condition_answer", False),
+                                 (d11_blocks, "is_clear", False), (d11_blocks, "clear_answer", False),
                                  (d11_blocks, "record_block", None)):
         monkeypatch.setattr(module, name, _noting(name, answer))
     return touched
@@ -4399,3 +4400,352 @@ async def test_a_record_that_raises_is_logged_and_the_purchase_still_fails(d11_r
     assert any("challenge record raised" in m and "error_type=RuntimeError" in m for m in messages)
     assert any("challenge NOT recorded" in m for m in messages)
     assert (await _row(pid))["last_error_code"] == "checkout_captcha_failed"
+
+
+# ── Follow-ups: the relay waits out a record it cannot read; the CAPTCHAs met while off are backfilled ──────
+
+from scripts import partner_agent_merchant_blocks as d11_tool  # noqa: E402
+
+D11_STAFF = "Ops Person One"
+D11_HELD = worker.RUN_CONDITION_UNREADABLE
+
+
+async def _d11_unreadable(which):
+    """Make one record unreadable the way production can: its table missing, or its read failing."""
+    if which == "facts_table_missing":
+        await database.execute(f"DROP TABLE {d11_facts.TABLE}")
+    elif which == "blocks_table_missing":
+        await database.execute(f"DROP TABLE {d11_blocks.TABLE}")
+    else:
+        raise AssertionError(which)
+
+
+async def _d11_readable_again(which):
+    if which == "facts_table_missing":
+        await _d11_create_facts()
+        await _d11_met()
+    else:
+        await _d11_create_blocks()
+
+
+@pytest.mark.parametrize("which", ["facts_table_missing", "blocks_table_missing"])
+async def test_an_unreadable_record_at_the_paid_relay_is_a_hold_and_the_next_tick_sends(d11_records, which):
+    await _d11_met()
+    pid = await _approving()
+    before = await _row(pid)
+    await _d11_unreadable(which)
+    rail = _approved(Rail())
+    assert await _step(rail, pid) == D11_HELD
+    row = await _row(pid)
+    assert rail.sent == [], "no `paid`, so no checkout setup"
+    assert (row["state"], row["pending_write"], row["claimed_by"], row["payment_token_id"]) == (
+        "awaiting_authorization", None, None, "ptk_1")
+    assert row["last_error_code"] == f"{before['last_error_code']}:{D11_HELD}"
+    assert worker._paid_state(row) == worker._paid_state(before), "the schedule's slot is not spent"
+    await _d11_readable_again(which)
+    rail = _approved(Rail())
+    assert await _step(rail, pid) == "placing"
+    assert rail.actions()[0] == "payment.visa-action-required#paid"
+
+
+async def test_an_unreadable_record_at_the_await_poll_relay_is_a_hold_too(d11_records):
+    await _d11_met()
+    pid = await _approving()
+    assert await _step(Rail().on("payment.visa-action-required#paid", _await("PENDING")), pid) == "waiting_on_buyer"
+    await _d11_unreadable("blocks_table_missing")
+    rail = Rail().on("payment.await#poll", _token_result()).on("checkout.setup#submit", CONFIRM_CARD)
+    assert await _step(rail, pid) == D11_HELD
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["pending_write"]) == ([], "awaiting_authorization", None)
+    assert worker._paid_state(row)[1] == "await" and row["last_error_code"].endswith(f":{D11_HELD}")
+
+
+async def test_a_hold_ends_at_the_approval_page_deadline_like_a_buyer_who_never_approves(d11_records):
+    await _d11_met()
+    pid = await _approving()
+    await _d11_unreadable("facts_table_missing")
+    assert await _step(_approved(Rail()), pid) == D11_HELD
+    await _ago("buyer_action_expires_at", 5, pid)
+    assert await ledger.expire_overdue_purchases() >= 1
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("expired", "buyer_action_expired")
+
+
+async def test_a_definite_block_beside_an_unreadable_fact_still_fails_at_the_relay(d11_records):
+    await _d11_met()
+    pid = await _approving()
+    await _d11_block()
+    await _d11_unreadable("facts_table_missing")
+    rail = _approved(Rail())
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["last_error_code"]) == ([], "failed", "merchant_not_eligible")
+
+
+async def test_a_read_that_cannot_tell_is_a_hold_and_a_definite_no_is_a_failure(d11_records, monkeypatch):
+    """The block reader's own answers, as the relay reads them: None holds, False fails."""
+    await _d11_met()
+    held, failed = await _approving(), await _approving()
+    answers = {held: None, failed: False}
+    current = []
+
+    async def _answer(*_a, **_k):
+        return answers[current[-1]]
+
+    monkeypatch.setattr(d11_blocks, "clear_answer", _answer)
+    current.append(held)
+    assert await _step(_approved(Rail()), held) == D11_HELD
+    current.append(failed)
+    assert await _step(_approved(Rail()), failed) == "failed"
+    assert (await _row(failed))["last_error_code"] == "merchant_not_eligible"
+
+
+async def test_off_an_unreadable_record_changes_nothing_at_the_relay(monkeypatch):
+    monkeypatch.delenv(D11_RAILS_ENV, raising=False)
+    touched = _d11_reads_forbidden(monkeypatch)
+    pid = await _approving()
+    assert await _step(_approved(Rail()), pid) == "placing"
+    assert touched == []
+
+
+async def _d11_run_tool(*argv):
+    lines = []
+    code = await d11_tool.amain(d11_tool.build_parser().parse_args(list(argv)), out=lines.append)
+    return code, lines
+
+
+def _d11_payloads(lines, prefix):
+    return [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+
+
+async def _d11_captcha_while_off(monkeypatch):
+    """A purchase whose checkout met a CAPTCHA while the setting did not name `a2a`: the worker's own code, no event."""
+    monkeypatch.delenv(D11_RAILS_ENV, raising=False)
+    pid = await _placing()
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    monkeypatch.setenv(D11_RAILS_ENV, "a2a")
+    assert (await _row(pid))["last_error_code"] == d11_tool.CAPTCHA_FAILURE_CODE, "the code the worker writes"
+    assert await _d11_events() == []
+    return pid
+
+
+async def test_the_backfill_records_a_captcha_the_worker_met_while_off_and_closes_the_merchant(d11_records, monkeypatch):
+    await _d11_met()
+    pid = await _d11_captcha_while_off(monkeypatch)
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    assert code == 0
+    [candidate] = [c for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX) if c["purchase_id"] == pid]
+    assert (candidate["domain"], candidate["recorded"], candidate["usable"]) == (D11_MERCHANT, False, True)
+    [dry] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert (dry["action"], dry["would_record"], dry["purchase_ids"], dry["more"]) == ("backfill-captcha", 1, pid, False)
+    assert await _d11_events() == [], "a dry run writes nothing"
+
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 0
+    assert [r["result"] for r in _d11_payloads(lines, d11_tool.RECORDED_PREFIX)] == ["recorded"]
+    assert _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX) == [{"recorded": 1, "duplicate": 0, "failed": 0}]
+    [event] = await _d11_events()
+    assert (event["rail"], event["kind"], event["source"], event["purchase_id"], event["recorded_by"]) == (
+        "a2a", "captcha", "operator", pid, D11_STAFF)
+
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 0 and _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX) == [{"recorded": 0, "duplicate": 1, "failed": 0}]
+    assert len(await _d11_events()) == 1, "one purchase, one event"
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [dry] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert (dry["would_record"], dry["purchase_ids"]) == (0, "")
+
+    second = await _locked()
+    rail = Rail()
+    assert await _step(rail, second) == "refused"
+    assert (rail.sent, (await _row(second))["refusal_reason"]) == ([], "merchant_not_eligible")
+
+
+async def test_a_captcha_the_worker_recorded_is_shown_recorded_and_never_a_second_event(d11_records):
+    await _d11_met()
+    pid = await _placing()
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [candidate] = [c for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX) if c["purchase_id"] == pid]
+    assert candidate["recorded"] is True and _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)[0]["would_record"] == 0
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 0 and _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX)[0]["duplicate"] == 1
+    [event] = await _d11_events()
+    assert event["source"] == "worker", "the worker's own event stands"
+
+
+@pytest.mark.parametrize("status", ["form-error", "pay-disabled"])
+async def test_a_failure_that_is_not_a_captcha_is_no_candidate(d11_records, monkeypatch, status):
+    monkeypatch.delenv(D11_RAILS_ENV, raising=False)
+    pid = await _placing()
+    answer = _checkout_result(status, success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    assert code == 0 and pid not in {c["purchase_id"] for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX)}
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 2 and any(line.startswith(f"{d11_tool.REFUSED_PREFIX}ids_not_candidates") for line in lines)
+
+
+@pytest.mark.parametrize("argv,reason", [
+    (("--by", D11_STAFF, "--apply"), "purchase_ids_required"),
+    (("--by", D11_STAFF, "--purchase-ids", "ap_not_a_captcha_purchase", "--apply"), "ids_not_candidates"),
+    (("--by", D11_STAFF, "--purchase-ids", "{pid},{pid}", "--apply"), "purchase_ids_invalid"),
+    (("--by", "Ops‮Person", "--purchase-ids", "{pid}", "--apply"), "backfill_refused part=by_hidden_character"),
+    (("--by", "  ", "--purchase-ids", "{pid}", "--apply"), "backfill_refused part=by_missing"),
+    (("--by", D11_STAFF, "--purchase-ids", "ap_not_a_captcha_purchase"), "ids_not_candidates"),
+])
+async def test_a_backfill_that_does_not_name_reviewed_candidates_writes_nothing(d11_records, monkeypatch, argv, reason):
+    pid = await _d11_captcha_while_off(monkeypatch)
+    argv = tuple(a.replace("{pid}", pid) for a in argv)
+    code, lines = await _d11_run_tool("backfill-captcha", *argv)
+    assert code == 2 and lines[-1].startswith(f"{d11_tool.REFUSED_PREFIX}{reason}"), lines
+    assert "Ops‮Person" not in "".join(lines), "a refusal never repeats what was typed"
+    assert await _d11_events() == []
+
+
+async def test_a_mixed_apply_with_an_unrecordable_id_writes_nothing(d11_records, monkeypatch):
+    """All or nothing on the review: one listed id that is not a candidate, and the good one is not recorded either."""
+    pid = await _d11_captcha_while_off(monkeypatch)
+    other = await _locked()
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", f"{pid},{other}", "--apply")
+    assert code == 2 and await _d11_events() == []
+
+
+async def test_a_backfill_write_that_does_not_land_is_named_and_exits_2(d11_records, monkeypatch):
+    pid = await _d11_captcha_while_off(monkeypatch)
+
+    async def _fails(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(d11_blocks, "record_block", _fails)
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 2
+    assert any(line == f"{d11_tool.REFUSED_PREFIX}record_failed purchase_id={pid} nothing was written for it" for line in lines)
+    assert _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX) == [{"recorded": 0, "duplicate": 0, "failed": 1}]
+
+
+async def test_the_backfill_reaches_past_the_cap_because_recorded_purchases_sort_last(d11_records, monkeypatch):
+    first, second = await _d11_captcha_while_off(monkeypatch), await _d11_captcha_while_off(monkeypatch)
+    monkeypatch.setattr(d11_tool, "BACKFILL_MAX", 1)
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [dry] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert (dry["candidates"], dry["more"]) == (1, True)
+    code, _ = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", dry["purchase_ids"], "--apply")
+    assert code == 0
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [dry_next] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert dry_next["would_record"] == 1 and dry_next["purchase_ids"] != dry["purchase_ids"]
+    assert {dry["purchase_ids"], dry_next["purchase_ids"]} == {first, second}
+
+
+async def test_a_dry_run_given_ids_shows_only_those(d11_records, monkeypatch):
+    first, second = await _d11_captcha_while_off(monkeypatch), await _d11_captcha_while_off(monkeypatch)
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", second)
+    assert code == 0
+    assert [c["purchase_id"] for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX)] == [second]
+    [dry] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert (dry["candidates"], dry["would_record"], dry["purchase_ids"]) == (1, 1, second)
+    assert first != second and await _d11_events() == []
+
+
+async def test_only_a_failed_purchase_is_a_candidate_whatever_its_code_says(d11_records, monkeypatch):
+    """A live or ended row carrying the code another way (a hand edit, a later state) is not a CAPTCHA the worker met."""
+    pid = await _d11_captcha_while_off(monkeypatch)
+    live = await _locked()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = :c WHERE id = :i",
+                           {"c": d11_tool.CAPTCHA_FAILURE_CODE, "i": live})
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    assert code == 0 and [c["purchase_id"] for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX)] == [pid]
+
+
+async def test_a_slow_fact_read_at_the_relay_is_a_hold_with_nothing_sent(d11_records, monkeypatch, caplog):
+    """The likeliest "cannot tell" in production: the fact's read runs past its bound. Held, never failed."""
+    await _d11_met()
+    pid = await _approving()
+    real = database.fetch_one
+
+    async def _slow_fact(query, *args, **kwargs):
+        if d11_facts.TABLE in str(query):
+            await asyncio.sleep(0.2)
+        return await real(query, *args, **kwargs)
+
+    monkeypatch.setattr(d11_facts, "READ_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(database, "fetch_one", _slow_fact)
+    rail = _approved(Rail())
+    with caplog.at_level(logging.WARNING):
+        assert await _step(rail, pid) == D11_HELD
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["pending_write"]) == ([], "awaiting_authorization", None)
+    assert row["last_error_code"].endswith(f":{D11_HELD}")
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("cause=record_unreadable" in m for m in messages)
+    assert any(f"run condition unreadable at the relay purchase={pid}; held" in m for m in messages)
+
+
+async def _d11_clear_merchant(age_seconds=0):
+    """An operator clears the token rail on the merchant on D11's evidence (an event recorded for it first)."""
+    assert await d11_blocks.record_block("a2a", D11_MERCHANT, "block", source=d11_blocks.SOURCE_OPERATOR,
+                                         recorded_by=D11_STAFF) == "recorded"
+    [event] = await d11_blocks.list_blocks(rail="a2a", domain=D11_MERCHANT, open_only=True)
+    assert await d11_blocks.clear_blocks("a2a", D11_MERCHANT, ids=[event["id"]], basis="written_permission",
+                                         cleared_by=D11_STAFF, evidence="ticket OPS-0002") == 1
+    return event["id"]
+
+
+async def test_a_captcha_older_than_a_clearance_is_held_back_and_never_reopens_the_merchant(d11_records, monkeypatch):
+    await _d11_met()
+    pid = await _d11_captcha_while_off(monkeypatch)
+    await _ago("terminal_at", 3600, pid)  # met an hour ago
+    await _d11_clear_merchant()  # cleared now, on newer evidence
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    assert code == 0
+    [candidate] = [c for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX) if c["purchase_id"] == pid]
+    assert (candidate["usable"], candidate["held_back"]) == (False, "cleared_since") and candidate["cleared_at"]
+    [dry] = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)
+    assert (dry["would_record"], dry["purchase_ids"]) == (0, "")
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 2 and lines[-1].startswith(f"{d11_tool.REFUSED_PREFIX}ids_not_candidates")
+    assert await d11_blocks.list_blocks(rail="a2a", domain=D11_MERCHANT, open_only=True) == []
+    assert await d11_blocks.is_clear("a2a", D11_MERCHANT) is True, "the clearance stands"
+
+
+async def test_a_captcha_met_after_the_latest_clearance_is_recorded(d11_records, monkeypatch):
+    await _d11_met()
+    pid = await _d11_captcha_while_off(monkeypatch)
+    await _d11_clear_merchant()
+    backdate = ("CURRENT_TIMESTAMP - INTERVAL '30 days'" if IS_POSTGRES else "datetime('now', '-30 days')")
+    await database.execute(f"UPDATE {d11_blocks.TABLE} SET cleared_at = {backdate}")  # cleared well before the CAPTCHA
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [candidate] = [c for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX) if c["purchase_id"] == pid]
+    assert (candidate["usable"], candidate["held_back"]) == (True, None) and candidate["cleared_at"]
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", pid, "--apply")
+    assert code == 0 and _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX)[0]["recorded"] == 1
+
+
+async def test_a_clearance_on_another_rail_or_merchant_holds_nothing_back(d11_records, monkeypatch):
+    await _d11_met()
+    pid = await _d11_captcha_while_off(monkeypatch)
+    await _ago("terminal_at", 3600, pid)
+    assert await d11_blocks.record_block("reap", D11_MERCHANT, "block", source=d11_blocks.SOURCE_OPERATOR,
+                                         recorded_by=D11_STAFF) == "recorded"
+    [event] = await d11_blocks.list_blocks(rail="reap", domain=D11_MERCHANT, open_only=True)
+    assert await d11_blocks.clear_blocks("reap", D11_MERCHANT, ids=[event["id"]], basis="written_permission",
+                                         cleared_by=D11_STAFF, evidence="ticket OPS-0003") == 1
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    [candidate] = [c for c in _d11_payloads(lines, d11_tool.CANDIDATE_PREFIX) if c["purchase_id"] == pid]
+    assert (candidate["usable"], candidate["held_back"], candidate["cleared_at"]) == (True, None, None)
+
+
+async def test_a_rerun_with_the_same_ids_after_an_apply_past_the_cap_is_a_duplicate_not_a_refusal(
+        d11_records, monkeypatch):
+    first, second = await _d11_captcha_while_off(monkeypatch), await _d11_captcha_while_off(monkeypatch)
+    monkeypatch.setattr(d11_tool, "BACKFILL_MAX", 1)
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF)
+    listed = _d11_payloads(lines, d11_tool.DRY_RUN_PREFIX)[0]["purchase_ids"]
+    assert listed in (first, second)
+    assert (await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", listed, "--apply"))[0] == 0
+    # The recorded one now sorts after the other, past the cap of one: the rerun still reads it by its id.
+    code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", listed, "--apply")
+    assert code == 0 and _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX) == [{"recorded": 0, "duplicate": 1, "failed": 0}]

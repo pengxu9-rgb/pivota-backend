@@ -457,12 +457,14 @@ def test_only_the_two_bases_d11_names_exist():
                                          ("a2a", "not a domain"), ("a2a", "a.example,b.example"), ("a2a", "localhost")])
 async def test_an_unusable_key_is_never_clear(_blocks_db, rail, domain):
     assert await blocks.is_clear(rail, domain) is False
+    assert await blocks.clear_answer(rail, domain) is False, "a key that can never be read is a definite no"
 
 
 async def test_a_missing_table_is_never_clear_and_never_an_error(_blocks_db):
     await database.execute(f"DROP TABLE {TABLE}")
     assert await blocks.table_is_readable() is False
     assert await blocks.is_clear("a2a", SHOP) is False
+    assert await blocks.clear_answer("a2a", SHOP) is None, "cannot tell, which is not a definite no"
     assert await _worker_event() is None and await _clear(ids=[NO_SUCH_EVENT]) is None
     assert await blocks.list_blocks() is None
 
@@ -477,6 +479,7 @@ async def test_a_slow_read_is_not_clear(_blocks_db, monkeypatch):
     monkeypatch.setattr(blocks, "READ_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(database, "fetch_one", slow)
     assert await blocks.is_clear("a2a", SHOP) is False
+    assert await blocks.clear_answer("a2a", SHOP) is None
     assert await blocks.table_is_readable() is False
 
 
@@ -801,7 +804,7 @@ def test_no_statement_in_the_application_can_delete_or_rewrite_an_event():
 
 
 def test_one_request_path_module_reads_the_record_and_it_never_writes():
-    """The run-condition filter is the one request-path reader, and it calls `is_clear` only. The token
+    """The run-condition filter is the one request-path reader, and it calls `clear_answer` only. The token
     rail worker is the one other module in routes/ or services/ that names the record: it records a
     challenge (`record_block`, as source `worker`) and reads it only through the filter."""
     reader = _REPO / "services/payment_orchestration/agent_run_condition.py"
@@ -811,5 +814,5 @@ def test_one_request_path_module_reads_the_record_and_it_never_writes():
         if TABLE in path.read_text("utf-8", errors="ignore")
     )
     assert readers == sorted([reader, worker])
-    assert set(re.findall(r"agent_blocks\.([a-z_]+)", reader.read_text("utf-8"))) == {"is_clear"}
+    assert set(re.findall(r"agent_blocks\.([a-z_]+)", reader.read_text("utf-8"))) == {"clear_answer"}
     assert set(re.findall(r"agent_blocks\.([A-Za-z_]+)", worker.read_text("utf-8"))) == {"record_block", "SOURCE_WORKER"}
