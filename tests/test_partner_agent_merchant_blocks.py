@@ -801,11 +801,15 @@ def test_no_statement_in_the_application_can_delete_or_rewrite_an_event():
 
 
 def test_one_request_path_module_reads_the_record_and_it_never_writes():
-    """The run-condition filter is the one request-path reader, and it calls `is_clear` only."""
+    """The run-condition filter is the one request-path reader, and it calls `is_clear` only. The token
+    rail worker is the one other module in routes/ or services/ that names the record: it records a
+    challenge (`record_block`, as source `worker`) and reads it only through the filter."""
     reader = _REPO / "services/payment_orchestration/agent_run_condition.py"
-    readers = [
+    worker = _REPO / "services/payment_orchestration/a2a_rail_worker.py"
+    readers = sorted(
         path for folder in ("routes", "services") for path in (_REPO / folder).rglob("*.py")
         if TABLE in path.read_text("utf-8", errors="ignore")
-    ]
-    assert readers == [reader]
+    )
+    assert readers == sorted([reader, worker])
     assert set(re.findall(r"agent_blocks\.([a-z_]+)", reader.read_text("utf-8"))) == {"is_clear"}
+    assert set(re.findall(r"agent_blocks\.([A-Za-z_]+)", worker.read_text("utf-8"))) == {"record_block", "SOURCE_WORKER"}

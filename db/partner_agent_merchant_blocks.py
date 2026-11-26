@@ -42,8 +42,9 @@ db/merchant_agent_checkout_facts):
      `clearance_problem`).
 
 WHO WRITES. An operator, through scripts/partner_agent_merchant_blocks.py, run as a gated one-off.
-A partner's worker will, for the purchase that met the event, in a later change. No request
-writes here.
+The token rail worker, for the purchase whose checkout met a CAPTCHA (source `worker`, only while
+PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`; services/payment_orchestration/a2a_rail_worker). No
+request writes here.
 
 FOR A CALLER ON A REQUEST PATH (services/payment_orchestration/agent_run_condition.py is the one: it
 calls `is_clear` on the create path, only for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS, and never

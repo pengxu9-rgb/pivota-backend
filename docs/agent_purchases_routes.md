@@ -463,6 +463,14 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
      every read timing out, a request that goes to Reap can wait about 8 s longer: up to 4 s here and
      up to 4 s in Reap's own filter. A setting with an entry that is not a rail name (`reap;a2a`,
      `a2a-rail`) enforces only the names it does spell right, and logs one WARNING per value.
+     **After create**, while the setting names `a2a` in the WORKER's environment too, the token rail
+     worker reads the same two records again right before each send to the merchant (the VIC quote,
+     the token request, the relay that carries the token into the checkout). Not met: nothing is
+     sent, and the purchase ends with `merchant_not_eligible`: `refused` before the quote or the
+     token, `failed` at the relay (a token was minted). A checkout answered with a
+     definite `captcha-failed` records a challenge for this rail and merchant (source `worker`)
+     before the purchase fails, which closes the merchant to the A2A agent until an operator clears
+     it on ADR-030 D11's evidence (`scripts/partner_agent_merchant_blocks.py`).
    - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
      refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
      that reason. It is never retried on Reap: the router decides once, before anything is written.
