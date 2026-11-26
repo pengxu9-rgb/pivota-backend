@@ -852,3 +852,13 @@ option A, a schema-only dump of prod** (step 10a). The rejected option B rebuilt
 repo's own DDL with no prod read, but drift in tables that are not copied (orders, ledgers) would
 only show up when a purchase failed. A adds one prod read, inside the export's existing gated
 one-off and the same go.
+
+**Q16. Backend URLs on the gateway host: verify or route before turning a feature on.** The web
+and worker profiles set `PUBLIC_API_BASE_URL` to the sandbox gateway host, which the backend's
+sandbox guard requires: unset, it resolves to prod's API host. The sandbox backend has no public
+host of its own (the LB sends that host only to Cloud Run `gateway`). So the managed-inbox
+webhook receiver URLs and the MCP OAuth login redirect that the backend hands out name
+`https://sandbox.mcp.pivota.cc`, and they work only if the gateway routes those paths on to the
+sandbox `web`. Both features are off in v0 (`WEBHOOK_DELIVERY_ENABLED=false`, Q14), so this does
+not block the first boot. Before either is turned on, verify those routes on the sandbox gateway,
+or add them, as part of that change and its own go.
