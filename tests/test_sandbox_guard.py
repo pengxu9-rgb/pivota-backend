@@ -251,6 +251,9 @@ _REFUSALS = [
     ("s1_bare_ip_host", {"UPSTREAM_HOST": "203.0.113.70:8080"}, "UPSTREAM_HOST"),
     ("s1_ip_anywhere", {"FOO_TARGETS": "a,203.0.113.70"}, "FOO_TARGETS"),
     ("s1_gs_other_bucket", {"CATALOG_COPY_GCS_URI": "gs://pivota-prod-backups/catalog"}, "CATALOG_COPY_GCS_URI"),
+    ("s1_gs_unrelated_bucket", {"CATALOG_COPY_GCS_URI": "gs://someone-elses-bucket/catalog"}, "CATALOG_COPY_GCS_URI"),
+    ("s1_bare_unlisted_host", {"UPSTREAM_HOST": "cache.example.com"}, "UPSTREAM_HOST"),
+    ("s1_redis_no_url", {"REDIS_CLUSTER_NODES": "cache-a"}, "REDIS_CLUSTER_NODES"),
     ("s1_agent_url_unset", {"PIVOTA_AGENT_INTERNAL_URL": None}, "PIVOTA_AGENT_INTERNAL_URL"),
     ("s1_agent_url_prod", {"PIVOTA_AGENT_INTERNAL_URL": "https://gateway.pivota.cc"}, "PIVOTA_AGENT_INTERNAL_URL"),
     ("s1_warm_url_unset", {"OUTBOUND_WARM_HANDOFF_RESOLVE_URL": None}, "OUTBOUND_WARM_HANDOFF_RESOLVE_URL"),
@@ -290,6 +293,18 @@ def test_each_bad_setting_is_refused_by_name_never_by_value(case, changes, setti
 ])
 def test_the_safe_form_of_each_s1_setting_passes(changes):
     assert G.sandbox_violations(_with(**changes)) == []
+
+
+@pytest.mark.parametrize("changes,setting,rule", [
+    # Each refused by exactly the positive rule named, not only by an older deny-list rule.
+    ({"CATALOG_COPY_GCS_URI": "gs://someone-elses-bucket/catalog"}, "CATALOG_COPY_GCS_URI", "allowlist"),
+    ({"UPSTREAM_HOST": "cache.example.com"}, "UPSTREAM_HOST", "allowlist"),
+    ({"REDIS_CLUSTER_NODES": "cache-a"}, "REDIS_CLUSTER_NODES", "no Redis"),
+    ({"REDIS_URL": "redis://cache.example.com:6379"}, "REDIS_URL", "no Redis"),
+])
+def test_the_positive_rule_itself_refuses(changes, setting, rule):
+    rules = [v.rule for v in G.sandbox_violations(_with(**changes)) if v.setting == setting]
+    assert any(rule in r for r in rules), rules
 
 
 def test_the_s1_positive_checks_are_in_addition_to_the_deny_list():
