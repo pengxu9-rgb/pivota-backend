@@ -247,8 +247,8 @@ def test_cli_end_to_end_outside_the_repo(tmp_path, capsys):
     log = tmp_path / "run.log"
     log.write_text("\n".join([
         "TRUTHSET_RUN read_only=on",
-        json.dumps(row("k1", "store-a.example", "Glow Serum 30ml", G1)),
-        json.dumps(row("k2", "store-b.example", "Glow Serum 30 ml", G1)),
+        "TRUTHSET_ROW " + json.dumps(row("k1", "store-a.example", "Glow Serum 30ml", G1)),
+        "TRUTHSET_ROW " + json.dumps(row("k2", "store-b.example", "Glow Serum 30 ml", G1)),
         json.dumps(row("k3", "store-a.example", "Glow Serum 50ml", G2)),
         json.dumps(row("k4", "store-b.example", "Glow Serum 50 ml", G2)),
         "{not json",
@@ -296,3 +296,34 @@ def test_the_sql_is_one_read_only_select_the_gated_runner_accepts():
                          code, re.I | re.M)
     assert code.count(";") == 1 and code.strip().endswith(";")
     assert "::text AS row" in code and "o.market = 'US'" in code
+
+
+def test_at_the_row_cap_the_last_barcode_group_is_dropped():
+    rows = [row(f"k{i}", f"store-{i % 2}.example", "Glow Serum 30ml", G1) for i in range(3)]
+    rows += [row("k9", "store-a.example", "Glow Serum 30ml", "0" + G2)]
+    kept, cut = cli.drop_cut_group(rows, cap=4)
+    assert cut and [r["listing_key"] for r in kept] == ["k0", "k1", "k2"]
+    assert cli.drop_cut_group(rows, cap=5) == (rows, False)
+
+
+def _select(path):
+    with open(os.path.join(REPO, "scripts", path), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    return lines, lines[lines.index("WITH live AS ("):lines.index("COMMIT;")]
+
+
+def test_the_data_sql_is_capped_prefixed_and_cross_host():
+    lines, select = _select("ops_identity_truth_set_barcode_rows.sql")
+    text = "\n".join(select)
+    assert select[-1] == "LIMIT 1800;" and str(cli.ROW_CAP) in select[-1]
+    assert "'TRUTHSET_ROW ' || json_build_object(" in text and cli.ROW_PREFIX == "TRUTHSET_ROW "
+    assert "count(DISTINCT host) >= 2" in text
+
+
+def test_the_explain_file_plans_exactly_the_data_select():
+    data_lines, data_select = _select("ops_identity_truth_set_barcode_rows.sql")
+    lines, select = _select("ops_identity_truth_set_barcode_rows_explain.sql")
+    assert select == data_select
+    assert lines[lines.index("WITH live AS (") - 1] == "EXPLAIN (FORMAT TEXT)"
+    assert "ANALYZE" not in "\n".join(lines).upper().replace("NO ANALYZE", "")
+    assert "BEGIN READ ONLY;" in lines and lines[-1] == "COMMIT;"

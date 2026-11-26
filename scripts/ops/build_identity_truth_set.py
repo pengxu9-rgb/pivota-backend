@@ -3,7 +3,9 @@
 This script reads local files and writes local files. It makes no database, store or model call.
 The barcode rows come from the reviewed read-only SQL run through the controller's gate:
     readonly_sql_gated.sh scripts/ops_identity_truth_set_barcode_rows.sql <sha256> TRUTHSET
-whose saved log is passed to `from-rows` (lines that are not JSON objects are ignored).
+whose saved log is passed to `from-rows`: each row is 'TRUTHSET_ROW {json}', other lines are ignored.
+The plan is reviewed first with ops_identity_truth_set_barcode_rows_explain.sql (prefix TRUTHSETX).
+At the SQL's 1800-row cap the last barcode group may be cut, so it is dropped and the run is narrowed.
 
 Every output path must be OUTSIDE this public repository (the set holds real store and product
 names); the script refuses otherwise. It prints counts only, never names.
@@ -22,7 +24,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -33,11 +35,18 @@ def _print(obj: Dict[str, Any]) -> None:
     print(json.dumps(obj, sort_keys=True, ensure_ascii=False), flush=True)
 
 
+ROW_PREFIX = "TRUTHSET_ROW "
+ROW_CAP = 1800  # the SQL's LIMIT: exactly this many rows means the output was cut
+
+
 def _rows_from_log(path: str) -> List[Dict[str, Any]]:
+    """The JSON rows of a gated run's log (each 'TRUTHSET_ROW {...}'), or of a plain JSON-lines file."""
     rows = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
+            if line.startswith(ROW_PREFIX):
+                line = line[len(ROW_PREFIX):]
             if not line.startswith("{"):
                 continue
             try:
@@ -47,6 +56,19 @@ def _rows_from_log(path: str) -> List[Dict[str, Any]]:
             if isinstance(obj, dict) and "listing_key" in obj:
                 rows.append(obj)
     return rows
+
+
+def _barcode_group(row: Dict[str, Any]) -> str:
+    return str(row.get("gtin") or "").strip().lstrip("0")  # the SQL's ORDER BY key (ltrim of '0')
+
+
+def drop_cut_group(rows: List[Dict[str, Any]], cap: int = ROW_CAP) -> Tuple[List[Dict[str, Any]], bool]:
+    """At the cap the last barcode group may be partial, and a partial group can look clean when the
+    row that disagrees was cut: drop every row of the last group. Returns (rows, truncated)."""
+    if len(rows) < cap:
+        return rows, False
+    last = _barcode_group(rows[-1])
+    return [r for r in rows if _barcode_group(r) != last], True
 
 
 def _write(path: str, pairs: List[ts.TruthPair]) -> int:
@@ -97,10 +119,11 @@ def main(argv: List[str] = None) -> int:
             _print({"truth_set": "from_owner_labels", "labels": len(labels), "written": _write(args.out, pairs),
                     "counts": counts, "summary": ts.summary(pairs)})
         elif args.cmd == "from-rows":
-            rows = _rows_from_log(args.rows)
+            read = _rows_from_log(args.rows)
+            rows, truncated = drop_cut_group(read)
             pairs, counts = ts.from_barcode_rows(rows)
-            _print({"truth_set": "from_rows", "rows": len(rows), "written": _write(args.out, pairs),
-                    "counts": counts, "summary": ts.summary(pairs)})
+            _print({"truth_set": "from_rows", "rows": len(read), "rows_used": len(rows), "truncated": truncated,
+                    "written": _write(args.out, pairs), "counts": counts, "summary": ts.summary(pairs)})
         elif args.cmd == "merge":
             sets = [[ts.from_row(x) for x in ts.read_jsonl(p)] for p in args.inputs]
             pairs, counts = ts.merge(*sets)
