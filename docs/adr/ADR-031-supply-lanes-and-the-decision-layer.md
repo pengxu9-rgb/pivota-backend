@@ -17,7 +17,7 @@
    - Platform-catalog and store-door `search` run in parallel for the product asked about.
    - The budget for the whole `get_offers` call is 5 seconds (owner, 2026-11-26). A lane that has not answered by then is cut off, and its results may show on a later call.
    - These reads ship only after lane reads have an egress of their own (D10; question 8 unchanged).
-   - D5's caps hold: no live read without a declared market, and a cap on the offers read per call. A cap on the stores searched per call is added; its value is written in the change that turns serving on.
+   - D5's caps hold: no live read without a declared market, and `lookup` reads at most 3 offers per call. A cap on the stores searched per call is added; its value is written in the change that turns serving on.
    - **Switch.** D12's catalog supply-lane switch gains a `serve` value. A new `LIVE_LANE_SERVE` (off, shadow, on) gates serving from any lane. It may be on only while ADR-032's `IDENTITY_REQUEST_JUDGE` is on and ADR-033's `SELLER_ADMISSION` is at `enforce_new` or above.
 3. **The storage rule is unchanged (D1).** After the answer is sent:
    - from a door, we keep the pointer, our verdict, which fields agreed and a fingerprint of the inputs;
@@ -38,7 +38,7 @@
 9. **Text below that this amendment overrides:**
    - the ADR-030 line under "Decisions this ADR follows" ("eligibility is a stored fact"): for a seller first seen in a request, ADR-030 Amendment 2 applies;
    - the ADR-007, ADR-018 and ADR-012 line there, and D8's "Nothing in this ADR changes a stored-price gate": both still hold for stored offers; a live offer falls outside them under item 7;
-   - D5's `get_offers` row: 5 seconds for the whole call, not 3 seconds for 3 offers;
+   - D5's `get_offers` row, for its time budget only: 5 seconds for the whole call instead of 3 seconds. Its cap of 3 offers for `lookup` stays;
    - D8's rule that a seller or listing first seen through a lane's `search` is not served in that answer;
    - D12's catalog supply-lane switch, which gains a serving value;
    - D13's rows for store-door variant sourcing and the platform catalog client;

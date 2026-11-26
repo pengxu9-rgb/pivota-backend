@@ -30,7 +30,7 @@
    - The M9 monitors raise alarms on a price outlier inside a variant, an image disagreement, a checkout variant mismatch, returns and complaints.
    - One confirmed wrong item drops that lane's automatic `confirmed` to `likely`. It stays there until the cause is fixed and the rule or model version changes.
 4. **Shades open now** (owner, 2026-11-26). The 2026-11-23 answer to question 1 is changed. Shades across stores are matched under the same rules: a price is compared only when the shade agrees exactly.
-5. **What is compared.** Only a `confirmed` match at variant grain is comparable. `likely` and family-grain matches are listed and labelled, and never priced side by side (ADR-034 Amendment 1).
+5. **What is compared.** Comparability is defined once, in ADR-034 Amendment 1 item 1. A `likely` or family-grain match is never comparable: it is listed and labelled, and never priced side by side.
 6. **Unchanged in M7:** star clusters, cannot-links and undo. A reverted pair is not proposed again until its cause is cleared and the rule or model version has changed; a person is no longer required to clear it.
 7. **Write-back.** A decision made in a request is recorded as an M7 membership with its stage, models and fingerprints. M3's storage rule applies to it.
 8. **M11's five fix-first items** all land before any of this is switched on.

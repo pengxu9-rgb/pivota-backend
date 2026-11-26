@@ -19,7 +19,7 @@
 1. **An agent may pay at a seller found live, on its first sighting, and on a `likely` match** (owner, 2026-11-26). The seller's ADR-033 live checks must have passed in the same request; the full checks do not have to finish first.
 2. **The D6 fact filter still fails closed.** For a seller with no stored fact, the fact is read from that seller's own checkout answer at buy time: the checkout session opened through its door gives the payment handlers it accepts, the currency and the merchant's total. That answer stands in for `is_purchasable` for that one purchase, and is then stored as a fact.
    - **Which paths:** only `card_held_by_rail`, `network_token` and `card_number`. Each is allowed only when the checkout answer lists a card handler that accepts that credential type, in the market's currency.
-   - **Still excluded:** `wallet_at_checkout`, and Shop MCP and merchant protocol completion. Their facts do not exist, as D6 says, and a checkout answer does not supply them.
+   - **Still excluded:** `wallet_at_checkout`, and a wallet-protocol or merchant-protocol completion. Their facts do not exist, as D6 says, and a checkout answer does not supply them.
    - A missing, unreadable or ineligible answer still excludes every agent-paid path.
    - **Switch.** A new `FIRST_SIGHT_AGENT_CHECKOUT` (off, on), off by default, gates this amendment. Each D8 dial still applies.
    - **Overrides** D6's line that these three paths need a fresh ELIGIBLE fact from the buyer vantage, for a seller with no stored fact only.
