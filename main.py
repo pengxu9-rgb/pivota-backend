@@ -468,6 +468,7 @@ from config.platform import (
     service_id as platform_service_id,
     service_name as platform_service_name,
 )
+from config.sandbox_guard import enforce_sandbox_guard
 from config.settings import settings
 from services.agent_governance import agent_governance, governance_runtime_contract
 
@@ -2191,6 +2192,10 @@ async def app_lifespan(_app: FastAPI):
     # CLOUD_RUN_JOB/CLOUD_RUN_EXECUTION for a job -- and no RAILWAY_*) resolve
     # "development" and pass straight through.
     resolved_env = require_platform_env()
+    # The partner sandbox (PIVOTA_ENV=sandbox) refuses to serve unless its settings prove it cannot
+    # move real money, fetch a store's site or reach prod (config/sandbox_guard.py). A no-op that
+    # reads nothing else in every other environment. Web and worker both boot through here.
+    enforce_sandbox_guard()
     # Again, idempotently: a deployment that hands uvicorn its own
     # `--log-config` reconfigures logging AFTER this module was imported, and
     # `dictConfig` on a named logger drops handlers. It does not drop filters,

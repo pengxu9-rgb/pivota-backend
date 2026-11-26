@@ -699,6 +699,7 @@ async def _start_token(s: _Step) -> str:
     method = _method(methods, s.row.get("payment_method_id"))
     if method is None or method.get("status") != "ACTIVE":
         return await _token_failed(s, "quoting", "token_method_unavailable")
+    await _record_payment_card(s, method)
     if str(s.row.get("currency") or "").upper() not in TOKEN_CURRENCIES:
         # No currency goes with the amount: a non-USD total would be read as USD cents. Refused.
         return await _token_failed(s, "quoting", "token_currency_unsupported")
@@ -738,6 +739,16 @@ async def _start_token(s: _Step) -> str:
             select["dynamic_data_type"] = DYNAMIC_DATA_TYPE
         result = await s.send(SELECT_METHOD, select, context=s.pay_context)
     return await _token_answer(s, action, result)
+
+
+async def _record_payment_card(s: _Step, method: Mapping[str, Any]) -> None:
+    """The card the token is about to be minted on: its network and last four, from the rail's own card list, for the
+    buyer page (db/a2a_rail_ledger.get_payment_card_for_owner). Display only: a fault is logged, never the step's."""
+    try:
+        await ledger.record_payment_card_as_holder(
+            s.id, s.worker, method_id=str(method["id"]), network=method.get("payment_brand"), last4=method.get("last4"))
+    except Exception as exc:  # noqa: BLE001 - the card line is decoration; the token step goes on
+        logger.warning("a2a_rail_worker: payment card record failed purchase=%s error_type=%s", s.id, type(exc).__name__)
 
 
 async def _token_answer(s: _Step, action: str, result: Any) -> str:

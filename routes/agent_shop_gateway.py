@@ -114,6 +114,7 @@ from services.similarity_service import (
 from services.similarity_config import get_similarity_scoring_weights
 from routes.agent_auth import (
     _AGENT_API_KEY_RE,
+    agent_api_key_format_ok,
     AgentContext,
     _is_internal_trusted_api_key,
     get_agent_context,
@@ -616,7 +617,7 @@ def _agent_key_has_money_gate_format(api_key: str) -> bool:
 
     The ONE rule, read by the gate below and by _proxy_agent_api before it forwards a caller's
     own key, so the proxy can never send upstream a value the gate would call malformed."""
-    return _is_internal_trusted_api_key(api_key) or bool(_AGENT_API_KEY_RE.match(api_key))
+    return _is_internal_trusted_api_key(api_key) or agent_api_key_format_ok(api_key)
 
 
 async def _money_operation_refusal_reason(
@@ -10929,10 +10930,15 @@ async def _catalog_price_freshness_sql() -> Tuple[str, str, Dict[str, Any]]:
 def _catalog_price_freshness_fragments(present: bool) -> Tuple[str, str, Dict[str, Any]]:
     """`_catalog_price_freshness_sql`'s fragments once the column probe has answered `present`.
     Split out so the group shadow can probe on its own connection and build the same statement."""
+    from config.platform import is_sandbox
     from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
 
     if not present:
         return "\n                           CAST(NULL AS TIMESTAMPTZ) AS price_checked_at,", "", {}
+    if is_sandbox():
+        # Every copied price is fresh in the partner sandbox (decision 4), so there is no fresh-first
+        # term: stock, then price, as for two fresh offers elsewhere. The stamp is still selected.
+        return "\n                           o.price_checked_at AS price_checked_at,", "", {}
     since = datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
     return (
         "\n                           o.price_checked_at AS price_checked_at,",
@@ -10944,7 +10950,13 @@ def _catalog_price_freshness_fragments(present: bool) -> Tuple[str, str, Dict[st
 
 def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, Any]:
     """`price_checked_at` (ISO, or None for no read on record) and, when the price is not fresh,
-    `price_stale: true` -- top-level, the one place both lanes say it (see `_mark_price_stale`)."""
+    `price_stale: true` -- top-level, the one place both lanes say it (see `_mark_price_stale`).
+
+    Under PIVOTA_ENV=sandbox every price is fresh: the copied catalog is treated as fresh (design
+    N72GzumjqaW8h7SCE96jt7 decision 4), so a copied offer can be price_comparable and best price.
+    `price_checked_at` is still reported as stored (None stays None): when the price was read is not
+    restated, only how old a price may be."""
+    from config.platform import is_sandbox
     from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
 
     checked: Optional[datetime] = None
@@ -10957,9 +10969,9 @@ def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, An
             checked = None
     if checked is not None:
         checked = checked.replace(tzinfo=timezone.utc) if checked.tzinfo is None else checked.astimezone(timezone.utc)
-    fresh = checked is not None and checked >= datetime.now(timezone.utc) - timedelta(
+    fresh = is_sandbox() or (checked is not None and checked >= datetime.now(timezone.utc) - timedelta(
         days=EXTERNAL_REFERRAL_STALE_DAYS
-    )
+    ))
     return {
         "price_checked_at": checked.isoformat() if checked is not None else None,
         **({} if fresh else {"price_stale": True}),

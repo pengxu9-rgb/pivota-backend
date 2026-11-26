@@ -85,12 +85,15 @@ The gateway fetches it server-side for the page; the buyer's browser never loads
 failed read: no field, never a 503. Never in the public route or the webhooks. Off: the body is byte for byte
 what it was.
 
-THE CARD (AGENPAS_PAYMENT_CARD_ENABLED, default off, read per request). On, a Reap-rail GET body carries a
-top-level `payment_card = {network, last4}` (network the partner's own word, e.g. "VISA", or null) once the
-purchase's checkout is bound to a card (awaiting_approval, processing, completed, under the dispatch journal:
-db/reap_agentic_ledger.get_payment_card_for_owner says why that row's enrollment IS the paying card). Never
-before the checkout exists, never on the A2A rail (its rail does not hand us the last four yet), never in the
-public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
+THE CARD (AGENPAS_PAYMENT_CARD_ENABLED, default off, read per request). On, a GET body carries a top-level
+`payment_card = {network, last4}` (network the partner's own word, e.g. "VISA", or null):
+  * Reap, once the purchase's checkout is bound to a card (awaiting_approval, processing, completed, under the
+    dispatch journal: db/reap_agentic_ledger.get_payment_card_for_owner says why that row's enrollment IS the paying
+    card); never before the checkout exists;
+  * A2A, once the token is minted on the card (awaiting_authorization, paying, completed): the network and last four
+    from the rail's own card list, recorded for that card (migration 298; db/a2a_rail_ledger.get_payment_card_for_owner),
+    and only while the row still names that card. Never the checkout answer's cardLast4 (the token's).
+Never in the public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
 shows no card), never the body. Off: the body is byte for byte what it was.
 
 THE AGENT'S NAME. A GET body, either rail, carries a top-level `agent_display_name` (a string), the page's
@@ -159,11 +162,14 @@ def product_image_enabled() -> bool:
 
 
 async def _payment_card(parent: Dict[str, Any], agent_id: str, owner: str) -> Optional[Dict[str, Any]]:
-    """The Reap purchase's bound card, or None (another rail, no bound card, or a failed read: never a 503)."""
-    if parent.get("rail") != "reap":
+    """The card the purchase pays with, or None (no card yet, another rail, or a failed read: never a 503). Reap: the
+    bound checkout's enrollment. A2A: the card the token was minted on, from the rail's own card list (migration 298)."""
+    read = {"reap": reap_ledger.get_payment_card_for_owner, "a2a": a2a_ledger.get_payment_card_for_owner}.get(
+        str(parent.get("rail") or ""))
+    if read is None:
         return None
     try:
-        return await reap_ledger.get_payment_card_for_owner(str(parent["rail_purchase_id"]), agent_id, owner)
+        return await read(str(parent["rail_purchase_id"]), agent_id, owner)
     except Exception as exc:  # noqa: BLE001 - the card is decoration: its fault drops it, never the body
         logger.warning("agent_internal_purchases: card read failed error_type=%s", type(exc).__name__)
         return None

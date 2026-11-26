@@ -360,6 +360,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Install pg_dump/psql of the service's major version
+        # tests/test_sandbox_schema_apply_postgres.py dumps and restores with the real
+        # pg_dump, which must be the SERVER's major version: the runner's own pg_dump is
+        # newer, and pg_dump 17 writes `SET transaction_timeout = 0`, which a 15 server
+        # rejects. That test finds /usr/lib/postgresql/<major>/bin and otherwise skips,
+        # and a skip fails this gate. PG_CLIENT_MAJOR must equal the `postgres:` image's
+        # major above (tests/test_dialect_gate_pg_client_matches_service.py pins it).
+        shell: bash
+        env:
+          PG_CLIENT_MAJOR: "15"
+        run: |
+          set -euo pipefail
+          pkg="postgresql-client-${PG_CLIENT_MAJOR}"
+          candidate() { apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}'; }
+          if [[ "$(candidate)" == "" || "$(candidate)" == "(none)" ]]; then
+            sudo apt-get update -q
+          fi
+          if [[ "$(candidate)" == "" || "$(candidate)" == "(none)" ]]; then
+            # apt.postgresql.org, via the script postgresql-common ships for exactly this.
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          fi
+          sudo apt-get install -y -q --no-install-recommends "$pkg"
+          bin="/usr/lib/postgresql/${PG_CLIENT_MAJOR}/bin"
+          got="$("$bin/pg_dump" --version)"
+          echo "$got"
+          [[ "$got" == "pg_dump (PostgreSQL) ${PG_CLIENT_MAJOR}."* ]] || { echo "::error::$bin/pg_dump is not ${PG_CLIENT_MAJOR}.x"; exit 1; }
+          test -x "$bin/psql"
+
       - name: Preflight — prove the Postgres URL actually took effect
         shell: bash
         run: |

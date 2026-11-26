@@ -587,12 +587,26 @@ EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES = {
 }
 
 
+#: The anomalies that say only "we have not looked recently" (the content clock, the link clock,
+#: never looked): age, never a fact about the offer.
+EXTERNAL_REFERRAL_AGE_ONLY_ANOMALIES = frozenset(
+    {"stale_snapshot", "destination_stale", "destination_never_verified"}
+)
+
+
 def external_referral_live_verification_reasons(status: ExternalReferralStatus) -> List[str]:
-    """Audit blockers that require live commerce validation but allow recall."""
-    return sorted(
-        set(getattr(status, "blocker_anomaly_types", []) or [])
-        - EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
-    )
+    """Audit blockers that require live commerce validation but allow recall.
+
+    Under PIVOTA_ENV=sandbox the age-only anomalies are not among them: nothing in the partner
+    sandbox re-reads a store, and its copied catalog is treated as fresh (design N72GzumjqaW8h7SCE96jt7
+    decision 4; every sandbox answer is marked sandbox:true by the gateway). The stored stamps are
+    not touched. Every other environment answers exactly as before."""
+    from config.platform import is_sandbox
+
+    reasons = set(getattr(status, "blocker_anomaly_types", []) or []) - EXTERNAL_REFERRAL_RUNTIME_BLOCKER_ANOMALIES
+    if is_sandbox():
+        reasons -= EXTERNAL_REFERRAL_AGE_ONLY_ANOMALIES
+    return sorted(reasons)
 
 
 EXTERNAL_REFERRAL_REVIEW_ANOMALIES = {

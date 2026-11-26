@@ -991,12 +991,15 @@ def test_the_classifier_reads_the_money_gates_one_format_rule():
     for reader in (gw._classify_invoke_credential_in_process, gw._money_operation_refusal_reason, gw._proxy_agent_api):
         assert inspect.getsource(reader).count(f"{rule}(") == 1, reader.__name__
     source = Path(gw.__file__).read_text()
-    pattern_lines = [line.strip() for line in source.splitlines() if "_AGENT_API_KEY_RE" in line]
+    # The key shape itself lives in routes.agent_auth.agent_api_key_format_ok (one rule for every
+    # reader, sandbox-aware); this module names it only inside the money-gate rule.
+    pattern_lines = [line.strip() for line in source.splitlines() if "agent_api_key_format_ok" in line]
     assert pattern_lines == [
-        "_AGENT_API_KEY_RE,",  # the import
-        "return _is_internal_trusted_api_key(api_key) or bool(_AGENT_API_KEY_RE.match(api_key))",
+        "agent_api_key_format_ok,",  # the import
+        "return _is_internal_trusted_api_key(api_key) or agent_api_key_format_ok(api_key)",
     ]
     assert pattern_lines[1] in inspect.getsource(getattr(gw, rule))
+    assert [line.strip() for line in source.splitlines() if "_AGENT_API_KEY_RE" in line] == ["_AGENT_API_KEY_RE,"]
 
 
 def test_the_two_class_sets_do_not_overlap():
