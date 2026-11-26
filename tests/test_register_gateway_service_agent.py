@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from scripts.sandbox import register_gateway_service_agent as R
@@ -74,7 +76,17 @@ def test_the_agent_id_must_be_in_both_service_agent_lists():
         R.check_agent_id("robot", _env())
 
 
+def _only(monkeypatch, env):
+    """main() reads os.environ: start from nothing but ``env``, so a setting of the machine running
+    the tests (a URL the sandbox guard rightly refuses) cannot decide the outcome."""
+    for key in list(os.environ):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
 def test_main_checks_the_id_before_reading_the_secret(monkeypatch, capsys):
+    _only(monkeypatch, {})
     for key, value in _env().items():
         monkeypatch.setenv(key, value)
 
@@ -87,6 +99,7 @@ def test_main_checks_the_id_before_reading_the_secret(monkeypatch, capsys):
 
 
 def test_main_checks_the_environment_before_reading_the_secret_even_with_a_listed_id(monkeypatch, capsys):
+    _only(monkeypatch, {})
     for key, value in _env(PIVOTA_ENV="staging").items():
         monkeypatch.setenv(key, value)
 

@@ -522,6 +522,12 @@ async def get_aurora_kb_v0_summary(
     include_debug: bool = Query(False),
     _: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    from config.platform import is_sandbox
+
+    if is_sandbox():
+        # SF1: AURORA_BFF_BASE_URL falls back to PROD's gateway even when empty; the sandbox has no
+        # Aurora upstream, so the monitor reports itself disabled there instead of calling prod.
+        return _build_disabled_payload(window, ["not available in the partner sandbox"])
     base_url = _normalize_base_url((os.getenv("AURORA_BFF_BASE_URL") or DEFAULT_BASE_URL).strip())
     if not base_url:
         return _build_disabled_payload(window, ["AURORA_BFF_BASE_URL not configured"])

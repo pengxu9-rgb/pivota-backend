@@ -77,24 +77,31 @@ def _masked_sha256(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address], pref
     return hashlib.sha256(str(network).encode("ascii")).hexdigest()
 
 
+def dsn_refusal(raw: str, setting: str = "DATABASE_URL") -> Optional[str]:
+    """Why the Postgres DSN ``raw`` (held in ``setting``) does not connect only to the sandbox's own
+    database, or None. Never quotes the DSN (it carries a password). Used for DATABASE_URL and, by
+    the startup guard, for every other DSN-shaped setting (any name containing DATABASE_URL)."""
+    dsn = (raw or "").strip().replace("postgresql+asyncpg://", "postgresql://")
+    if not dsn:
+        return "%s names no host" % setting
+    try:
+        addrs = database_addresses(dsn)
+    except ValueError as exc:
+        return str(exc).replace("DATABASE_URL", setting)
+    if not addrs:
+        return "%s names no host" % setting
+    for addr in addrs:
+        if not _address_ok(addr):
+            if isinstance(addr, str):
+                return "%s's socket is not the sandbox's Cloud SQL instance" % setting
+            return "%s's host is not an address in the sandbox's private range" % setting
+    return None
+
+
 def sandbox_database_refusal(env: Mapping[str, str]) -> Optional[str]:
     """Why DATABASE_URL / GOOGLE_CLOUD_PROJECT do not name the sandbox's own database, or None.
     Never quotes the DSN (it carries a password)."""
     project = (env.get("GOOGLE_CLOUD_PROJECT") or "").strip()
     if project and project != SANDBOX_PROJECT:
         return "GOOGLE_CLOUD_PROJECT is not %s" % SANDBOX_PROJECT
-    dsn = (env.get("DATABASE_URL") or "").strip().replace("postgresql+asyncpg://", "postgresql://")
-    if not dsn:
-        return "DATABASE_URL names no host"
-    try:
-        addrs = database_addresses(dsn)
-    except ValueError as exc:
-        return str(exc)
-    if not addrs:
-        return "DATABASE_URL names no host"
-    for addr in addrs:
-        if not _address_ok(addr):
-            if isinstance(addr, str):
-                return "DATABASE_URL's socket is not the sandbox's Cloud SQL instance"
-            return "DATABASE_URL's host is not an address in the sandbox's private range"
-    return None
+    return dsn_refusal(env.get("DATABASE_URL") or "", "DATABASE_URL")

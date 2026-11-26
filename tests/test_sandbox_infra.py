@@ -96,6 +96,32 @@ def test_committed_profiles_pass_after_render(tmp_path):
     assert not [l for l in gw.splitlines() if "@@" in l and not l.startswith("#")]
 
 
+#: The backend's sandbox startup guard refuses to boot web/worker unless these are set this way:
+#: each code default is ON or a prod URL (ENV_PROFILE.md, "Required by the backend's sandbox
+#: startup guard"). PUBLIC_API_BASE_URL is the gateway host token, rendered below.
+S1_GUARD_SETTINGS = {
+    "FF_ENABLE_INTERNAL_REFUND": "false",
+    "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND": "false",
+    "PIVOTA_AGENT_INTERNAL_URL": "",
+    "OUTBOUND_WARM_HANDOFF_RESOLVE_URL": "",
+    "PUBLIC_API_BASE_URL": "https://@@GATEWAY_HOST@@",
+    "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED": "false",
+    "STORE_LIFECYCLE_RECONCILE_ENABLED": "false",
+    "AUDIT_RESOLVE_GROUNDING_REDIRECTS": "false",
+}
+
+
+def test_web_and_worker_set_what_the_backend_sandbox_guard_requires(tmp_path):
+    for svc in ("web", "worker"):
+        env = check_profile.parse_profile(SANDBOX / "env" / f"{svc}.yaml", [])
+        assert {k: env.get(k) for k in S1_GUARD_SETTINGS} == S1_GUARD_SETTINGS, svc
+    assert check_profile.main(["--render", str(tmp_path / "out"), "--web-url", WEB_URL,
+                               "--gateway-host", "sandbox.mcp.pivota.cc", "--agenpaz-host", "sandbox.agenpaz.com",
+                               "--sandbox-project", "pivota-sandbox"]) == 0
+    for svc in ("web", "worker"):
+        assert 'PUBLIC_API_BASE_URL: "https://sandbox.mcp.pivota.cc"' in (tmp_path / "out" / f"{svc}.yaml").read_text()
+
+
 @pytest.mark.parametrize(
     "svc,key,value,rule",
     [

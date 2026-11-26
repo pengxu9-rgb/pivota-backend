@@ -191,11 +191,15 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            Not met (no fresh protocol fact, an open challenge or block on this rail, or either
                            record unreadable): nothing is sent, and the code is `merchant_not_eligible`, the
                            create door's own answer for the same cause. Before the quote or the token (in
-                           `quoting`: no order, no token) the purchase is REFUSED; at the relay (a token minted,
-                           perhaps approved) it FAILS, like the relay's other pre-send failures, and the token
-                           stays on the rail as an orphan (counted below). A send already out (a VIC
-                           order at the rail, a checkout set up and confirmed in the same step) is not
-                           reached: nothing here can call it back.
+                           `quoting`: no order, no token) the purchase is REFUSED, an unreadable record
+                           included. At the relay (a token minted, perhaps approved) a DEFINITE no FAILS it,
+                           like the relay's other pre-send failures, and the token stays on the rail as an
+                           orphan (counted below); an unreadable record (and no definite no) is a HOLD
+                           instead: nothing sent, `merchant_check_unavailable` after the schedule's count,
+                           asked again next tick, bounded by the approval page's deadline
+                           (`_run_condition_at_relay`). A send already out (a VIC order at the rail, a
+                           checkout set up and confirmed in the same step) is not reached: nothing here can
+                           call it back.
   THE CHALLENGE RECORD    the checkout's definite `captcha-failed` (success exactly false: nothing was
                            submitted) records one event, kind `captcha`, source `worker`, for this purchase
                            and this rail's merchant (db/partner_agent_merchant_blocks.record_block), BEFORE
@@ -801,34 +805,51 @@ RUN_CONDITION_RAIL = "a2a"
 #: A purchase whose merchant no longer meets the run condition ends with the create door's own answer for that
 #: cause: a code of its own would tell an agent which merchants are cleared (agent_run_condition's docstring).
 RUN_CONDITION_REFUSAL = "merchant_not_eligible"
+#: The relay's hold while a record cannot be read (agent_run_condition.RECORD_UNREADABLE). The agent sees a live
+#: row's code, so it says only that the check was unavailable, nothing about the merchant.
+RUN_CONDITION_UNREADABLE = "merchant_check_unavailable"
 #: The checkout result status that is a merchant challenge, and the kind it is recorded as.
 _CHALLENGE_KINDS = {"captcha-failed": "captcha"}
 
 
-async def _run_condition_unmet(s: _Step) -> bool:
-    """False when the step may send (the setting does not name this rail: nothing is read; or the condition is met).
-    The cause of a True goes to agent_run_condition's WARNING line. Called right before a send, never on a read or a
-    reconcile (see the module docstring)."""
-    return not await agent_run_condition.agent_may_run(
+async def _run_condition_unmet(s: _Step) -> Optional[str]:
+    """None when the step may send (the setting does not name this rail: nothing is read; or the condition is met),
+    else the cause, which also goes to agent_run_condition's WARNING line. Called right before a send, never on a
+    read or a reconcile (see the module docstring)."""
+    return await agent_run_condition.enforced_unmet_cause(
         RUN_CONDITION_RAIL, str(s.row.get("merchant_domain") or ""), agent_id=str(s.row.get("agent_id") or ""))
 
 
 async def _run_condition_refusal(s: _Step) -> Optional[str]:
     """In `quoting`, before the VIC quote or the token request: None, or the purchase REFUSED with nothing sent (no
     order and no token exist yet: tests/test_terminal_write_dispatch_invariant.py's pre-dispatch state)."""
-    if not await _run_condition_unmet(s):
+    if await _run_condition_unmet(s) is None:
         return None
     moved = await ledger.transition_as_holder(
         s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason=RUN_CONDITION_REFUSAL)
     return await _settled(s, moved, "refused")
 
 
-async def _run_condition_relay_failure(s: _Step) -> Optional[str]:
-    """In `awaiting_authorization`, before a relay would carry the token into the checkout: None, or the purchase
-    FAILED with nothing sent, the code `merchant_not_eligible`, like the relay's other pre-send failures. A token was
-    minted (and the buyer may have approved it), so the purchase did not merely never start: failed, not refused."""
-    if not await _run_condition_unmet(s):
+async def _run_condition_at_relay(s: _Step) -> Optional[str]:
+    """In `awaiting_authorization`, before a relay would carry the token into the checkout: None (send), a HOLD, or
+    the purchase FAILED.
+
+    A record that cannot be read (agent_run_condition.RECORD_UNREADABLE) is waited out: nothing is sent, the lease
+    goes back with `merchant_check_unavailable` after the schedule's count (so no slot is spent), and the next tick
+    asks again. The buyer may already have approved, and one slow read must not end that purchase. The approval
+    page's deadline bounds the wait: the expiry sweep ends the row then (`buyer_action_expired`), as for a buyer
+    who never approves, since no write is pending.
+
+    A definite no (no fresh fact, an open challenge or block) FAILS the purchase with nothing sent, the code
+    `merchant_not_eligible`, like the relay's other pre-send failures. A token was minted (and the buyer may have
+    approved it), so the purchase did not merely never start: failed, not refused."""
+    cause = await _run_condition_unmet(s)
+    if cause is None:
         return None
+    if cause == agent_run_condition.RECORD_UNREADABLE:
+        logger.warning("a2a_rail_worker: run condition unreadable at the relay purchase=%s; held, nothing sent", s.id)
+        await s.release(POLL_RETRY, RUN_CONDITION_UNREADABLE)
+        return RUN_CONDITION_UNREADABLE
     return await _token_failed(s, "awaiting_authorization", RUN_CONDITION_REFUSAL)
 
 
@@ -981,9 +1002,9 @@ async def _authorizing(s: _Step) -> str:
             return await _approval_answer(s, None, result, sent, variant)
         if not _relay_sendable(s, setup):
             return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
-        failed = await _run_condition_relay_failure(s)
-        if failed is not None:
-            return failed
+        stopped = await _run_condition_at_relay(s)
+        if stopped is not None:
+            return stopped
         # Through the relay the poll may be followed by the setup (a write): recorded first.
         if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_SETUP_ACTION) is None:
             return "lost"
@@ -1005,9 +1026,9 @@ async def _authorizing(s: _Step) -> str:
     if setup is not None and not _relay_sendable(s, setup):
         return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
     if setup is not None:
-        failed = await _run_condition_relay_failure(s)
-        if failed is not None:
-            return failed
+        stopped = await _run_condition_at_relay(s)
+        if stopped is not None:
+            return stopped
         # Through the relay `paid` is recorded under its own name: a step cut while the relay is out is
         # then held (`_checkout_pending`), never reconciled by resending `paid` (a second setup).
         action = CHECKOUT_RELAY_PAID_ACTION

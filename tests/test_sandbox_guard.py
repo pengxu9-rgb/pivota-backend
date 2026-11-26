@@ -36,12 +36,25 @@ GOOD = {
     "REAP_AGENTIC_SIMULATE_CHECKOUT": "COMPLETED",
     "ORDER_CREATE_LIVE_QUOTE_REVALIDATION_ENABLED": "0",
     "PUBLIC_MCP_URL": "https://sandbox.mcp.pivota.cc/mcp",
-    "AGENPAS_PUBLIC_BASE_URL": "https://pay-sandbox.agenpaz.com",
+    "AGENPAS_PUBLIC_BASE_URL": "https://sandbox.agenpaz.com",
     "CATALOG_COPY_GCS_URI": "gs://pivota-sandbox-catalog-drop/catalog/",
     "A2A_RAIL_ENABLED": "false",
     "AUDIT_WORKER_ENABLED": "true",
     "SCHEDULER_JOB_ALLOWLIST": "reap_agentic_purchase_poll,agent_purchase_events",
     "CATALOG_TRUST_CRAWL_FRESH_ENABLED": "false",
+    # S1: the refund flags default ON, so they are set off; the two settings whose code default is a
+    # prod gateway URL are set (empty = the feature has nowhere to go).
+    "FF_ENABLE_INTERNAL_REFUND": "false",
+    "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND": "false",
+    "PIVOTA_AGENT_INTERNAL_URL": "",
+    "OUTBOUND_WARM_HANDOFF_RESOLVE_URL": "",
+    # SF2: links and receiver URLs the backend hands out resolve to the sandbox gateway, not prod's API.
+    "PUBLIC_API_BASE_URL": "https://sandbox.mcp.pivota.cc",
+    # SF5: the keyless budget-FX lookup defaults on; off in the sandbox.
+    "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED": "false",
+    # Default-on flags found by the SF5 audit: store reconcile and the grounding-redirect fetch.
+    "STORE_LIFECYCLE_RECONCILE_ENABLED": "false",
+    "AUDIT_RESOLVE_GROUNDING_REDIRECTS": "false",
 }
 
 _PLATFORM_KEYS = (
@@ -207,6 +220,107 @@ _REFUSALS = [
     ("worker_no_allowlist", {"SCHEDULER_JOB_ALLOWLIST": None}, "SCHEDULER_JOB_ALLOWLIST"),
     ("worker_star", {"SCHEDULER_JOB_ALLOWLIST": "*"}, "SCHEDULER_JOB_ALLOWLIST"),
     ("worker_extra_job", {"SCHEDULER_JOB_ALLOWLIST": "reap_agentic_purchase_poll,catalog_row_trust_crawl_fresh_recheck"}, "SCHEDULER_JOB_ALLOWLIST"),
+    # S1: each gap the 5d8e3aa73 review found passing the old deny list, now refused by a positive rule.
+    ("s1_live_offer", {"LIVE_OFFER_VERIFICATION_ENABLED": "1"}, "LIVE_OFFER_VERIFICATION_ENABLED"),
+    ("s1_live_offer_egress", {"LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS": "1"}, "LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS"),
+    ("s1_preflight_enforce", {"CHECKOUT_PREFLIGHT_MODE": "enforce"}, "CHECKOUT_PREFLIGHT_MODE"),
+    ("s1_preflight_shadow", {"CHECKOUT_PREFLIGHT_MODE": "shadow"}, "CHECKOUT_PREFLIGHT_MODE"),
+    ("s1_preflight_egress", {"CHECKOUT_PREFLIGHT_ALLOW_EGRESS": "1"}, "CHECKOUT_PREFLIGHT_ALLOW_EGRESS"),
+    ("s1_any_egress", {"FOO_ALLOW_EGRESS": "true"}, "FOO_ALLOW_EGRESS"),
+    ("s1_visa_env", {"VISA_VDP_ENV": "production"}, "VISA_VDP_ENV"),
+    ("s1_visa_allow_prod", {"VISA_VDP_ALLOW_PRODUCTION": "yes"}, "VISA_VDP_ALLOW_PRODUCTION"),
+    ("s1_sendgrid", {"SENDGRID_API_KEY": "SG.%s" % SECRET}, "SENDGRID_API_KEY"),
+    ("s1_smtp2go", {"SMTP2GO_API_KEY": "api-%s" % SECRET}, "SMTP2GO_API_KEY"),
+    ("s1_twilio", {"TWILIO_AUTH_TOKEN": SECRET}, "TWILIO_AUTH_TOKEN"),
+    ("s1_adyen", {"ADYEN_API_KEY": "AQE%s" % SECRET}, "ADYEN_API_KEY"),
+    ("s1_stripe_live", {"STRIPE_SECRET_KEY": "sk_live_%s" % SECRET}, "STRIPE_SECRET_KEY"),
+    ("s1_stripe_unshaped", {"STRIPE_SECRET_KEY": SECRET}, "STRIPE_SECRET_KEY"),
+    ("s1_aws_key", {"AWS_SECRET_ACCESS_KEY": SECRET}, "AWS_SECRET_ACCESS_KEY"),
+    ("s1_reap_ext_auth", {"REAP_EXTERNAL_AUTH_ENABLED": "1"}, "REAP_EXTERNAL_AUTH_ENABLED"),
+    ("s1_refund_unset", {"FF_ENABLE_INTERNAL_REFUND": None}, "FF_ENABLE_INTERNAL_REFUND"),
+    ("s1_refund_on", {"FF_ENABLE_INTERNAL_REFUND": "true"}, "FF_ENABLE_INTERNAL_REFUND"),
+    ("s1_order_failure_refund_unset", {"FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND": None}, "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND"),
+    ("s1_other_refund_flag", {"FF_ENABLE_REFUND_AUTO_RETRY": "true"}, "FF_ENABLE_REFUND_AUTO_RETRY"),
+    ("s1_environment_prod", {"ENVIRONMENT": "production"}, "ENVIRONMENT"),
+    ("s1_app_env_prod", {"APP_ENV": "production"}, "APP_ENV"),
+    ("s1_project_unset", {"GOOGLE_CLOUD_PROJECT": None}, "GOOGLE_CLOUD_PROJECT"),
+    ("s1_project_other", {"GOOGLE_CLOUD_PROJECT": "pivota-sandbox-2"}, "GOOGLE_CLOUD_PROJECT"),
+    ("s1_db_unset", {"DATABASE_URL": None}, "DATABASE_URL"),
+    ("s1_db_other_ip", {"DATABASE_URL": "postgresql://u:%s@203.0.113.70:5432/pivota" % SECRET}, "DATABASE_URL"),
+    ("s1_db_hostname", {"DATABASE_URL": "postgresql://u:%s@db.example.com/pivota" % SECRET}, "DATABASE_URL"),
+    ("s1_second_dsn", {"SHOPIFY_DISCOUNT_CANARY_DATABASE_URL": "postgresql://u:%s@203.0.113.70/x" % SECRET}, "SHOPIFY_DISCOUNT_CANARY_DATABASE_URL"),
+    ("s1_redis", {"REDIS_URL": "redis://:%s@203.0.113.70:6379/0" % SECRET}, "REDIS_URL"),
+    ("s1_redis_host", {"REDIS_HOST": "203.0.113.70"}, "REDIS_HOST"),
+    ("s1_run_app", {"SOME_SERVICE_URL": "https://web-abc123-uw.a.run.app"}, "SOME_SERVICE_URL"),
+    ("s1_url_in_any_name", {"FEATURE_TARGET": "https://api.pivota.cc/x"}, "FEATURE_TARGET"),
+    ("s1_redis_scheme_elsewhere", {"CACHE_TARGET": "redis://cache.example.com:6379"}, "CACHE_TARGET"),
+    ("s1_bare_host", {"INDEXNOW_HOST": "agent.pivota.cc"}, "INDEXNOW_HOST"),
+    ("s1_bare_ip_host", {"UPSTREAM_HOST": "203.0.113.70:8080"}, "UPSTREAM_HOST"),
+    ("s1_ip_anywhere", {"FOO_TARGETS": "a,203.0.113.70"}, "FOO_TARGETS"),
+    ("s1_gs_other_bucket", {"CATALOG_COPY_GCS_URI": "gs://pivota-prod-backups/catalog"}, "CATALOG_COPY_GCS_URI"),
+    ("s1_gs_unrelated_bucket", {"CATALOG_COPY_GCS_URI": "gs://someone-elses-bucket/catalog"}, "CATALOG_COPY_GCS_URI"),
+    ("s1_bare_unlisted_host", {"UPSTREAM_HOST": "cache.example.com"}, "UPSTREAM_HOST"),
+    ("s1_redis_no_url", {"REDIS_CLUSTER_NODES": "cache-a"}, "REDIS_CLUSTER_NODES"),
+    ("s1_agent_url_unset", {"PIVOTA_AGENT_INTERNAL_URL": None}, "PIVOTA_AGENT_INTERNAL_URL"),
+    ("s1_agent_url_prod", {"PIVOTA_AGENT_INTERNAL_URL": "https://gateway.pivota.cc"}, "PIVOTA_AGENT_INTERNAL_URL"),
+    ("s1_warm_url_unset", {"OUTBOUND_WARM_HANDOFF_RESOLVE_URL": None}, "OUTBOUND_WARM_HANDOFF_RESOLVE_URL"),
+    ("s1_store_token", {"SHOPIFY_ACCESS_TOKEN": "shpat_%s" % SECRET}, "SHOPIFY_ACCESS_TOKEN"),
+    ("s1_cafe24_secret", {"CAFE24_CLIENT_SECRET": SECRET}, "CAFE24_CLIENT_SECRET"),
+    # SF2: the public base URL the backend hands out must resolve to the sandbox gateway.
+    ("sf2_public_unset", {"PUBLIC_API_BASE_URL": None}, "PUBLIC_API_BASE_URL"),
+    ("sf2_public_empty", {"PUBLIC_API_BASE_URL": ""}, "PUBLIC_API_BASE_URL"),
+    ("sf2_public_prod", {"PUBLIC_API_BASE_URL": "https://api.pivota.cc"}, "PUBLIC_API_BASE_URL"),
+    ("sf2_public_agenpaz_host", {"PUBLIC_API_BASE_URL": "https://sandbox.agenpaz.com"}, "PUBLIC_API_BASE_URL"),
+    ("sf2_public_http", {"PUBLIC_API_BASE_URL": "http://sandbox.mcp.pivota.cc"}, "PUBLIC_API_BASE_URL"),
+    # SF5: no LLM/search credential, model dials off, keyless FX egress explicitly off.
+    ("sf5_openai", {"OPENAI_API_KEY": "sk-" + SECRET}, "OPENAI_API_KEY"),
+    ("sf5_anthropic", {"ANTHROPIC_API_KEY": SECRET}, "ANTHROPIC_API_KEY"),
+    ("sf5_gemini", {"GEMINI_API_KEY": SECRET}, "GEMINI_API_KEY"),
+    ("sf5_pivota_gemini", {"PIVOTA_GEMINI_API_KEY": SECRET}, "PIVOTA_GEMINI_API_KEY"),
+    ("sf5_deepseek", {"DEEPSEEK_API_KEY": SECRET}, "DEEPSEEK_API_KEY"),
+    ("sf5_serpapi", {"SERPAPI_API_KEY": SECRET}, "SERPAPI_API_KEY"),
+    ("sf5_vertex", {"VERTEX_AI_ENABLED": "true"}, "VERTEX_AI_ENABLED"),
+    ("sf5_fx_unset", {"AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED": None}, "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED"),
+    ("sf5_fx_on", {"AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED": "true"}, "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED"),
+    # Review nits: hosts that hid from the allowlist.
+    ("nit_userinfo_backslash", {"SOME_SERVICE_URL": "http://evil.example\\@sandbox.mcp.pivota.cc/x"}, "SOME_SERVICE_URL"),
+    ("nit_userinfo", {"SOME_SERVICE_URL": "https://user:pw@sandbox.mcp.pivota.cc/x"}, "SOME_SERVICE_URL"),
+    ("nit_json_escaped_url", {"FEATURE_TARGET": "https:\\/\\/evil.example\\/x"}, "FEATURE_TARGET"),
+    ("nit_percent_encoded_url", {"FEATURE_TARGET": "https%3A%2F%2Fevil.example"}, "FEATURE_TARGET"),
+    ("nit_base64_url", {"FEATURE_BLOB": "aHR0cHM6Ly9ldmlsLmV4YW1wbGUveA=="}, "FEATURE_BLOB"),
+    ("nit_bare_host_any_name", {"FEATURE_TARGET": "evil.example.com"}, "FEATURE_TARGET"),
+    ("nit_email_other_domain", {"FROM_EMAIL": "ops@evil.example"}, "FROM_EMAIL"),
+    ("nit_scheme_relative", {"SOME_SERVICE_URL": "//evil.example/x"}, "SOME_SERVICE_URL"),
+    ("nit_url_name_bare_word", {"SOME_SERVICE_URL": "evil"}, "SOME_SERVICE_URL"),
+    ("nit_proxy", {"HTTPS_PROXY": "proxy:3128"}, "HTTPS_PROXY"),
+    ("nit_proxy_lower", {"https_proxy": "proxy:3128"}, "https_proxy"),
+    ("nit_ipv6", {"FEATURE_TARGET": "2001:db8::5"}, "FEATURE_TARGET"),
+    ("nit_hex_ip", {"FEATURE_TARGET": "0x7f000001"}, "FEATURE_TARGET"),
+    ("nit_single_label_host", {"REAP_RETURN_URL_HOSTS": "sandbox.agenpaz.com,evil"}, "REAP_RETURN_URL_HOSTS"),
+    ("nit_store_credentials", {"SHOPIFY_CREDENTIALS": SECRET}, "SHOPIFY_CREDENTIALS"),
+    ("nit_store_token_json", {"SHOPIFY_ACCESS_TOKEN_JSON": SECRET}, "SHOPIFY_ACCESS_TOKEN_JSON"),
+    # Positive flag rule, and the default-on flags the SF5 audit found.
+    ("flag_merchant_ucp_checkout", {"MERCHANT_UCP_CHECKOUT_ENABLED": "1"}, "MERCHANT_UCP_CHECKOUT_ENABLED"),
+    ("flag_unreviewed_new", {"SOME_NEW_FEATURE_ENABLED": "true"}, "SOME_NEW_FEATURE_ENABLED"),
+    ("flag_unreviewed_armed", {"SOMETHING_ARMED": "yes"}, "SOMETHING_ARMED"),
+    ("flag_payout", {"PARTNER_PAYOUT_EXECUTION_ENABLED": "true"}, "PARTNER_PAYOUT_EXECUTION_ENABLED"),
+    ("store_reconcile_unset", {"STORE_LIFECYCLE_RECONCILE_ENABLED": None}, "STORE_LIFECYCLE_RECONCILE_ENABLED"),
+    ("grounding_redirects_unset", {"AUDIT_RESOLVE_GROUNDING_REDIRECTS": None}, "AUDIT_RESOLVE_GROUNDING_REDIRECTS"),
+    # Review V8: more flag shapes, inverse flags, proxies, encodings, long TLDs, cloud credentials.
+    ("v8_flag_on_suffix", {"FOO_ON": "1"}, "FOO_ON"),
+    ("v8_use_live", {"USE_LIVE_PRICES": "true"}, "USE_LIVE_PRICES"),
+    ("v8_enable_live", {"ENABLE_LIVE_CHECKOUT": "1"}, "ENABLE_LIVE_CHECKOUT"),
+    ("v8_enable_prefix", {"ENABLE_SOMETHING_NEW": "yes"}, "ENABLE_SOMETHING_NEW"),
+    ("v8_allow", {"ALLOW_SHAKEOUT_ON_PROD": "true"}, "ALLOW_SHAKEOUT_ON_PROD"),
+    ("v8_inverse_disabled_false", {"FOO_DISABLED": "false"}, "FOO_DISABLED"),
+    ("v8_inverse_disable_zero", {"DISABLE_SAFETY_NET": "0"}, "DISABLE_SAFETY_NET"),
+    ("v8_grpc_proxy", {"grpc_proxy": "proxy:1080"}, "grpc_proxy"),
+    ("v8_socks_proxy", {"SOCKS5_PROXY": "proxy:1080"}, "SOCKS5_PROXY"),
+    ("v8_hex_url", {"FEATURE_BLOB": "68747470733a2f2f6576696c2e6578616d706c652f78"}, "FEATURE_BLOB"),
+    ("v8_long_tld", {"FEATURE_TARGET": "evil.international"}, "FEATURE_TARGET"),
+    ("v8_gcp_key_json", {"GOOGLE_APPLICATION_CREDENTIALS_JSON": SECRET}, "GOOGLE_APPLICATION_CREDENTIALS_JSON"),
+    ("v8_gcp_key_file", {"GOOGLE_APPLICATION_CREDENTIALS": "/secrets/key.json"}, "GOOGLE_APPLICATION_CREDENTIALS"),
+    ("v8_oauth_secret", {"GOOGLE_OAUTH_CLIENT_SECRET": SECRET}, "GOOGLE_OAUTH_CLIENT_SECRET"),
 ]
 
 
@@ -223,6 +337,65 @@ def test_each_bad_setting_is_refused_by_name_never_by_value(case, changes, setti
     for value in changes.values():
         if value and value not in ("1", "true", "yes", "*", "completed", "flase"):
             assert value not in message, (case, "the refusal quoted a value")
+
+
+@pytest.mark.parametrize("changes", [
+    {"STRIPE_SECRET_KEY": "sk_test_abc", "STRIPE_PUBLISHABLE_KEY": "pk_test_abc"},
+    {"STRIPE_REQUEST_TIMEOUT_SECONDS": "30", "STRIPE_MAX_NETWORK_RETRIES": "2"},
+    {"VISA_VDP_ENV": "sandbox", "VISA_VDP_ALLOW_PRODUCTION": "false"},
+    {"SENDGRID_API_KEY": "", "ADYEN_API_KEY": "  "},
+    {"ENVIRONMENT": "sandbox", "APP_ENV": "sandbox"},
+    {"CHECKOUT_PREFLIGHT_MODE": "off", "CHECKOUT_PREFLIGHT_ALLOW_EGRESS": "0"},
+    {"FF_ENABLE_INTERNAL_REFUND": "0", "FF_ENABLE_REFUND_AUTO_RETRY": "false"},
+    {"PIVOTA_AGENT_INTERNAL_URL": "https://sandbox.mcp.pivota.cc"},
+    {"DATABASE_URL": "postgresql://u:p@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pivota-pg"},
+    {"DATABASE_URL_NOVERIFY": "postgresql://u:p@198.51.100.126:5432/pivota", "SHOPIFY_DISCOUNT_CANARY_DATABASE_URL": ""},
+    {"REDIS_URL": "", "REAP_RETURN_URL_HOSTS": "sandbox.agenpaz.com,sandbox.mcp.pivota.cc"},
+    {"PORT": "8080", "PYTHON_VERSION": "3.11.9", "DB_POOL_MAX_SIZE": "4"},
+    # SF2: the resolver's own fallbacks count; SF5 off values; values that only look host-like.
+    {"PUBLIC_API_BASE_URL": None, "APP_URL": "https://sandbox.mcp.pivota.cc"},
+    {"VERTEX_AI_ENABLED": "false", "OPENAI_API_KEY": "", "OPENAI_MODEL": "gpt-4.1-mini"},
+    {"SOME_SERVICE_URL": "", "SCHEDULE_AT": "10:30:00", "PROFILE_FILE": "config.json", "MODULE": "jobs.sandbox_copy"},
+    {"FROM_EMAIL": "noreply@sandbox.agenpaz.com", "REAP_RETURN_URL_HOSTS": "sandbox.agenpaz.com, sandbox.mcp.pivota.cc:443"},
+    # Review V8: an inverse flag set to its SAFE side, the profile's serving flags, a hex secret.
+    {"IDENTITY_LIVE_READ_DISABLED": "true", "DISABLE_WEBHOOK_OUTBOX": "true", "ENABLE_STORELESS_BRAND_CATALOG": "1",
+     "ENABLE_BRAND_DIRECT_OFFER_TYPE": "true", "ENABLE_INTERNAL_DEMO_FIXTURES": "false", "SOME_SIGNING_SECRET": "ab" * 32},
+])
+def test_the_safe_form_of_each_s1_setting_passes(changes):
+    assert G.sandbox_violations(_with(**changes)) == []
+
+
+def test_the_flags_the_profile_turns_on_are_allowed_and_any_flag_may_be_off():
+    on = {name: "1" for name in G._FLAGS_ALLOWED_ON}
+    on["AUDIT_WORKER_ENABLED"] = "true"
+    assert G.sandbox_violations(_with(**on)) == []
+    off = {"MERCHANT_UCP_CHECKOUT_ENABLED": "0", "SOME_NEW_FEATURE_ENABLED": "false", "SOMETHING_ARMED": ""}
+    assert G.sandbox_violations(_with(**off)) == []
+
+
+@pytest.mark.parametrize("changes,setting,rule", [
+    # Each refused by exactly the positive rule named, not only by an older deny-list rule.
+    ({"CATALOG_COPY_GCS_URI": "gs://someone-elses-bucket/catalog"}, "CATALOG_COPY_GCS_URI", "allowlist"),
+    ({"UPSTREAM_HOST": "cache.example.com"}, "UPSTREAM_HOST", "allowlist"),
+    ({"REDIS_CLUSTER_NODES": "cache-a"}, "REDIS_CLUSTER_NODES", "no Redis"),
+    ({"REDIS_URL": "redis://cache.example.com:6379"}, "REDIS_URL", "no Redis"),
+    ({"SOME_NEW_FEATURE_ENABLED": "1"}, "SOME_NEW_FEATURE_ENABLED", "not reviewed for the sandbox"),
+    ({"GOOGLE_GENAI_USE_VERTEXAI": "true"}, "GOOGLE_GENAI_USE_VERTEXAI", "model-provider dial"),
+    # An escaped URL is refused even when it names an allowed host (it hides from every other check).
+    ({"FEATURE_TARGET": "https:\\/\\/sandbox.mcp.pivota.cc\\/x"}, "FEATURE_TARGET", "escaped or percent-encoded"),
+    # A scheme-relative URL to a single-label host: no TLD shape for the bare-host rule to see.
+    ({"FEATURE_TARGET": "//evil:8080/x"}, "FEATURE_TARGET", "not on the sandbox's allowlist"),
+    ({"SOME_SERVICE_URL": "http://evil.example\\@sandbox.mcp.pivota.cc/x"}, "SOME_SERVICE_URL", "credentials or an unusual authority"),
+])
+def test_the_positive_rule_itself_refuses(changes, setting, rule):
+    rules = [v.rule for v in G.sandbox_violations(_with(**changes)) if v.setting == setting]
+    assert any(rule in r for r in rules), rules
+
+
+def test_the_s1_positive_checks_are_in_addition_to_the_deny_list():
+    # A prod project in a value is still refused by the old rule as well as the new identity rule.
+    names = [v.setting for v in G.sandbox_violations(_with(GOOGLE_CLOUD_PROJECT="pivota-prod"))]
+    assert names.count("GOOGLE_CLOUD_PROJECT") == 2
 
 
 def test_a_star_allowlist_is_refused_as_all_jobs():
@@ -268,12 +441,17 @@ def test_a_web_process_needs_no_allowlist():
     assert G.sandbox_violations(env) == []
 
 
-def test_sandbox_hosts_under_guarded_zones_are_allowed():
+def test_only_the_listed_hosts_are_allowed_in_a_url():
+    # S1: an allowlist. The two sandbox hosts and Reap's sandbox hosts pass ...
     env = _with(
-        X1="https://sandbox.mcp.pivota.cc", X2="https://sandbox-developer.pivota.cc/x",
-        X3="https://pay-sandbox.agenpaz.com", X4="https://sg.sandbox.api.reap.global",
+        X1="https://sandbox.mcp.pivota.cc", X2="https://sandbox.agenpaz.com/x",
+        X3="https://sg.sandbox.api.reap.global/v1", X4="gs://pivota-sandbox-catalog-drop/catalog",
     )
     assert G.sandbox_violations(env) == []
+    # ... and a host that merely LOOKS like a sandbox host is refused: nobody listed it.
+    for value in ("https://sandbox-developer.pivota.cc/x", "https://pay-sandbox.agenpaz.com",
+                  "https://x.sandbox.mcp.pivota.cc", "https://sandbox.mcp.pivota.cc.evil.example"):
+        assert [v.setting for v in G.sandbox_violations(_with(X=value))] == ["X"], value
 
 
 def test_every_refusal_is_reported_at_once():
