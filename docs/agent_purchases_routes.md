@@ -602,15 +602,16 @@ door, the address write, the router, the worker's token and ceiling steps and th
   (`currency_market_mismatch` otherwise: a Canadian address shown in USD never takes it). The address write
   refuses a country other than the market of the purchase's currency (`country: unsupported`), and the worker
   refuses one before anything is minted (`shipping_market_mismatch`) and never builds the relay with one.
-- **The table:** US, CA, AU, NZ, SG, JP. Each market's currency is the market registry's
-  (`config/market_registry.json`). Not yet in it: South Korea and Taiwan, which the rail can price only once the
-  Reap lane's market map (also the directory's list of Reap's agentic markets) is split; and Hong Kong, whose
+- **The table:** US, CA, AU, NZ, SG, JP, KR, TW. Each market's currency is the market registry's
+  (`config/market_registry.json`). The rail prices a cart link through the Reap lane's loader with its own
+  market's currency, so KR and TW are priced without joining the Reap lane's market map (which is also the
+  merchant directory's list of Reap's agentic markets: Reap is not advertised there). Not in it: Hong Kong, whose
   addresses have no postcode while the provider's checkout requires `zip_code`.
 - **Addresses.** `region` is the ISO 3166-2 subdivision code without the country prefix. It is required in
-  the US, CA, AU and JP (and sent as `state`), optional in NZ, and refused in SG. Every market
+  the US, CA, AU and JP (and sent as `state`), optional in NZ, KR and TW, and refused in SG. Every market
   needs a postcode in its own format. Outside the US these rules apply with shipping-address capture off too.
 - **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
-  minor units (yen are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
+  minor units (yen and won are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
   already (`USD:3000,CAD:4000`). The ceiling's three envs (`A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS`,
   `A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR`, `A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR`) take `CUR:value`
   entries too. A bare value is USD's, as before, and only as the first entry; the defaults are USD's only. A
@@ -619,8 +620,8 @@ door, the address write, the router, the worker's token and ceiling steps and th
   own usable entry in all three, or its purchases are refused `checkout_ceiling_unconfigured`.
 - **The final total.** The worker completes a checkout only on a total it can read in the purchase's currency
   (`a2a_rail_worker.checkout_total_minor`). Outside USD it reads only marks that name one currency: the ISO
-  code ("CAD 25.00", "25.00 CAD") and symbols no other currency uses (CA$, C$, A$, AU$, NZ$, SG$, S$, JP¥,
-  円). A bare "$" or "¥" is not read. Any other spelling is held for a human
+  code ("CAD 25.00", "25.00 CAD") and symbols no other currency uses (CA$, C$, A$, AU$, NZ$, SG$, S$, NT$,
+  JP¥, ₩, 円, 원). A bare "$" or "¥" is not read. Any other spelling is held for a human
   (`checkout_total_*`), never guessed.
 - **The confirm card and the setup prose.** USD purchases are read exactly as before (`checkout_amounts`). In
   any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
@@ -634,10 +635,12 @@ door, the address write, the router, the worker's token and ceiling steps and th
 
 **Before a market goes on**, in the sandbox, for that currency:
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor
-   units (the yen case decides between ×1 and ×100).
+   units (the yen and won cases decide between ×1 and ×100).
 2. One checkout end to end: the address fills the store's form (the region as `state`), and the
    `checkout.result` total reads (`checkout_total_minor`) or is held.
 3. The ceiling's three entries set for its currency, and `A2A_RAIL_MAX_TOTAL_MINOR` too.
+4. The merchant's own facts for that market, as for the US: its `A2A_RAIL_MERCHANTS` entry, a fresh
+   purchasability fact and the daily cart-link (Tier B) verdict for the market.
 
 Then add the market to `A2A_RAIL_MARKETS`, on web and worker, as its own go.
 

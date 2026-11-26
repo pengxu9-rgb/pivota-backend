@@ -4777,9 +4777,11 @@ def jp_on(monkeypatch):
 @pytest.mark.parametrize("text,currency,minor", [
     ("CA$25.00", "CAD", 2500), ("C$ 25.00", "CAD", 2500), ("CAD 25.00", "CAD", 2500), ("25.00 CAD", "CAD", 2500),
     ("$25.00", "CAD", None), ("A$12.30", "AUD", 1230), ("AU$1,234.56", "AUD", 123456), ("A$12.30", "CAD", None),
-    ("NZ$9.90", "NZD", 990), ("S$9.90", "SGD", 990), ("SG$9.90", "SGD", 990), ("NT$330", "TWD", None),
+    ("NZ$9.90", "NZD", 990), ("S$9.90", "SGD", 990), ("SG$9.90", "SGD", 990), ("NT$330", "TWD", 33000),
+    ("NT$330.50", "TWD", 33050), ("$330", "TWD", None), ("NT$330", "USD", None),
     ("JPY 1,500", "JPY", 1500), ("1,500円", "JPY", 1500), ("JP¥1500", "JPY", 1500), ("¥1,500", "JPY", None),
-    ("JPY 1,500.00", "JPY", None), ("₩15,000", "KRW", None), ("HK$10.00", "HKD", None), ("25.00", "CAD", None), ("CA$25.00", "USD", None),
+    ("JPY 1,500.00", "JPY", None), ("₩15,000", "KRW", 15000), ("15,000원", "KRW", 15000), ("KRW 15000", "KRW", 15000),
+    ("₩15,000.00", "KRW", None), ("HK$10.00", "HKD", None), ("25.00", "CAD", None), ("CA$25.00", "USD", None),
     ("€23,00", "EUR", None),
 ])
 def test_a_total_outside_usd_is_read_only_by_a_mark_that_names_its_currency(text, currency, minor):
@@ -4788,7 +4790,7 @@ def test_a_total_outside_usd_is_read_only_by_a_mark_that_names_its_currency(text
 
 @pytest.mark.parametrize("country,state_needed", [
     ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False),
-    ("GB", False),
+    ("TW", False), ("GB", False),
 ])
 def test_the_checkout_shipping_needs_a_state_only_where_the_market_requires_a_region(country, state_needed):
     shipping = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
