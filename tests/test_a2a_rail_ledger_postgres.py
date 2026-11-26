@@ -30,6 +30,7 @@ _MIGRATION_287 = _REPO / "db/migrations/287_a2a_rail_checkout_task_id.sql"
 _MIGRATION_288 = _REPO / "db/migrations/288_a2a_rail_ceiling_source.sql"
 _MIGRATION_290 = _REPO / "db/migrations/290_a2a_rail_checkout_lookups.sql"
 _MIGRATION_298 = _REPO / "db/migrations/298_a2a_rail_payment_card.sql"
+_MIGRATION_300 = _REPO / "db/migrations/300_a2a_rail_card_choice.sql"
 AGENT = "agent_a2a_pg"
 PAGE = "https://pay.rail.test/approve/1"
 
@@ -95,7 +96,7 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
 
     for table in _TABLES:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
-    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288, _MIGRATION_290, _MIGRATION_298):
+    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288, _MIGRATION_290, _MIGRATION_298, _MIGRATION_300):
         for statement in split_statements(migration.read_text(encoding="utf-8")):
             await database.execute(statement)
     from_migration = [await _fingerprint(t) for t in _TABLES]
@@ -110,6 +111,10 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
             "AND column_name = :c AND data_type = 'character varying' AND character_maximum_length = :w",
             {"c": column, "w": width}), column
+    for column, kind in (("card_options", "text"), ("card_confirmed_at", "timestamp with time zone")):
+        assert await database.fetch_one(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
+            "AND column_name = :c AND data_type = :k", {"c": column, "k": kind}), column
     assert [name for name, _ in from_migration[0][2]] == [
         "ck_a2a_rail_purchases_action", "ck_a2a_rail_purchases_price",
         "ck_a2a_rail_purchases_quantity", "ck_a2a_rail_purchases_state"]
