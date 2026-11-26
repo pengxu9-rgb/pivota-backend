@@ -51,6 +51,9 @@ ORDER_CREATE_LIVE_QUOTE_REVALIDATION_ENABLED: "0"
 LEGACY_SETTLEMENT_LIVE: "false"
 SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING: "false"
 ENABLE_INTERNAL_DEMO_FIXTURES: "false"
+# both refund flags default ON when unset (config/feature_flags.py); the sandbox guard requires them off
+FF_ENABLE_INTERNAL_REFUND: "false"
+FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND: "false"
 
 # -- AgenPaz backend side (buyer read + consent) -------------------------------------------------
 AGENPAS_INTERNAL_READ_ENABLED: "1"
@@ -93,6 +96,17 @@ WEBHOOK_DELIVERY_ENABLED: "false"
 DISABLE_WEBHOOK_OUTBOX: "true"
 ORDER_CONFIRMATION_EMAIL_ENABLED: "false"
 VERTEX_AI_ENABLED: "false"
+# default-on outbound calls the sandbox guard requires off (each defaults ON when unset)
+AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED: "false"
+STORE_LIFECYCLE_RECONCILE_ENABLED: "false"
+AUDIT_RESOLVE_GROUNDING_REDIRECTS: "false"
+# empty, not unset: unset falls back to prod gateway URLs in code
+PIVOTA_AGENT_INTERNAL_URL: ""
+OUTBOUND_WARM_HANDOFF_RESOLVE_URL: ""
+# the public base URL the backend hands out; unset or empty resolves to prod's API host. The
+# sandbox backend has no public host of its own, so it is the sandbox gateway (rendered from
+# config.sh GATEWAY_HOST; RUNBOOK Q16).
+PUBLIC_API_BASE_URL: "https://@@GATEWAY_HOST@@"
 
 # -- catalog / search / offers behaviour, carried from staging so answers match ---------------------
 AGENT_CHECKOUT_STRICT: "on"
