@@ -312,15 +312,27 @@ def _names_the_callers_purchase(exc: reap_svc.PurchaseRefused) -> bool:
 _HEARTBEAT_READ_TIMEOUT_S = 1.0
 
 
+async def _a2a_heartbeats_fresh() -> bool:
+    """The worker's heartbeat AND the contact purge's (migration 299): a purchase opened while either is
+    stale would never advance, or would keep its buyer's contact past the 72 h the terms promise. The
+    stale one is logged by name; the agent sees the router's usual reason."""
+    if not await a2a_ledger.worker_is_alive():
+        return False
+    if not await a2a_ledger.contact_purge_is_alive():
+        logger.warning("agent_purchases: a2a contact purge heartbeat stale; A2A creates closed")
+        return False
+    return True
+
+
 async def _a2a_worker_alive(*, agent_id: str, preferred: Optional[str]) -> bool:
-    """The A2A worker's heartbeat, read only for a request the A2A rail could take: its create dials on,
-    the agent on its pilot list, and Reap not chosen explicitly (otherwise the router answers before it
-    would look, and every create would pay for a read). A failed or slow read is "not alive": the rail
-    is not offered."""
+    """The A2A worker's and contact purge's heartbeats, read only for a request the A2A rail could take:
+    its create dials on, the agent on its pilot list, and Reap not chosen explicitly (otherwise the router
+    answers before it would look, and every create would pay for a read). A failed or slow read is "not
+    alive": the rail is not offered. Both reads share the one timeout."""
     if not rail_router.a2a_create_dials_on() or preferred == "reap" or agent_id not in rail_router.pilot_agents():
         return False
     try:
-        return await asyncio.wait_for(a2a_ledger.worker_is_alive(), _HEARTBEAT_READ_TIMEOUT_S)
+        return await asyncio.wait_for(_a2a_heartbeats_fresh(), _HEARTBEAT_READ_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - timeouts included
         logger.warning("agent_purchases: a2a worker heartbeat unreadable error_type=%s", type(exc).__name__)
         return False

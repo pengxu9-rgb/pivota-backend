@@ -143,6 +143,33 @@ def test_migration_278_holds_the_heartbeat_ddl():
     assert "DROP TABLE IF EXISTS a2a_rail_worker_heartbeat" in down
 
 
+def test_migration_299_holds_the_contact_purge_heartbeat_ddl():
+    migration = (_REPO / "db/migrations/299_a2a_rail_contact_purge_heartbeat.sql").read_text("utf-8")
+    squash = lambda text: " ".join(text.split())  # noqa: E731
+    assert squash(ledger._CREATE_CONTACT_PURGE_HEARTBEAT_PG).rstrip() in squash(migration)
+    assert "schema-guard-exempt:" in migration
+    down = (_REPO / "db/migrations/down/299_a2a_rail_contact_purge_heartbeat_down.sql").read_text("utf-8")
+    assert "DROP TABLE IF EXISTS a2a_rail_contact_purge_heartbeat" in down
+
+
+async def test_the_contact_purge_heartbeat_is_one_row_and_ages_out():
+    await database.execute("DROP TABLE IF EXISTS a2a_rail_contact_purge_heartbeat")
+    await ensure_required_schema_light()
+    assert await ledger.contact_purge_is_alive() is False  # never ran
+    await ledger.record_contact_purge_heartbeat()
+    await ledger.record_contact_purge_heartbeat()
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_contact_purge_heartbeat"))["n"] == 1
+    assert await ledger.contact_purge_is_alive() is True
+    await database.execute("UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = datetime('now', '-2701 seconds')")
+    assert await ledger.contact_purge_is_alive() is False
+    assert await ledger.contact_purge_is_alive(max_age_seconds=3000) is True
+    # the worker's heartbeat is a different row in a different table
+    await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    assert await ledger.contact_purge_is_alive(max_age_seconds=3000) is True
+    with pytest.raises(Exception):
+        await database.execute("INSERT INTO a2a_rail_contact_purge_heartbeat (id, ran_at) VALUES (2, CURRENT_TIMESTAMP)")
+
+
 async def test_the_heartbeat_is_one_row_and_ages_out():
     await database.execute("DROP TABLE IF EXISTS a2a_rail_worker_heartbeat")
     await ensure_required_schema_light()

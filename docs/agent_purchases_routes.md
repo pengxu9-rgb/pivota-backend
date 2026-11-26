@@ -297,7 +297,17 @@ dials and makes no outside call; it logs counts only.
   Turning the rail's dials off does not stop this purge, and a rail rollback must leave it on.
 - On Postgres, two purges running at once (the tick, this job, a run-now) skip each other's locked rows
   (`FOR UPDATE SKIP LOCKED`) instead of waiting.
-- A worker with `SCHEDULER_JOB_ALLOWLIST` set must name `a2a_rail_contact_purge` too, or the job is not started.
+- **Fail closed.** Every enabled run that finished its purge stamps `a2a_rail_contact_purge_heartbeat`
+  (migration 299, one row) and prints `a2a_rail_contact_purge: {"batches":…,"contact_purged":…}` on the pivota
+  logger. The create route reads that heartbeat beside the worker's (278) and opens **no A2A purchase** unless
+  it is under 45 minutes old (`CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS`): without a choice the request goes to
+  Reap unchanged, an explicit `a2a` choice is the usual 404 `not_available_on_this_rail`, and the stale
+  heartbeat is logged by name. So the kill switch, a paused job or a stalled worker also stops new A2A purchases.
+  Purchases already open keep their 71 h deadline.
+- **Alert:** `prod: A2A contact purge went silent` (infra/gcp/monitoring/money_path_alerts.json): the summary
+  line was present in the last 24 h and absent for 45 min, the same moment the create route closes.
+- A worker with `SCHEDULER_JOB_ALLOWLIST` set must name `a2a_rail_contact_purge` too, or the job is not started
+  and **A2A creates stay closed** (staging: add it beside `a2a_rail_purchase_poll`).
 - One forced run: `POST /admin/scheduler/jobs/a2a_rail_contact_purge/run-now`.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address` (server to server, AgenPas)
