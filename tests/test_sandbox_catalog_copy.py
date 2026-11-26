@@ -198,10 +198,14 @@ def test_the_staff_and_free_text_columns_found_in_review_stay_dropped():
 def test_the_import_refuses_a_target_that_is_not_positively_the_sandbox_s(clean_env):
     from tests.test_sandbox_guard import GOOD
 
+    from config.sandbox_guard import SandboxGuardRefused
+
     good = dict(GOOD, CLOUD_RUN_JOB="sandbox-catalog-import")
     for dsn in ("postgresql://u:p@203.0.113.7/pivota?host=/cloudsql/pivota-sandbox:us-west1:pg",
                 "postgresql://u:p@203.0.113.70/pivota", "postgresql://u:p@db.internal/pivota"):
-        with pytest.raises(C.CopyRefused, match="private range"):
+        # S1: the startup guard now makes the same positive check, so it refuses first; the import's
+        # own check (sandbox_database_refusal) stays as the second lock.
+        with pytest.raises((C.CopyRefused, SandboxGuardRefused), match="private range"):
             C.check_import_environment(dict(good, DATABASE_URL=dsn))
 
 

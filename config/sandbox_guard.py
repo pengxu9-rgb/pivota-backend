@@ -42,6 +42,32 @@ DATABASE_URL and API keys):
                      and refreshes are scheduled jobs; this pins the sandbox worker to the purchase
                      poller whatever flags say.
 
+POSITIVE CHECKS (S1: what a setting MUST be, not only what it must not be):
+
+  identity           GOOGLE_CLOUD_PROJECT is exactly the sandbox's project, DATABASE_URL is set,
+                     and every DSN-shaped setting (any name containing DATABASE_URL) connects only
+                     to the sandbox's own database (config/sandbox_identity.dsn_refusal: asyncpg's
+                     own parser, the sandbox range or socket). No Redis setting at all (v0 has none).
+  url_allowlist      every scheme://host in ANY value names an allowed host: Reap's sandbox hosts or
+                     the sandbox's two public hosts for http(s), the drop bucket for gs://, nothing
+                     for any other scheme (DSN settings excepted, checked above). A host/URL-named
+                     setting (*_URL, *_HOST, *_ORIGINS, ...) may name no other bare host either, and no
+                     setting outside the DSNs may hold an IP address. The two consent links stay
+                     exempt as exact pairs.
+  prod_default       the settings whose CODE default is a prod gateway URL the server calls must be
+                     SET (empty, or an allowed URL): unset means "call prod".
+  money_default_on   the refund dials that default ON when unset are set to an explicit off value;
+                     every other FF_ENABLE_*REFUND*, REAP_EXTERNAL_AUTH_ENABLED and
+                     VISA_VDP_ALLOW_PRODUCTION are off.
+  live_read          the live-offer and checkout-preflight egress dials, and any *EGRESS* name, are
+                     off; CHECKOUT_PREFLIGHT_MODE is unset or off; VISA_VDP_ENV is unset or sandbox;
+                     ENVIRONMENT and APP_ENV (read directly by several routes and by Sentry) are unset
+                     or sandbox.
+  provider           email/SMS/payment-provider settings (SendGrid, SMTP2GO, Twilio, Adyen, Stripe,
+                     Visa, AWS keys, ...) hold nothing but an off value, a number, or a test-shaped
+                     value for that setting (sk_test_/pk_test_ for Stripe); store-platform
+                     credentials (Shopify, Cafe24, Wix, ... *_TOKEN/*_SECRET/*_KEY) are unset.
+
 WHAT IT DOES NOT CLAIM. The flag lists are the flags this codebase has today; a store fetch behind a
 flag of a different shape, or behind no flag at all, is not caught here. The second lock is the
 data: the catalog copy (jobs/sandbox_catalog_copy.py) carries no store credential (no Shopify /
@@ -169,6 +195,80 @@ _DISPLAY_ONLY_LINKS = {
 }
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
 
+# --- positive checks (S1): what a sandbox setting MUST be, not only what it must not be ----------
+#: Identity: the project every sandbox process names (the deploy reads it back off each revision).
+_IDENTITY_PROJECT_SETTING = "GOOGLE_CLOUD_PROJECT"
+#: A setting is a Postgres DSN when its name contains this; every one must connect only to the
+#: sandbox's own database (config/sandbox_identity.dsn_refusal). DATABASE_URL itself is required.
+_DSN_NAME_RE = re.compile(r"DATABASE_URL|_DSN$")
+#: No Redis in sandbox v0 (the assertion replay guard falls back in-process). A sandbox Redis is a
+#: new range to add here first, never a URL that happens not to be prod's.
+_REDIS_NAME_RE = re.compile(r"REDIS")
+#: The ONLY hosts an http(s) URL in a sandbox setting may name: Reap's sandbox hosts and the
+#: sandbox's own two public hosts (infra/gcp/sandbox/config.sh GATEWAY_HOST / AGENPAZ_HOST). Exact
+#: strings, not "a label contains sandbox": an allowlist, so a host nobody listed is refused.
+_SANDBOX_PUBLIC_HOSTS = frozenset({"sandbox.mcp.pivota.cc", "sandbox.agenpaz.com"})
+#: The ONLY bucket a gs:// URL may name (config/sandbox_identity.SANDBOX_DROP_BUCKET).
+_URL_RE = re.compile(r"([a-z][a-z0-9+.-]*)://([^/\s?#,;'\"]*)")
+#: Names whose value is a host, a URL or a list of them: every item must be an allowed host.
+_HOSTISH_NAME_RE = re.compile(
+    r"(_URL|_URLS|_URI|_URIS|_HOST|_HOSTS|_HOSTNAME|_DOMAIN|_DOMAINS|_ORIGIN|_ORIGINS"
+    r"|_ENDPOINT|_ENDPOINTS|_ADDR|_ADDRESS|_BASE)$"
+)
+#: Settings whose CODE DEFAULT is a prod host the server calls (config/settings.py). Unset means
+#: "call prod", so the sandbox must set each one: to empty (the feature has nowhere to go) or to an
+#: allowed sandbox URL.
+_PROD_DEFAULT_URL_SETTINGS = (
+    "PIVOTA_AGENT_INTERNAL_URL",          # gateway.pivota.cc: search/detail proxies, LLM probe
+    "OUTBOUND_WARM_HANDOFF_RESOLVE_URL",  # gateway.pivota.cc/internal/ucp/warm-handoff/resolve
+)
+#: Real-money dials that DEFAULT ON when unset (config/feature_flags.py): each must be SET to an
+#: explicit off value. Any other FF_ENABLE_*REFUND* that is set must be off too.
+_MONEY_DEFAULT_ON = ("FF_ENABLE_INTERNAL_REFUND", "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND")
+_REFUND_FLAG_RE = re.compile(r"^FF_ENABLE_[A-Z0-9_]*REFUND[A-Z0-9_]*$")
+#: More real-money / live-network dials. Unset or off.
+_MORE_MONEY_DIALS = ("REAP_EXTERNAL_AUTH_ENABLED", "VISA_VDP_ALLOW_PRODUCTION")
+#: Live-read dials whose names the store-fetch pattern does not catch. Unset or off.
+_MORE_STORE_FETCH_FLAGS = (
+    "LIVE_OFFER_VERIFICATION_ENABLED",
+    "LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS",
+    "CHECKOUT_PREFLIGHT_ALLOW_EGRESS",
+)
+#: Any set name with EGRESS in it allows outbound fetches: off (a *_DISABLED name is the safe side).
+_EGRESS_NAME_RE = re.compile(r"EGRESS(?!.*_DISABLED$)")
+#: Mode settings pinned to the values that are safe in the sandbox ("" = unset).
+_PINNED_VALUES = {
+    "CHECKOUT_PREFLIGHT_MODE": frozenset({"", "off"}),
+    "VISA_VDP_ENV": frozenset({"", "sandbox"}),
+    # Read directly by utils/runtime_safety.py, utils/service_token.py, routes/webhook_routes.py,
+    # routes/payment_routes.py, routes/billing_routes.py, routes/shopify_setup.py, routes/photos.py,
+    # routes/refund_webhook_routes.py, routes/agent_shop_gateway.py and Sentry's environment tag.
+    "ENVIRONMENT": frozenset({"", "sandbox"}),
+    "APP_ENV": frozenset({"", "sandbox"}),
+}
+#: Email, SMS and payment-provider settings: the sandbox sends no mail or SMS and has no PSP but
+#: Reap's sandbox. Any non-empty value is refused unless it is an explicit off value, a number (a
+#: timeout or retry count), or test-shaped for that setting (_PROVIDER_TEST_SHAPES).
+_PROVIDER_NAME_RE = re.compile(
+    r"^(SENDGRID|SMTP2GO|SMTP|MAILGUN|MAILJET|POSTMARK|MANDRILL|RESEND|SPARKPOST|BREVO|SES|AWS_SES"
+    r"|TWILIO|VONAGE|NEXMO|PLIVO|MESSAGEBIRD|SINCH|TELNYX"
+    r"|ADYEN|STRIPE|PAYPAL|BRAINTREE|KLARNA|AFTERPAY|EVONET|AIRWALLEX|RAPYD|SQUARE|WORLDPAY"
+    r"|CYBERSOURCE|MOLLIE|RAZORPAY|CKO|CHECKOUT_COM|VISA|MASTERCARD|FEISHU)_"
+    r"|^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)$"
+)
+_PROVIDER_TEST_SHAPES = {
+    "STRIPE_SECRET_KEY": ("sk_test_",),
+    "STRIPE_TEST_SECRET_KEY": ("sk_test_",),
+    "STRIPE_PUBLISHABLE_KEY": ("pk_test_",),
+    "VISA_VDP_ENV": ("sandbox",),
+}
+_NUMBER_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+#: Store-platform credentials: with one, a store API call from the sandbox could authenticate.
+_STORE_CREDENTIAL_RE = re.compile(
+    r"^(SHOPIFY|CAFE24|WIX|WOOCOMMERCE|WOO|AMAZON_SP_API|SQUARESPACE|BIGCOMMERCE|MAGENTO|SHOPLINE"
+    r"|SHOPLAZZA)_[A-Z0-9_]*(TOKEN|SECRET|KEY|PASSWORD|CLIENT_ID)$"
+)
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -234,6 +334,56 @@ def _prod_reference_rule(value: str) -> Optional[str]:
             if not any("sandbox" in label for label in labels if label):
                 return "names a non-sandbox %s host" % zone
     return None
+
+
+def _allowed_url_host(scheme: str, host: str) -> bool:
+    from config.sandbox_identity import SANDBOX_DROP_BUCKET
+    from services.reap_agentic_client import REAP_SANDBOX_HOSTS
+
+    if scheme in ("http", "https"):
+        return host in REAP_SANDBOX_HOSTS or host in _SANDBOX_PUBLIC_HOSTS
+    if scheme == "gs":
+        return host == SANDBOX_DROP_BUCKET
+    return False  # redis://, postgres:// outside a DSN setting, amqp://, ftp://, ...
+
+
+def _url_authority_host(authority: str) -> str:
+    host = authority.rsplit("@", 1)[-1]
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.split(":", 1)[0].rstrip(".")
+
+
+def _url_rule(name: str, value: str) -> Optional[str]:
+    """The rule a URL inside ``value`` breaks, or None: every scheme://host must be allowed."""
+    for scheme, authority in _URL_RE.findall(value.lower()):
+        if not _allowed_url_host(scheme, _url_authority_host(authority)):
+            return "names a URL whose host is not on the sandbox's allowlist"
+    return None
+
+
+def _hostish_rule(value: str) -> Optional[str]:
+    """For a host/URL-named setting: every bare item (comma or space separated) that is a host or
+    an address must be an allowed host. URLs are left to _url_rule."""
+    for item in re.split(r"[\s,;]+", value.strip().lower()):
+        if not item or "://" in item:
+            continue
+        host = item.rsplit("@", 1)[-1]
+        host = host[1:].split("]", 1)[0] if host.startswith("[") else host.split(":", 1)[0]
+        host = host.split("/", 1)[0].rstrip(".")
+        if not host:
+            continue
+        looks_like_host = "." in host or host == "localhost" or _ip_sha256(host) is not None
+        if looks_like_host and not _allowed_url_host("https", host):
+            return "names a host that is not on the sandbox's allowlist"
+    return None
+
+
+def _provider_value_ok(name: str, raw: str) -> bool:
+    value = raw.strip()
+    if not value or _is_off(value) or _NUMBER_RE.match(value):
+        return True
+    return any(value.startswith(p) for p in _PROVIDER_TEST_SHAPES.get(name, ()))
 
 
 def _worker_enabled(env: Mapping[str, str]) -> bool:
@@ -303,6 +453,68 @@ def sandbox_violations(env: Mapping[str, str]) -> List[Violation]:
                     "SCHEDULER_JOB_ALLOWLIST",
                     "names jobs outside SANDBOX_SCHEDULER_JOBS: %s" % ",".join(extra),
                 ))
+
+    # Identity: the sandbox's project, and every DSN the sandbox's own database.
+    from config.sandbox_identity import SANDBOX_PROJECT, dsn_refusal
+
+    if _val(env, _IDENTITY_PROJECT_SETTING) != SANDBOX_PROJECT:
+        out.append(Violation(_IDENTITY_PROJECT_SETTING, "must be exactly %s" % SANDBOX_PROJECT))
+    dsn_names = {name for name in env if _DSN_NAME_RE.search(name)} | {"DATABASE_URL"}
+    for name in sorted(dsn_names):
+        raw = env.get(name) or ""
+        if name != "DATABASE_URL" and not raw.strip():
+            continue
+        refusal = dsn_refusal(raw, name)
+        if refusal:
+            out.append(Violation(name, refusal))
+
+    # Redis: none in sandbox v0.
+    for name in sorted(env):
+        if _REDIS_NAME_RE.search(name) and (env.get(name) or "").strip() and not _is_off(env.get(name) or ""):
+            out.append(Violation(name, "no Redis in the sandbox (v0): must be unset"))
+
+    # URLs and hosts: on the allowlist, wherever they appear (DSNs are checked above instead).
+    for name in sorted(env):
+        value = env.get(name) or ""
+        if not value.strip() or name in dsn_names or _DISPLAY_ONLY_LINKS.get(name) == value.strip():
+            continue
+        rule = _url_rule(name, value)
+        if rule is None and _HOSTISH_NAME_RE.search(name):
+            rule = _hostish_rule(value)
+        if rule is None and any(_ip_sha256(t) for t in _IPV4_TOKEN_RE.findall(value)):
+            rule = "holds an IP address (only DATABASE_URL may, and only the sandbox's)"
+        if rule:
+            out.append(Violation(name, rule))
+    for name in _PROD_DEFAULT_URL_SETTINGS:
+        if name not in env:
+            out.append(Violation(name, "defaults to a prod host when unset; set it to empty or a sandbox URL"))
+
+    # Money that defaults on, and every refund flag.
+    for name in _MONEY_DEFAULT_ON:
+        if not _val(env, name) or not _is_off(env.get(name) or ""):
+            out.append(Violation(name, "defaults on; must be set to an explicit off value (0/false)"))
+    for name in sorted(env):
+        if name in _MONEY_DEFAULT_ON:
+            continue
+        if (_REFUND_FLAG_RE.match(name) or name in _MORE_MONEY_DIALS) and not _is_off(env.get(name) or ""):
+            out.append(Violation(name, "real-money dial must be off in the sandbox"))
+
+    # Live reads and egress the store-fetch pattern does not catch; pinned modes.
+    for name in sorted(env):
+        if name in _MORE_STORE_FETCH_FLAGS or _EGRESS_NAME_RE.search(name):
+            if not _is_off(env.get(name) or ""):
+                out.append(Violation(name, "live read / egress flag must be off"))
+    for name, allowed in sorted(_PINNED_VALUES.items()):
+        if _val(env, name).lower() not in allowed:
+            out.append(Violation(name, "must be one of: %s" % ", ".join(sorted(v or "(unset)" for v in allowed))))
+
+    # Email, SMS and payment providers; store credentials.
+    for name in sorted(env):
+        raw = env.get(name) or ""
+        if _PROVIDER_NAME_RE.search(name) and name not in _PINNED_VALUES and not _provider_value_ok(name, raw):
+            out.append(Violation(name, "email/SMS/payment-provider setting: refused unless test-shaped"))
+        elif _STORE_CREDENTIAL_RE.match(name) and raw.strip():
+            out.append(Violation(name, "store credential: the sandbox holds none"))
 
     # Prod references, in any setting's value.
     for name in sorted(env):

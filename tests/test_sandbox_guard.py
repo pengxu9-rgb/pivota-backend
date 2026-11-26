@@ -36,12 +36,18 @@ GOOD = {
     "REAP_AGENTIC_SIMULATE_CHECKOUT": "COMPLETED",
     "ORDER_CREATE_LIVE_QUOTE_REVALIDATION_ENABLED": "0",
     "PUBLIC_MCP_URL": "https://sandbox.mcp.pivota.cc/mcp",
-    "AGENPAS_PUBLIC_BASE_URL": "https://pay-sandbox.agenpaz.com",
+    "AGENPAS_PUBLIC_BASE_URL": "https://sandbox.agenpaz.com",
     "CATALOG_COPY_GCS_URI": "gs://pivota-sandbox-catalog-drop/catalog/",
     "A2A_RAIL_ENABLED": "false",
     "AUDIT_WORKER_ENABLED": "true",
     "SCHEDULER_JOB_ALLOWLIST": "reap_agentic_purchase_poll,agent_purchase_events",
     "CATALOG_TRUST_CRAWL_FRESH_ENABLED": "false",
+    # S1: the refund flags default ON, so they are set off; the two settings whose code default is a
+    # prod gateway URL are set (empty = the feature has nowhere to go).
+    "FF_ENABLE_INTERNAL_REFUND": "false",
+    "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND": "false",
+    "PIVOTA_AGENT_INTERNAL_URL": "",
+    "OUTBOUND_WARM_HANDOFF_RESOLVE_URL": "",
 }
 
 _PLATFORM_KEYS = (
@@ -207,6 +213,49 @@ _REFUSALS = [
     ("worker_no_allowlist", {"SCHEDULER_JOB_ALLOWLIST": None}, "SCHEDULER_JOB_ALLOWLIST"),
     ("worker_star", {"SCHEDULER_JOB_ALLOWLIST": "*"}, "SCHEDULER_JOB_ALLOWLIST"),
     ("worker_extra_job", {"SCHEDULER_JOB_ALLOWLIST": "reap_agentic_purchase_poll,catalog_row_trust_crawl_fresh_recheck"}, "SCHEDULER_JOB_ALLOWLIST"),
+    # S1: each gap the 5d8e3aa73 review found passing the old deny list, now refused by a positive rule.
+    ("s1_live_offer", {"LIVE_OFFER_VERIFICATION_ENABLED": "1"}, "LIVE_OFFER_VERIFICATION_ENABLED"),
+    ("s1_live_offer_egress", {"LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS": "1"}, "LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS"),
+    ("s1_preflight_enforce", {"CHECKOUT_PREFLIGHT_MODE": "enforce"}, "CHECKOUT_PREFLIGHT_MODE"),
+    ("s1_preflight_shadow", {"CHECKOUT_PREFLIGHT_MODE": "shadow"}, "CHECKOUT_PREFLIGHT_MODE"),
+    ("s1_preflight_egress", {"CHECKOUT_PREFLIGHT_ALLOW_EGRESS": "1"}, "CHECKOUT_PREFLIGHT_ALLOW_EGRESS"),
+    ("s1_any_egress", {"FOO_ALLOW_EGRESS": "true"}, "FOO_ALLOW_EGRESS"),
+    ("s1_visa_env", {"VISA_VDP_ENV": "production"}, "VISA_VDP_ENV"),
+    ("s1_visa_allow_prod", {"VISA_VDP_ALLOW_PRODUCTION": "yes"}, "VISA_VDP_ALLOW_PRODUCTION"),
+    ("s1_sendgrid", {"SENDGRID_API_KEY": "SG.%s" % SECRET}, "SENDGRID_API_KEY"),
+    ("s1_smtp2go", {"SMTP2GO_API_KEY": "api-%s" % SECRET}, "SMTP2GO_API_KEY"),
+    ("s1_twilio", {"TWILIO_AUTH_TOKEN": SECRET}, "TWILIO_AUTH_TOKEN"),
+    ("s1_adyen", {"ADYEN_API_KEY": "AQE%s" % SECRET}, "ADYEN_API_KEY"),
+    ("s1_stripe_live", {"STRIPE_SECRET_KEY": "sk_live_%s" % SECRET}, "STRIPE_SECRET_KEY"),
+    ("s1_stripe_unshaped", {"STRIPE_SECRET_KEY": SECRET}, "STRIPE_SECRET_KEY"),
+    ("s1_aws_key", {"AWS_SECRET_ACCESS_KEY": SECRET}, "AWS_SECRET_ACCESS_KEY"),
+    ("s1_reap_ext_auth", {"REAP_EXTERNAL_AUTH_ENABLED": "1"}, "REAP_EXTERNAL_AUTH_ENABLED"),
+    ("s1_refund_unset", {"FF_ENABLE_INTERNAL_REFUND": None}, "FF_ENABLE_INTERNAL_REFUND"),
+    ("s1_refund_on", {"FF_ENABLE_INTERNAL_REFUND": "true"}, "FF_ENABLE_INTERNAL_REFUND"),
+    ("s1_order_failure_refund_unset", {"FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND": None}, "FF_ENABLE_MERCHANT_ORDER_FAILURE_REFUND"),
+    ("s1_other_refund_flag", {"FF_ENABLE_REFUND_AUTO_RETRY": "true"}, "FF_ENABLE_REFUND_AUTO_RETRY"),
+    ("s1_environment_prod", {"ENVIRONMENT": "production"}, "ENVIRONMENT"),
+    ("s1_app_env_prod", {"APP_ENV": "production"}, "APP_ENV"),
+    ("s1_project_unset", {"GOOGLE_CLOUD_PROJECT": None}, "GOOGLE_CLOUD_PROJECT"),
+    ("s1_project_other", {"GOOGLE_CLOUD_PROJECT": "pivota-sandbox-2"}, "GOOGLE_CLOUD_PROJECT"),
+    ("s1_db_unset", {"DATABASE_URL": None}, "DATABASE_URL"),
+    ("s1_db_other_ip", {"DATABASE_URL": "postgresql://u:%s@203.0.113.70:5432/pivota" % SECRET}, "DATABASE_URL"),
+    ("s1_db_hostname", {"DATABASE_URL": "postgresql://u:%s@db.example.com/pivota" % SECRET}, "DATABASE_URL"),
+    ("s1_second_dsn", {"SHOPIFY_DISCOUNT_CANARY_DATABASE_URL": "postgresql://u:%s@203.0.113.70/x" % SECRET}, "SHOPIFY_DISCOUNT_CANARY_DATABASE_URL"),
+    ("s1_redis", {"REDIS_URL": "redis://:%s@203.0.113.70:6379/0" % SECRET}, "REDIS_URL"),
+    ("s1_redis_host", {"REDIS_HOST": "203.0.113.70"}, "REDIS_HOST"),
+    ("s1_run_app", {"SOME_SERVICE_URL": "https://web-abc123-uw.a.run.app"}, "SOME_SERVICE_URL"),
+    ("s1_url_in_any_name", {"FEATURE_TARGET": "https://api.pivota.cc/x"}, "FEATURE_TARGET"),
+    ("s1_redis_scheme_elsewhere", {"CACHE_TARGET": "redis://cache.example.com:6379"}, "CACHE_TARGET"),
+    ("s1_bare_host", {"INDEXNOW_HOST": "agent.pivota.cc"}, "INDEXNOW_HOST"),
+    ("s1_bare_ip_host", {"UPSTREAM_HOST": "203.0.113.70:8080"}, "UPSTREAM_HOST"),
+    ("s1_ip_anywhere", {"FOO_TARGETS": "a,203.0.113.70"}, "FOO_TARGETS"),
+    ("s1_gs_other_bucket", {"CATALOG_COPY_GCS_URI": "gs://pivota-prod-backups/catalog"}, "CATALOG_COPY_GCS_URI"),
+    ("s1_agent_url_unset", {"PIVOTA_AGENT_INTERNAL_URL": None}, "PIVOTA_AGENT_INTERNAL_URL"),
+    ("s1_agent_url_prod", {"PIVOTA_AGENT_INTERNAL_URL": "https://gateway.pivota.cc"}, "PIVOTA_AGENT_INTERNAL_URL"),
+    ("s1_warm_url_unset", {"OUTBOUND_WARM_HANDOFF_RESOLVE_URL": None}, "OUTBOUND_WARM_HANDOFF_RESOLVE_URL"),
+    ("s1_store_token", {"SHOPIFY_ACCESS_TOKEN": "shpat_%s" % SECRET}, "SHOPIFY_ACCESS_TOKEN"),
+    ("s1_cafe24_secret", {"CAFE24_CLIENT_SECRET": SECRET}, "CAFE24_CLIENT_SECRET"),
 ]
 
 
@@ -223,6 +272,30 @@ def test_each_bad_setting_is_refused_by_name_never_by_value(case, changes, setti
     for value in changes.values():
         if value and value not in ("1", "true", "yes", "*", "completed", "flase"):
             assert value not in message, (case, "the refusal quoted a value")
+
+
+@pytest.mark.parametrize("changes", [
+    {"STRIPE_SECRET_KEY": "sk_test_abc", "STRIPE_PUBLISHABLE_KEY": "pk_test_abc"},
+    {"STRIPE_REQUEST_TIMEOUT_SECONDS": "30", "STRIPE_MAX_NETWORK_RETRIES": "2"},
+    {"VISA_VDP_ENV": "sandbox", "VISA_VDP_ALLOW_PRODUCTION": "false"},
+    {"SENDGRID_API_KEY": "", "ADYEN_API_KEY": "  "},
+    {"ENVIRONMENT": "sandbox", "APP_ENV": "sandbox"},
+    {"CHECKOUT_PREFLIGHT_MODE": "off", "CHECKOUT_PREFLIGHT_ALLOW_EGRESS": "0"},
+    {"FF_ENABLE_INTERNAL_REFUND": "0", "FF_ENABLE_REFUND_AUTO_RETRY": "false"},
+    {"PIVOTA_AGENT_INTERNAL_URL": "https://sandbox.mcp.pivota.cc"},
+    {"DATABASE_URL": "postgresql://u:p@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pivota-pg"},
+    {"DATABASE_URL_NOVERIFY": "postgresql://u:p@198.51.100.126:5432/pivota", "SHOPIFY_DISCOUNT_CANARY_DATABASE_URL": ""},
+    {"REDIS_URL": "", "REAP_RETURN_URL_HOSTS": "sandbox.agenpaz.com,sandbox.mcp.pivota.cc"},
+    {"PORT": "8080", "PYTHON_VERSION": "3.11.9", "DB_POOL_MAX_SIZE": "4"},
+])
+def test_the_safe_form_of_each_s1_setting_passes(changes):
+    assert G.sandbox_violations(_with(**changes)) == []
+
+
+def test_the_s1_positive_checks_are_in_addition_to_the_deny_list():
+    # A prod project in a value is still refused by the old rule as well as the new identity rule.
+    names = [v.setting for v in G.sandbox_violations(_with(GOOGLE_CLOUD_PROJECT="pivota-prod"))]
+    assert names.count("GOOGLE_CLOUD_PROJECT") == 2
 
 
 def test_a_star_allowlist_is_refused_as_all_jobs():
@@ -268,12 +341,17 @@ def test_a_web_process_needs_no_allowlist():
     assert G.sandbox_violations(env) == []
 
 
-def test_sandbox_hosts_under_guarded_zones_are_allowed():
+def test_only_the_listed_hosts_are_allowed_in_a_url():
+    # S1: an allowlist. The two sandbox hosts and Reap's sandbox hosts pass ...
     env = _with(
-        X1="https://sandbox.mcp.pivota.cc", X2="https://sandbox-developer.pivota.cc/x",
-        X3="https://pay-sandbox.agenpaz.com", X4="https://sg.sandbox.api.reap.global",
+        X1="https://sandbox.mcp.pivota.cc", X2="https://sandbox.agenpaz.com/x",
+        X3="https://sg.sandbox.api.reap.global/v1", X4="gs://pivota-sandbox-catalog-drop/catalog",
     )
     assert G.sandbox_violations(env) == []
+    # ... and a host that merely LOOKS like a sandbox host is refused: nobody listed it.
+    for value in ("https://sandbox-developer.pivota.cc/x", "https://pay-sandbox.agenpaz.com",
+                  "https://x.sandbox.mcp.pivota.cc", "https://sandbox.mcp.pivota.cc.evil.example"):
+        assert [v.setting for v in G.sandbox_violations(_with(X=value))] == ["X"], value
 
 
 def test_every_refusal_is_reported_at_once():
