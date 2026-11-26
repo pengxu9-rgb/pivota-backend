@@ -173,3 +173,61 @@ async def test_over_http_the_sandbox_redirects_an_anonymous_spec_read_and_hides_
     assert anonymous.headers["location"].endswith("/agent/docs/openapi.json")
     assert keyed.status_code == 200 and "paths" in keyed.json()
     assert [p.status_code for p in pages] == [404, 404]
+
+
+# --- SF1: the Aurora exchange and monitor fall back to PROD's gateway; shut in the sandbox --------
+
+#: The test's own client, kept before `no_outbound` replaces httpx.AsyncClient for the routes.
+_TestClient = httpx.AsyncClient
+
+
+@pytest.fixture
+def no_outbound(monkeypatch):
+    import routes.accounts_orders_api as accounts
+    import routes.employee_kb_monitoring as kb
+
+    class Boom:
+        def __init__(self, *a, **kw):
+            raise AssertionError("an outbound HTTP client was opened")
+
+    monkeypatch.setattr(accounts.httpx, "AsyncClient", Boom)
+    monkeypatch.setattr(kb.httpx, "AsyncClient", Boom)
+
+
+@pytest.mark.asyncio
+async def test_the_sandbox_has_no_aurora_exchange(monkeypatch, no_outbound):
+    monkeypatch.setenv("PIVOTA_ENV", "sandbox")
+    transport = httpx.ASGITransport(app=main.app)
+    async with _TestClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/accounts/auth/aurora/exchange",
+                                 json={"aurora_token": "t-" + ADMIN_KEY, "aurora_uid": "u1"})
+    assert resp.status_code == 404
+    assert ADMIN_KEY not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_the_aurora_fetch_itself_refuses_in_the_sandbox(monkeypatch, no_outbound):
+    import routes.accounts_orders_api as accounts
+
+    monkeypatch.setenv("PIVOTA_ENV", "sandbox")
+    with pytest.raises(HTTPException) as excinfo:
+        await accounts._fetch_aurora_auth_me(aurora_token="t", aurora_uid="u")
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.parametrize("label", ["staging", "development", "test"])
+def test_outside_the_sandbox_the_exchange_is_not_refused(monkeypatch, label):
+    import routes.accounts_orders_api as accounts
+
+    monkeypatch.setenv("PIVOTA_ENV", label)
+    assert accounts._refuse_aurora_exchange_in_sandbox() is None
+
+
+@pytest.mark.asyncio
+async def test_the_sandbox_kb_monitor_reports_disabled_without_calling_out(monkeypatch, no_outbound):
+    import routes.employee_kb_monitoring as kb
+
+    monkeypatch.setenv("PIVOTA_ENV", "sandbox")
+    monkeypatch.delenv("AURORA_BFF_BASE_URL", raising=False)
+    payload = await kb.get_aurora_kb_v0_summary(window="5m", include_debug=False, _={})
+    assert payload["status"] == "disabled"

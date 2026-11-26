@@ -91,6 +91,20 @@ observed-seller detail proxies, both flag-off by default, and the LLM probe) and
 shown to a person, never fetched by the server (portal base URLs, `CHECKOUT_SUCCESS_URL`,
 `CHECKOUT_CANCEL_URL`, `AGENT_ACP_CHECKOUT_URL_BASE`, `GOOGLE_OAUTH_REDIRECT_URI`): see follow-ups.
 
+### Fallbacks an env value cannot switch off (SF1)
+
+`routes/accounts_orders_api.py` (`AURORA_BFF_BASE ... or DEFAULT_AURORA_BFF_BASE`) and
+`routes/employee_kb_monitoring.py` (`AURORA_BFF_BASE_URL or DEFAULT_BASE_URL`) fall back to prod's
+gateway even when the setting is empty. Unrefused, the anonymous `POST /accounts/auth/aurora/exchange`
+would send the caller's bearer token to prod's `/v1/auth/me` and create a shop_user with the real email
+prod returns. In the sandbox the exchange answers 404 before any call and the monitor reports itself
+disabled. `tests/test_sandbox_prod_default_hosts.py` lists every prod-host URL literal in the code
+with what keeps it from prod in the sandbox, so a new fallback of this shape fails a test.
+
+`config.settings.resolve_public_api_base_url` falls back to `https://api.pivota.cc` (managed-inbox
+receiver URLs, the MCP OAuth login redirect, OpenAPI servers). The guard requires its RESOLVED value
+to be `https://sandbox.mcp.pivota.cc` (SF2), so `PUBLIC_API_BASE_URL` must be set.
+
 ## Follow-ups (not in this change)
 
 1. `proof_issuer_main.py` does not run the sandbox guard; it is not part of sandbox v0.
