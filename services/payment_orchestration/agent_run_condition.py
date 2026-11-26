@@ -13,7 +13,7 @@ False then, and this module passes that on. It never raises.
 
 DARK BY DEFAULT, PER RAIL. `PARTNER_AGENT_RUN_CONDITION_RAILS` (services/payment_orchestration/router.py)
 names the rails it applies to. A rail not on it is never read for, and behaves exactly as before.
-Only the web service reads it; the token rail worker does not (yet).
+Both the web service and the token rail worker read it, each in its own environment.
 
 WHERE IT RUNS, AND WHAT A FAILURE ANSWERS:
   * the token rail, in the rail-neutral create door, BEFORE the router chooses: a failure is the router's
@@ -29,8 +29,10 @@ THE KEY is the host the request names (`merchant_host`, lowercased), the spellin
 fact under; both readers fold it themselves.
 
 CREATE ONLY. A replay of an existing purchase is never refused by this, purchases already open are not
-re-checked, and the Reap resume door does not call it. The worker's own re-check before it dispatches,
-and its challenge write, are a later change.
+re-checked here, and the Reap resume door does not call it. The token rail worker calls `agent_may_run`
+again right before each send to the merchant, and records a challenge it meets
+(services/payment_orchestration/a2a_rail_worker, "ADR-030 D11's run condition"). Reap's purchases are
+not re-checked after create, and a Reap challenge is recorded by an operator.
 
 READ ORDER AND TIMING. Read outside any transaction and before the request fans out, as both readers'
 docstrings require. The two reads run one after the other (each is bounded at 2 s), never together: the

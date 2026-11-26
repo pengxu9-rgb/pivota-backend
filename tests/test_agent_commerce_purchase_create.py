@@ -71,7 +71,7 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 2820, "currency": "USD", "marke
 
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
            "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs",
-           "a2a_rail_worker_heartbeat")
+           "a2a_rail_worker_heartbeat", "a2a_rail_contact_purge_heartbeat")
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +83,7 @@ async def _db():
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         await ensure_required_schema_light()
         await a2a_ledger.record_worker_heartbeat()  # an armed worker is ticking, unless a test says not
+        await a2a_ledger.record_contact_purge_heartbeat()  # and the contact purge is running
         yield
         return
     # On Postgres these tables are shared with other files (one gate database): emptied, never dropped.
@@ -90,6 +91,7 @@ async def _db():
     for table in _TABLES:
         await database.execute(f"DELETE FROM {table}")
     await a2a_ledger.record_worker_heartbeat()
+    await a2a_ledger.record_contact_purge_heartbeat()
     # asyncpg's pool belongs to this test's event loop: give it back at the end of every test.
     try:
         yield
@@ -443,20 +445,25 @@ async def test_a_lost_key_race_to_a_reap_purchase_is_handed_to_the_reap_route(cl
 
 _DROPPED_FOR = {
     "rail_off": "a2a_rail_disabled", "create_off": "a2a_rail_disabled", "worker_down": "a2a_worker_unavailable",
-    "worker_stale": "a2a_worker_unavailable", "not_pilot": "agent_not_in_pilot", "not_proven": "merchant_not_proven",
+    "worker_stale": "a2a_worker_unavailable", "purge_down": "a2a_worker_unavailable",
+    "purge_stale": "a2a_worker_unavailable", "not_pilot": "agent_not_in_pilot", "not_proven": "merchant_not_proven",
     "currency": "currency_unsupported", "no_cap": "amount_limit_unset", "variant_lane": "item_source_unsupported",
     "offer_code": "offer_code_unsupported",
 }
 
 
-@pytest.mark.parametrize("change", ["rail_off", "create_off", "worker_down", "worker_stale", "not_pilot", "not_proven",
-                                    "currency", "no_cap", "variant_lane", "offer_code"])
+@pytest.mark.parametrize("change", ["rail_off", "create_off", "worker_down", "worker_stale", "purge_down", "purge_stale",
+                                    "not_pilot", "not_proven", "currency", "no_cap", "variant_lane", "offer_code"])
 async def test_without_a_choice_an_ineligible_request_goes_to_reap_unchanged(client, stubs, monkeypatch, change):
     b = body()
     if change == "worker_down":
         await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
     elif change == "worker_stale":
         await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS + 60)
+    elif change == "purge_down":
+        await database.execute("DELETE FROM a2a_rail_contact_purge_heartbeat")
+    elif change == "purge_stale":
+        await _age_purge_heartbeat(seconds=a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS + 60)
     elif change == "currency":
         stubs.facts["currency"] = "SGD"
         b = body(expected_currency="SGD")  # SGD has a cap; the token step cannot carry it
@@ -614,10 +621,57 @@ async def _age_heartbeat(*, seconds: int) -> None:
                                {"s": seconds})
 
 
+async def _age_purge_heartbeat(*, seconds: int) -> None:
+    if IS_POSTGRES:
+        await database.execute(
+            "UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = now() - (:s * INTERVAL '1 second')", {"s": seconds})
+    else:
+        await database.execute(
+            "UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = datetime('now', '-' || :s || ' seconds')", {"s": seconds})
+
+
 async def test_a_heartbeat_inside_the_window_admits_the_rail(client, stubs):
     await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS - 60)
+    await _age_purge_heartbeat(seconds=a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS - 60)
     resp = await client.post(BASE, body())
     assert resp.status_code == 202 and resp.json()["rail"] == "a2a"
+
+
+@pytest.mark.parametrize("how", ["down", "stale"])
+async def test_a_stalled_contact_purge_refuses_an_explicit_a2a_choice(client, stubs, how):
+    """Fail closed: the buyer terms promise deletion within 72 h, so no purge, no A2A purchase."""
+    if how == "down":
+        await database.execute("DELETE FROM a2a_rail_contact_purge_heartbeat")
+    else:
+        await _age_purge_heartbeat(seconds=a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS + 60)
+    resp = await client.post(BASE, body(payment_preference={"rail": "a2a"}))
+    assert resp.status_code == 404 and "not_available_on_this_rail" in resp.text
+    assert "purge" not in resp.text and "worker" not in resp.text  # the reason is logged, not answered
+    await _nothing_written()
+
+
+async def test_an_unreadable_purge_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch, caplog):
+    import logging
+
+    async def broken(**_kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(a2a_ledger, "contact_purge_is_alive", broken)
+    with caplog.at_level(logging.WARNING):
+        assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    assert "a2a contact purge heartbeat unreadable error_type=RuntimeError" in caplog.text, "the purge read is named"
+    await _nothing_written()
+
+
+def test_the_purge_heartbeat_window_outlives_two_missed_runs_and_ends_before_the_promise():
+    from jobs import a2a_rail_contact_purge as purge_job
+    from services.audit_scheduler import run_deadline_for
+
+    # Runs every 15 min (cron :03/:18/:33/:48): two missed runs put three slots between stamps, and
+    # the late run may take its deadline. A window shorter than that closes A2A on a healthy purge.
+    assert a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS >= 3 * 900 + run_deadline_for("a2a_rail_contact_purge")
+    # A purchase admitted on the last fresh stamp still has its contact purged at 71 h, before 72 h.
+    assert purge_job.PURGE_AGE_SECONDS < 72 * 3600
 
 
 async def test_an_unreadable_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch):

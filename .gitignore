@@ -77,3 +77,7 @@ zz_lint_canary_probe.py
 # scripts/ops/reap_local_e2e.py writes its JSON log of Reap sandbox calls to the cwd by default.
 # Authorization is redacted, but the bodies carry the operator's test buyer address and email.
 reap_local_e2e_*.json
+
+# infra/gcp/sandbox/config.sh reads the sandbox's private ranges from this untracked file (the
+# repo is public: no private IPs in committed files). Template: config.local.example.sh.
+infra/gcp/sandbox/config.local.sh

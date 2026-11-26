@@ -227,6 +227,18 @@ CREATE TABLE IF NOT EXISTS a2a_rail_worker_heartbeat (
 """
 _CREATE_WORKER_HEARTBEAT_SQLITE = _CREATE_WORKER_HEARTBEAT_PG.replace("TIMESTAMPTZ", "TIMESTAMP")
 
+# Migration 299: the contact purge's heartbeat. ONE row, stamped by every enabled run of
+# jobs/a2a_rail_contact_purge that finished its purge, so the create route can refuse A2A purchases
+# while nothing would delete their buyer's contact within the 72 h the terms promise. Its own table:
+# a2a_rail_worker_heartbeat is CHECK (id = 1).
+_CREATE_CONTACT_PURGE_HEARTBEAT_PG = """
+CREATE TABLE IF NOT EXISTS a2a_rail_contact_purge_heartbeat (
+    id SMALLINT PRIMARY KEY CONSTRAINT ck_a2a_rail_contact_purge_heartbeat_one CHECK (id = 1),
+    ran_at TIMESTAMPTZ NOT NULL
+)
+"""
+_CREATE_CONTACT_PURGE_HEARTBEAT_SQLITE = _CREATE_CONTACT_PURGE_HEARTBEAT_PG.replace("TIMESTAMPTZ", "TIMESTAMP")
+
 # Migration 287: the provider's checkout task id (`ckout_...`), written once the checkout's confirm is
 # answered, read to poll and look the submission up. Nullable, no default: a catalog-only change on
 # Postgres 11+. Only the checkout step (`record_checkout_task_as_holder`) and its readers touch it, so
@@ -282,7 +294,7 @@ _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchas
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288, 290 and 298. Idempotent; called at every startup.
+    """Self-heal parity with migrations 268, 278, 287, 288, 290, 298 and 299. Idempotent; called at every startup.
     NOT 296 (a2a_rail_manual_resolution_audit): that table has no startup heal, on purpose (see its section)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
@@ -294,6 +306,7 @@ async def ensure_a2a_rail_schema() -> None:
         for statement in (_CREATE_BUYER_REFS_OWNER_INDEX, _CREATE_PURCHASES_OWNER_INDEX, _CREATE_PURCHASES_DUE_INDEX):
             await _ensure_index(statement)
         await database.execute(_CREATE_WORKER_HEARTBEAT_PG)
+        await database.execute(_CREATE_CONTACT_PURGE_HEARTBEAT_PG)
         # A lock-free catalog check first; the ALTER (ACCESS EXCLUSIVE) runs only while a column is
         # missing, under schema_guard's lock_timeout. A timeout defers the heal to the next boot: only
         # the dark checkout step needs these columns.
@@ -314,6 +327,7 @@ async def ensure_a2a_rail_schema() -> None:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
         await database.execute(_CREATE_WORKER_HEARTBEAT_SQLITE)
+        await database.execute(_CREATE_CONTACT_PURGE_HEARTBEAT_SQLITE)
         columns = {row["name"] for row in await database.fetch_all(_SQLITE_PURCHASE_COLUMNS)}
         for column, heal_sqlite in _HEALED_COLUMNS_SQLITE:
             if column not in columns:
@@ -1485,8 +1499,11 @@ async def expire_overdue_purchases(
 # them, and the expiry sweep ends every pre-pay row within MAX_LIFETIME_SECONDS_DEFAULT; this purge is
 # the BACKSTOP for what neither reaches (a long `paying`, a row parked on a money result, which the sweep
 # never ends), in any state, without moving the state: such a row keeps its contact for up to
-# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick, so with the worker
-# switched off nothing purges; no purchase advances then either. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
+# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick AND, on its own
+# clock with no dependency on the rail's dials, in jobs/a2a_rail_contact_purge (71 h, every 15 min, on by
+# default, kill switch A2A_RAIL_CONTACT_PURGE_DISABLED): with the worker's dial off, that job still purges.
+# Postgres skips rows another purge (the tick, the job, a run-now) has locked: two purges never wait on
+# each other, and what one skips the other is already NULLing. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
@@ -1497,6 +1514,7 @@ _PURGE_CONTACT_SQL = """
                AND created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
              ORDER BY created_at
              LIMIT :limit
+             FOR UPDATE SKIP LOCKED
            )
        AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
     RETURNING id
@@ -1566,6 +1584,50 @@ async def worker_is_alive(*, max_age_seconds: int = WORKER_HEARTBEAT_MAX_AGE_SEC
         row = await database.fetch_one(_WORKER_ALIVE_SQL, values)
     else:
         row = await database.fetch_one(_WORKER_ALIVE_SQL_SQLITE, values)
+    return row is not None
+
+
+# ── the contact purge's heartbeat ──────────────────────────────────────────────────────────────
+#
+# Stamped by jobs/a2a_rail_contact_purge after every enabled run whose purge finished (a failed or
+# killed run stamps nothing). Read by the create route beside the worker's heartbeat: no fresh stamp,
+# no new A2A purchase, because nothing would delete its buyer's contact on time.
+_RECORD_CONTACT_PURGE_HEARTBEAT_SQL = """
+    INSERT INTO a2a_rail_contact_purge_heartbeat (id, ran_at) VALUES (1, clock_timestamp())
+    ON CONFLICT (id) DO UPDATE SET ran_at = excluded.ran_at
+"""
+_RECORD_CONTACT_PURGE_HEARTBEAT_SQL_SQLITE = _RECORD_CONTACT_PURGE_HEARTBEAT_SQL.replace(
+    "clock_timestamp()", "CURRENT_TIMESTAMP")
+_CONTACT_PURGE_ALIVE_SQL = """
+    SELECT 1 AS alive FROM a2a_rail_contact_purge_heartbeat
+     WHERE id = 1 AND ran_at > clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+"""
+_CONTACT_PURGE_ALIVE_SQL_SQLITE = """
+    SELECT 1 AS alive FROM a2a_rail_contact_purge_heartbeat
+     WHERE id = 1 AND ran_at > datetime('now', '-' || :max_age_seconds || ' seconds')
+"""
+#: How old the purge's last finished run may be for it to count as running. Two missed runs put three
+#: 15-minute slots (2700 s) between stamps, and a run may start late (misfire grace) and take up to its
+#: 120 s deadline: 3000 s keeps a healthy-but-late purge from closing A2A creates. Stalled or switched
+#: off for longer and they close; the 71 h threshold leaves the hour before 72 h for what is open.
+CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS = 3000
+
+
+async def record_contact_purge_heartbeat() -> None:
+    if IS_POSTGRES:
+        await database.execute(_RECORD_CONTACT_PURGE_HEARTBEAT_SQL)
+    else:
+        await database.execute(_RECORD_CONTACT_PURGE_HEARTBEAT_SQL_SQLITE)
+
+
+async def contact_purge_is_alive(*, max_age_seconds: int = CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS) -> bool:
+    """True when an enabled contact purge run finished within `max_age_seconds`. Raises on a database
+    error: the caller decides (the create route treats it as not alive)."""
+    values = {"max_age_seconds": _limit(max_age_seconds, 7 * 86400)}
+    if IS_POSTGRES:
+        row = await database.fetch_one(_CONTACT_PURGE_ALIVE_SQL, values)
+    else:
+        row = await database.fetch_one(_CONTACT_PURGE_ALIVE_SQL_SQLITE, values)
     return row is not None
 
 

@@ -60,6 +60,9 @@ Job registration happens at start-up time. Currently registers:
 - `a2a_rail_purchase_poll` — every A2A_RAIL_POLL_INTERVAL_SECONDS (default 20): advance A2A token
   rail purchases one step each (jobs/a2a_rail_purchase_poll). Dormant unless A2A_RAIL_WORKER_ENABLED
   and the rail client is configured.
+- `a2a_rail_contact_purge` — cron at :03/:18/:33/:48: delete the buyer's email and address from A2A
+  purchases opened more than 71 h ago (jobs/a2a_rail_contact_purge), whatever the rail's own dials.
+  On by default; A2A_RAIL_CONTACT_PURGE_DISABLED is its kill switch.
 - `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
   detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
   webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
@@ -281,6 +284,8 @@ _JOB_RUN_DEADLINES = {
     # 60 s), so a step is <= 180 s and a tick <= ~240 s. A cut tick releases every claim it did not
     # step, and a write cut mid-call stays pending for the next holder to reconcile.
     "a2a_rail_purchase_poll": 300,
+    # At most 25 bounded UPDATEs of <= 200 rows each on one table; no outside call.
+    "a2a_rail_contact_purge": 120,
 }
 
 
@@ -687,6 +692,22 @@ async def start_scheduler() -> None:
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=_a2a_interval,
+            coalesce=True,
+        )
+
+        # The A2A buyer-contact purge on its OWN clock: the worker's tick purges too, but only while the
+        # rail's dials are on, and the buyer terms promise deletion within 72 h regardless. On by default;
+        # A2A_RAIL_CONTACT_PURGE_DISABLED (checked inside the job) is the kill switch. Cron, not interval: a
+        # redeploy must not push the next run back (jobs/a2a_rail_contact_purge has the arithmetic).
+        from jobs.a2a_rail_contact_purge import run_a2a_rail_contact_purge
+        _add_job(
+            run_a2a_rail_contact_purge,
+            "cron",
+            minute="3,18,33,48",
+            id="a2a_rail_contact_purge",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=900,
             coalesce=True,
         )
 
