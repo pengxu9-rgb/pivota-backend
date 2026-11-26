@@ -62,7 +62,7 @@ Job registration happens at start-up time. Currently registers:
   and the rail client is configured.
 - `a2a_rail_contact_purge` — cron at :03/:18/:33/:48: delete the buyer's email and address from A2A
   purchases opened more than 71 h ago (jobs/a2a_rail_contact_purge), whatever the rail's own dials.
-  Dormant unless A2A_RAIL_CONTACT_PURGE_ENABLED.
+  On by default; A2A_RAIL_CONTACT_PURGE_DISABLED is its kill switch.
 - `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
   detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
   webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
@@ -693,8 +693,8 @@ async def start_scheduler() -> None:
         )
 
         # The A2A buyer-contact purge on its OWN clock: the worker's tick purges too, but only while the
-        # rail's dials are on, and the buyer terms promise deletion within 72 h regardless. Dormant
-        # unless A2A_RAIL_CONTACT_PURGE_ENABLED (checked inside the job). Cron, not interval: a
+        # rail's dials are on, and the buyer terms promise deletion within 72 h regardless. On by default;
+        # A2A_RAIL_CONTACT_PURGE_DISABLED (checked inside the job) is the kill switch. Cron, not interval: a
         # redeploy must not push the next run back (jobs/a2a_rail_contact_purge has the arithmetic).
         from jobs.a2a_rail_contact_purge import run_a2a_rail_contact_purge
         _add_job(

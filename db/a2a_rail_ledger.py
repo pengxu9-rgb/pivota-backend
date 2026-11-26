@@ -1397,8 +1397,10 @@ async def expire_overdue_purchases(
 # the BACKSTOP for what neither reaches (a long `paying`, a row parked on a money result, which the sweep
 # never ends), in any state, without moving the state: such a row keeps its contact for up to
 # CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick AND, on its own
-# clock with no dependency on the rail's dials, in jobs/a2a_rail_contact_purge (71 h, every 15 min, behind
-# A2A_RAIL_CONTACT_PURGE_ENABLED): with the worker's dial off, that job still purges. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
+# clock with no dependency on the rail's dials, in jobs/a2a_rail_contact_purge (71 h, every 15 min, on by
+# default, kill switch A2A_RAIL_CONTACT_PURGE_DISABLED): with the worker's dial off, that job still purges.
+# Postgres skips rows another purge (the tick, the job, a run-now) has locked: two purges never wait on
+# each other, and what one skips the other is already NULLing. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
@@ -1409,6 +1411,7 @@ _PURGE_CONTACT_SQL = """
                AND created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
              ORDER BY created_at
              LIMIT :limit
+             FOR UPDATE SKIP LOCKED
            )
        AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
     RETURNING id

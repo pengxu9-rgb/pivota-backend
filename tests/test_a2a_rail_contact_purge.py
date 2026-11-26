@@ -1,6 +1,6 @@
 """jobs/a2a_rail_contact_purge: the buyer's email and address go within 72 h even with the rail's dials off.
 
-Pinned here: dormant until its own flag; independent of A2A_RAIL_WORKER_ENABLED and the rail client;
+Pinned here: ON by default, with A2A_RAIL_CONTACT_PURGE_DISABLED as the kill switch; independent of A2A_RAIL_WORKER_ENABLED and the rail client;
 purges rows past 71 h in any state without moving the state, keeps younger ones; bounded batches that
 finish a backlog over runs; logs counts, never a value; registered on the worker as a cron at four fixed
 minutes, with a deadline and run-now; and the schedule arithmetic keeps the 72 h promise.
@@ -43,7 +43,7 @@ def _rail_off(monkeypatch):
     """Every test runs with the rail's own dials and client OFF: the job must not need them."""
     for name in _RAIL_ENV:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv(job.ENABLED_ENV, raising=False)
+    monkeypatch.delenv(job.DISABLED_ENV, raising=False)
 
 
 async def _opened(hours_ago: float, state: str = "opened") -> str:
@@ -62,15 +62,25 @@ async def _rows():
     return {r["id"]: r for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")}
 
 
-async def test_dormant_until_its_own_flag():
+async def test_on_by_default_with_nothing_set():
+    old = await _opened(100)
+    assert await job.run_a2a_rail_contact_purge() == {"contact_purged": 1, "batches": 1}
+    assert (await _rows())[old]["buyer_email"] is None
+
+
+@pytest.mark.parametrize("value", ["1", "true", "on", "yes", " TRUE "])
+async def test_the_kill_switch_stops_it(monkeypatch, value):
+    monkeypatch.setenv(job.DISABLED_ENV, value)
     old = await _opened(100)
     assert await job.run_a2a_rail_contact_purge() == {"skipped": "disabled"}
     assert (await _rows())[old]["buyer_email"] == EMAIL
 
 
-@pytest.mark.parametrize("value", ["1", "true", "on", "yes", " TRUE "])
+@pytest.mark.parametrize("value", [None, "", "0", "false", "off", "no", "disabled"])
 async def test_purges_with_the_rail_dials_and_client_off(monkeypatch, value):
-    monkeypatch.setenv(job.ENABLED_ENV, value)
+    """Anything but a truthy kill switch leaves it running (a typo never turns it off)."""
+    if value is not None:
+        monkeypatch.setenv(job.DISABLED_ENV, value)
     paying = await _opened(71.5, state="paying")
     waiting = await _opened(80, state="needs_payment_method")
     young = await _opened(70)
@@ -84,16 +94,13 @@ async def test_purges_with_the_rail_dials_and_client_off(monkeypatch, value):
     assert rows[young]["buyer_email"] == EMAIL and rows[young]["shipping_address"] is not None
 
 
-@pytest.mark.parametrize("value", ["", "0", "false", "off", "no", "enabled"])
-async def test_anything_else_is_off(monkeypatch, value):
-    monkeypatch.setenv(job.ENABLED_ENV, value)
-    old = await _opened(100)
-    assert await job.run_a2a_rail_contact_purge() == {"skipped": "disabled"}
-    assert (await _rows())[old]["buyer_email"] == EMAIL
+def test_the_postgres_purge_skips_rows_another_purge_holds():
+    """The tick, this job and a run-now can overlap: on Postgres they skip, never wait on, each other."""
+    sql = " ".join(ledger._PURGE_CONTACT_SQL.split())
+    assert "ORDER BY created_at LIMIT :limit FOR UPDATE SKIP LOCKED )" in sql
 
 
 async def test_a_backlog_is_bounded_per_run_and_finishes_over_runs(monkeypatch):
-    monkeypatch.setenv(job.ENABLED_ENV, "1")
     monkeypatch.setattr(job, "BATCH", 2)
     monkeypatch.setattr(job, "MAX_BATCHES", 2)
     for _ in range(5):
@@ -105,7 +112,6 @@ async def test_a_backlog_is_bounded_per_run_and_finishes_over_runs(monkeypatch):
 
 
 async def test_logs_counts_never_a_value(monkeypatch, caplog):
-    monkeypatch.setenv(job.ENABLED_ENV, "1")
     pid = await _opened(90)
     with caplog.at_level(logging.DEBUG):
         await job.run_a2a_rail_contact_purge()

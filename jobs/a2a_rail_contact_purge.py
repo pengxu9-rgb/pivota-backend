@@ -17,8 +17,9 @@ guard), which every live purchase has long passed by then. Bounded: at most `BAT
 and `MAX_BATCHES` statements per run; a backlog finishes over several runs. Logs counts only, never an
 id or a value.
 
-DORMANT unless A2A_RAIL_CONTACT_PURGE_ENABLED is on ("1", "true", "on", "yes"). Turn it on before the
-first A2A purchase can be created, and leave it on when rolling the rail back.
+ON BY DEFAULT. A2A_RAIL_CONTACT_PURGE_DISABLED ("1", "true", "on", "yes", read per run) is the kill switch;
+anything else, unset included, leaves it running. It does not follow the rail's dials: rolling the rail
+back leaves it on. It runs only where the scheduler registers jobs (the production worker).
 
     POST /admin/scheduler/jobs/a2a_rail_contact_purge/run-now    # one forced run, same path
 """
@@ -33,7 +34,7 @@ import db.a2a_rail_ledger as a2a_ledger
 
 logger = logging.getLogger(__name__)
 
-ENABLED_ENV = "A2A_RAIL_CONTACT_PURGE_ENABLED"
+DISABLED_ENV = "A2A_RAIL_CONTACT_PURGE_DISABLED"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 #: One hour inside the 72 h promise (the worker's own sweep keeps CONTACT_RETENTION_SECONDS_DEFAULT).
@@ -43,7 +44,8 @@ MAX_BATCHES = 25
 
 
 def is_enabled() -> bool:
-    return (os.getenv(ENABLED_ENV) or "").strip().lower() in _TRUTHY
+    """True unless the kill switch is set: the default is ON."""
+    return (os.getenv(DISABLED_ENV) or "").strip().lower() not in _TRUTHY
 
 
 async def run_a2a_rail_contact_purge() -> Dict[str, Any]:

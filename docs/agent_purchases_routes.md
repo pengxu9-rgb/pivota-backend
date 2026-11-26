@@ -275,7 +275,7 @@ consent step first.
 once. The records stay
 (insert-only: nothing updates or deletes them, no PII scrub touches them).
 
-## Buyer contact retention on the A2A rail (`A2A_RAIL_CONTACT_PURGE_ENABLED`)
+## Buyer contact retention on the A2A rail (`A2A_RAIL_CONTACT_PURGE_DISABLED`)
 
 The buyer terms promise the email and shipping address are deleted when the purchase ends, and no later
 than 72 hours after it opens. A terminal write NULLs them; the worker's tick also purges any row older
@@ -286,9 +286,11 @@ so a second purge runs on its own clock: `jobs/a2a_rail_contact_purge.py`, sched
 contact is gone by 71 h 15 min (72 h even with two runs missed in a row). It reads none of the rail's
 dials and makes no outside call; it logs counts only.
 
-- **Dark** until `A2A_RAIL_CONTACT_PURGE_ENABLED` is on (`1`, `true`, `on`, `yes`), read per run, on the
-  worker. **Turn it on before the first A2A purchase can be created**, and leave it on when the rail is rolled
-  back: turning the rail's dials off does not stop this purge.
+- **On by default**, on the worker (where the scheduler registers jobs). `A2A_RAIL_CONTACT_PURGE_DISABLED`
+  (`1`, `true`, `on`, `yes`, read per run) is the kill switch; anything else, unset included, leaves it on.
+  Turning the rail's dials off does not stop this purge, and a rail rollback must leave it on.
+- On Postgres, two purges running at once (the tick, this job, a run-now) skip each other's locked rows
+  (`FOR UPDATE SKIP LOCKED`) instead of waiting.
 - A worker with `SCHEDULER_JOB_ALLOWLIST` set must name `a2a_rail_contact_purge` too, or the job is not started.
 - One forced run: `POST /admin/scheduler/jobs/a2a_rail_contact_purge/run-now`.
 
