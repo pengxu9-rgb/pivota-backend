@@ -5048,3 +5048,85 @@ def test_a_usd_value_with_a_thousands_separator_falls_back_to_the_default_as_bef
     assert ceiling == 10000 + 1500 + shipping
     assert ("," in value and ":" not in value.split(",")[1]) == any(
         "not CUR:value entries" in r.getMessage() for r in caplog.records)
+
+
+# ── delta review of fbcecf3ed: every amount shape outside USD, and the rest ─────────────────────────────
+
+
+#: Every shape the delta review named: each must refuse on a non-USD purchase.
+NON_USD_PROSE_AMOUNTS = [
+    "1500 yen", "15000 won", "1500 円", "合計 1500", "総額 1500", "お会計は1500です", "15 Canadian dollars",
+    "Order value 1500", "合计1500元", "총액 15000", "15000 원", "1500円送料", "Amount: 1500", "20 NZ dollars",
+]
+#: What a confirm card or prose holds that is not an amount: never refused for it.
+NON_USD_NOT_AMOUNTS = [
+    "3丁目1-2", "〒150-0043", "Qty 2", "2026-11-27", "円山町", "1-2 円山町", "1-2 元町", "1 원효로",
+    "Ship to 1-2 円山町, 150-0044", "Your order is ready to confirm.", "15 entries",
+]
+
+
+@pytest.mark.parametrize("text", NON_USD_PROSE_AMOUNTS)
+def test_outside_usd_every_amount_shape_in_prose_refuses(text):
+    assert a2a_rail._text_parts_refused(_text_only(text), None, 150000, "JPY") is True
+
+
+@pytest.mark.parametrize("text", NON_USD_NOT_AMOUNTS)
+def test_outside_usd_addresses_postcodes_quantities_and_dates_do_not_refuse(text):
+    assert a2a_rail._text_parts_refused(_text_only(text), None, 150000, "JPY") is False
+    assert worker.setup_answer_refused(_setup_with({**MEASURED_CARD, "note": text}), 150000, "JPY") is False
+
+
+@pytest.mark.parametrize("data", [
+    {"note": "1500 円"}, {"note": "1500 yen"}, {"合計": "1500"}, {"总计": "1500"}, {"label": "15000 won"},
+    {"合計": "15000"}, {"summary": {"総額": "1500"}}, {"lines": [{"金額": "1500"}]},
+    {"合計 1500": None}, {"1500円": True},  # an amount written as the key alone
+])
+def test_outside_usd_every_amount_shape_on_a_card_refuses(data):
+    assert worker.setup_answer_refused(_setup_with(data), 1500, "JPY") is True
+
+
+@pytest.mark.parametrize("ceiling", [None, 0, -1, True])
+def test_outside_usd_no_positive_ceiling_refuses_even_a_card_without_an_amount(ceiling):
+    assert worker.setup_answer_refused(_setup_with(MEASURED_CARD), ceiling, "JPY") is True
+    assert worker.setup_answer_refused(_setup_with(MEASURED_CARD), 1500, "JPY") is False
+
+
+async def test_a_relay_setup_without_a_currency_reads_its_prose_strictly():
+    """`CheckoutSetup.currency` None is not USD: an amount within the ceiling is still refused."""
+    answer = _task({"kind": "text", "text": "Order total: $51.49"},
+                   _card("checkout.confirm", {"merchant": "merchant.example"}, ("confirm",), kind="confirm"))
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL, currency=None))
+    assert relay.checkout.text_amounts_refused is True
+    relay = await _relay(_Provider(_token_result(), answer), setup=_setup(ceiling_minor=TOTAL, currency="USD"))
+    assert relay.checkout.text_amounts_refused is False
+
+
+@pytest.mark.usefixtures("ca_on")
+async def test_a_legacy_row_on_the_approval_page_with_another_markets_address_fails_by_name():
+    pid = await _cad_unlocked(CA_ADDRESS)
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "approval_page_issued"
+    await database.execute("UPDATE a2a_rail_purchases SET shipping_address = :a WHERE id = :i",
+                           {"a": json.dumps(ADDRESS), "i": pid})
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, pid)
+    rail = Rail()
+    assert await _step(rail, pid) == "failed"
+    assert rail.sent == []
+    assert (await _row(pid))["last_error_code"] == worker.SHIPPING_MARKET_MISMATCH
+
+
+def test_a_currency_named_twice_reads_the_first_and_says_so(monkeypatch, caplog, jp_on):
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, "1000,JPY:1500,JPY:9000")
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        assert worker.checkout_ceiling({"currency": "JPY", "our_price_minor": 4650, "quantity": 1})[0] == (
+            4650 + 465 + 1500)
+    assert any("names JPY twice" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("value", [",2000", "USD:2000,1500"])
+def test_a_bare_value_after_another_entry_is_unusable_and_logged(monkeypatch, caplog, value):
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, value)
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        assert worker.checkout_ceiling({"currency": "USD", "our_price_minor": 10000, "quantity": 1})[0] == (
+            10000 + 1500 + 1000)
+    assert any("not CUR:value entries" in r.getMessage() for r in caplog.records)

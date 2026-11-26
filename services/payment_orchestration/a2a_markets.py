@@ -97,6 +97,9 @@ def enabled_markets() -> FrozenSet[str]:
         return frozenset(DEFAULT_MARKETS)
     codes = [part.strip().upper() for part in raw.split(",") if part.strip()]
     unknown = sorted({code for code in codes if code not in MARKETS})
+    if not codes and raw not in _WARNED and len(_WARNED) < 32:
+        _WARNED.add(raw)
+        logger.warning("a2a_markets: %s is set but names no market: every market is off", MARKETS_ENV)
     if unknown and raw not in _WARNED and len(_WARNED) < 32:
         _WARNED.add(raw)
         # WARNING, not INFO: prod drops module-logger INFO. Codes are config, never a secret.

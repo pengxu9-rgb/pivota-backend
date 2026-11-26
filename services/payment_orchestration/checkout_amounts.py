@@ -445,49 +445,79 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
 # ── a purchase in another currency than USD (no measured shape yet) ─────────────────────────────────────
 
 #: A number followed by a currency word written in letters, not a symbol: "1,500円", "15,000원", "1万円", "1만원",
-#: "100元". Only digits and grouping commas between, so "2 円山町" (a Japanese place name after a block number,
-#: with a space) is not one. ¥, ￥, ₩ and the other symbols are Unicode Sc: `_money_pattern` catches them already.
+#: "100元". Glued to the number (only digits and grouping commas between), whatever follows: "1500円送料".
 _LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:円|圓|圆|元|원|엔)")
+#: The same with a space before the word ("1500 円", "15000 원"), unless the word runs on into a place name of its
+#: own script ("1-2 円山町", "1-2 元町", "1 원효로": 円 / 元 then a Han character, 원 then a Hangul syllable).
+_SPACED_LETTER_CURRENCY_RE = re.compile(
+    r"\d[\d,]*\s+(?:[万萬億亿千百만억천]\s?)?(?:(?:円|圓|圆|元)(?![\u3400-\u9fff\uf900-\ufaff])|(?:원|엔)(?![\uac00-\ud7a3]))")
+#: A number, then up to two words, then a currency word in Latin letters: "1500 yen", "15000 won", "15 Canadian
+#: dollars", "20 NZ dollars". Whole words only ("15 entries" is not "en").
+_LATIN_CURRENCY_WORD_AFTER_DIGIT_RE = re.compile(
+    r"\d[\d,.]*\s*(?:[A-Za-z]+\s+){0,2}(?:dollars?|bucks|cents?|yen|won|yuan|renminbi|rmb|en)(?![A-Za-z])",
+    re.IGNORECASE)
+#: Total words, English and CJK, before a number within a few characters: "合計 1500", "総額1500", "お会計は1500です",
+#: "총액 15000", "Order value 1500", "amount: 1500".
+_TOTAL_WORDS_ANY = (
+    "合計", "合计", "總計", "总计", "総額", "总额", "總額", "会計", "會計", "金額", "金额", "価格", "价格", "價格", "料金",
+    "代金", "小計", "小计", "支払", "支付", "付款", "应付", "應付", "총액", "합계", "금액", "결제", "가격", "소계",
+)
+_TOTAL_WORD_BEFORE_DIGIT_RE = re.compile(
+    r"(?:(?<![A-Za-z])(?:total|subtotal|amount|price|due|balance|sum|cost|charge|charged|pay|paid|payable|owe|owed|fee|"
+    r"fees|value|grand)(?![A-Za-z])|" + "|".join(_TOTAL_WORDS_ANY) + r")[^\d\n]{0,12}\d",
+    re.IGNORECASE)
 
 
 def text_amount_shaped(text: Any) -> bool:
     """For a purchase in a currency other than USD: whether `text` shows anything that may be an amount, in ANY
     currency or spelling. There is no measured non-USD confirm card or prose yet, so no amount in it can be
     verified against the ceiling: the caller refuses on any. That is a currency mark or ISO code next to a
-    number, a two- or three-decimal or decimal-comma number, a total word before a number, a plural currency
-    word, a non-ASCII digit (`_money_pattern`, `_prose_money`), or a number followed by 円 / 원 / 元 and the
-    like. Pure; never raises."""
+    number, a two- or three-decimal or decimal-comma number, a plural currency word, a non-ASCII digit
+    (`_money_pattern`, `_prose_money`); a number followed by 円 / 원 / 元 (glued, or spaced unless the word is a
+    place name's), or by yen / won / yuan / dollars, up to two words later; or a total word, English or CJK,
+    shortly before a number. Not an address, a postcode, a quantity or a date ("3丁目1-2", "〒150-0043",
+    "Qty 2", "2026-11-27"). Pure; never raises."""
     if not isinstance(text, str) or not text:
         return False
     try:
         normal = normalise(text)
-        return bool(_money_pattern(normal) or _prose_money(normal) or _LETTER_CURRENCY_AFTER_DIGIT_RE.search(normal))
+        return bool(_money_pattern(normal) or _prose_money(normal) or _LETTER_CURRENCY_AFTER_DIGIT_RE.search(normal)
+                    or _SPACED_LETTER_CURRENCY_RE.search(normal) or _LATIN_CURRENCY_WORD_AFTER_DIGIT_RE.search(normal)
+                    or _TOTAL_WORD_BEFORE_DIGIT_RE.search(normal))
     except Exception:  # noqa: BLE001 - unreadable text is refused
         return True
 
 
-def _letter_currency_anywhere(data: Any, depth: int = 0) -> bool:
-    """Whether any string leaf or key in `data` holds a number followed by a letter currency word (bounded)."""
+def _amount_shaped_anywhere(data: Any, depth: int = 0) -> bool:
+    """Whether any string, any key, or any `key value` pair in `data` is `text_amount_shaped` (bounded): a
+    {"合計": "1500"} reads as "合計 1500"."""
     if depth > CARD_SCAN_MAX_DEPTH:
         return True
     if isinstance(data, str):
-        return bool(_LETTER_CURRENCY_AFTER_DIGIT_RE.search(normalise(data)))
+        return text_amount_shaped(data)
     if isinstance(data, Mapping):
-        return any(_letter_currency_anywhere(k, depth + 1) or _letter_currency_anywhere(v, depth + 1)
-                   for k, v in data.items())
+        for key, value in data.items():
+            if text_amount_shaped(str(key)):
+                return True
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                if text_amount_shaped(f"{key} {value}"):
+                    return True
+            elif _amount_shaped_anywhere(value, depth + 1):
+                return True
+        return False
     if isinstance(data, (list, tuple)):
-        return any(_letter_currency_anywhere(v, depth + 1) for v in data)
+        return any(_amount_shaped_anywhere(v, depth + 1) for v in data)
     return False
 
 
 def confirm_card_refused_outside_usd(data: Any) -> bool:
-    """For a purchase in a currency other than USD: True unless the card shows NOTHING money-like (rule 1, plus a
-    number followed by a letter currency word). No rule-2 shape is accepted: none has been measured in another
-    currency, so a card with any amount is refused, whatever its `currency` says. Pure."""
+    """For a purchase in a currency other than USD: True unless the card shows NOTHING money-like (rule 1, plus
+    anything `text_amount_shaped` in a string, a key or a `key value` pair). No rule-2 shape is accepted: none has
+    been measured in another currency, so a card with any amount is refused, whatever its `currency` says. Pure."""
     if not isinstance(data, Mapping):
         return True
     try:
-        return money_like(data) or _letter_currency_anywhere(data)
+        return money_like(data) or _amount_shaped_anywhere(data)
     except (_Refused, RecursionError):
         return True
 

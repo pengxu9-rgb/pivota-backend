@@ -835,3 +835,16 @@ async def test_with_capture_off_a_non_us_address_still_meets_its_markets_rules(m
     assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
     good = await _http("POST", BASE, json=_body(address=JP_ADDRESS, expected_currency="JPY", idempotency_key="key-2"))
     assert good.status_code == 202, good.text
+
+
+async def test_with_canada_on_a_canadian_address_shown_in_dollars_is_refused_by_the_router(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,CA")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:CA")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,CAD:50000")
+    with caplog.at_level(logging.WARNING):
+        resp = await _http("POST", BASE, json=_body(address=CA_FORM_ADDRESS, payment_preference={"rail": "a2a"}))
+    assert resp.status_code == 404 and _error(resp) == "not_available_on_this_rail", resp.text
+    assert any("currency_market_mismatch" in r.getMessage() for r in caplog.records)
+    assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []

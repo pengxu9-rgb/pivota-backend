@@ -541,9 +541,13 @@ door, the address write, the router, the worker's token and ceiling steps and th
   (`checkout_total_*`), never guessed.
 - **The confirm card and the setup prose.** USD purchases are read exactly as before (`checkout_amounts`). In
   any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
-  in any currency or script ("$15.00", "1,500円", "15,000원"), is refused before anything is submitted
-  (`confirm_card_refused_outside_usd`, `text_amount_shaped`). A card that shows no amount (the measured card)
-  proceeds on the token cap.
+  in any currency or script, is refused before anything is submitted (`confirm_card_refused_outside_usd`,
+  `text_amount_shaped`): a currency symbol or code next to a number ("$15.00", "JPY 1500"); a number followed
+  by 円 / 원 / 元 ("1,500円", "1500 円") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
+  or CJK, before a number ("合計 1500", "お会計は1500です", "Order value 1500"), on a card also as a key
+  ({"合計": "1500"}). Addresses, postcodes, quantities and dates are not amounts ("1-2 円山町", "〒150-0043",
+  "Qty 2"). No positive ceiling refuses too. A card that shows no amount (the measured card) proceeds on the
+  token cap.
 
 **Before a market goes on**, in the sandbox, for that currency:
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor

@@ -196,3 +196,23 @@ def test_the_address_write_with_a_market_takes_only_that_country(monkeypatch):
     assert shipping.read_submission(body, email_required=True, address_required=True, market=None)[2] == {
         "country": "unsupported"}  # a currency with no one market: every country refused
     assert shipping.read_submission(body, email_required=True, address_required=True, market="US")[2] == {}
+
+
+def test_a_markets_value_that_names_nothing_is_logged(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(markets, "_WARNED", set())
+    monkeypatch.setenv(markets.MARKETS_ENV, ",")
+    with caplog.at_level(logging.WARNING, logger=markets.__name__):
+        assert markets.enabled_markets() == frozenset()
+    assert any("names no market" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.usefixtures("_a2a_router")
+def test_a_canadian_purchase_shown_in_dollars_never_takes_the_rail(monkeypatch):
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, "shop.example:CA,shop.example:US")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,CAD:50000")
+    assert _choice(market_country="CA", currency="USD").dropped == {"a2a": "currency_market_mismatch"}
+    assert _choice(market_country="CA", currency="USD", preferred="a2a").refusal == "currency_market_mismatch"
+    assert _choice(market_country="CA", currency="CAD").rail == "a2a"
