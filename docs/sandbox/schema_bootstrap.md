@@ -141,7 +141,8 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
   domain's constraints obey the same rule, the input function of every type the dump can create runs
   built-in code only, so even a bare literal coerced into a domain or composite column reaches no
   dump-defined function. Refused outright: CREATE OPERATOR, CREATE CAST, an ALTER DOMAIN other than pg_dump's
-  named NOT VALID CHECK (never evaluated: tested), CREATE AGGREGATE
+  named NOT VALID CHECK (which still runs on every new value coerced to the domain, during the apply too:
+  tested; the expression rule above is what makes it safe), CREATE AGGREGATE
   unless reviewed by name (`AGGREGATES_ALLOWED`, empty), a range type with a canonical or subtype_diff
   function, an ALTER TABLE ADD CHECK that is not pg_dump's named NOT VALID form, a partition key column
   of a type that is not pg_catalog's or an enum. Function bodies, view queries, WITH NO DATA

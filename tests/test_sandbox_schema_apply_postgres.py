@@ -1029,10 +1029,34 @@ async def test_the_dump_is_read_only_even_when_the_role_is_not(dbs, tmp_path):
         await session.close()
 
 
-async def test_pg_dumps_not_valid_forms_are_never_evaluated(dbs, tmp_path, monkeypatch):
-    """Why the NOT VALID forms are allowed: the server stores the CHECK without running it."""
-    statements = [NOTICE_F, "CREATE DOMAIN public.d AS integer", "CREATE TABLE public.t1 (a integer)",
-                  "ALTER DOMAIN public.d ADD CONSTRAINT c2 CHECK (public.f(1)) NOT VALID",
+async def test_a_not_valid_domain_check_still_runs_so_the_expression_rule_is_what_makes_it_safe(dbs, tmp_path, monkeypatch):
+    """NOT VALID skips only existing data: a domain's NOT VALID CHECK runs on every NEW value coerced to the
+    domain, inside the apply too (controller, bbd54683e). So with the parser off the dump's function runs,
+    and with it on the CHECK is refused by the expression rule before anything reaches the server."""
+    statements = [NOTICE_F, "CREATE DOMAIN public.d AS integer",
+                  "ALTER DOMAIN public.d ADD CONSTRAINT c2 CHECK (public.f(VALUE)) NOT VALID",
+                  "CREATE TABLE public.t1 (a public.d[] DEFAULT '{1}'::public.d[])"]
+    dst = await _as_apply_role()
+    try:
+        server = await _server_major(dst)
+        store = _hand_drop(tmp_path, ";\n".join(statements) + ";", pg_dump_version="%d.1" % server)
+        seen = await _notices_from(dst, lambda: A.apply_schema(dst, store))
+        with pytest.raises(A.SchemaRefused, match=r"not pg_catalog's \(public\.f\)"):
+            await A.apply_schema(dst, store)
+        assert RAN not in seen and await A._user_table_count(dst) == 0
+        with monkeypatch.context() as m:
+            m.setattr(A, "validate_schema_sql",
+                      lambda text: A.SchemaPlan(tuple(statements), frozenset(), len(statements)))
+            raw = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % server, folder="raw")
+            assert RAN in await _notices_from(dst, lambda: A.apply_schema(dst, raw))
+    finally:
+        await dst.close()
+
+
+async def test_a_not_valid_table_check_is_not_run_by_the_apply(dbs, tmp_path, monkeypatch):
+    """A table's NOT VALID CHECK runs only on rows written later; the apply writes only ledger rows, and a
+    ledger table may carry no CHECK. A validated one runs at once (controller A4, in A_CASES)."""
+    statements = [NOTICE_F, "CREATE TABLE public.t1 (a integer)",
                   "ALTER TABLE ONLY public.t1 ADD CONSTRAINT c CHECK (public.f(1)) NOT VALID"]
     monkeypatch.setattr(A, "validate_schema_sql",
                         lambda text: A.SchemaPlan(tuple(statements), frozenset(), len(statements)))

@@ -410,8 +410,10 @@ def _refusal(node, enums) -> Optional[str]:
             constraint = cmd.def_ if sub == "AT_AddConstraint" else None
             if constraint is not None and enums.ConstrType(constraint.contype).name == "CONSTR_CHECK" \
                     and not (constraint.conname and constraint.skip_validation):
-                # pg_dump writes a CHECK on its own only when it is NOT VALID, which the server does not
-                # evaluate; a validated one is planned (constant-folded) on the spot (controller A4).
+                # pg_dump writes a CHECK on its own only when it is NOT VALID: the server does not check
+                # (or plan) it against existing rows, only on rows written later, and the apply writes rows
+                # only into the ledgers, which may carry no CHECK. A validated one is planned (constant-
+                # folded) on the spot (controller A4). The expression rule applies to both.
                 return "an ALTER TABLE ADD CONSTRAINT CHECK that is not pg_dump's named NOT VALID form"
         return None
     if kind == "AlterOwnerStmt":
@@ -420,7 +422,11 @@ def _refusal(node, enums) -> Optional[str]:
         constraint = node.def_ if node.subtype == "C" else None
         if constraint is not None and enums.ConstrType(constraint.contype).name == "CONSTR_CHECK" \
                 and constraint.conname and constraint.skip_validation:
-            return None  # pg_dump's form for a NOT VALID domain constraint: never evaluated (controller A3)
+            # pg_dump's form for a NOT VALID domain constraint (controller A3). NOT VALID skips only the
+            # existing data: the CHECK still runs on every NEW value coerced to the domain, during the apply
+            # too (a DEFAULT '(1)' into a composite of it, an array literal cast to it). What makes it safe
+            # is the expression rule, applied to it like any CHECK: pg_catalog only, nothing that writes.
+            return None
         return "an ALTER DOMAIN other than pg_dump's named NOT VALID CHECK"
     if kind == "CreateCastStmt":
         return "a CREATE CAST (it lets an expression reach a function without naming it)"
