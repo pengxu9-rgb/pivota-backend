@@ -889,3 +889,81 @@ async def test_the_job_has_no_vic_transport_so_the_step_stays_off(monkeypatch):
     await job.run_a2a_rail_purchase_poll()  # the VIC dial is on (fixture), and still no client
     assert seen and all(kw.get("vic") is None and kw.get("voider") is None for kw in seen)
     assert vic_order.from_env() is None
+
+
+# ── ADR-030 D11's run condition before the quote (2b-D; dark while the setting does not name `a2a`) ──────────
+
+from db import merchant_agent_checkout_facts as d11_facts  # noqa: E402
+from db import partner_agent_merchant_blocks as d11_blocks  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import POSITIVE_UCP as D11_POSITIVE  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import _assert_throwaway_database as _d11_throwaway  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import _create_table as _d11_create_facts  # noqa: E402
+from tests.test_partner_agent_merchant_blocks import _create_table as _d11_create_blocks  # noqa: E402
+
+D11_MERCHANT = "brand.example"  # `_quoting`'s merchant_domain
+
+
+@pytest.fixture
+async def d11_vic_records(monkeypatch):
+    """Migrations 294 and 295's tables, empty, and the setting naming the token rail."""
+    _d11_throwaway()
+    monkeypatch.delenv(d11_facts.MAX_AGE_ENV, raising=False)
+    monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
+    for create, table in ((_d11_create_facts, d11_facts.TABLE), (_d11_create_blocks, d11_blocks.TABLE)):
+        await create()
+        await database.execute(f"DELETE FROM {table}")
+    yield
+    for create, table in ((_d11_create_facts, d11_facts.TABLE), (_d11_create_blocks, d11_blocks.TABLE)):
+        await create()
+        await database.execute(f"DELETE FROM {table}")
+
+
+@pytest.mark.parametrize("closed", ["no_fact", "open_block"])
+async def test_on_and_not_met_no_quote_and_no_order_go_out_and_the_purchase_is_refused(
+        a2a, fake, d11_vic_records, closed):
+    if closed == "open_block":
+        assert await d11_facts.record_check(D11_MERCHANT, D11_POSITIVE)
+        assert await d11_blocks.record_block(
+            "a2a", D11_MERCHANT, "captcha", source=d11_blocks.SOURCE_WORKER, purchase_id="ap_" + "f" * 24) == "recorded"
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "refused"
+    row = await _row(pid)
+    assert fake.calls == [], "the rail is asked for nothing: no quote, no order"
+    assert (row["state"], row["refusal_reason"], row["pending_write"], row["order_id"]) == (
+        "refused", "merchant_not_eligible", None, None)
+
+
+async def test_on_and_met_the_quote_and_the_order_go_out_as_before(a2a, fake, d11_vic_records):
+    assert await d11_facts.record_check(D11_MERCHANT, D11_POSITIVE)
+    assert await d11_blocks.record_block(
+        "reap", D11_MERCHANT, "captcha", source=d11_blocks.SOURCE_WORKER, purchase_id="rp_" + "e" * 24) == "recorded"
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "approval_page_issued"
+    assert len(fake.quotes()) == 1 and len(fake.submits()) == 1
+
+
+async def test_off_nothing_is_read_before_the_quote(a2a, fake, monkeypatch):
+    monkeypatch.delenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, raising=False)
+
+    async def _no(*a, **k):
+        raise AssertionError("a run-condition record was read")
+
+    monkeypatch.setattr(d11_facts, "meets_run_condition", _no)
+    monkeypatch.setattr(d11_blocks, "is_clear", _no)
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "approval_page_issued"
+
+
+async def test_an_order_already_out_at_the_rail_is_never_re_checked(a2a, fake, d11_vic_records, monkeypatch):
+    """The re-check is before the quote only: an issued order is watched whatever the records say."""
+    assert await d11_facts.record_check(D11_MERCHANT, D11_POSITIVE)
+    pid = await _issued(a2a, fake)
+
+    async def _no(*a, **k):
+        raise AssertionError("a run-condition record was read")
+
+    monkeypatch.setattr(d11_facts, "meets_run_condition", _no)
+    monkeypatch.setattr(d11_blocks, "is_clear", _no)
+    await _ago("next_poll_at", 1, pid)
+    outcome = await _step(a2a, fake, pid)
+    assert outcome != "refused" and (await _row(pid))["state"] == "awaiting_authorization"

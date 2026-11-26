@@ -39,6 +39,10 @@ def test_the_sandbox_database_passes(dsn):
     ("postgresql://u:pw@/pivota", "socket"),  # no host: libpq's default sockets / localhost
     ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-prod:us-west1:pivota-pg", "socket"),
     ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox-evil:x", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:x/../../../tmp", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pg/../../pivota-prod:us-west1:pivota-pg", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:us-west1:pivota-pg/sub", "socket"),
+    ("postgresql://u:pw@/pivota?host=/cloudsql/pivota-sandbox:US-WEST1:pg", "socket"),
     ("", "no host"),
     ("not a dsn", "could not be parsed"),
 ])
@@ -77,6 +81,16 @@ def test_one_source_for_every_sandbox_db_writer():
                sandbox_catalog_copy.check_import_environment):
         assert "sandbox_database_refusal(" in inspect.getsource(fn), fn.__qualname__
     assert register_gateway_service_agent.sandbox_database_refusal is I.sandbox_database_refusal
+
+
+@pytest.mark.parametrize("addr,ok", [
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432", True),
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432\n", False),  # `$` would let this pass
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/.s.PGSQL.5432/x", False),
+    ("/cloudsql/pivota-sandbox:us-west1:pivota-pg/../../tmp/.s.PGSQL.5432", False),
+])
+def test_the_socket_path_shape_is_exact(addr, ok):
+    assert I._address_ok(addr) is ok
 
 
 # --- the range is held only as a hash (the repo is public) ---------------------------------------

@@ -1,0 +1,25 @@
+# Build + push the prod-schema-dump image (RUNBOOK step 10a, PROD half) to the shared registry.
+#   gcloud builds submit --config infra/gcp/sandbox/cloudbuild.schema-dump.yaml --project pivota-shared \
+#     --substitutions=COMMIT_SHA=<backend commit of the sandbox release> .
+# Run from a pivota-backend checkout AT that commit: the image COPYs scripts/sandbox/dump_prod_schema.sh.
+# No floating tag: the prod job is always deployed by digest of a commit-tagged image.
+substitutions:
+  _REGION: us-west1
+  _REPO: pivota
+  _IMAGE: sandbox-schema-dump
+steps:
+  # Refuse anything but a full 40-hex commit (review T4): the tag is the image's only identity, and
+  # the prod job is deployed by the digest of exactly that tag.
+  # Both steps run the Cloud Build docker builder pinned by DIGEST (as of 2026-11-25); no step pulls
+  # a floating image (review: a `name: bash` step pulled an unpinned docker.io/library/bash).
+  - name: gcr.io/cloud-builders/docker@sha256:2d89b48c704ddcc4a199dd1cc70c21813fb675227600f19cb77e5bbf368012bc
+    entrypoint: bash
+    args: ['-c', '[[ "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$$ ]] || { echo "COMMIT_SHA must be a full 40-hex commit" >&2; exit 1; }']
+  - name: gcr.io/cloud-builders/docker@sha256:2d89b48c704ddcc4a199dd1cc70c21813fb675227600f19cb77e5bbf368012bc
+    args: ['build', '-f', 'infra/gcp/sandbox/Dockerfile.schema-dump',
+           '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}', '.']
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 900s

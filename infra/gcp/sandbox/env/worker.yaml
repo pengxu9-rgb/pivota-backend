@@ -1,0 +1,163 @@
+# Partner sandbox: Cloud Run `worker` (same image as web, min=max=1). PIVOTA_ENV=sandbox.
+# Identical to web.yaml except the WORKER block at the end and the two scheduler lines;
+# check_profile.py enforces that, so the two cannot drift apart.
+# Rendered by deploy_sandbox.sh (@@TOKENS@@ substituted), checked by check_profile.py.
+# Based on staging `worker` as of 2026-11-25 (names and non-secret flag values only).
+# Every staging setting NOT carried over is listed with its reason in ../ENV_PROFILE.md.
+# Secrets are mounted from ../secrets/worker.list, never written here.
+
+# -- identity ------------------------------------------------------------------------------------
+PIVOTA_ENV: "sandbox"
+# Second identity signal, rendered from config.sh SANDBOX_PROJECT: the gateway boot check and the
+# backend guard both read it, and the deploy reads it back off every new revision.
+GOOGLE_CLOUD_PROJECT: "@@SANDBOX_PROJECT@@"
+PIVOTA_PLATFORM: "cloud_run"
+SKIP_HEAVY_STARTUP_INIT: "true"
+DEV_MODE: "false"
+DB_POOL_MIN_SIZE: "1"
+DB_POOL_MAX_SIZE: "4"
+DB_COMMAND_TIMEOUT_SECONDS: "600"
+UVICORN_TIMEOUT_KEEP_ALIVE: "75"
+
+# -- sandbox contract: the backend's startup guard runs whenever PIVOTA_ENV=sandbox (no switch;
+#    config/sandbox_guard.py on the sandbox-backend branch). It refuses to boot on a prod host,
+#    credential or live flag, naming the setting only.
+
+# -- the only rail: Reap SANDBOX, simulated checkout ---------------------------------------------
+PAYMENT_ORCHESTRATOR_ENABLED: "1"
+AGENT_PURCHASE_LEDGER_ENABLED: "1"
+REAP_API_BASE_URL: "https://sandbox.api.reap.global"
+REAP_AGENTIC_SIMULATE_CHECKOUT: "COMPLETED"
+REAP_AGENTIC_ENABLED: "1"
+REAP_AGENTIC_CREATE_ENABLED: "1"
+REAP_AGENTIC_RECONCILE_ENABLED: "1"
+REAP_AGENTIC_CART_LINK_ENABLED: "1"
+REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED: "0"
+REAP_AGENTIC_PREFLIGHT_MODE: "off"
+REAP_AGENTIC_PRICE_WRITEBACK: "off"
+REAP_EXTERNAL_AUTH_ENABLED: "0"
+AGENT_CARD_ISSUANCE_ENABLED: "0"
+
+# -- every other way money could move: off ---------------------------------------------------------
+AGENT_ACP_ALLOW_LIVE_CAPTURE: "false"
+AGENT_ACP_TEST_CAPTURE: "false"
+ALLOW_TEST_PSP_PROBE: "0"
+SUBMIT_PAYMENT: "false"
+ALLOW_SHAKEOUT_ON_PROD: "false"
+FF_ENABLE_REFUND_AUTO_RETRY: "false"
+FF_ENABLE_PLATFORM_WEBHOOK_REFUND: "false"
+FF_ENABLE_PLATFORM_SYNC_OUTBOUND: "false"
+ORDER_CREATE_LIVE_QUOTE_REVALIDATION_ENABLED: "0"
+LEGACY_SETTLEMENT_LIVE: "false"
+SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING: "false"
+ENABLE_INTERNAL_DEMO_FIXTURES: "false"
+
+# -- AgenPaz backend side (buyer read + consent) -------------------------------------------------
+AGENPAS_INTERNAL_READ_ENABLED: "1"
+AGENPAS_CONSENT_WRITE_ENABLED: "1"
+AGENPAS_CONSENT_GATE: "1"
+AGENPAS_TERMS_URL: "https://pivota.cc/terms"
+AGENPAS_TERMS_VERSION: "sandbox-2026-11"
+AGENPAS_PRIVACY_URL: "https://merchant.pivota.cc/privacy"
+AGENPAS_PRIVACY_VERSION: "sandbox-2026-11"
+
+# -- background work: ONLY the two jobs in SCHEDULER_JOB_ALLOWLIST, nothing else -------------------
+AUDIT_WORKER_ENABLED: "true"
+SCHEDULER_JOB_ALLOWLIST: "reap_agentic_purchase_poll,agent_purchase_events"
+REVIEWS_INVITATION_WORKER_ENABLED: "false"
+EXTERNAL_CONVERSION_POLLER_ENABLED: "false"
+PAYMENT_RECONCILE_SWEEP_ENABLED: "0"
+ENABLE_IDENTITY_RECONCILE_SWEEP: "0"
+QUALITY_BACKFILL_WORKER_ENABLED: "false"
+CATALOG_INVARIANT_SWEEP_ENABLED: "false"
+COMMERCE_INDEX_INSIGHT_REFRESH_ENABLED: "false"
+AGENT_CARD_REVOCATION_SWEEP_ENABLED: "false"
+STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED: "false"
+STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED: "false"
+STORE_AUDIT_UCP_REPROBE_SCHEDULER_ENABLED: "false"
+STORE_AUDIT_COMMERCE_REPROBE_SCHEDULER_ENABLED: "false"
+
+# -- no live reads, no store fetches, no outbound sends ---------------------------------------------
+LIVE_OFFER_VERIFICATION_ENABLED: "0"
+LIVE_OFFER_VERIFICATION_ALLOW_REQUEST_PATH_EGRESS: "0"
+CHECKOUT_PREFLIGHT_MODE: "off"
+CHECKOUT_PREFLIGHT_ALLOW_EGRESS: "0"
+OFFICIAL_DOMAIN_LIVENESS_ENABLED: "0"
+OUTBOUND_WARM_HANDOFF_ENABLED: "false"
+AGENT_CHECKOUT_UCP_DISCOVERY_ENABLED: "0"
+SERVE_PDP_ENRICHMENT_ON_WRITE: "0"
+CATALOG_ONBOARD_ENABLED: "false"
+INDEXNOW_ENABLED: "false"
+GSC_INTEGRATION_ENABLED: "false"
+WEBHOOK_DELIVERY_ENABLED: "false"
+DISABLE_WEBHOOK_OUTBOX: "true"
+ORDER_CONFIRMATION_EMAIL_ENABLED: "false"
+VERTEX_AI_ENABLED: "false"
+
+# -- catalog / search / offers behaviour, carried from staging so answers match ---------------------
+AGENT_CHECKOUT_STRICT: "on"
+AGENT_EXTERNAL_SEED_BUILD_CONCURRENCY: "8"
+AGENT_EXTERNAL_SEED_CACHE_EMPTY_TTL_SECONDS: "30"
+AGENT_EXTERNAL_SEED_CACHE_ENABLED: "true"
+AGENT_EXTERNAL_SEED_CACHE_FIRST_SCREEN_ONLY: "true"
+AGENT_EXTERNAL_SEED_CACHE_HIT_TTL_SECONDS: "120"
+AGENT_EXTERNAL_SEED_CACHE_MAX_ENTRIES: "500"
+AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS: "400"
+AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS: "400"
+AGENT_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS: "0.35"
+AGENT_SDK_FIXED_EXTERNAL_SEED_QUERY_TIMEOUT_SECONDS: "0.35"
+AGENT_PDP_VIEW_RECONCILE_LIMIT: "600"
+AGENT_SHOP_INVOKE_MAX_WAIT_SECONDS: "4.5"
+AGENT_SHOP_MAX_CALLS_PER_SESSION: "24"
+AGENT_SHOP_MAX_DUPLICATE_CALLS_PER_SESSION: "2"
+AGENT_SHOP_MAX_QUEUE_SIZE: "64"
+AGENT_SHOP_MAX_QUEUE_WAIT_SECONDS: "2.0"
+AGENT_SHOP_MAX_WORKERS: "6"
+AGENT_SHOP_MULTI_BYPASS_QUEUE_SHOPPING: "true"
+AGENT_SHOP_MULTI_DELEGATE_SHOPPING_TO_UPSTREAM: "false"
+AGENT_SHOP_MULTI_ENABLE_BASE_MERCHANT_FANOUT_SHOPPING: "false"
+AGENT_SHOP_PIVOT_MULTI_SERVE_ENABLED: "true"
+AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_EXTERNAL: "true"
+AGENT_SHOP_PIVOT_MULTI_SERVE_INCLUDE_INCENTIVES: "true"
+AGENT_SHOP_PIVOT_MULTI_SERVE_MAX_PAGE: "1"
+AGENT_SHOP_PIVOT_MULTI_SERVE_SOURCE_ALLOWLIST: "shopping_agent,shopping-agent-ui,shopping-agent-web"
+AGENT_SHOP_PIVOT_MULTI_SHADOW_ENABLED: "false"
+AGENT_SHOP_TASK_TIMEOUT_SECONDS: "5.0"
+AGENT_SHOP_UPSTREAM_CLIENT_KEEPALIVE_EXPIRY_SECONDS: "300"
+AGENT_SHOP_UPSTREAM_CLIENT_MAX_KEEPALIVE_CONNECTIONS: "128"
+AGENT_SHOP_UPSTREAM_CLIENT_WARMUP_ENABLED: "false"
+FIND_PRODUCTS_MULTI_SEED_BUDGET_MS: "400"
+FIND_PRODUCTS_MULTI_SEED_BUILD_CONCURRENCY: "8"
+SEED_QUERY_FAST_MULTITERM: "true"
+STRICT_BEAUTY_CATEGORY_TEXT_RECALL: "true"
+RECALL_RELEVANCE_V2: "0"
+INDEX_ELIGIBLE_READ: "1"
+INDEX_ELIGIBLE_RECALL: "1"
+GATEWAY_DYNAMIC_BRAND_DETECT: "true"
+ENABLE_STORELESS_BRAND_CATALOG: "1"
+ENABLE_BRAND_DIRECT_OFFER_TYPE: "true"
+OFFICIAL_SOURCE_SELLER_DERIVED: "1"
+PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS: "1"
+ENABLE_KBEAUTY_AGENT_DECISION_GATES: "true"
+PDP_SCOPE_BACKFILL_ENABLED: "false"
+PARTNER_REV_SHARE_USE_V2: "true"
+
+# -- the sandbox gateway's own service agent (owns PIVOTA_API_KEY; registered by hand, RUNBOOK step 14)
+# routes/agent_auth.py hard-codes PROD's gateway agent as the one never credited with a link and the
+# one whose signed X-Pivota-Issuing-Agent header may name the partner. The sandbox's gateway agent has
+# its own id, so it must be ADDED to both lists, or every MCP link is credited to the gateway itself
+# and partners are never named as the issuing agent.
+ISSUING_AGENT_EXCLUDED_AGENT_IDS: "agent_388a63cd97b4fb54"
+ISSUING_ASSERTION_VOUCHER_AGENT_IDS: "agent_388a63cd97b4fb54"
+
+# -- limits and metrics --------------------------------------------------------------------------
+RATE_LIMIT_RPM: "120"
+RATE_LIMIT_WINDOW_SECONDS: "60"
+PROMETHEUS_METRICS_ENABLED: "true"
+
+# -- WORKER: the one job the sandbox needs ---------------------------------------------------------
+# reap_agentic_purchase_poll advances Reap purchases (quote -> card -> checkout -> completed);
+# agent_purchase_events is the other id the backend's sandbox guard allows (purchase events).
+# Every other scheduled job is skipped by the allowlist (services/scheduler_job_allowlist.py).
+DB_STATEMENT_TIMEOUT_SECONDS: "30"
+REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS: "3600"

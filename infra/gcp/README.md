@@ -871,3 +871,18 @@ Two incidents came from not doing this:
 
 **Before merging into any repo that Railway builds from, list its services and know what a redeploy
 will do to each.**
+
+## Partner sandbox (`pivota-sandbox`): see `infra/gcp/sandbox/`
+
+The partner sandbox is its own project, not a third case in the scripts above: none of
+`bootstrap_env.sh`, `deploy_backend.sh` or `deploy_gateway.sh` knows it. Nothing in
+`infra/gcp/sandbox/` deploys to or changes `pivota-staging`. Its changes in `pivota-prod`, each its own controller step:
+`setup_catalog_drop.sh prod-writer` (one new service account, create-only on the sandbox's drop
+bucket); in RUNBOOK step 10a a dedicated schema-dump DB role with its own secret (Q3: decided, the
+dedicated hardened role), that account's per-run read of that one secret, and one one-off Cloud Run job,
+`sandbox-schema-dump`, which writes prod's schema (no rows) into the drop; and in step 10c the
+daily catalog export job (sandbox-backend's), with its own catalog-only role and secret and its
+schedule, which writes catalog tables only. Start at
+`infra/gcp/sandbox/RUNBOOK.md`; the env profile and every staging setting it drops are in
+`infra/gcp/sandbox/ENV_PROFILE.md`. Its scripts are dry runs unless `APPLY=1`, and it deploys only
+tagged releases (`sandbox-rN` in both repos), never on merge.
