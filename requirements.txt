@@ -22,6 +22,7 @@ supabase>=2.0.0  # for Supabase integration
 # test_scheduler_zombie_connection_terminate_postgres) fail on it. 0.31.0 is what production runs.
 # Move only with those two tests green on the new version.
 asyncpg==0.31.0  # for PostgreSQL async connections (Supabase)
+pglast==7.22  # PostgreSQL 17 parser; jobs/sandbox_schema_apply.py only, imported lazily (cp311 manylinux wheel)
 psycopg2-binary  # for PostgreSQL synchronous connections (Supabase)
 python-multipart  # for form data handling
 pypdf>=4.0  # lab-report (PDF) text extraction for evidence intake (pure-Python)

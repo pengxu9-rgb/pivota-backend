@@ -1,0 +1,32 @@
+# The image for RUNBOOK step 10a's PROD half: sandbox-backend's scripts/sandbox/dump_prod_schema.sh,
+# which needs pg_dump/psql at the prod server's major version (17) plus curl. The backend image has
+# neither (libpq5 only). Built by infra/gcp/sandbox/cloudbuild.schema-dump.yaml from a pivota-backend
+# checkout at the release commit; run as a gated one-off Cloud Run job in pivota-prod.
+#
+# Kept minimal on purpose: no shell tools beyond what the script uses, no secrets at build time, and
+# the script is the entrypoint, so the job cannot be pointed at anything else with --command.
+# The base is pinned by DIGEST (review T4): the multi-arch index of postgres:17-bookworm as of
+# 2026-11-25. A rebuild pulls exactly this; moving to a newer base is a reviewed edit of this line.
+FROM postgres:17-bookworm@sha256:1eff563f6c868b9b433566e9f3cf6e5c79fbd3b95bf70ec7277d376cdbfc50d7
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+# The script refuses to run without these (sandbox-backend: coreutils `timeout` bounds every step).
+# Fail the BUILD, not the prod run, if the base ever drops one.
+RUN for t in pg_dump psql curl gzip sha256sum awk timeout; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done \
+ && pg_dump --version | grep -q ' 17\.' 
+COPY scripts/sandbox/dump_prod_schema.sh /usr/local/bin/dump_prod_schema.sh
+# Refuse to build from any script but a manifest-format-2 one (review: a bare grep for the marker
+# was satisfied by a COMMENT on top of a format-1 script). Two rules, both on the copied file:
+#   1. the manifest heredoc line itself, at column 0: {"format_version": 2, "kind": "schema", ...
+#   2. every `"format_version": <n>` anywhere in it says 2 (a format-1 line, even beside a comment
+#      that says 2, fails)
+# The apply job accepts only format 2 (jobs/sandbox_schema_apply.FORMAT_VERSION; a repo test keeps
+# the two equal). The format-2 script is sandbox-backend's approved successor of 77a881c7f.
+RUN f=/usr/local/bin/dump_prod_schema.sh \
+ && grep -qE '^\{"format_version": 2, "kind": "schema"' "$f" \
+ && [ "$(grep -oE '"format_version": *[0-9]+' "$f" | grep -vcE ': *2$')" = 0 ] \
+ || { echo "dump_prod_schema.sh is not a manifest-format-2 script; build from a release that has it" >&2; exit 1; }
+RUN chmod 0555 /usr/local/bin/dump_prod_schema.sh
+USER postgres
+ENTRYPOINT ["/usr/local/bin/dump_prod_schema.sh"]

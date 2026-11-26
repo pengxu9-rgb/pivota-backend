@@ -260,6 +260,7 @@ def _rewrite_manifest(tmp_path, stamp, mutate):
     ("dropped_column", "dropped column"),
     ("keep_column", "keep list"),
     ("unknown_table", "not in CATALOG_TABLES"),
+    ("never_copy_table", "never copied: orders"),
     ("missing_table", "missing table"),
 ])
 async def test_a_tampered_copy_is_refused_and_the_sandbox_is_untouched(db, tmp_path, tamper, match):
@@ -278,6 +279,9 @@ async def test_a_tampered_copy_is_refused_and_the_sandbox_is_untouched(db, tmp_p
         elif tamper == "keep_column":
             next(t for t in m["tables"] if t["name"] == "merchant_onboarding")["columns"].append("api_key")
         elif tamper == "unknown_table":
+            m["tables"].append({"name": "mystery_table", "columns": ["id"], "rows": 1,
+                                "file": "%s/mystery_table.csv.gz" % stamp, "sha256": "x"})
+        elif tamper == "never_copy_table":
             m["tables"].append({"name": "orders", "columns": ["order_id"], "rows": 1,
                                 "file": "%s/orders.csv.gz" % stamp, "sha256": "x"})
         elif tamper == "missing_table":

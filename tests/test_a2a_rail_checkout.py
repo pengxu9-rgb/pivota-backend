@@ -4151,3 +4151,251 @@ def test_the_short_form_needs_two_digits_left_and_077_still_catches_77():
     exact = a2a_rail._scrub_needles(_network_token(cvv="077"))[1]
     assert {"077", "77"} <= exact
     assert a2a_rail.davv_echo_matcher("077")("cvv 77")
+
+
+# ── ADR-030 D11's run condition in the worker (2b-D; dark while the setting does not name `a2a`) ──────────────
+
+from db import merchant_agent_checkout_facts as d11_facts  # noqa: E402
+from db import partner_agent_merchant_blocks as d11_blocks  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import POSITIVE_UCP as D11_POSITIVE  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import _assert_throwaway_database as _d11_throwaway  # noqa: E402
+from tests.test_merchant_agent_checkout_facts import _create_table as _d11_create_facts  # noqa: E402
+from tests.test_partner_agent_merchant_blocks import _create_table as _d11_create_blocks  # noqa: E402
+
+D11_MERCHANT = "merchant.example"  # `_open`'s merchant_domain
+D11_RAILS_ENV = rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV
+
+
+@pytest.fixture
+async def d11_records(monkeypatch):
+    """Migrations 294 and 295's tables, empty (on Postgres the migrations themselves), and the setting naming
+    the token rail. A test that wants the condition met records the fact itself."""
+    _d11_throwaway()
+    monkeypatch.delenv(d11_facts.MAX_AGE_ENV, raising=False)
+    monkeypatch.setenv(D11_RAILS_ENV, "a2a")
+    for create, table in ((_d11_create_facts, d11_facts.TABLE), (_d11_create_blocks, d11_blocks.TABLE)):
+        await create()
+        await database.execute(f"DELETE FROM {table}")
+    yield
+    for create, table in ((_d11_create_facts, d11_facts.TABLE), (_d11_create_blocks, d11_blocks.TABLE)):
+        await create()
+        await database.execute(f"DELETE FROM {table}")
+
+
+async def _d11_met():
+    assert await d11_facts.record_check(D11_MERCHANT, D11_POSITIVE)
+
+
+async def _d11_block(rail="a2a", purchase="ap_" + "f" * 24):
+    """Another purchase met a challenge on this merchant (an event the worker or an operator recorded)."""
+    assert await d11_blocks.record_block(
+        rail, D11_MERCHANT, "captcha", source=d11_blocks.SOURCE_WORKER, purchase_id=purchase) == "recorded"
+
+
+async def _d11_events():
+    return await d11_blocks.list_blocks(rail="a2a", domain=D11_MERCHANT) or []
+
+
+def _d11_reads_forbidden(monkeypatch):
+    """Every read or write of either record is noted (and answers 'not met' / 'not recorded'); the returned list
+    must stay empty. Noted rather than raised: the worker's backstops would swallow a raise."""
+    touched = []
+
+    def _noting(name, answer):
+        async def _note(*a, **k):
+            touched.append(name)
+            return answer
+        return _note
+
+    for module, name, answer in ((d11_facts, "meets_run_condition", False), (d11_blocks, "is_clear", False),
+                                 (d11_blocks, "record_block", None)):
+        monkeypatch.setattr(module, name, _noting(name, answer))
+    return touched
+
+
+@pytest.mark.parametrize("setting", [None, "reap", "a2a_rail"])
+async def test_off_the_worker_reads_and_writes_no_record_and_a_captcha_fails_as_before(monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv(D11_RAILS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(D11_RAILS_ENV, setting)
+    touched = _d11_reads_forbidden(monkeypatch)
+    pid = await _placing()  # the token request and the `paid` relay: nothing read
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("failed", "checkout_captcha_failed")
+    assert touched == []
+
+
+async def test_on_and_met_the_checkout_runs_as_before_and_a_captcha_is_recorded_before_the_failure(
+        d11_records, caplog):
+    await _d11_met()
+    await _d11_block(rail="reap", purchase="rp_" + "e" * 24)  # Reap's event says nothing about this rail
+    pid = await _placing()
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("failed", "checkout_captcha_failed")
+    [event] = await _d11_events()
+    assert (event["rail"], event["merchant_domain"], event["kind"], event["source"], event["purchase_id"],
+            event["cleared_at"]) == ("a2a", D11_MERCHANT, "captcha", "worker", pid, None)
+    assert any(f"merchant challenge recorded purchase={pid}" in r.getMessage() for r in caplog.records)
+    # The merchant is now closed to this rail's agent: a new purchase there is refused before its token.
+    second = await _locked()
+    rail = Rail()
+    assert await _step(rail, second) == "refused"
+    assert (rail.sent, (await _row(second))["refusal_reason"]) == ([], "merchant_not_eligible")
+
+
+async def test_a_crash_after_the_record_then_the_same_answer_again_is_one_event(d11_records, monkeypatch):
+    await _d11_met()
+    pid = await _placing()
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    real_failed = worker._checkout_failed
+
+    async def _crash(*a, **k):
+        raise RuntimeError("instance killed after the record")
+
+    monkeypatch.setattr(worker, "_checkout_failed", _crash)
+    with pytest.raises(RuntimeError):
+        await _step(Rail().on("checkout.await#poll", answer), pid)
+    monkeypatch.setattr(worker, "_checkout_failed", real_failed)
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_by = NULL WHERE id = :i", {"i": pid})
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    assert [e["purchase_id"] for e in await _d11_events()] == [pid]
+
+
+@pytest.mark.parametrize("status", ["form-error", "pay-disabled"])
+async def test_a_failure_that_is_not_a_challenge_records_nothing(d11_records, status):
+    await _d11_met()
+    pid = await _placing()
+    answer = _checkout_result(status, success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    assert await _d11_events() == []
+
+
+@pytest.mark.parametrize("success", [True, None])
+async def test_a_contradictory_captcha_is_held_and_records_nothing(d11_records, success):
+    await _d11_met()
+    pid = await _placing()
+    answer = _checkout_result("captcha-failed", success=success, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "checkout_result_unrecognised"
+    assert await _d11_events() == []
+
+
+async def test_a_record_that_does_not_land_is_logged_for_an_operator_and_the_purchase_still_fails(
+        d11_records, monkeypatch, caplog):
+    await _d11_met()
+    pid = await _placing()
+
+    async def _fails(*a, **k):
+        return None
+
+    monkeypatch.setattr(d11_blocks, "record_block", _fails)
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    [record] = [r for r in caplog.records if "challenge NOT recorded" in r.getMessage()]
+    assert record.levelname == "ERROR" and f"purchase={pid}" in record.getMessage()
+    assert (await _row(pid))["last_error_code"] == "checkout_captcha_failed"
+
+
+@pytest.mark.parametrize("closed", ["no_fact", "open_block", "facts_table_missing", "blocks_table_missing"])
+async def test_on_and_not_met_no_token_is_asked_for_and_the_purchase_is_refused(d11_records, closed, caplog):
+    if closed != "no_fact":
+        await _d11_met()
+    if closed == "open_block":
+        await _d11_block()
+    pid = await _locked()
+    if closed == "facts_table_missing":
+        await database.execute(f"DROP TABLE {d11_facts.TABLE}")
+    if closed == "blocks_table_missing":
+        await database.execute(f"DROP TABLE {d11_blocks.TABLE}")
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    with caplog.at_level(logging.WARNING):
+        assert await _step(rail, pid) == "refused"
+    row = await _row(pid)
+    assert rail.sent == [], "not even the card read: nothing goes to the rail"
+    assert (row["state"], row["refusal_reason"], row["payment_token_id"], row["pending_write"], row["claimed_by"]) == (
+        "refused", "merchant_not_eligible", None, None, None)
+    assert any("agent_run_condition: not met rail=a2a merchant=merchant.example" in r.getMessage()
+               for r in caplog.records), "the cause goes to the log"
+
+
+async def test_a_challenge_recorded_while_the_buyer_approves_stops_the_paid_relay(d11_records):
+    await _d11_met()
+    pid = await _approving()  # the token was minted while the merchant was open
+    await _d11_block()
+    rail = _approved(Rail())
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert rail.sent == [], "no `paid`, so no checkout setup"
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "merchant_not_eligible", None)
+    assert row["payment_token_id"] == "ptk_1", "the minted token stays on the row: counted as an orphan"
+
+
+async def test_a_challenge_recorded_before_the_await_poll_stops_that_relay_too(d11_records):
+    await _d11_met()
+    pid = await _approving()
+    assert await _step(Rail().on("payment.visa-action-required#paid", _await("PENDING")), pid) == "waiting_on_buyer"
+    await _d11_block()
+    rail = Rail().on("payment.await#poll", _token_result()).on("checkout.setup#submit", CONFIRM_CARD)
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["last_error_code"], row["pending_write"]) == ([], "failed", "merchant_not_eligible", None)
+
+
+async def test_a_buyer_still_inside_the_schedule_gap_is_not_read_for(d11_records, monkeypatch):
+    """The re-check sits after the schedule: a tick that sends nothing reads nothing."""
+    await _d11_met()
+    pid = await _approving()
+    await _ago("state_entered_at", 0, pid)
+    touched = _d11_reads_forbidden(monkeypatch)
+    assert await _step(Rail(), pid) == "waiting_on_buyer"
+    assert touched == []
+
+
+async def test_a_checkout_being_placed_is_never_re_checked(d11_records, monkeypatch):
+    """A send already out is not reached: a placing purchase is polled whatever the records say."""
+    await _d11_met()
+    pid = await _placing()
+    await _d11_block()
+    touched = _d11_reads_forbidden(monkeypatch)
+    rail = Rail().on("checkout.await#poll", _checkout_await(state="processing"))
+    assert await _step(rail, pid) == "placing"
+    assert (rail.actions(), touched) == (["checkout.await#poll"], [])
+
+
+async def test_the_challenge_is_recorded_while_the_purchase_is_still_paying(d11_records, monkeypatch):
+    """Recorded BEFORE the failure: a step cut between the two leaves the row live, so a retry records it."""
+    await _d11_met()
+    pid = await _placing()
+    real_record, seen = d11_blocks.record_block, []
+
+    async def _watch(*a, **k):
+        seen.append((await _row(pid))["state"])
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(d11_blocks, "record_block", _watch)
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    assert seen == ["paying"]
+
+
+async def test_a_record_that_raises_is_logged_and_the_purchase_still_fails(d11_records, monkeypatch, caplog):
+    await _d11_met()
+    pid = await _placing()
+
+    async def _raises(*a, **k):
+        raise RuntimeError("the record's own guard was bypassed")
+
+    monkeypatch.setattr(d11_blocks, "record_block", _raises)
+    answer = _checkout_result("captcha-failed", success=False, order_id=None, total=None)
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        assert await _step(Rail().on("checkout.await#poll", answer), pid) == "failed"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("challenge record raised" in m and "error_type=RuntimeError" in m for m in messages)
+    assert any("challenge NOT recorded" in m for m in messages)
+    assert (await _row(pid))["last_error_code"] == "checkout_captcha_failed"
