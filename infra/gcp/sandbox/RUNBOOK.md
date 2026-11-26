@@ -108,7 +108,8 @@ release tags (step 9) and the DNS records (steps 6 and 13).
 APPLY=1 infra/gcp/sandbox/bootstrap_sandbox.sh network
 ```
 **Check:** `verify_sandbox.sh network`: peers only with servicenetworking, no `default` VPC, egress
-IP reserved. Record the egress IP for Reap (Q1).
+IP reserved. Record the egress IP. Nothing is sent to Reap about it up front (Q1): step 12b's
+Reap call from this IP is the check.
 **Rollback:** in this order:
 ```bash
 gcloud --project "$SANDBOX_PROJECT" compute routers nats delete sandbox-nat --router sandbox-router --region us-west1 --quiet
@@ -143,16 +144,23 @@ Creates the DB user and `pivota-db-password`, `DATABASE_URL`, `DATABASE_URL_NOVE
 `sandbox-pg`; mints the 18 internal keys inside the project (`PIVOTA_API_KEY` as `ak_test_<64 hex>`,
 the format the gateway's boot check and its MCP loopback require); creates `REAP_API_KEY` **empty**.
 
-Then **the owner only**, from the Reap **sandbox** dashboard (Q1: a new key for this project is the
-recommendation), types the key into a version without it touching a file, a chat or a log:
+The key is the Reap **sandbox** key that production frees when it moves to the real production
+key (Q1, decided). No second key is requested from Reap. Order:
+1. Production is confirmed working on the live key first. Until then, stop here: step 4's check
+   and every step from 11 on need the key, so they wait.
+2. Then **the owner only** types the key into a version, from the Reap sandbox dashboard, without
+   it touching a file, a chat or a log:
 ```bash
 gcloud --project "$SANDBOX_PROJECT" secrets versions add REAP_API_KEY --data-file=-
 # paste the key, press Enter, then Ctrl-D
 ```
-Never copy it from `pivota-staging`'s `REAP_API_KEY` unless the owner decides so in Q1; if that is
-the decision, the owner pipes it secret-to-secret
-(`gcloud secrets versions access ... --project pivota-staging | gcloud secrets versions add ... --project "$SANDBOX_PROJECT" --data-file=-`),
-and the controller notes it.
+3. Then, as its own owner + controller go, the key's old version in `pivota-prod`'s `REAP_API_KEY`
+   is disabled, so production holds no usable copy. Disable it by its version number
+   (`gcloud --project pivota-prod secrets versions list REAP_API_KEY` shows numbers and states;
+   metadata only), never `latest`.
+
+Nobody reads the value or copies it out of prod's or staging's Secret Manager, not even
+secret-to-secret.
 
 **Check:** `verify_sandbox.sh secrets`: exactly the inventory, every secret labelled `env=sandbox`
 with its origin, each with an enabled version. (Reads metadata only.)
@@ -666,7 +674,32 @@ not add A records). A mismatch on `full_sha` or `deployment_id` means another re
 than the one step 11 promoted. `env` needs a gateway release that includes the sandbox label
 (sandbox-gateway's 31e551b86, and 2f64123a9 for `env` in every environment); an older gateway
 leaves it out and fails here, by design.
-**Rollback:** nothing to undo (read-only).
+
+**12b. One Reap sandbox call from the sandbox's egress IP (own go: it creates a job).** The checks
+above never reach Reap. This one does, before any partner exists: one read-only product search,
+run in the sandbox VPC, so it leaves through Cloud NAT on the step-2 IP, exactly as the worker's
+calls will. It runs as `sa-worker` (it holds `REAP_API_KEY`), with the worker profile as env
+(`/tmp/sbx-env` rendered as in step 14a), and prints one line: never the key, never the response
+body.
+```bash
+REACH='import asyncio
+from services import reap_agentic_client as rc
+assert rc.is_sandbox_base_url(), "REAP_API_BASE_URL is not exactly a Reap sandbox host"
+r = asyncio.run(rc.search_products(query="t-shirt", limit=1))
+print("reap_reach", "ok" if r.ok else "refused", r.status, r.error or "")
+raise SystemExit(0 if r.ok else 1)'
+gcloud --project "$SANDBOX_PROJECT" run jobs deploy sandbox-reap-reach --image "$BE_IMG" $VPC_FLAGS \
+  --service-account "sa-worker@$SANDBOX_PROJECT.iam.gserviceaccount.com" \
+  --env-vars-file /tmp/sbx-env/worker.yaml --set-secrets REAP_API_KEY=REAP_API_KEY:latest \
+  --command python --args="^@@^-c@@$REACH" --task-timeout 120s
+gcloud --project "$SANDBOX_PROJECT" run jobs execute sandbox-reap-reach --region us-west1 --wait
+```
+Expect `reap_reach ok 200`, read from the execution's logs. `refused 401` or `403` with the key
+in place is the source-IP signal (Q1): stop before step 13 and ask Reap to allow the egress IP.
+Any other `refused` (`transport_error:...`, `reap_status_5xx`) means Reap is unreachable from the
+sandbox, so check NAT first.
+**Rollback:** the checks above are read-only. 12b leaves one job:
+`gcloud --project "$SANDBOX_PROJECT" run jobs delete sandbox-reap-reach --region us-west1 --quiet`.
 
 ## Step 13. DNS round 2: the A records
 
@@ -747,16 +780,30 @@ The prod-side export job adds well under 1/month to pivota-prod.
 
 ## Open questions
 
-**Q1. Reap: can the existing Reap sandbox account be used from a new project?** What we know: the
-Reap sandbox key lives in pivota-staging today; the sandbox reaches Reap from a new egress IP
-(step 2); Reap's sandbox completes checkouts by polling (no callback URL needed by the sandbox).
-To ask Reap: (a) issue a **second sandbox API key** for this environment (recommended: separate
-revocation, separate logs, the staging key never leaves staging); (b) do they allowlist source IPs
-on sandbox keys, and if so add the sandbox egress IP; (c) are rate limits per key or per account
-(staging rehearsals and partner traffic would share an account); (d) do sandbox quotes cover the
-US stores in our catalog copy, or only stores Reap has enabled, since a partner's purchase of a
-store Reap cannot quote fails at the quote step; (e) the hosted card page host
-(`sandbox.collect.prava.space` on staging) stays the same for a new key.
+**Q1. Reap key: decided (2026-11-26, the owner).** The sandbox reuses the Reap sandbox key that
+production frees when it moves to the real production key. No second key is requested from Reap.
+- **Order** (step 4): the key moves only after production is confirmed working on the live key.
+  The owner pastes it into the sandbox's `REAP_API_KEY` by hand. Then, on its own owner +
+  controller go, its version in `pivota-prod`'s Secret Manager is disabled by number, so the
+  sandbox holds the only copy outside staging. Nobody reads or copies the value out of prod's
+  secrets.
+- **Shared with staging, if it is the same key.** Then staging and partner sandbox traffic share
+  one key, its logs at Reap and its rate limits, and revoking it cuts off both. That is accepted
+  at v0 volume. A second key becomes the option only if the two need separating later.
+- **Source-IP allowlist:** nothing is asked of Reap up front. Step 12b makes one Reap sandbox call
+  from the sandbox's own egress IP (step 2) before any partner exists; a refusal there
+  (`reap_reach refused 401` or `403`) is the signal to ask Reap to allow that IP.
+- **Open notes**, for the shared key:
+  - (c) rate limits: per key or per account? Either way, staging rehearsals and partner
+    sandbox runs draw on the same limit, so a heavy staging run can slow a partner's sandbox
+    test. Watch for `429`s in both.
+  - (d) quote coverage: do sandbox quotes cover the US stores in our catalog copy, or only
+    stores Reap has enabled for this key? A partner's purchase at a store Reap cannot quote
+    fails at the quote step. The proof run (step 15) shows it for the stores it uses.
+  - (e) the hosted card page host: the key is the same, so the sandbox should get the card page
+    host this key gets today (`sandbox.collect.prava.space` on staging). The proof run (step 15)
+    confirms it.
+Reap's sandbox completes checkouts by polling, so the sandbox needs no callback URL.
 
 **Q2. Cost:** ≈ 225-230/month as sized above; ≈ 115 with cold starts. Owner to pick.
 
