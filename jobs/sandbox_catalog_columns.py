@@ -4,11 +4,15 @@ jobs/sandbox_catalog_copy.py refuses to export or import a column that is not li
 by its TableSpec): a column prod gains later is a refusal naming the table and column, never a silent
 copy. The classes are a review record; only two change what is copied:
 
-  JSON      the value is copied through the person-key scrub (sandbox_catalog_copy.scrub_select):
-            every key that names a person, a secret or free text (reviewed_by, *_by, email, phone,
-            token, session_id, notes, ...) at any depth has its string value replaced by "redacted"
-            and any other scalar by null; the export checks its own output before upload and the
-            import checks it again. Each JSON column carries the reason it is catalog data.
+  JSON      the value is copied through the scrub (sandbox_catalog_copy.scrub_csv / scrub_json):
+            every key that names a person, a secret, a request id or free text (*by, *mail*,
+            *address*, phone, token, session/request/trace id, name, handle, notes, comments,
+            reason, rationale, ...) at any depth has a string value replaced by "redacted" and any
+            other value, objects and arrays included, by null; email- and phone-shaped parts of
+            every other string are redacted. The export checks its own output before upload and the
+            import checks it again. Each JSON column carries the reason it is catalog data; a column
+            of product data may keep PRODUCT_KEYS (a product's or option's name, a handle).
+  TEXT      email- and phone-shaped parts are redacted the same way.
   REPLACED  the TableSpec selects a placeholder instead (contact_email, realtime_enabled, reason).
 
 KEY ids of catalog rows (products, SKUs, offers, merchants; never a person), TEXT catalog text and
@@ -34,7 +38,11 @@ TIME = "time"
 JSON = "json"
 REPLACED = "replaced"
 
-Column = Union[str, Tuple[str, str]]
+Column = Union[str, Tuple[str, str], Tuple[str, str, Tuple[str, ...]]]
+
+#: Keys a JSON column of PRODUCT data keeps although the person-key scrub would redact them: a product's
+#: or option's "name" and a product's "handle" (its URL slug). Anywhere else they are redacted.
+PRODUCT_KEYS = ("name", "names", "handle", "handles")
 
 #: table -> column -> class, or (JSON, why this JSON is catalog data).
 COLUMNS: Mapping[str, Mapping[str, Column]] = {
@@ -93,7 +101,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'platform': TEXT,
         'price_tier': TEXT,
         'product_key': KEY,
-        'product_payload': (JSON, 'the product as served'),
+        'product_payload': (JSON, 'the product as served', PRODUCT_KEYS),
         'product_type': TEXT,
         'rating_count': NUM,
         'rating_value': NUM,
@@ -130,7 +138,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'readiness_tier': TEXT,
         'sku': TEXT,
         'sku_key': KEY,
-        'sku_payload': (JSON, 'the SKU as served'),
+        'sku_payload': (JSON, 'the SKU as served', PRODUCT_KEYS),
         'source_domain': URL,
         'source_product_id': KEY,
         'source_variant_id': KEY,
@@ -139,8 +147,8 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'suppression_reason': TEXT,
         'title': TEXT,
         'updated_at': TIME,
-        'visible_attributes': (JSON, "the SKU's visible attributes"),
-        'visible_option_labels': (JSON, "the SKU's option labels"),
+        'visible_attributes': (JSON, "the SKU's visible attributes", PRODUCT_KEYS),
+        'visible_option_labels': (JSON, "the SKU's option labels", PRODUCT_KEYS),
     },
     'catalog_offers': {
         'availability': TEXT,
@@ -157,7 +165,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'merchant_id': KEY,
         'offer_id': KEY,
         'offer_mode': TEXT,
-        'offer_payload': (JSON, 'the offer as served (price, stock, seller)'),
+        'offer_payload': (JSON, 'the offer as served (price, stock, seller)', PRODUCT_KEYS),
         'offer_type': TEXT,
         'price_checked_at': TIME,
         'price_confidence': NUM,
@@ -228,7 +236,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'evidence_profile': (JSON, 'evidence summary; reviewer fields are redacted by the scrub'),
         'merchant_id': KEY,
         'product_key': KEY,
-        'profile_payload': (JSON, 'the beauty profile'),
+        'profile_payload': (JSON, 'the beauty profile', PRODUCT_KEYS),
         'required_disclaimers': (JSON, 'regulatory disclaimers'),
         'routine_phase': TEXT,
         'taxonomy_json': (JSON, 'beauty taxonomy'),
@@ -332,7 +340,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'price_amount': NUM,
         'price_currency': TEXT,
         'search_text': TEXT,
-        'seed_data': (JSON, 'the reviewed listing as served'),
+        'seed_data': (JSON, 'the reviewed listing as served', PRODUCT_KEYS),
         'seed_kind': TEXT,
         'seller_ref': KEY,
         'status': TEXT,
@@ -351,7 +359,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'merchant_id': KEY,
         'platform': TEXT,
         'platform_product_id': KEY,
-        'product_data': (JSON, 'the cached product as served'),
+        'product_data': (JSON, 'the cached product as served', PRODUCT_KEYS),
         'ttl_seconds': NUM,
     },
     'product_group_members': {
@@ -413,7 +421,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
     },
     'agent_pdp_view': {
         'brand': TEXT,
-        'breadcrumb': (JSON, 'category breadcrumb of the product page'),
+        'breadcrumb': (JSON, 'category breadcrumb of the product page', PRODUCT_KEYS),
         'bullet_points': (JSON, 'product bullet points (catalog copy)'),
         'care': TEXT,
         'care_confidence': NUM,
@@ -432,7 +440,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'material_confidence': NUM,
         'material_source': TEXT,
         'offer_count': NUM,
-        'offers': (JSON, "the product's offers (seller, price, stock)"),
+        'offers': (JSON, "the product's offers (seller, price, stock)", PRODUCT_KEYS),
         'pdp_lifecycle_stage': TEXT,
         'pivota_signature_id': KEY,
         'price_max': NUM,
@@ -453,7 +461,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'taxonomy_tags': (JSON, 'category tags'),
         'title': TEXT,
         'usage_scenarios': (JSON, 'usage scenarios (catalog copy)'),
-        'variants': (JSON, "the product's variants (options, prices)"),
+        'variants': (JSON, "the product's variants (options, prices)", PRODUCT_KEYS),
         'variants_count': NUM,
     },
     'index_pipeline_state': {
@@ -601,7 +609,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'soft_identity': (JSON, 'soft identity attributes'),
         'source_kind': TEXT,
         'source_listing_ref': KEY,
-        'source_payload': (JSON, 'the source listing'),
+        'source_payload': (JSON, 'the source listing', PRODUCT_KEYS),
         'source_tier': TEXT,
         'strong_identity': (JSON, 'strong identity attributes (GTIN, ...)'),
         'title_core_norm': TEXT,
@@ -654,17 +662,17 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
     },
     'relationship_candidate_labels': {
         'anchor_ref': KEY,
-        'anchor_snapshot': (JSON, 'the anchor product as labelled'),
+        'anchor_snapshot': (JSON, 'the anchor product as labelled', PRODUCT_KEYS),
         'anchor_type': TEXT,
         'candidate_product_ref': KEY,
-        'candidate_snapshot': (JSON, 'the candidate product as labelled'),
+        'candidate_snapshot': (JSON, 'the candidate product as labelled', PRODUCT_KEYS),
         'category_taxonomy': (JSON, 'category taxonomy'),
         'created_at': TIME,
         'display_label': TEXT,
         'edge_id': KEY,
         'evidence_grade': TEXT,
         'expires_at': TIME,
-        'human_review': (JSON, 'the review outcome; reviewer and note fields are redacted by the scrub'),
+        'human_review': (JSON, 'the review outcome; its reviewer, reason (built from reviewer notes), note and comment fields are redacted and reviewer_decisions nulled'),
         'id': KEY,
         'label_state': TEXT,
         'last_verified_at': TIME,
@@ -726,11 +734,11 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'updated_at': TIME,
     },
     'aurora_dupe_kb': {
-        'comparables': (JSON, 'comparable products'),
+        'comparables': (JSON, 'comparable products', PRODUCT_KEYS),
         'created_at': TIME,
-        'dupes': (JSON, 'dupe products'),
+        'dupes': (JSON, 'dupe products', PRODUCT_KEYS),
         'kb_key': KEY,
-        'original': (JSON, 'the original product'),
+        'original': (JSON, 'the original product', PRODUCT_KEYS),
         'source': TEXT,
         'source_meta': (JSON, 'how the KB row was produced (model, run)'),
         'updated_at': TIME,
@@ -762,7 +770,7 @@ COLUMNS: Mapping[str, Mapping[str, Column]] = {
         'kb_key': KEY,
         'lang': TEXT,
         'last_success_at': TIME,
-        'local_brand_candidates': (JSON, 'brands sold at a destination'),
+        'local_brand_candidates': (JSON, 'brands sold at a destination', PRODUCT_KEYS),
         'month_bucket': NUM,
         'product_type_recos': (JSON, 'product types recommended for a destination'),
         'quality_flags': (JSON, 'KB quality flags'),
@@ -941,3 +949,8 @@ def column_class(table: str, column: str) -> Union[str, None]:
 def json_reason(table: str, column: str) -> Union[str, None]:
     entry = COLUMNS.get(table, {}).get(column)
     return entry[1] if isinstance(entry, tuple) else None
+
+
+def json_keep_keys(table: str, column: str) -> Tuple[str, ...]:
+    entry = COLUMNS.get(table, {}).get(column)
+    return tuple(entry[2]) if isinstance(entry, tuple) and len(entry) > 2 else ()

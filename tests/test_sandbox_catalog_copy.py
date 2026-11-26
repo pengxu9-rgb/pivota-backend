@@ -234,11 +234,13 @@ async def test_the_export_never_lists_the_drop(tmp_path):
 
         async def execute(self, *a): return "SET"
 
-        async def fetch(self, *a): return [{"column_name": "merchant_id", "type_name": "varchar"}]
+        async def fetch(self, *a):
+            return [{"column_name": "merchant_id", "type_name": "varchar", "type_kind": "b",
+                     "base_name": None, "elem_name": None, "base_elem_name": None}]
 
         async def fetchval(self, *a): return 1
 
-        async def copy_from_query(self, query, output, format):
+        async def copy_from_query(self, query, output, **kw):
             output.write(b"m1\n")
 
     spec = (C.TableSpec("catalog_merchants", "x"),)
@@ -368,6 +370,9 @@ def test_ops_free_text_reasons_are_placeholders():
 
 
 @pytest.mark.parametrize("key", [
+    "emailAddress", "email_address", "E-mail", "mail", "mobileNumber", "shipping_address", "review_notes",
+    "audit_note", "name", "signed_by_name", "handle", "request_id", "trace_id", "reason", "rationale",
+    "reviewer_decisions", "tokens", "group_by",
     "reviewed_by", "reviewedBy", "last_approved_by", "createdBy", "email", "Email", "billing_email", "emails",
     "phone", "phone_number", "contact_phone", "password", "api_key", "apiKey", "access_token", "refresh_token",
     "client_secret", "authorization", "cookie", "session_id", "sessionId", "user_id", "userId", "username",
@@ -384,14 +389,17 @@ def test_person_keys_are_recognised(key):
     "claim_text", "evidence_grade", "review_status", "review_source_url", "title", "price", "product_key",
     "shade_name", "brand", "ingredients", "market", "currency", "image_url", "source_ref", "decision",
     "display_name", "verdict", "category", "tier",
+    # a prefix-matching mutant passed these as person keys (review): whole-key match only
+    "panthenol", "ipa", "pantone", "thumbnail", "shade_name", "brand_name", "retail_price", "nail_polish",
 ])
 def test_catalog_keys_are_left_alone(key):
     assert not C.PERSON_KEY_RE.match(key)
 
 
 def test_person_values_reports_paths_never_values():
-    value = {"a": [{"reviewer": {"id": "staff-1"}}, {"email": None}, {"notes": "redacted"}], "userId": 3}
-    assert C.person_values(value) == ["$.a[0].reviewer", "$.userId"]
+    value = {"a": [{"reviewer": {"id": "staff-1"}}, {"email": None}, {"notes": "redacted"}], "userId": 3,
+             "note2": "write to a@b.example", "ok": "fine"}
+    assert C.person_values(value) == ["$.a[0].reviewer", "$.userId", "$.note2"]
 
 
 def test_a_json_typed_column_must_be_classified_json():
@@ -402,3 +410,68 @@ def test_a_json_typed_column_must_be_classified_json():
         C.plan_columns(spec, ["merchant_id", "merchant_name"], {"merchant_name": "jsonb"})
     with pytest.raises(C.CopyRefused, match="type is unknown"):
         C.plan_columns(spec, ["merchant_id", "metadata_json"])
+
+
+# --- SF3/SF4 (review of 6314c488e) --------------------------------------------------------------
+
+
+def test_scrub_json_nulls_containers_and_redacts_strings_under_person_keys():
+    value = {"human_review": {"decision": "approved", "reason": "per my call with Jo",
+                              "reviewer_decisions": [{"by": "staff-1"}]}, "tokens": ["a"], "price": 1}
+    new, changed = C.scrub_json(value)
+    assert changed and new == {"human_review": {"decision": "approved", "reason": "redacted",
+                                                "reviewer_decisions": None}, "tokens": None, "price": 1}
+    assert C.person_values(new) == []
+
+
+def test_product_data_columns_keep_product_names_and_handles():
+    value = {"name": "Lip Tint", "handle": "lip-tint", "options": [{"name": "Shade"}], "reviewed_by": "x"}
+    new, _ = C.scrub_json(value, COLS.PRODUCT_KEYS)
+    assert new == {"name": "Lip Tint", "handle": "lip-tint", "options": [{"name": "Shade"}], "reviewed_by": "redacted"}
+    assert COLS.json_keep_keys("catalog_products", "product_payload") == COLS.PRODUCT_KEYS
+    assert COLS.json_keep_keys("relationship_candidate_labels", "human_review") == ()
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("mail me at a.b@c.example", "mail me at [redacted]"),
+    ("call +1 555 010 0199 now", "call [redacted] now"),
+    ("call 010-1234-5678", "call [redacted]"),
+    ("call (02) 555-0100", "call [redacted]"),
+    ("Size 100 ml, 2026-11-26, GTIN 8809123456789, SPF 50+", "Size 100 ml, 2026-11-26, GTIN 8809123456789, SPF 50+"),
+])
+def test_contact_details_in_text_are_redacted_and_catalog_text_is_not(text, expected):
+    assert C.redact_text(text) == expected
+
+
+def test_the_ingredient_research_kb_copies_only_ready_short_rows():
+    spec = next(s for s in C.CATALOG_TABLES if s.name == "aurora_ingredient_research_kb")
+    assert spec.where == "status = 'ready' AND char_length(query_norm) <= 64"
+
+
+async def test_the_export_query_and_its_count_both_carry_the_where(tmp_path):
+    seen = []
+
+    class FakeConn:
+        def transaction(self, **kw):
+            class T:
+                async def __aenter__(self): return None
+                async def __aexit__(self, *a): return False
+            return T()
+
+        async def execute(self, *a): return "SET"
+
+        async def fetch(self, *a):
+            return [{"column_name": "kb_key", "type_name": "text", "type_kind": "b",
+                     "base_name": None, "elem_name": None, "base_elem_name": None}]
+
+        async def fetchval(self, query, *a):
+            seen.append(query)
+            return 1
+
+        async def copy_from_query(self, query, output, **kw):
+            seen.append(query)
+            output.write(b"k1\n")
+
+    spec = (next(s for s in C.CATALOG_TABLES if s.name == "aurora_ingredient_research_kb"),)
+    await C.export_catalog(FakeConn(), C.LocalDirStore(tmp_path), stamp="20261126T0100Z", specs=spec)
+    assert len(seen) == 2 and all(q.endswith("WHERE status = 'ready' AND char_length(query_norm) <= 64") for q in seen)

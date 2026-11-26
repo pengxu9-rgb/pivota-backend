@@ -37,16 +37,30 @@ time and **refuses**, before anything is uploaded:
   headers, ...) unless the spec drops, replaces or allows it;
 * a JSON-typed column that is not classified JSON, or the other way round.
 
-**JSON columns** (113) each carry the reason they are catalog data, and are copied through a
-person-key scrub in the export's own SELECT: at any depth, a key that names a person, a secret or
-free text (`*by` such as reviewed_by / createdBy, email, phone, token, secret, api_key, session_id,
-user/userId, customer_*, employee_*, reviewer*, contact*, names, address, ip, card fields, notes,
-comments, raw_payload, headers, webhook_url, ...) has its string value replaced by `"redacted"` and
-any other scalar by null. A string, not null: the gateway serves a `product_evidence` claim only when
-`reviewed_by` is a non-empty string. The export then parses its own output and refuses if any person
-key still holds anything else (for example an object, or a `\u`-escaped key in a `json` column); the
-import checks every file again before touching the database. The manifest (format 2) lists each
-table's `json_columns`; the import refuses format 1 (an export from before the scrub).
+**JSON columns** (113) each carry the reason they are catalog data. The export reads each table
+with `COPY ... (FORMAT csv, NULL <a random token>)` and scrubs it in Python before anything is
+uploaded (`scrub_csv`):
+
+* at any depth, a key that names a person, a secret, a request or free text (`*by` / `*_by_*` such as
+  reviewed_by, createdBy, signed_by_name; `*mail*`, `*address*`, `*phone*`, mobile*; token, secret,
+  api_key, session/request/trace id; user, customer_*, employee_*, reviewer*, contact*, name, handle;
+  notes, comments, reason, rationale; card fields, raw_payload, headers, webhook_url, ...) has a
+  string value replaced by `"redacted"` (a string: the gateway serves a `product_evidence` claim
+  only when `reviewed_by` is a non-empty string) and ANY other value, objects and arrays included,
+  by null. A JSON column of product data keeps a product's or option's `name` and its `handle`;
+* email- and phone-shaped parts of every other JSON string and of every text column become
+  `[redacted]` (a brand's support address in a description, a contact under a catalog-named key);
+* the export then checks its own output and refuses on anything left, and on an email-shaped value
+  in any other column (a key or URL); the manifest's `email_like_values` is 0 by construction and
+  the import refuses one that is not;
+* a rewritten JSON cell keeps its numbers' own text (2.50 stays 2.50); an untouched cell keeps its
+  bytes. NULL and the empty string stay distinct;
+* an array of JSON or a domain over JSON is refused (review it first).
+
+The import checks every file again before touching the database. The manifest (format 2) lists
+each table's `json_columns`; the import refuses format 1 (an export from before the scrub).
+`aurora_ingredient_research_kb` copies only `status = 'ready'` rows with a `query_norm` of at most 64
+characters (it is built from a user's ingredient query).
 
 | table | why | dropped / restricted |
 |---|---|---|
@@ -135,9 +149,8 @@ placeholder and `realtime_enabled=false` itself.
 
 ## Known limits
 
-* The JSON scrub works on key names. A person's details under a catalog-named key (an email inside
-  a product description) are not caught by it; the manifest's `email_like_values` per table stays as
-  a review signal for the first prod export.
+* The scrub knows people by key names and by email/phone shapes. A person's name under a
+  catalog-named key (free text that is neither) is not caught; the key list is broad for that reason.
 * A first prod export may refuse on a column the classification does not list (prod drift), on a
   risky name, or on a person key holding an object; that is the rule working. Classify, drop or
   scrub it in its own reviewed change.
