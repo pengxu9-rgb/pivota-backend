@@ -84,7 +84,7 @@ async def _columns(database, table: str):
         "SELECT column_name, data_type, is_nullable, column_default, character_maximum_length "
         "FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = :t "
         "ORDER BY ordinal_position", {"t": table})
-    return [tuple(r) for r in rows]
+    return [tuple(r._mapping.values()) for r in rows]
 
 
 async def _constraints(database, table: str, renames):

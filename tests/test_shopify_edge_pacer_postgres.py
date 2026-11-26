@@ -66,7 +66,7 @@ _KEY_SQL = """
 
 
 async def _catalog(database):
-    cols = [tuple(r) for r in await database.fetch_all(_CATALOG_SQL, {"t": _TABLE})]
+    cols = [tuple(r._mapping.values()) for r in await database.fetch_all(_CATALOG_SQL, {"t": _TABLE})]
     keys = [r[0] for r in await database.fetch_all(_KEY_SQL, {"t": _TABLE})]
     return cols, keys
 
