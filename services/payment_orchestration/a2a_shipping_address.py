@@ -16,7 +16,7 @@ THE FIELDS are the door's own (the Reap client's vocabulary): email, firstName, 
 addressLine1, addressLine2 (optional), city, region, postalCode, country. The country must be a market switched on
 for the rail (a2a_markets.enabled_markets, `A2A_RAIL_MARKETS`, the US only by default). Each market has its own
 region and postcode rules (a2a_markets.MARKETS): the US takes one of the 50 states or DC (territories refused) and
-a ZIP (12345 or 12345-6789); a market with no region (SG) refuses one, and in NZ it is optional.
+a ZIP (12345 or 12345-6789); a market with no region (SG) refuses one, and in some (NZ, KR, TW) it is optional.
 
 CAPTURE (`capture_enabled`) is ONE predicate, read by the door, the view and the worker alike: the internal read's
 dial AGENPAS_INTERNAL_READ_ENABLED (whose router carries the write) AND the checkout step AND the token step AND

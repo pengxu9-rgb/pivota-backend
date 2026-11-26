@@ -152,13 +152,15 @@ class Stubs:
     def __init__(self):
         self.reap = []
         self.clicks = []
+        self.catalog_currency = []  # the `market_currency` the A2A route priced the cart link in
 
 
 @pytest.fixture(autouse=True)
 def stubs(monkeypatch):
     s = Stubs()
 
-    async def _catalog(*, merchant_domain, product_key, variant_key, market_country):
+    async def _catalog(*, merchant_domain, product_key, variant_key, market_country, market_currency=None):
+        s.catalog_currency.append(market_currency)
         return dict(FACTS), "merch_obs_shop_a", VARIANT, "brand_official"
 
     async def _click(click):
@@ -782,7 +784,7 @@ async def test_the_door_refuses_a_market_that_is_not_on_if_the_router_ever_lets_
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []
 
 
-async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch):
+async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch, stubs):
     monkeypatch.setenv("A2A_RAIL_MARKETS", "US,JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,JPY:30000")
@@ -793,6 +795,7 @@ async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert (row["currency"], row["our_price_minor"]) == ("JPY", 4650)
     assert row["shipping_address"]["region"] == "13" and row["shipping_address"]["country"] == "JP"
+    assert stubs.catalog_currency == ["JPY"]  # the cart link is priced in the market's own currency
     bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY",
                                                idempotency_key="key-2"))
     assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
@@ -847,4 +850,43 @@ async def test_with_canada_on_a_canadian_address_shown_in_dollars_is_refused_by_
         resp = await _http("POST", BASE, json=_body(address=CA_FORM_ADDRESS, payment_preference={"rail": "a2a"}))
     assert resp.status_code == 404 and _error(resp) == "not_available_on_this_rail", resp.text
     assert any("currency_market_mismatch" in r.getMessage() for r in caplog.records)
+
+
+KR_ADDRESS = {"firstName": "Minneedle", "lastName": "Examplenee", "phone": "+82212345678",
+              "addressLine1": "1 Needle-ro", "city": "Jongno-gu", "region": "11", "postalCode": "03154",
+              "country": "KR"}
+
+
+def _kr_on(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,KR")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:KR")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,KRW:300000")
+    monkeypatch.setitem(FACTS, "currency", "KRW")
+    monkeypatch.setitem(FACTS, "market_country", "KR")
+
+
+async def test_a_won_purchase_is_priced_in_won_though_the_reap_lane_does_not_sell_in_korea(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    assert "KR" not in reap_routes._MARKET_CURRENCY  # the Reap lane's markets, and the directory's, are unchanged
+    resp = await _http("POST", BASE, json=_body(address=KR_ADDRESS, expected_currency="KRW"))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert (row["currency"], row["shipping_address"]["country"]) == ("KRW", "KR")
+    assert stubs.catalog_currency == ["KRW"]
+
+
+async def test_with_no_address_a_won_purchase_takes_korea_as_its_market(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    pid = await _create(email=None, expected_currency="KRW")
+    assert (await a2a_ledger.get_purchase_internal(pid))["currency"] == "KRW"
+    assert stubs.catalog_currency == ["KRW"]
+
+
+async def test_while_korea_is_off_a_won_purchase_is_not_taken_by_the_a2a_rail(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US")
+    resp = await _http("POST", BASE, json=_body(address=KR_ADDRESS, expected_currency="KRW"))
+    # The router drops the rail (currency_unsupported) and hands the request to Reap, as for any market it is off for.
+    assert resp.json().get("handled_by") == "reap", resp.text
+    assert stubs.catalog_currency == []
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []

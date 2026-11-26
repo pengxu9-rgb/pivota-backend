@@ -74,6 +74,13 @@ class _LedgerUnavailable(Exception):
     """The agent_purchases table could not be read (missing, or the database refused)."""
 
 
+def _purchase_market_currency() -> Dict[str, str]:
+    """Market -> currency for a purchase with no address: the Reap lane's markets and the A2A rail's
+    (a2a_markets.MARKETS), each currency naming one market. A market only the A2A rail prices (KR, TW) that is not
+    switched on goes to Reap, which refuses it without an address."""
+    return {**reap_routes._MARKET_CURRENCY, **{m: a2a_markets.currency_for(m) for m in a2a_markets.MARKETS}}
+
+
 def _ledger_unavailable() -> JSONResponse:
     return JSONResponse(status_code=503, content={"error": "ledger_unavailable"})
 
@@ -414,7 +421,7 @@ async def create_purchase(
             if market_country is None:
                 raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
         else:
-            market_country = shipping_capture.market_for_currency(req.expected_currency, reap_routes._MARKET_CURRENCY)
+            market_country = shipping_capture.market_for_currency(req.expected_currency, _purchase_market_currency())
             if market_country is None:
                 raise reap_svc.PurchaseRefused(
                     shipping_capture.SHIPPING_MARKET_UNKNOWN, "no shipping address and no currency naming one market")
@@ -551,7 +558,8 @@ async def _open_a2a_purchase(
             variant_id=req.variant_id, market_country=market_country)
     reap_routes._refuse_named_placeholder(variant_key, product_key)
     facts, seller_ref, variant_id, seed_kind = await reap_routes._load_cart_link_item(
-        merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country)
+        merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country,
+        market_currency=a2a_markets.currency_for(market_country))
     # A selected variant is bought as itself or not at all (`variant_id` above is the PROVEN one).
     reap_routes._require_selected_variant(variant_id, req.variant_id)
     unit_minor, currency = facts["our_price_minor"], facts["currency"]

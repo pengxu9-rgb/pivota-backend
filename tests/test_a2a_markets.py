@@ -1,8 +1,8 @@
 """services/payment_orchestration/a2a_markets.py: which markets the A2A rail takes, and each one's address rules.
 
 Pinned here: unset means the US only (the rail as before); the env is the whole list, and a code outside the table
-turns nothing on; every market's currency is the market registry's; South Korea, Taiwan and Hong Kong are not
-in the table yet; each market's
+turns nothing on; every market's currency is the market registry's; Hong Kong is not in the table; KR and TW are
+priced in their own currency without joining the Reap lane's market map; each market's
 region and postcode rules, as the door and the address write read them; and the router takes a currency only
 while its market is on.
 """
@@ -31,6 +31,8 @@ VALID = {
     "NZ": {"region": "AUK", "postalCode": "1010"},
     "SG": {"postalCode": "018989"},
     "JP": {"region": "13", "postalCode": "100-0001"},
+    "KR": {"region": "11", "postalCode": "04524"},
+    "TW": {"region": "TPE", "postalCode": "100"},
 }
 
 
@@ -56,18 +58,31 @@ def test_unset_is_the_us_only_and_the_env_is_the_whole_list(monkeypatch, raw, ex
     assert markets.enabled_markets() == frozenset(expected)
 
 
-def test_every_market_is_the_registrys_with_its_currency_and_three_are_not_in_the_table_yet():
-    assert set(markets.MARKETS) == {"US", "CA", "AU", "NZ", "SG", "JP"}
+def test_every_market_is_the_registrys_with_its_currency_and_hong_kong_is_not_in_the_table():
+    assert set(markets.MARKETS) == {"US", "CA", "AU", "NZ", "SG", "JP", "KR", "TW"}
     for market in markets.MARKETS:
         assert markets.currency_for(market) == market_registry.currency_for(market), market
-    for market in ("HK", "KR", "TW", "GB"):
+    for market in ("HK", "GB"):
         assert markets.currency_for(market) is None, market
+    assert market_registry.market("TW")["status"] == "off"  # listed for its currency, served nowhere
+
+
+def test_the_reap_lanes_markets_are_unchanged_and_only_the_a2a_rail_prices_korea_and_taiwan():
+    import routes.agent_commerce_reap as reap_routes
+
+    assert set(reap_routes._MARKET_CURRENCY) == {"US", "CA", "GB", "AU", "SG", "HK", "JP", "NZ"}
+    for market in reap_routes._MARKET_CURRENCY:  # a caller that names no currency is priced as before
+        assert reap_routes._cart_market_currency(market, None) == reap_routes._MARKET_CURRENCY[market]
+    assert reap_routes._cart_market_currency("KR", None) is None
+    assert reap_routes._cart_market_currency("KR", markets.currency_for("KR")) == "KRW"
+    assert reap_routes._cart_market_currency("TW", markets.currency_for("TW")) == "TWD"
+    assert reap_routes._cart_market_currency("US", "CAD") == "CAD"  # a caller's currency always wins
 
 
 def test_the_enabled_currencies_follow_the_markets(monkeypatch):
     assert markets.enabled_currencies() == frozenset({"USD"})
-    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA,AU,NZ,SG,JP,KR,TW")  # KR and TW are not in the table: ignored
-    assert markets.enabled_currencies() == frozenset({"USD", "CAD", "AUD", "NZD", "SGD", "JPY"})
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA,AU,NZ,SG,JP,KR,TW")
+    assert markets.enabled_currencies() == frozenset({"USD", "CAD", "AUD", "NZD", "SGD", "JPY", "KRW", "TWD"})
 
 
 @pytest.mark.parametrize("country", sorted(VALID))
@@ -91,14 +106,22 @@ def test_a_valid_address_passes_its_markets_rules(country):
     ("JP", {"region": None}, {"region": "required"}),
     ("JP", {"postalCode": "1000001"}, {}),
     ("JP", {"postalCode": None}, {"postalCode": "required"}),
+    ("KR", {"region": None}, {}),
+    ("KR", {"region": "51"}, {}),
+    ("KR", {"region": "99"}, {"region": "invalid"}),
+    ("KR", {"postalCode": "045240"}, {"postalCode": "invalid"}),
+    ("TW", {"postalCode": "10048"}, {}),
+    ("TW", {"postalCode": "1004"}, {"postalCode": "invalid"}),
+    ("TW", {"region": "TPQ"}, {"region": "invalid"}),
+    ("TW", {"postalCode": None}, {"postalCode": "required"}),
 ])
 def test_each_markets_region_and_postcode_rules(country, over, errors):
     assert dict(markets.address_errors(_address(country, **over))) == errors
 
 
 @pytest.mark.parametrize("country,region_listed", [
-    ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("HK", True), ("KR", True),
-    (None, True),
+    ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False), ("TW", False),
+    ("HK", True), (None, True),
 ])
 def test_fields_missing_asks_for_a_region_only_where_the_market_requires_one(country, region_listed):
     address = {"country": country} if country else {}

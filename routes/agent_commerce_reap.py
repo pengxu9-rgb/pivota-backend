@@ -701,6 +701,13 @@ _MERCHANT_ROW = ledger.ELIGIBILITY_MERCHANT_ROW
 _PRICED_MARKETS = ("US", "CA", "GB", "AU", "SG", "HK", "JP", "NZ")
 _MARKET_CURRENCY: Dict[str, str] = {market: market_registry.currency_for(market) for market in _PRICED_MARKETS}
 
+
+def _cart_market_currency(market_country: str, market_currency: Optional[str]) -> Optional[str]:
+    """The currency a cart link is priced in: the caller's `market_currency` when it gives one (the A2A rail
+    passes its own market's, services/payment_orchestration/a2a_markets.currency_for, for markets this lane does
+    not sell in), else this lane's map. A caller that gives none is priced exactly as before."""
+    return market_currency if market_currency is not None else _MARKET_CURRENCY.get(market_country)
+
 #: THE STORED DOMAIN IS CANONICALISED IN THE SQL, not trusted to be canonical.
 #:
 #: `:merchant_domain` is `_merchant_domain_key`'s output. The column is folded by the SAME rule
@@ -1852,7 +1859,7 @@ def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
 
 async def _load_enrichment_cart_link_item(
     *, product: Dict[str, Any], merchant_host: str, variant_key: Optional[str],
-    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None, market_currency: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """`_load_cart_link_item` for an ENRICHMENT row: the same four-tuple, or a refusal.
 
@@ -1943,7 +1950,7 @@ async def _load_enrichment_cart_link_item(
     if len(offers) > _CART_ENRICHMENT_MAX_OFFERS:
         raise svc.PurchaseRefused("row_price_ambiguous", "too many offers for one listing")
     listing = [offer for offer in offers if _enrichment_listing_offer(offer, shop_host, handle)]
-    market_currency = str(_MARKET_CURRENCY.get(market_country) or "").upper()
+    market_currency = str(_cart_market_currency(market_country, market_currency) or "").upper()
     priced, price_minor, price_reason = enrichment_offer_price_ok(listing, proof, market_currency)
     if not priced:
         raise svc.PurchaseRefused(price_reason, "enrichment offer price refused")
@@ -1965,7 +1972,7 @@ async def _load_enrichment_cart_link_item(
 
 async def _load_cart_link_item(
     *, merchant_domain: str, product_key: str, variant_key: Optional[str],
-    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None, market_currency: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
@@ -1979,6 +1986,9 @@ async def _load_cart_link_item(
 
     `priced_sku`, when given, is filled with the `sku_key` of the sku this load PRICED (on success
     only): the one a no-key load chose, which `/purchases/prepare` names in its witness.
+
+    `market_currency`, when given, is the currency the market is priced in (`_cart_market_currency`); this
+    lane's own callers give none.
     """
     from services.exact_retailer_cohorts import PROTECTED_RETAILER_LISTING_KEYS
 
@@ -1993,6 +2003,7 @@ async def _load_cart_link_item(
             return await _load_enrichment_cart_link_item(
                 product=dict(enrichment), merchant_host=merchant_domain,
                 variant_key=variant_key, market_country=market_country, priced_sku=priced_sku,
+                market_currency=market_currency,
             )
     raw = await database.fetch_one(
         _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
@@ -2138,7 +2149,7 @@ async def _load_cart_link_item(
         return dict(candidate), found, cur, ledger.amount_minor_or_none(found.get("price"), cur)
 
     offer_params = {"product_key": product_key, "merchant_id": seller_ref,
-                    "market_currency": _MARKET_CURRENCY.get(market_country)}
+                    "market_currency": _cart_market_currency(market_country, market_currency)}
     priced: List[Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]] = []
     for candidate in candidates:
         if mirror_placeholder is not None and candidate["sku_key"] == mirror_placeholder["sku_key"]:
@@ -2166,7 +2177,7 @@ async def _load_cart_link_item(
         # variant's own sku offer is its price. The product-level `::canonical` placeholder offer
         # stands in only under a SOLE proof (one live variant), never here.
         raise svc.PurchaseRefused("row_unpriced", "no offer on the proven variant's own sku")
-    if currency != _MARKET_CURRENCY.get(market_country):
+    if currency != _cart_market_currency(market_country, market_currency):
         raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
     if not price_minor or price_minor <= 0:
         raise svc.PurchaseRefused("row_unpriced", "offer price is not an exact minor amount")

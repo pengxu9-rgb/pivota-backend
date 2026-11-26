@@ -11,7 +11,7 @@ US off.
 A MARKET IS SWITCHED ON ONLY AFTER ITS OWN SANDBOX MEASURE (docs/agent_purchases_routes.md, "A2A markets"). The
 provider's `token-setup` takes `amount_cents` with no currency field. This module assumes the amount is in the
 currency's ISO 4217 minor units, which is how every amount here is stored (`utils/money`,
-`db/reap_agentic_ledger.amount_minor_or_none`): yen are whole units, the rest are hundredths. One sandbox
+`db/reap_agentic_ledger.amount_minor_or_none`): yen and won are whole units, the rest are hundredths. One sandbox
 token per currency must echo the cap we sent before that market goes on. Until then a wrong reading would set
 the cap 100 times too high or too low.
 
@@ -26,11 +26,11 @@ THE ADDRESS RULES. Each market says:
   - `postal`: the postcode's pattern. Every market here has one, because the provider's checkout requires
     `zip_code` (a2a_rail.CHECKOUT_SHIPPING_REQUIRED).
 
+PRICING. The rail prices a cart link through the Reap lane's loader, passing its own market's currency
+(`currency_for`, routes/agent_commerce_reap._cart_market_currency). So KR and TW are priced here without being in
+the Reap lane's map, which is also the merchant directory's list of Reap's agentic markets.
+
 NOT HERE, ON PURPOSE:
-  - South Korea and Taiwan. The rail prices a cart link through the Reap lane's market map
-    (routes/agent_commerce_reap._MARKET_CURRENCY), which is also what the merchant directory advertises as Reap's
-    agentic markets. They are added once that map is split, so the A2A rail can price them without Reap
-    advertising them.
   - Hong Kong. Its addresses have no postcode and the provider's checkout requires `zip_code`. It is added
     once the provider says what to send.
   - FX. No amount is ever converted: a purchase is priced, capped, minted and checked in its market's currency.
@@ -66,6 +66,13 @@ NZ_REGIONS = frozenset({"AUK", "BOP", "CAN", "CIT", "GIS", "HKB", "MBH", "MWT", 
                         "TAS", "TKI", "WGN", "WKO", "WTC"})
 #: The 47 prefectures, by their JIS / ISO 3166-2:JP number.
 JP_REGIONS = frozenset(f"{n:02d}" for n in range(1, 48))
+#: The provinces and metropolitan cities. 42 (Gangwon) and 45 (Jeonbuk) were renumbered 51 and 52 in 2023 and
+#: 2024; both spellings are accepted, as addresses written before then still use them.
+KR_REGIONS = frozenset({"11", "26", "27", "28", "29", "30", "31", "41", "42", "43", "44", "45", "46", "47", "48",
+                        "49", "50", "51", "52"})
+#: The counties and cities.
+TW_REGIONS = frozenset({"CHA", "CYI", "CYQ", "HSQ", "HSZ", "HUA", "ILA", "KEE", "KHH", "KIN", "LIE", "MIA", "NAN",
+                        "NWT", "PEN", "PIF", "TAO", "TNN", "TPE", "TTT", "TXG", "YUN"})
 
 REGION_REQUIRED, REGION_OPTIONAL, REGION_NONE = "required", "optional", "none"
 
@@ -82,6 +89,8 @@ MARKETS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
     "NZ": _market(REGION_OPTIONAL, NZ_REGIONS, r"^[0-9]{4}\Z"),
     "SG": _market(REGION_NONE, None, r"^[0-9]{6}\Z"),
     "JP": _market(REGION_REQUIRED, JP_REGIONS, r"^[0-9]{3}-?[0-9]{4}\Z"),
+    "KR": _market(REGION_OPTIONAL, KR_REGIONS, r"^[0-9]{5}\Z"),
+    "TW": _market(REGION_OPTIONAL, TW_REGIONS, r"^[0-9]{3}(?:[0-9]{2,3})?\Z"),
 })
 
 
