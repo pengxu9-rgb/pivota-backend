@@ -442,6 +442,56 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
     return matched_shape(data, ceiling) is None  # rule 2
 
 
+# ── a purchase in another currency than USD (no measured shape yet) ─────────────────────────────────────
+
+#: A number followed by a currency word written in letters, not a symbol: "1,500円", "15,000원", "1万円", "1만원",
+#: "100元". Only digits and grouping commas between, so "2 円山町" (a Japanese place name after a block number,
+#: with a space) is not one. ¥, ￥, ₩ and the other symbols are Unicode Sc: `_money_pattern` catches them already.
+_LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:円|圓|圆|元|원|엔)")
+
+
+def text_amount_shaped(text: Any) -> bool:
+    """For a purchase in a currency other than USD: whether `text` shows anything that may be an amount, in ANY
+    currency or spelling. There is no measured non-USD confirm card or prose yet, so no amount in it can be
+    verified against the ceiling: the caller refuses on any. That is a currency mark or ISO code next to a
+    number, a two- or three-decimal or decimal-comma number, a total word before a number, a plural currency
+    word, a non-ASCII digit (`_money_pattern`, `_prose_money`), or a number followed by 円 / 원 / 元 and the
+    like. Pure; never raises."""
+    if not isinstance(text, str) or not text:
+        return False
+    try:
+        normal = normalise(text)
+        return bool(_money_pattern(normal) or _prose_money(normal) or _LETTER_CURRENCY_AFTER_DIGIT_RE.search(normal))
+    except Exception:  # noqa: BLE001 - unreadable text is refused
+        return True
+
+
+def _letter_currency_anywhere(data: Any, depth: int = 0) -> bool:
+    """Whether any string leaf or key in `data` holds a number followed by a letter currency word (bounded)."""
+    if depth > CARD_SCAN_MAX_DEPTH:
+        return True
+    if isinstance(data, str):
+        return bool(_LETTER_CURRENCY_AFTER_DIGIT_RE.search(normalise(data)))
+    if isinstance(data, Mapping):
+        return any(_letter_currency_anywhere(k, depth + 1) or _letter_currency_anywhere(v, depth + 1)
+                   for k, v in data.items())
+    if isinstance(data, (list, tuple)):
+        return any(_letter_currency_anywhere(v, depth + 1) for v in data)
+    return False
+
+
+def confirm_card_refused_outside_usd(data: Any) -> bool:
+    """For a purchase in a currency other than USD: True unless the card shows NOTHING money-like (rule 1, plus a
+    number followed by a letter currency word). No rule-2 shape is accepted: none has been measured in another
+    currency, so a card with any amount is refused, whatever its `currency` says. Pure."""
+    if not isinstance(data, Mapping):
+        return True
+    try:
+        return money_like(data) or _letter_currency_anywhere(data)
+    except (_Refused, RecursionError):
+        return True
+
+
 # ── the prose (`text_refused`) ──────────────────────────────────────────────────────────────────
 
 #: Words that make a nearby number in the answer's prose an amount.

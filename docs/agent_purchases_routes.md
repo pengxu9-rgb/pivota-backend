@@ -513,28 +513,37 @@ door, the address write, the router, the worker's token and ceiling steps and th
 
 - **Switched on by config, one market at a time.** `A2A_RAIL_MARKETS` (comma-separated, read per call, on
   web and worker alike) names the markets that are on. Unset or blank: the US only, exactly as before. A code
-  not in the table is ignored. Set to anything, it is the whole list (`CA` alone switches the US off).
+  not in the table is ignored and logged as a WARNING (`USA` turns the US off: check the log after a change).
+  Set to anything, it is the whole list (`CA` alone switches the US off).
+- **Currency is the market's.** The router takes the rail only when the shown currency is the market's own
+  (`currency_market_mismatch` otherwise: a Canadian address shown in USD never takes it). The address write
+  refuses a country other than the market of the purchase's currency (`country: unsupported`), and the worker
+  refuses one before anything is minted (`shipping_market_mismatch`) and never builds the relay with one.
 - **The table:** US, CA, AU, NZ, SG, JP. Each market's currency is the market registry's
   (`config/market_registry.json`). Not yet in it: South Korea and Taiwan, which the rail can price only once the
   Reap lane's market map (also the directory's list of Reap's agentic markets) is split; and Hong Kong, whose
   addresses have no postcode while the provider's checkout requires `zip_code`.
 - **Addresses.** `region` is the ISO 3166-2 subdivision code without the country prefix. It is required in
   the US, CA, AU and JP (and sent as `state`), optional in NZ, and refused in SG. Every market
-  needs a postcode in its own format.
+  needs a postcode in its own format. Outside the US these rules apply with shipping-address capture off too.
 - **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
   minor units (yen are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
   already (`USD:3000,CAD:4000`). The ceiling's three envs (`A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS`,
   `A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR`, `A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR`) take `CUR:value`
-  entries too. A bare value is USD's, as before, and the defaults are USD's only. Any other currency needs its
-  own entry in all three, or its purchases are refused `checkout_ceiling_unconfigured`.
+  entries too. A bare value is USD's, as before, and only as the first entry; the defaults are USD's only. A
+  thousands separator ("2,000") or any other stray entry makes the whole value unusable (logged): USD takes
+  its default, as a bad value did before, and every other currency is refused. Any other currency needs its
+  own usable entry in all three, or its purchases are refused `checkout_ceiling_unconfigured`.
 - **The final total.** The worker completes a checkout only on a total it can read in the purchase's currency
   (`a2a_rail_worker.checkout_total_minor`). Outside USD it reads only marks that name one currency: the ISO
   code ("CAD 25.00", "25.00 CAD") and symbols no other currency uses (CA$, C$, A$, AU$, NZ$, SG$, S$, JP¥,
   円). A bare "$" or "¥" is not read. Any other spelling is held for a human
   (`checkout_total_*`), never guessed.
-- **The confirm card and the setup prose** (`checkout_amounts`) are unchanged and read amounts as USD. A card
-  that shows no amount (the measured card) proceeds on the token cap. A card or prose that shows an amount in
-  another currency's code is refused before anything is submitted.
+- **The confirm card and the setup prose.** USD purchases are read exactly as before (`checkout_amounts`). In
+  any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
+  in any currency or script ("$15.00", "1,500円", "15,000원"), is refused before anything is submitted
+  (`confirm_card_refused_outside_usd`, `text_amount_shaped`). A card that shows no amount (the measured card)
+  proceeds on the token cap.
 
 **Before a market goes on**, in the sandbox, for that currency:
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor

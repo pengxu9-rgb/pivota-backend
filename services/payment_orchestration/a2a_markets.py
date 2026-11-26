@@ -38,12 +38,15 @@ NOT HERE, ON PURPOSE:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from types import MappingProxyType
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
 from services import market_registry
+
+logger = logging.getLogger(__name__)
 
 MARKETS_ENV = "A2A_RAIL_MARKETS"
 #: The rail as it was before this table: the US only. Also the answer when `A2A_RAIL_MARKETS` is unset.
@@ -82,18 +85,44 @@ MARKETS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
 })
 
 
+#: The distinct unusable `A2A_RAIL_MARKETS` values already warned about (bounded), so a typo is loud once per process.
+_WARNED: set = set()
+
+
 def enabled_markets() -> FrozenSet[str]:
-    """The markets switched on (`A2A_RAIL_MARKETS`), each one in `MARKETS`. Unset or blank: the US only."""
+    """The markets switched on (`A2A_RAIL_MARKETS`), each one in `MARKETS`. Unset or blank: the US only. A code
+    outside `MARKETS` ("USA", "HK") turns nothing on and is logged as a WARNING, once per value per process."""
     raw = os.getenv(MARKETS_ENV)
     if raw is None or not raw.strip():
         return frozenset(DEFAULT_MARKETS)
-    return frozenset(code for code in (part.strip().upper() for part in raw.split(",")) if code in MARKETS)
+    codes = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    unknown = sorted({code for code in codes if code not in MARKETS})
+    if unknown and raw not in _WARNED and len(_WARNED) < 32:
+        _WARNED.add(raw)
+        # WARNING, not INFO: prod drops module-logger INFO. Codes are config, never a secret.
+        logger.warning("a2a_markets: %s names markets that are not in the table and are ignored: %s",
+                       MARKETS_ENV, ",".join(code[:8] for code in unknown[:10]))
+    return frozenset(code for code in codes if code in MARKETS)
 
 
 def currency_for(market: Any) -> Optional[str]:
     """The market's currency (the market registry's), or None for a market not in `MARKETS`."""
     code = str(market or "").strip().upper()
     return market_registry.currency_for(code) if code in MARKETS else None
+
+
+def market_for_currency(currency: Any) -> Optional[str]:
+    """The one market in `MARKETS` whose currency is `currency`, or None (none, or not one). Never a default."""
+    code = str(currency or "").strip().upper()
+    found = [market for market in MARKETS if currency_for(market) == code]
+    return found[0] if len(found) == 1 else None
+
+
+def address_matches_currency(address: Any, currency: Any) -> bool:
+    """Whether the address's country is the market of the purchase's currency: a CAD purchase ships to Canada
+    only. An address with no country, or a currency with no one market here, does not match."""
+    country = str(address.get("country") or "").strip().upper() if isinstance(address, Mapping) else ""
+    return bool(country) and country == market_for_currency(currency)
 
 
 def enabled_currencies() -> FrozenSet[str]:

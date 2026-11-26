@@ -353,7 +353,7 @@ def _setup(**over):
     values = dict(checkout_url="https://merchant.example/cart/40000000001:1", shipping={
         "email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100", "country": "US",
         "address1": "1 Main St", "city": "Austin", "state": "TX", "zip_code": "78701"},
-        cardholder_name="Pat Example", idempotency_key="pvt-ap_000000000000000000000001-checkout")
+        cardholder_name="Pat Example", idempotency_key="pvt-ap_000000000000000000000001-checkout", currency="USD")
     values.update(over)
     return a2a_rail.CheckoutSetup(**values)
 
@@ -2947,7 +2947,8 @@ async def test_the_card_name_is_never_empty_when_it_is_sent(name):
 
 def test_the_card_name_is_the_buyers_first_and_last_name_from_the_shipping_contact():
     row = {"id": "ap_" + "0" * 24, "buyer_email": EMAIL, "shipping_address": ADDRESS,
-           "checkout_url": "https://merchant.example/cart/40000000001:1", "quoted_total_minor": TOTAL}
+           "checkout_url": "https://merchant.example/cart/40000000001:1", "quoted_total_minor": TOTAL,
+           "currency": "USD"}  # every stored row has its currency; the relay pairs it with the address's market
     assert worker._checkout_setup(row).cardholder_name == "Pat Example"
 
 
@@ -4886,3 +4887,164 @@ async def test_a_yen_purchase_never_mints_while_its_market_is_off(monkeypatch, j
     assert await _step(rail, pid) == "failed"
     assert "payment.token-setup#submit" not in rail.actions()
     assert (await _row(pid))["last_error_code"] == "token_currency_unsupported"
+
+
+# ── review follow-ups: the address's market, and amounts outside USD ─────────────────────────────────────
+
+
+CA_ADDRESS = {
+    "firstName": "Pat", "lastName": "Example", "phone": "+16135550100", "addressLine1": "1 Example St",
+    "city": "Ottawa", "region": "ON", "postalCode": "K1A 0B1", "country": "CA",
+}
+CAD_ENV = {
+    "A2A_RAIL_MARKETS": "US,CA",
+    worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV: "1500,CAD:1500",
+    worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV: "1000,CAD:1500",
+    worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV: "20000,CAD:30000",
+    rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV: "USD:50000,CAD:30000",
+}
+
+
+@pytest.fixture
+def ca_on(monkeypatch):
+    for name, value in CAD_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+async def _cad_unlocked(address):
+    pid = (await ledger.create_purchase(
+        agent_id="agent_w", agent_user_ref_hash="h" * 64, merchant_domain="merchant.example",
+        checkout_url="https://merchant.example/cart/40000000001:1", currency="CAD", our_price_minor=4650,
+        buyer_email=EMAIL, shipping_address=address))["id"]
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA)), pid) == "method_ready"
+    return pid
+
+
+@pytest.mark.usefixtures("ca_on")
+async def test_a_cad_purchase_with_a_us_address_never_locks_or_mints():
+    pid = await _cad_unlocked(ADDRESS)  # a US (TX) address on a purchase priced in CAD
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    assert "payment.token-setup#submit" not in rail.actions()
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("failed", worker.SHIPPING_MARKET_MISMATCH)
+
+
+@pytest.mark.usefixtures("ca_on")
+async def test_a_locked_cad_purchase_with_a_us_address_never_mints():
+    pid = await _cad_unlocked(ADDRESS)
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = :t WHERE id = :i",
+                           {"o": ORDER, "t": TOTAL, "i": pid})
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    assert "payment.token-setup#submit" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == worker.SHIPPING_MARKET_MISMATCH
+
+
+@pytest.mark.usefixtures("ca_on")
+async def test_the_token_step_refuses_another_markets_address_even_past_the_lock(monkeypatch):
+    """`_start_token`'s own check, should a row reach it without the lock branch's."""
+    pid = await _cad_unlocked(CA_ADDRESS)
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = :t WHERE id = :i",
+                           {"o": ORDER, "t": TOTAL, "i": pid})
+    await database.execute("UPDATE a2a_rail_purchases SET shipping_address = :a WHERE id = :i",
+                           {"a": json.dumps(ADDRESS), "i": pid})
+    monkeypatch.setattr(worker, "_checkout_setup", lambda row: object())  # past the lock branch's checks
+    real, calls = worker.a2a_markets.address_matches_currency, []
+
+    def _lock_branch_passes(address, currency):
+        calls.append(currency)
+        return True if len(calls) == 1 else real(address, currency)  # the lock branch's call passes; the next is real
+
+    monkeypatch.setattr(worker.a2a_markets, "address_matches_currency", _lock_branch_passes)
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    assert "payment.token-setup#submit" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == worker.SHIPPING_MARKET_MISMATCH
+
+
+def test_the_relay_is_never_built_with_another_markets_address(ca_on):
+    row = {"id": "ap_0123456789abcdef01234567", "buyer_email": EMAIL, "checkout_url": "https://merchant.example/c",
+           "currency": "CAD", "quoted_total_minor": 5000}
+    assert worker._checkout_setup({**row, "shipping_address": ADDRESS}) is None
+    setup = worker._checkout_setup({**row, "shipping_address": CA_ADDRESS})
+    assert setup is not None and setup.currency == "CAD" and setup.shipping["country"] == "CA"
+    assert worker._checkout_setup({**row, "currency": "USD", "shipping_address": ADDRESS}).currency == "USD"
+
+
+def _setup_with(*datas):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(credential_fields_stripped=0, text_amounts_refused=False,
+                           cards=[SimpleNamespace(data=d) for d in datas])
+
+
+MEASURED_CARD = {"merchant": "merchant.example", "cardLast4": "3478", "cardBrand": "visa",
+                 "shipping": {"email": EMAIL, "city": "Chiyoda", "zip_code": "100-0001", "state": "13"}}
+
+
+@pytest.mark.parametrize("data,currency,ceiling,refused", [
+    ({"total": "15.00", "currency": "USD"}, "JPY", 1500, True),   # a USD total against a yen ceiling
+    ({"total": "24.00", "currency": "USD"}, "CAD", 2500, True),   # a USD total against a CAD ceiling
+    ({"total": "24.00", "currency": "CAD"}, "CAD", 2500, True),   # no measured CAD shape: refused too
+    ({"total": "1,500円"}, "JPY", 1500, True),
+    ({"note": "合計 1,500円"}, "JPY", 1500, True),
+    ({"note": "15,000원"}, "KRW", 15000, True),
+    ({"note": "1500円"}, "JPY", 1500, True),          # no grouping comma: only the letter-currency rule sees it
+    ({"note": "15000원"}, "KRW", 15000, True),
+    ({"items": ["1万円"]}, "JPY", 10000, True),
+    (MEASURED_CARD, "JPY", 1500, False),                         # nothing money-like: the token cap decides
+    ({**MEASURED_CARD, "shipping": {**MEASURED_CARD["shipping"], "address1": "1-2 円山町"}}, "JPY", 1500, False),
+    ({"total": "15.00", "currency": "USD"}, "USD", 1500, False),  # USD unchanged: S1 within the ceiling
+    ({"total": "15.01", "currency": "USD"}, "USD", 1500, True),
+])
+def test_outside_usd_a_card_with_any_amount_is_refused(data, currency, ceiling, refused):
+    assert worker.setup_answer_refused(_setup_with(data), ceiling, currency) is refused
+
+
+@pytest.mark.parametrize("text,currency,ceiling,refused", [
+    ("Total: $15.00", "JPY", 1500, True),
+    ("1,500円", "JPY", 1500, True),
+    ("お支払い 1500円です", "JPY", 1500, True),
+    ("Total JPY 1500", "JPY", 1500, True),
+    ("15,000원 결제", "KRW", 15000, True),
+    ("Total: CA$24.00", "CAD", 2500, True),
+    ("Your order is ready to confirm.", "JPY", 1500, False),
+    ("Ship to 1-2 円山町, 150-0044", "JPY", 1500, False),
+    ("Total: $15.00", "USD", 1500, False),  # USD unchanged
+    ("Total: $15.01", "USD", 1500, True),
+])
+def test_outside_usd_prose_with_any_amount_is_refused(text, currency, ceiling, refused):
+    assert a2a_rail._text_parts_refused(_text_only(text), None, ceiling, currency) is refused
+
+
+@pytest.mark.parametrize("text,currency", [("CA$12.00 USD", "CAD"), ("CA$12.00 USD", "USD"), ("$12.00 CAD", "USD"),
+                                           ("JPY 1,500 USD", "JPY")])
+def test_a_total_with_two_currencies_reads_as_neither(text, currency):
+    assert worker.checkout_total_minor(text, currency) is None
+
+
+@pytest.mark.parametrize("name,value", [
+    (worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, "1500,JPY:20000"),       # out of range: never a USD default
+    (worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, "1000,JPY:999999999"),
+    (worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, "20000,JPY:0"),
+    (worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, "JPY:30000,20000"),     # a bare value only comes first
+    (worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, "1000,JPY:1,500"),  # a thousands separator
+])
+def test_an_unusable_non_usd_entry_refuses_and_never_takes_the_usd_default(monkeypatch, jp_on, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling({"currency": "JPY", "our_price_minor": 4650, "quantity": 1})
+    assert (raised.value.code, raised.value.refused) == (worker.CHECKOUT_CEILING_UNCONFIGURED, True)
+
+
+@pytest.mark.parametrize("value,shipping", [("2,000", 1000), ("USD:1,000", 1000), ("1,000", 1000), ("2000", 2000),
+                                            ("USD:2000", 2000), ("2000,JPY:1500", 2000)])
+def test_a_usd_value_with_a_thousands_separator_falls_back_to_the_default_as_before(monkeypatch, caplog, value,
+                                                                                   shipping):
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, value)
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        ceiling = worker.checkout_ceiling({"currency": "USD", "our_price_minor": 10000, "quantity": 1})[0]
+    assert ceiling == 10000 + 1500 + shipping
+    assert ("," in value and ":" not in value.split(",")[1]) == any(
+        "not CUR:value entries" in r.getMessage() for r in caplog.records)

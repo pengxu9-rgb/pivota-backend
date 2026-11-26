@@ -167,3 +167,32 @@ def test_the_router_takes_a_currency_only_while_its_market_is_on(monkeypatch):
     assert _choice().rail == "a2a"
     monkeypatch.setenv(markets.MARKETS_ENV, "JP")
     assert _choice(market_country="US", currency="USD").dropped == {"a2a": "currency_unsupported"}
+
+
+def test_an_unknown_market_code_is_logged_once_and_turns_nothing_on(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(markets, "_WARNED", set())
+    monkeypatch.setenv(markets.MARKETS_ENV, "USA")
+    with caplog.at_level(logging.WARNING, logger=markets.__name__):
+        assert markets.enabled_markets() == frozenset()
+        assert markets.enabled_markets() == frozenset()
+    lines = [r.getMessage() for r in caplog.records if "not in the table" in r.getMessage()]
+    assert len(lines) == 1 and "USA" in lines[0]
+
+
+def test_the_market_of_a_currency_and_the_address_pairing():
+    assert markets.market_for_currency("cad") == "CA" and markets.market_for_currency("EUR") is None
+    assert markets.address_matches_currency({"country": "ca"}, "CAD")
+    assert not markets.address_matches_currency({"country": "US"}, "CAD")
+    assert not markets.address_matches_currency({}, "USD") and not markets.address_matches_currency(None, "USD")
+
+
+def test_the_address_write_with_a_market_takes_only_that_country(monkeypatch):
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA")
+    body = {"email": EMAIL, **_address("US")}
+    assert shipping.read_submission(body, email_required=True, address_required=True, market="CA")[2] == {
+        "country": "unsupported"}
+    assert shipping.read_submission(body, email_required=True, address_required=True, market=None)[2] == {
+        "country": "unsupported"}  # a currency with no one market: every country refused
+    assert shipping.read_submission(body, email_required=True, address_required=True, market="US")[2] == {}

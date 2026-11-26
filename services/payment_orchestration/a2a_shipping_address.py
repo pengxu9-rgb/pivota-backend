@@ -226,14 +226,24 @@ def door_email(raw: Any) -> str:
     return email
 
 
+#: `read_submission`'s default: no market given (the pure reader used without a purchase). Not None, which means
+#: "the purchase's currency names no market" and refuses every country.
+_NO_MARKET: Any = object()
+
+
 def read_submission(
-    body: Any, *, email_required: bool, address_required: bool
+    body: Any, *, email_required: bool, address_required: bool, market: Any = _NO_MARKET,
 ) -> Tuple[Optional[str], Optional[Dict[str, str]], Dict[str, str]]:
     """(email or None, address or None, field_errors) for the gateway's flat body. A part may be left out
     when the row already has it (`email_required` / `address_required` False); a part that is sent is read
-    whole. The address that comes back is exactly what the door would store for the same input."""
+    whole. The address that comes back is exactly what the door would store for the same input.
+
+    `market` is the purchase's own market (a2a_markets.market_for_currency of its currency): a country other
+    than it is `country: unsupported`, so a purchase priced in CAD is never given a US address. The write passes
+    it always; None (no one market for the currency) refuses every country."""
     if not isinstance(body, Mapping):
         return None, None, {"body": "invalid"}
+    market_given = market is not _NO_MARKET
     errors: Dict[str, str] = {}
     values: Dict[str, str] = {}
     for name in FIELDS:
@@ -266,7 +276,8 @@ def read_submission(
         for name in required_address_fields(values.get("country")):
             if name not in values and name not in errors:
                 errors[name] = "required"
-        if "country" in values and not a2a_markets.market_enabled(values["country"]):
+        if "country" in values and (not a2a_markets.market_enabled(values["country"])
+                                    or (market_given and values["country"] != market)):
             errors["country"] = "unsupported"
         if "phone" in values and (not _PHONE_RE.match(values["phone"])
                                   or not 7 <= sum(ch.isdigit() for ch in values["phone"]) <= 15):

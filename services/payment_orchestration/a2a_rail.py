@@ -820,6 +820,9 @@ class CheckoutSetup:
     #: The approval ceiling (minor units): the setup answer's PROSE is read against it here, in the
     #: transport, so no text leaves this module (`text_amounts_refused`). None: any text part refuses.
     ceiling_minor: Optional[int] = None
+    #: The purchase's currency. Outside USD no prose amount can be verified (none is measured): any amount-shaped
+    #: text part refuses (checkout_amounts.text_amount_shaped). None (not given) is read as "not USD": refused too.
+    currency: Optional[str] = None
 
 
 def _setup_problem(setup: Any) -> Optional[str]:
@@ -993,10 +996,11 @@ def _scrub_prose(text: str, contains: Tuple[str, ...], exact: FrozenSet[str]) ->
     return text
 
 
-def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -> bool:
+def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int], currency: Optional[str]) -> bool:
     """Whether any text part of the agent's answer shows an amount the ceiling cannot be verified against
     (checkout_amounts.text_refused). The token's own values are removed from the text first. No ceiling:
-    any text part refuses. Never raises; the text is not kept."""
+    any text part refuses. A purchase in another currency than USD: any amount-shaped text part refuses, in
+    whatever currency (checkout_amounts.text_amount_shaped). Never raises; the text is not kept."""
     try:
         task = body.get("result") if isinstance(body, dict) else None
         texts = [str(p.get("text") or "") for p in _latest_agent_parts(task) if p.get("kind") == "text"] if isinstance(
@@ -1008,6 +1012,10 @@ def _text_parts_refused(body: Any, network_token: Any, ceiling: Optional[int]) -
         contains, exact = _scrub_needles(network_token) if isinstance(network_token, Mapping) else ((), frozenset())
         for text in texts:
             text = _scrub_prose(text, contains, exact)
+            if str(currency or "").upper() != "USD":
+                if checkout_amounts.text_amount_shaped(text):
+                    return True
+                continue
             if checkout_amounts.text_refused(text, ceiling):
                 return True
         return False
@@ -1258,12 +1266,13 @@ class A2ARailClient:
             }
             known = network_token
             ceiling = setup.ceiling_minor
+            currency = setup.currency
 
             def _read_setup_answer(result: A2AResult, body: Any) -> None:
                 _scrub_values(result, known)
                 # The answer's prose: read for amounts HERE, with the token's own values removed first, and
                 # only a yes/no kept. Prose never leaves this module (rule 1).
-                result.text_amounts_refused = _text_parts_refused(body, known, ceiling)
+                result.text_amounts_refused = _text_parts_refused(body, known, ceiling, currency)
 
             relay.checkout, _ = await self._send(
                 member_id=member_id, context_id=checkout_context_id, component="checkout.setup",

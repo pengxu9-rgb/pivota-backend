@@ -760,16 +760,26 @@ JP_ADDRESS = {"firstName": "Hananeedle", "lastName": "Examplenee", "phone": "+81
               "country": "JP"}
 
 
-async def test_the_door_refuses_a_market_that_is_not_on_even_when_the_router_takes_the_rail(monkeypatch):
-    # The merchant is listed for JP and the shown currency is one the rail takes, so the router picks A2A; the
-    # door's own market check still refuses JP while A2A_RAIL_MARKETS does not name it.
+async def test_a_japanese_address_shown_in_dollars_never_takes_the_rail(monkeypatch):
+    # The merchant is listed for JP and USD is on, but USD is not Japan's currency: the router refuses the pairing
+    # (`currency_market_mismatch`), so an explicit A2A choice is the usual 404 and nothing is opened.
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
-    resp = await _http("POST", BASE, json=_body(address=JP_ADDRESS))
-    assert resp.status_code == 400 and _error(resp) == "shipping_country_unsupported", resp.text
+    resp = await _http("POST", BASE, json=_body(address=JP_ADDRESS, payment_preference={"rail": "a2a"}))
+    assert resp.status_code == 404 and _error(resp) == "not_available_on_this_rail", resp.text
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []  # nothing was opened
     for value in JP_ADDRESS.values():
         if len(value) > 3:
             assert value not in resp.text
+
+
+async def test_the_door_refuses_a_market_that_is_not_on_if_the_router_ever_lets_it_through(monkeypatch):
+    """Belt and braces: the door's own market check (`a2a_markets.market_enabled`) stands even if the router
+    were to take a market that is not on."""
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
+    monkeypatch.setattr(rail_router, "a2a_unavailable_reason", lambda **kwargs: None)
+    resp = await _http("POST", BASE, json=_body(address=JP_ADDRESS))
+    assert resp.status_code == 400 and _error(resp) == "shipping_country_unsupported", resp.text
+    assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []
 
 
 async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch):
@@ -786,3 +796,42 @@ async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_
     bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY",
                                                idempotency_key="key-2"))
     assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
+
+
+CA_FORM_ADDRESS = {"firstName": "Patneedle", "lastName": "Examplenee", "phone": "+16135550199",
+                   "addressLine1": "77 Needle Lane", "city": "Needleton", "region": "ON", "postalCode": "K1A 0B1",
+                   "country": "CA"}
+
+
+def _ca_on(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,CA")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:CA")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,CAD:50000")
+    monkeypatch.setitem(FACTS, "currency", "CAD")
+    monkeypatch.setitem(FACTS, "market_country", "CA")
+
+
+async def test_the_address_write_refuses_another_markets_address_for_a_cad_purchase(monkeypatch):
+    _ca_on(monkeypatch)
+    pid = await _create(email=None, expected_currency="CAD")  # no address: the market is CAD's, Canada
+    resp = await _submit(pid, _form())  # a US (TX) address
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"status": "error", "error": "invalid_shipping_address",
+                           "field_errors": {"country": "unsupported"}}
+    assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"] is None
+    ok = await _submit(pid, {"email": EMAIL, **CA_FORM_ADDRESS})
+    assert ok.status_code in (200, 204), ok.text
+    assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"]["country"] == "CA"
+
+
+async def test_with_capture_off_a_non_us_address_still_meets_its_markets_rules(monkeypatch):
+    monkeypatch.delenv("A2A_SHIPPING_CAPTURE_ENABLED", raising=False)
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,JP")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,JPY:30000")
+    monkeypatch.setitem(FACTS, "currency", "JPY")
+    monkeypatch.setitem(FACTS, "market_country", "JP")
+    bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY"))
+    assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
+    good = await _http("POST", BASE, json=_body(address=JP_ADDRESS, expected_currency="JPY", idempotency_key="key-2"))
+    assert good.status_code == 202, good.text

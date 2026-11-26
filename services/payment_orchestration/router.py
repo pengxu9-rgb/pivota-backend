@@ -25,6 +25,8 @@ the answer.
      currency_unsupported     the shown currency is not the currency of a market switched on for the
                               rail (a2a_markets.enabled_currencies, `A2A_RAIL_MARKETS`: USD only by
                               default; the rail's amount has no currency field)
+     currency_market_mismatch the shown currency is not the market's own (a2a_markets.currency_for): a CA
+                              purchase shown in USD never takes the rail
      amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR names no cap at all: no cap, no rail
      agent_run_condition_unmet  only while PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`: the merchant
                               does not meet ADR-030 D11's run condition for this rail's checkout agent
@@ -227,6 +229,8 @@ def a2a_unavailable_reason(
         return "merchant_not_proven"
     if str(currency or "").upper() not in a2a_markets.enabled_currencies():
         return "currency_unsupported"
+    if a2a_markets.currency_for(market_country) != str(currency or "").upper():
+        return "currency_market_mismatch"
     if not max_total_minor():
         return "amount_limit_unset"
     if agent_may_run is not True and run_condition_enforced("a2a"):

@@ -517,6 +517,10 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
+        if market_country != "US":
+            # Outside the US the market's own region and postcode rules apply with capture off too (the US keeps
+            # today's capture-off rules exactly).
+            stored_address = shipping_capture.door_address(stored_address)
     else:
         # Capture on: each part is optional; one that is given is read by the same rules (the address also by
         # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.
