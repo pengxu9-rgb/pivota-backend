@@ -562,6 +562,35 @@ def test_what_pg_dump_writes_for_columns_enums_and_bodies_is_kept(statement):
     assert A.validate_schema_sql(_schema(statement)).statements
 
 
+@pytest.mark.parametrize("statement,match", [
+    # the d66c349c9 review, finding 3: a built-in with a side effect, run by a domain's input at DDL time
+    ("CREATE DOMAIN public.d AS integer CONSTRAINT c CHECK ((pg_catalog.setval('public.s'::regclass, 424242) > 0));",
+     "runs SQL"),
+    ("CREATE DOMAIN public.d AS integer CONSTRAINT c CHECK ((pg_catalog.lo_from_bytea(0, '\\x00'::bytea) > 0));",
+     "runs SQL"),
+    ("CREATE TABLE public.c (a oid DEFAULT pg_catalog.lo_create(0));", "runs SQL"),
+    # finding 5: a three-part name is not pg_catalog's
+    ("CREATE TABLE public.c (a int DEFAULT pg_catalog.public.pwn(1));", "not pg_catalog's"),
+    ("CREATE TABLE public.c (a int DEFAULT ('1')::pg_catalog.public.d);", "not pg_catalog's"),
+    # pg_dump's NOT VALID domain form keeps the expression rule
+    ("ALTER DOMAIN public.currency_code ADD CONSTRAINT c2 CHECK (public.f(VALUE)) NOT VALID;", "not pg_catalog's"),
+])
+def test_side_effect_builtins_and_three_part_names_are_refused(statement, match):
+    with pytest.raises(A.SchemaRefused, match=match):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement", [
+    # the d66c349c9 review, finding 4: real pg_dump output that was refused
+    "CREATE TEXT SEARCH CONFIGURATION public.cfg (PARSER = pg_catalog.\"default\");\n"
+    "ALTER TEXT SEARCH CONFIGURATION public.cfg ADD MAPPING FOR asciiword WITH simple;",
+    "ALTER DOMAIN public.currency_code ADD CONSTRAINT c2 CHECK ((VALUE IS NOT NULL)) NOT VALID;",
+    "CREATE TABLE public.d2 (a bigint DEFAULT nextval('public.s'::regclass));",  # nextval stays: pg_dump writes it
+])
+def test_pg_dumps_text_search_mapping_and_not_valid_domain_check_are_kept(statement):
+    assert A.validate_schema_sql(_schema(statement)).statements
+
+
 def test_a_reviewed_name_is_allowed_and_the_dump_may_not_define_it(monkeypatch):
     monkeypatch.setattr(A, "EXPRESSION_NAMES_ALLOWED", frozenset({"public.uuid_generate_v4"}))
     A.validate_schema_sql(_schema("CREATE TABLE public.u (a uuid DEFAULT public.uuid_generate_v4());"))
@@ -588,3 +617,29 @@ def test_the_plan_counts_the_kinds_the_audit_expects():
     plan = A.validate_schema_sql(_schema("CREATE TRIGGER t BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.f();\n"
                                          "CREATE POLICY p ON public.t USING (true);"))
     assert plan.count("CreateTrigStmt") == 1 and plan.count("CreatePolicyStmt") == 1 and plan.count("RuleStmt") == 0
+
+
+def test_the_check_command_from_the_shell_only_checks_and_never_applies(tmp_path):
+    """`python -m jobs.sandbox_schema_apply check ...` reads sys.argv (controller, d66c349c9). With no
+    database and no sandbox environment at all, check succeeds offline; had it fallen through to apply, it
+    would refuse to run outside the sandbox (exit 2)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "schema.sql").write_text(OK_SCHEMA)
+    (tmp_path / "ledgers.sql").write_text(A.LEDGER_TRAILER + "\n")
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path),
+           "PYTHONPATH": os.pathsep.join(p for p in (os.environ.get("PYTHONPATH", ""), str(root)) if p)}
+    run = lambda *args: subprocess.run([sys.executable, "-m", "jobs.sandbox_schema_apply", *args], cwd=root, env=env,
+                                       capture_output=True, text=True, timeout=120)
+    done = run("check", str(tmp_path / "schema.sql"), str(tmp_path / "ledgers.sql"))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("sandbox_schema_apply OK ") and "DONE" not in done.stdout
+    assert "runs only in the sandbox" not in done.stderr
+    bad = run("check", str(tmp_path / "schema.sql"))
+    assert bad.returncode == 2 and "usage: check" in bad.stderr
+    applied = run()  # the default command is apply: outside the sandbox it refuses before any connection
+    assert applied.returncode == 2 and "runs only in the sandbox" in applied.stderr

@@ -283,6 +283,7 @@ def test_every_secret_kind_is_refused_by_the_dump_and_by_the_apply(harness, samp
     ("settings", "per-role settings"),
     ("owns", "owns a function, type, schema, large object"),
     ("lo", "may write a large object"),
+    ("priv", "may create a trigger or a foreign key"),  # the d66c349c9 review, finding 1
     ("", "could not check the credential"),
     ("something else", "could not check the credential"),
 ])
@@ -307,7 +308,11 @@ def test_the_privilege_check_runs_before_the_dump_and_is_read_only(harness):
                    "transaction_read_only", "pg_db_role_setting", "pg_shdepend", "proowner", "typowner",
                    "nspowner", "lomowner", "lomacl", "lo_compat_privileges",
                    # unreachable while PGOPTIONS forces read-only; pinned so it is not lost
-                   "when pg_catalog.current_setting('transaction_read_only') <> 'on' then 'rw'"):
+                   "when pg_catalog.current_setting('transaction_read_only') <> 'on' then 'rw'",
+                   # the d66c349c9 review: TRIGGER/REFERENCES/MAINTAIN, foreign servers, parameters; catalogs qualified
+                   "'TRIGGER', 'REFERENCES', 'MAINTAIN'", "pg_catalog.aclexplode(t.attacl)", "pg_catalog.pg_foreign_server",
+                   "pg_catalog.pg_foreign_data_wrapper", "pg_catalog.pg_parameter_acl", "from pg_catalog.pg_db_role_setting s",
+                   "from pg_catalog.pg_auth_members m"):
         assert needle in calls, needle
 
 
@@ -317,4 +322,6 @@ def test_every_session_the_dump_opens_is_read_only(harness):
     done = harness()
     assert done.returncode == 0, done.stderr
     env = (harness.log / "pg_dump.env").read_text()
-    assert "default_transaction_read_only=on" in next(line for line in env.splitlines() if line.startswith("PGOPTIONS="))
+    options = next(line for line in env.splitlines() if line.startswith("PGOPTIONS="))
+    assert "default_transaction_read_only=on" in options
+    assert "search_path=pg_catalog,pg_temp" in options  # the d66c349c9 review, finding 2

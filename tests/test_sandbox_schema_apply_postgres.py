@@ -894,6 +894,10 @@ BLINDING_CASES = {
     "3_alter_role_self_set": (["ALTER ROLE CURRENT_USER SET work_mem = '3MB'"], (), "per-role setting"),
     "3_setval_not_called": (["CREATE SEQUENCE public.s", "SELECT pg_catalog.setval('public.s', 99, false)"], (),
                             "advanced or set"),
+    # the d66c349c9 review, finding 3: a sequence a ledger column owns was not audited
+    "3_ledger_owned_sequence": (["CREATE TABLE public.schema_migrations (id text PRIMARY KEY, applied_at text)",
+                                 "CREATE SEQUENCE public.sx OWNED BY public.schema_migrations.id",
+                                 "SELECT pg_catalog.setval('public.sx', 424242)"], (), "advanced or set"),
 }
 
 
@@ -965,6 +969,19 @@ F_CASES = {
                                  "may write a large object"),
     "lo_compat_privileges": (['ALTER DATABASE "%s" SET lo_compat_privileges = on' % SRC_DB], "may write a large object"),
     "role_setting": (['ALTER ROLE "{d}" SET work_mem = \'2MB\''], "per-role settings"),
+    # the d66c349c9 review, finding 1: privileges that change persistent state without INSERT/UPDATE
+    "trigger_privilege": (['GRANT TRIGGER ON public.offers TO "{d}"'], "may create a trigger"),
+    "references_privilege": (['GRANT REFERENCES ON public.offers TO "{d}"'], "may create a trigger"),
+    "column_references": (['GRANT REFERENCES (id) ON public.offers TO "{d}"'], "may create a trigger"),
+    "foreign_server_usage": (["CREATE FOREIGN DATA WRAPPER rv_fdw", "CREATE SERVER rv_srv FOREIGN DATA WRAPPER rv_fdw",
+                              'GRANT USAGE ON FOREIGN SERVER rv_srv TO "{d}"'], "may create a trigger"),
+    "parameter_privilege": (['GRANT ALTER SYSTEM ON PARAMETER work_mem TO "{d}"'], "may create a trigger"),
+    # finding 2: the check itself, blinded by a per-database search_path and look-alike views
+    "search_path_blinding": (["CREATE VIEW public.pg_auth_members AS SELECT * FROM pg_catalog.pg_auth_members WHERE false",
+                              "CREATE VIEW public.pg_db_role_setting AS SELECT * FROM pg_catalog.pg_db_role_setting WHERE false",
+                              'GRANT SELECT ON public.pg_auth_members, public.pg_db_role_setting TO "{d}"',
+                              'ALTER ROLE "{d}" IN DATABASE "%s" SET search_path = public, pg_catalog' % SRC_DB,
+                              'GRANT pg_write_all_data TO "{d}"'], "member of another role"),
 }
 
 
@@ -981,7 +998,12 @@ async def test_a_dump_credential_that_owns_or_may_alter_anything_never_dumps(dbs
         assert done.returncode == 3 and match in done.stderr, done.stderr
         assert not (tmp_path / "drop").exists()
     finally:
-        await src_admin.execute('DROP OWNED BY "%s"' % DUMP_ROLE)  # its objects, and its grants
+        await src_admin.execute('DROP OWNED BY "%s"' % DUMP_ROLE)  # its objects, and its grants (parameters too)
+        await src_admin.execute('REVOKE pg_write_all_data FROM "%s"' % DUMP_ROLE)
+        await src_admin.execute('ALTER ROLE "%s" IN DATABASE "%s" RESET ALL' % (DUMP_ROLE, SRC_DB))
+        await src_admin.execute("DROP VIEW IF EXISTS public.pg_auth_members, public.pg_db_role_setting")
+        await src_admin.execute("DROP SERVER IF EXISTS rv_srv")
+        await src_admin.execute("DROP FOREIGN DATA WRAPPER IF EXISTS rv_fdw")
         await src_admin.execute("SELECT lo_unlink(oid) FROM pg_largeobject_metadata")
         await src_admin.execute('ALTER DATABASE "%s" RESET ALL' % SRC_DB)
         await src_admin.execute('ALTER ROLE "%s" RESET work_mem' % DUMP_ROLE)
@@ -1005,3 +1027,18 @@ async def test_the_dump_is_read_only_even_when_the_role_is_not(dbs, tmp_path):
                 await session.execute(statement)
     finally:
         await session.close()
+
+
+async def test_pg_dumps_not_valid_forms_are_never_evaluated(dbs, tmp_path, monkeypatch):
+    """Why the NOT VALID forms are allowed: the server stores the CHECK without running it."""
+    statements = [NOTICE_F, "CREATE DOMAIN public.d AS integer", "CREATE TABLE public.t1 (a integer)",
+                  "ALTER DOMAIN public.d ADD CONSTRAINT c2 CHECK (public.f(1)) NOT VALID",
+                  "ALTER TABLE ONLY public.t1 ADD CONSTRAINT c CHECK (public.f(1)) NOT VALID"]
+    monkeypatch.setattr(A, "validate_schema_sql",
+                        lambda text: A.SchemaPlan(tuple(statements), frozenset(), len(statements)))
+    dst = await _as_apply_role()
+    try:
+        store = _hand_drop(tmp_path, "CREATE TABLE public.x (a int);", pg_dump_version="%d.1" % await _server_major(dst))
+        assert RAN not in await _notices_from(dst, lambda: A.apply_schema(dst, store))
+    finally:
+        await dst.close()

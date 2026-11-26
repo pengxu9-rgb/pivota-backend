@@ -141,7 +141,9 @@ export PGAPPNAME=sandbox-schema-dump
 # Every session is READ ONLY, whatever the role's defaults (a client option outranks a role setting): even a
 # credential that slipped past the check below could not write, create a large object or ALTER a role or a
 # function. The check then proves the session it runs in is read-only (8155964d4 review, (f)).
-export PGOPTIONS="-c statement_timeout=120s -c idle_in_transaction_session_timeout=60s -c default_transaction_read_only=on"
+# search_path is pinned too, pg_temp last: a per-role or per-database search_path plus a look-alike view in
+# public must not blind the check below (the d66c349c9 review, finding 2). It also names every catalog.
+export PGOPTIONS="-c statement_timeout=120s -c idle_in_transaction_session_timeout=60s -c default_transaction_read_only=on -c search_path=pg_catalog,pg_temp"
 # The dump must come from pg_dump of the SERVER's major version: a newer pg_dump writes settings an older
 # server rejects (pg_dump 17: SET transaction_timeout), and the sandbox apply refuses a mismatch too.
 PG_DUMP_VERSION=$(pg_dump --version | sed -nE 's/^pg_dump \(PostgreSQL\) ([0-9]+(\.[0-9]+)*).*/\1/p')
@@ -159,18 +161,18 @@ echo "dump_prod_schema: pg_dump $PG_DUMP_VERSION server_version_num=$SERVER_NUM 
 WRITABLE=$(capped psql -XAtc "select case
     when pg_catalog.current_setting('transaction_read_only') <> 'on' then 'rw'
     when (select rolsuper or rolcreaterole or rolcreatedb or rolreplication or rolbypassrls
-            from pg_roles where rolname = current_user) then 'role'
-    when exists (select 1 from pg_auth_members m join pg_roles r on r.oid = m.member
+            from pg_catalog.pg_roles where rolname = current_user) then 'role'
+    when exists (select 1 from pg_catalog.pg_auth_members m join pg_catalog.pg_roles r on r.oid = m.member
                   where r.rolname = current_user) then 'member'
     -- a per-role setting other than the read-only default (ALTER ROLE ... SET persists across sessions)
-    when exists (select 1 from pg_db_role_setting s, unnest(s.setconfig) c
-                  where s.setrole = (select oid from pg_roles where rolname = current_user)
+    when exists (select 1 from pg_catalog.pg_db_role_setting s, unnest(s.setconfig) c
+                  where s.setrole = (select oid from pg_catalog.pg_roles where rolname = current_user)
                     and c <> 'default_transaction_read_only=on') then 'settings'
-    when exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    when exists (select 1 from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
                   where c.relkind in ('r', 'p', 'S', 'v', 'f', 'm')
                    -- system schemas excluded: PUBLIC may UPDATE pg_catalog.pg_settings (that is how SET works)
                    and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'
-                   and (c.relowner = (select oid from pg_roles where rolname = current_user)
+                   and (c.relowner = (select oid from pg_catalog.pg_roles where rolname = current_user)
                         or case when c.relkind = 'S'
                                 then has_sequence_privilege(current_user, c.oid, 'UPDATE')
                                      or has_sequence_privilege(current_user, c.oid, 'USAGE')
@@ -179,22 +181,34 @@ WRITABLE=$(capped psql -XAtc "select case
                                      or has_table_privilege(current_user, c.oid, 'DELETE')
                                      or has_table_privilege(current_user, c.oid, 'TRUNCATE') end)) then 'table'
     -- owner of anything else: a function or type can be ALTERed (SECURITY DEFINER), a large object written
-    when exists (select 1 from pg_shdepend d where d.refclassid = 'pg_authid'::regclass and d.deptype = 'o'
-                  and d.refobjid = (select oid from pg_roles where rolname = current_user))
-      or exists (select 1 from pg_proc p where p.proowner = (select oid from pg_roles where rolname = current_user))
-      or exists (select 1 from pg_type t where t.typowner = (select oid from pg_roles where rolname = current_user))
-      or exists (select 1 from pg_namespace n where n.nspowner = (select oid from pg_roles where rolname = current_user))
-      or exists (select 1 from pg_largeobject_metadata l
-                  where l.lomowner = (select oid from pg_roles where rolname = current_user)) then 'owns'
+    when exists (select 1 from pg_catalog.pg_shdepend d where d.refclassid = 'pg_authid'::regclass and d.deptype = 'o'
+                  and d.refobjid = (select oid from pg_catalog.pg_roles where rolname = current_user))
+      or exists (select 1 from pg_catalog.pg_proc p where p.proowner = (select oid from pg_catalog.pg_roles where rolname = current_user))
+      or exists (select 1 from pg_catalog.pg_type t where t.typowner = (select oid from pg_catalog.pg_roles where rolname = current_user))
+      or exists (select 1 from pg_catalog.pg_namespace n where n.nspowner = (select oid from pg_catalog.pg_roles where rolname = current_user))
+      or exists (select 1 from pg_catalog.pg_largeobject_metadata l
+                  where l.lomowner = (select oid from pg_catalog.pg_roles where rolname = current_user)) then 'owns'
     -- a large object it may write: lo_compat_privileges lets anyone, an ACL lets it or PUBLIC
     when pg_catalog.current_setting('lo_compat_privileges') <> 'off'
-      or exists (select 1 from pg_largeobject_metadata l, aclexplode(l.lomacl) a
+      or exists (select 1 from pg_catalog.pg_largeobject_metadata l, aclexplode(l.lomacl) a
                   where a.privilege_type = 'UPDATE'
-                    and a.grantee in (0, (select oid from pg_roles where rolname = current_user))) then 'lo'
+                    and a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user))) then 'lo'
+    -- privileges that change persistent state without writing a row (the d66c349c9 review, finding 1): a trigger
+    -- or a foreign key on a prod table, MAINTAIN (17: VACUUM FULL, CLUSTER, REFRESH), a user mapping, a parameter
+    when exists (select 1 from pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
+                  where a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user)) and a.privilege_type in ('TRIGGER', 'REFERENCES', 'MAINTAIN'))
+      or exists (select 1 from pg_catalog.pg_attribute t, pg_catalog.aclexplode(t.attacl) a
+                  where a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user)) and a.privilege_type = 'REFERENCES')
+      or exists (select 1 from pg_catalog.pg_foreign_server f, pg_catalog.aclexplode(f.srvacl) a
+                  where a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user)))
+      or exists (select 1 from pg_catalog.pg_foreign_data_wrapper w, pg_catalog.aclexplode(w.fdwacl) a
+                  where a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user)))
+      or exists (select 1 from pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a
+                  where a.grantee in (0, (select oid from pg_catalog.pg_roles where rolname = current_user))) then 'priv'
     when has_database_privilege(current_database(), 'CREATE')
-      or exists (select 1 from pg_namespace n where n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast%'
+      or exists (select 1 from pg_catalog.pg_namespace n where n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast%'
                    and has_schema_privilege(current_user, n.oid, 'CREATE')) then 'create'
-    when exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    when exists (select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
                   where p.prosecdef and n.nspname not in ('pg_catalog', 'information_schema')
                     and has_function_privilege(current_user, p.oid, 'EXECUTE')) then 'definer'
     else 'none' end") || die "could not check the credential's privileges" 3
@@ -203,6 +217,7 @@ case "$WRITABLE" in
   rw) die "the dump's session is not read-only (default_transaction_read_only did not take effect)" 3 ;;
   settings) die "the dump credential has per-role settings (ALTER ROLE ... SET) besides default_transaction_read_only=on" 3 ;;
   owns) die "the dump credential owns a function, type, schema, large object or other object; use RUNBOOK 10a-role's read-only role" 3 ;;
+  priv) die "the dump credential may create a trigger or a foreign key, MAINTAIN a table, use a foreign server or set a parameter" 3 ;;
   lo) die "the dump credential may write a large object (an ACL, or lo_compat_privileges on)" 3 ;;
   role) die "the dump credential is a superuser or can create roles/databases; use RUNBOOK 10a-role's read-only role" 3 ;;
   member) die "the dump credential is a member of another role (SET ROLE would lend it that role's rights); use RUNBOOK 10a-role's read-only role" 3 ;;
@@ -217,8 +232,8 @@ capped pg_dump --lock-wait-timeout="$LOCK_WAIT" --schema-only --no-owner --no-pr
   --no-publications --no-subscriptions --no-security-labels --no-tablespaces --format=plain > "$WORK/schema.sql"
 
 # --- the ledgers, explicit columns, one INSERT per line ------------------------------------------------------
-LEDGERS=$(capped psql -XAtc "select coalesce(string_agg(c.relname, ' ' order by c.relname), '') from pg_class c
-  join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'
+LEDGERS=$(capped psql -XAtc "select coalesce(string_agg(c.relname, ' ' order by c.relname), '') from pg_catalog.pg_class c
+  join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'
   and c.relname in ('startup_sql_migrations', 'schema_migrations')")
 : > "$WORK/ledgers.sql"
 for t in $LEDGERS; do

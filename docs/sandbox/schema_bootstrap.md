@@ -55,10 +55,16 @@ plus prod's two migration ledgers. Code: `scripts/sandbox/dump_prod_schema.sh` (
   CREATE on the database or any schema; no EXECUTE on a SECURITY DEFINER function outside pg_catalog;
   owns no function, type, schema, large object or other object (`pg_shdepend`, so ALTER FUNCTION ...
   SECURITY DEFINER is out of reach); may write no large object (an ACL, or `lo_compat_privileges` on); no
-  per-role setting but `default_transaction_read_only=on`.
-* **Every session is READ ONLY**: `PGOPTIONS` carries `default_transaction_read_only=on`, which outranks the
-  role's own default, and the check above refuses a session where `transaction_read_only` is not on. So
-  even a credential that slipped past it cannot write, CREATE, or ALTER a role or a function.
+  per-role setting but `default_transaction_read_only=on`; holds no TRIGGER, REFERENCES (table or column)
+  or MAINTAIN privilege on any table, no USAGE on a foreign server or wrapper, and no parameter privilege
+  (`pg_parameter_acl`), granted to it or to PUBLIC: each changes persistent state without writing a row.
+  The check names every catalog `pg_catalog.x` and runs under a pinned `search_path` (below), so a
+  per-role or per-database `search_path` plus a look-alike view cannot blind it.
+* **Every session is READ ONLY**: `PGOPTIONS` carries `default_transaction_read_only=on` and
+  `search_path=pg_catalog,pg_temp`, which outrank the role's and the database's own settings, and the check
+  above refuses a session where `transaction_read_only` is not on. That stops the dump's OWN sessions from
+  writing rows, CREATE or ALTER. It is not a property of the credential: a client that connects with it
+  can `BEGIN READ WRITE`, which is why the check refuses every privilege that could change state.
   **Accepted trade-off: `lo_create`.** A READ ONLY transaction still allows it (measured on PG15; not yet
   measured on 17), and PUBLIC may EXECUTE it, so any prod role can create a large object. The dump's SQL is
   fixed and never calls it. Closing it is a prod-wide `REVOKE EXECUTE ON FUNCTION lo_create(oid),
@@ -127,14 +133,15 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
 * **No dump-defined code is reachable while the schema is created** (the 8155964d4 review). In EVERY
   expression position (CHECK, a domain's constraint, DEFAULT, generated column, index / partition-key /
   statistics expression, bound, predicate, policy, trigger WHEN, parameter default) a function or
-  operator must be pg_catalog's (an unqualified name is, with `search_path` ''), minus the few that run
-  SQL or another type's input (`query_to_xml` and kin, `ts_stat`, `ts_rewrite`, `set_config`, `*_in`/
-  `*_recv` of array/record/domain/range); a cast only to a pg_catalog type, an enum the dump creates, or
+  operator must be pg_catalog's (an unqualified name is, with `search_path` ''; a three-part name never is), minus the few
+  that run SQL or another type's input or write something lasting (`query_to_xml` and kin, `ts_stat`,
+  `ts_rewrite`, `set_config`, `*_in`/`*_recv` of array/record/domain/range, `setval`, `lo_*`); a cast only to a pg_catalog type, an enum the dump creates, or
   a name in the reviewed `EXPRESSION_NAMES_ALLOWED` (EMPTY: neither repo's migrations need one; the first
   real dump's `check` names any prod has, each added only after review that it is an extension's). Since a
   domain's constraints obey the same rule, the input function of every type the dump can create runs
   built-in code only, so even a bare literal coerced into a domain or composite column reaches no
-  dump-defined function. Refused outright: CREATE OPERATOR, CREATE CAST, ALTER DOMAIN, CREATE AGGREGATE
+  dump-defined function. Refused outright: CREATE OPERATOR, CREATE CAST, an ALTER DOMAIN other than pg_dump's
+  named NOT VALID CHECK (never evaluated: tested), CREATE AGGREGATE
   unless reviewed by name (`AGGREGATES_ALLOWED`, empty), a range type with a canonical or subtype_diff
   function, an ALTER TABLE ADD CHECK that is not pg_dump's named NOT VALID form, a partition key column
   of a type that is not pg_catalog's or an enum. Function bodies, view queries, WITH NO DATA
@@ -149,15 +156,15 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
   CLIENT-side deadlines a statement cannot change: 120s per statement and 900s for the whole apply. Each statement runs ALONE through
   the extended protocol (the server refuses a string with two commands). Then: no ledger table may run
   code on INSERT (trigger, rule, expression/partial index, CHECK/FK, domain or generated column, row
-  security, a default other than now()/nextval()); `standard_conforming_strings` re-asserted; the
+  security, a default other than now()); `standard_conforming_strings` re-asserted; the
   ledger rows; then a POST-APPLY AUDIT, the catch-all behind the parser: no rows in any table but the
   ledgers (read with row security off, and past a declared FORCE inside a rolled-back savepoint, so a
   policy can neither hide a row nor run); no GRANT on any table, column, function, type or schema the role
   owns; no default privileges; no SECURITY DEFINER function; no large object at all; no per-role setting
   (`pg_db_role_setting`); no temporary object; no rule but views' `_RETURN`; exactly the dump's triggers
   and policies, and row security ENABLEd / FORCEd on exactly the tables the dump declares; no populated
-  materialized view; every sequence as created (`last_value` = its start, not called; `setval(s, n,
-  false)` included). Then the base-table count
+  materialized view; every sequence as created, a ledger column's included (`last_value` = its start, not
+  called; `setval(s, n, false)` included), so a ledger table's defaults may only be now(). Then the base-table count
   must equal the source's live count and the ledger rows the manifest's, or everything rolls back.
   `search_path` is restored. A server newer than the parser's major version (17) is refused.
 * Exit 0 = `DONE {...}`, exit 2 = `REFUSED: <rule>`.

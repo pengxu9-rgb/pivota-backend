@@ -114,6 +114,7 @@ _ALTER_TABLE_OBJECTS = ("OBJECT_TABLE", "OBJECT_INDEX", "OBJECT_SEQUENCE", "OBJE
 _PLAIN_KINDS = frozenset({
     "CreateStmt", "CreateSeqStmt", "AlterSeqStmt", "CreateDomainStmt", "CreateEnumStmt",
     "AlterEnumStmt", "CompositeTypeStmt", "ViewStmt", "IndexStmt", "CreatePolicyStmt", "CreateStatsStmt",
+    "AlterTSConfigurationStmt",  # the ADD MAPPING pg_dump writes after every CREATE TEXT SEARCH CONFIGURATION
 })
 #: ALTER DOMAIN (ADD CONSTRAINT runs the CHECK, controller A3) and CREATE CAST are refused by name: with
 #: neither, a domain's constraints are only the ones its CREATE DOMAIN shows.
@@ -225,8 +226,10 @@ def _names(names) -> Tuple[str, ...]:
 
 
 def _qualified_outside_catalog(names) -> bool:
+    """A name that is not pg_catalog's: schema-qualified elsewhere, or three parts (db.schema.name,
+    whatever the first part says: the d66c349c9 review, finding 5)."""
     parts = _names(names)
-    return len(parts) > 1 and parts[0] != "pg_catalog"
+    return len(parts) > 2 or (len(parts) == 2 and parts[0] != "pg_catalog")
 
 
 #: Non-pg_catalog functions and types an expression may name, by "schema.name", each one REVIEWED (the
@@ -236,11 +239,14 @@ def _qualified_outside_catalog(names) -> bool:
 EXPRESSION_NAMES_ALLOWED: FrozenSet[str] = frozenset()
 #: CREATE AGGREGATE, by "schema.name", same review (direction (b)). EMPTY: neither repo has one.
 AGGREGATES_ALLOWED: FrozenSet[str] = frozenset()
-#: pg_catalog functions that run SQL text or another type's input by OID: built in, but they could reach
-#: dump-defined code, so no expression the server evaluates at DDL time may call them.
+#: pg_catalog functions that run SQL text or another type's input by OID (they could reach dump-defined
+#: code), or that WRITE something that outlives the statement (a sequence's state, a large object: the
+#: d66c349c9 review, finding 3). Built in, but no expression the server evaluates at DDL time may call one.
 _RUNS_OTHER_CODE = re.compile(
     r"^((query|cursor|table|schema|database)_to_xml(schema|_and_xmlschema)?|ts_stat|ts_rewrite|set_config"
-    r"|(array|record|domain|range|multirange|anyarray|anyelement|anyrange|anymultirange|enum)_(in|recv))$")
+    r"|(array|record|domain|range|multirange|anyarray|anyelement|anyrange|anymultirange|anycompatiblerange"
+    r"|anycompatiblemultirange|enum)_(in|recv)"
+    r"|setval|lo_[a-z_0-9]+|lowrite|loread)$")
 #: Fields whose subtree is not evaluated while the statement runs: a function body (a string, or a
 #: SQL-standard body that is analysed but not executed), a view's or a WITH NO DATA matview's query, a
 #: trigger's function reference. Everything else in a statement is an expression position.
@@ -274,7 +280,8 @@ def _safe_type(names, enums: FrozenSet[str]) -> bool:
     """A type whose input runs no dump-defined code: pg_catalog's (an unqualified name: search_path is '',
     and TEMP is refused), an enum the dump creates (enum_in reads pg_enum), or a reviewed name."""
     parts = _names(names)
-    return len(parts) == 1 or parts[0] == "pg_catalog" or ".".join(parts) in enums | EXPRESSION_NAMES_ALLOWED
+    return (len(parts) == 1 or (len(parts) == 2 and parts[0] == "pg_catalog")
+            or ".".join(parts) in enums | EXPRESSION_NAMES_ALLOWED)
 
 
 def _temp_refusal(stmt) -> Optional[str]:
@@ -316,7 +323,7 @@ def _ddl_time_refusal(stmt, enums: FrozenSet[str]) -> Optional[str]:
             if _qualified_outside_catalog(getattr(node, names)) and ".".join(parts) not in EXPRESSION_NAMES_ALLOWED:
                 return "a function or operator that is not pg_catalog's (%s) in an expression" % ".".join(parts)
             if sub == "FuncCall" and _RUNS_OTHER_CODE.match(parts[-1] or ""):
-                return "a call of pg_catalog.%s (it runs SQL or another type's input) in an expression" % parts[-1]
+                return "a call of pg_catalog.%s (it runs SQL or another type's input, or writes) in an expression" % parts[-1]
         if sub == "TypeName" and (parent, field) not in _DECLARED_TYPES and not _safe_type(node.names, enums):
             return "a cast to a type that is not pg_catalog's or an enum (%s) in an expression" % ".".join(_names(node.names))
         if sub == "PartitionBoundSpec":
@@ -409,9 +416,14 @@ def _refusal(node, enums) -> Optional[str]:
         return None
     if kind == "AlterOwnerStmt":
         return "an ownership change"
-    if kind in ("AlterDomainStmt", "CreateCastStmt"):
-        return "an %s (a domain's constraints and a type's casts come only from its CREATE)" % (
-            "ALTER DOMAIN" if kind == "AlterDomainStmt" else "CREATE CAST")
+    if kind == "AlterDomainStmt":
+        constraint = node.def_ if node.subtype == "C" else None
+        if constraint is not None and enums.ConstrType(constraint.contype).name == "CONSTR_CHECK" \
+                and constraint.conname and constraint.skip_validation:
+            return None  # pg_dump's form for a NOT VALID domain constraint: never evaluated (controller A3)
+        return "an ALTER DOMAIN other than pg_dump's named NOT VALID CHECK"
+    if kind == "CreateCastStmt":
+        return "a CREATE CAST (it lets an expression reach a function without naming it)"
     return "a statement pg_dump --schema-only does not emit (%s)" % kind
 
 
@@ -666,7 +678,8 @@ SELECT c.relname, c.relkind::pg_catalog.text AS relkind, c.relrowsecurity,
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname = 'public' AND c.relname = ANY($1::pg_catalog.text[])
 """
-_PLAIN_DEFAULT = re.compile(r"^(now\(\)|CURRENT_TIMESTAMP|nextval\('[A-Za-z0-9_.\"]+'::regclass\))$")
+#: A ledger INSERT may draw from no sequence: every sequence is audited, a ledger column's too.
+_PLAIN_DEFAULT = re.compile(r"^(now\(\)|CURRENT_TIMESTAMP)$")
 
 
 async def _ledger_tables_refusal(conn) -> Optional[str]:
@@ -683,7 +696,7 @@ async def _ledger_tables_refusal(conn) -> Optional[str]:
             if row[column]:
                 return "ledger table %s has %s" % (name, what)
         if any(not _PLAIN_DEFAULT.match(d or "") for d in row["defaults"]):
-            return "ledger table %s has a column default that is not now() or nextval()" % name
+            return "ledger table %s has a column default that is not now()" % name
     return None
 
 
@@ -736,17 +749,12 @@ SELECT pg_catalog.format('%I.%I', n.nspname, c.relname) AS name, n.nspname || '.
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
  WHERE c.relowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER) AND c.relkind IN ('r', 'p')
 """
-#: The role's sequences but those a ledger column owns (a ledger INSERT may draw from one).
+#: Every sequence the role owns, a ledger column's included (the d66c349c9 review, finding 3).
 _OWNED_SEQUENCES_SQL = """
 SELECT pg_catalog.format('%I.%I', n.nspname, c.relname) AS name, s.seqstart
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
  WHERE c.relowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER) AND c.relkind = 'S'
-   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
-                     JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
-                    WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid
-                      AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.deptype IN ('a', 'i')
-                      AND tn.nspname = 'public' AND t.relname = ANY($1::pg_catalog.text[]))
 """
 
 
@@ -794,7 +802,7 @@ async def _audit_refusal(conn, plan: SchemaPlan) -> Optional[str]:
     for table in tables:
         if not table["is_ledger"] and await _has_rows(conn, table["name"], table["relforcerowsecurity"]):
             return "the apply left rows in a table that is not a ledger; rolled back"
-    for sequence in await conn.fetch(_OWNED_SEQUENCES_SQL, list(_LEDGER_COLUMNS), timeout=APPLY_STATEMENT_SECONDS):
+    for sequence in await conn.fetch(_OWNED_SEQUENCES_SQL, timeout=APPLY_STATEMENT_SECONDS):
         state = await conn.fetchrow("SELECT last_value, is_called FROM %s" % sequence["name"], timeout=APPLY_STATEMENT_SECONDS)
         if state["is_called"] or state["last_value"] != sequence["seqstart"]:  # setval(s, n, false) included
             return "the apply left a sequence that was advanced or set; rolled back"
@@ -902,7 +910,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jobs.sandbox_schema_apply")
     parser.add_argument("command", nargs="?", choices=("apply", "check"), default="apply")
     parser.add_argument("files", nargs="*", help="check: <schema.sql> <ledgers.sql>")
-    args = parser.parse_args(list(argv or []))
+    args = parser.parse_args(argv)  # None = sys.argv: `python -m ... check` must never fall through to apply
     try:
         if args.command == "check":
             if len(args.files) != 2:
