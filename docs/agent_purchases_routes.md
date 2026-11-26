@@ -125,6 +125,13 @@ does not exist. Turning it on needs a restart.
   the buyer switch cards, the page would still name the earlier one. `network` is the partner's word or `null`; there is no field without exactly four digits, before
   the card is bound, or when the card read fails (the body is still served). Never in the public route or
   the webhooks. Off: no field.
+- With `AGENPAS_CARD_PICKER_ENABLED` on (default off, read per request), an A2A-rail body whose purchase waits for
+  the buyer's card (below) carries `"card_choice": {"confirmed": false, "expires_at": "...", "cards": [{"handle",
+  "network", "last4", "added_at", "selected"}]}`: the buyer's ACTIVE cards as the worker last read them from the
+  rail, newest first, `selected` on the card the purchase will pay with unless the buyer picks another. `handle`
+  names a card for this purchase only (a hash of the purchase and the rail's card id; never the card id itself).
+  No field otherwise (another rail, not waiting, past the token or the deadline) or when the read fails (the body
+  is still served). The read calls no rail. Never in the public route or the webhooks. Off: no field.
 - Either rail's body carries `"agent_display_name": "<name>"`, the name the page shows as "Requested by":
   - a name set by hand in `agents.buyer_display_name` (migration 297, a gated one-off) when that column
     is not NULL. It wins over the portal name, and it never falls through to it: `''` hides a portal name
@@ -413,6 +420,45 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   - 404 `purchase_not_found`: another agent's purchase, or none.
   - 400 `agent_id_required`. 401. 503.
   - Nothing of the body is logged.
+
+## `POST /agent/internal/commerce/purchases/{purchase_id}/card-choice` (server to server, AgenPas)
+
+The buyer's card, confirmed on the AgenPas page's Approve, for an A2A-rail purchase that waits for it.
+
+**The wait** (`AGENPAS_CARD_PICKER_ENABLED`, default off, read per request on `web` and the worker). On, the
+worker locks the order and then asks the rail for NO token until the buyer confirmed a card: the rail has no void,
+so the card is chosen before the token is asked for, or not at all. It reads the buyer's cards, keeps the ACTIVE
+ones (newest first, at most 10: id, network, last four, date added; migration 300 `card_options`), names the
+default (the card the purchase names if still ACTIVE, else the newest) and parks the purchase in `quoting` with
+`last_error_code = card_choice_required` and a deadline of 30 minutes (`a2a_rail_worker.CARD_CHOICE_SECONDS`), set
+once. It looks again every 2 minutes (`POLL_CARD_CHOICE`; a card added or removed meanwhile changes the list).
+Past the deadline the sweep ends it `expired` with `buyer_action_expired`; nothing was minted. The VIC order step
+waits the same way, after its first quote (no new quote while it waits; a fresh one goes out once confirmed). A
+purchase that waited when the dial was turned off loses the wait's deadline and park code on its next look. No ACTIVE card left: `failed` / `token_method_unavailable`. Once confirmed,
+the token goes out on the confirmed card (or the purchase fails `token_method_unavailable` if that card is gone).
+The dial off: the worker mints on the card the purchase names, exactly as before, including for a purchase that
+was waiting. **Turn on** on `web` first, then the worker; **off** on the worker first, then `web` (a worker that
+waits while `web` shows no choice leaves purchases waiting until the deadline).
+
+Same router as the read: its dial, its key (`AGENPAS_INTERNAL_READ_KEY`) and its (agent id, purchase id) scoping,
+like the shipping-address write.
+
+- Body, exactly `{"handle": "<24 hex>"}`, at most 256 bytes: a handle from the read's `card_choice.cards`.
+- A compare-and-swap (`db/a2a_rail_ledger.confirm_card_choice`) on exactly the cards the read showed, only while
+  the purchase waits (`quoting`, no token, no pending write, not purged, not confirmed, the deadline not passed) and
+  no worker holds it (a held purchase may be on its way to the token on the card it names).
+  It sets the card, records `card_confirmed_at`, clears the deadline and makes the purchase due at once.
+
+| Answer | When |
+|---|---|
+| 200 the unified view, with `card_choice` (`confirmed: true`) while it still waits | recorded, or the same card again (also after the worker moved on) |
+| 400 `invalid_card_choice` | not exactly that body |
+| 409 `card_choice_unavailable` | `AGENPAS_CARD_PICKER_ENABLED` is off |
+| 409 `card_choice_closed` | not an A2A purchase, not waiting on a card, or another card was already confirmed |
+| 409 `card_choice_stale` | the handle is not one of the cards the purchase now offers, the list changed since the read, or the worker holds the purchase this moment: re-read and send again |
+| 404 `purchase_not_found` / 401 / 503 `temporarily_unavailable` | as for the read |
+
+A 4xx is re-wrapped by ErrorHandlerMiddleware: read `detail.error`. Calls no rail; nothing of the body is logged.
 
 ## `GET /agent/v2/commerce/purchases?limit=N`
 
