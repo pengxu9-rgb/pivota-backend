@@ -154,11 +154,104 @@ async def test_the_new_card_confirmation_is_only_for_the_held_binding_row_and_it
     assert await ledger.confirm_new_card_as_holder(pid, W, method_id="pm_new") is None  # once
 
 
-async def test_with_the_choice_off_a_bound_purchase_falls_back_to_any_active_card_as_before(monkeypatch):
+# ── review follow-ups: the crash windows, the race, the counts ──────────────────────────────────────
+
+
+async def _confirmed_mid_binding(*, pending=None):
+    """The new card was confirmed and the process died before the move back to `quoting` (a later read may lag)."""
+    pid, _ = await _binding_new()
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET card_confirmed_at = CURRENT_TIMESTAMP, pending_write = CAST(:p AS TEXT), "
+        "pending_write_at = CASE WHEN CAST(:p AS TEXT) IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END WHERE id = :i",
+        {"p": pending, "i": pid})
+    return pid
+
+
+@pytest.mark.parametrize("pending", ["payment.method-add-required-card#bound", None])
+async def test_after_a_crash_past_the_confirmation_no_other_card_ever_stands_in(pending):
+    # `_send_bound` (an unseen `bound`, reconciled first) and `_binding` (no write pending): a read that still lists the
+    # new card PENDING beside an old ACTIVE one waits; it never moves on, or mints, on the old card.
+    pid = await _confirmed_mid_binding(pending=pending)
+    lagging = _methods(VISA, NEWEST, NEW_PENDING)
+    for _ in range(2):
+        await _ago("next_poll_at", 1, purchase_id=pid)
+        rail = Rail().on("payment.method-view#submit", lagging)
+        await _step(rail, pid)
+        assert "payment.token-setup#submit" not in rail.actions()
+        row = await _row(pid)
+        assert (row["state"], row["payment_method_id"]) == ("needs_payment_method", "pm_new")
+    # The new card turns ACTIVE: on to `quoting` on IT, and the token on it once locked again.
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA, NEWEST, NEW_ACTIVE)), pid) == "method_ready"
+    row = await _row(pid)
+    assert (row["state"], row["payment_method_id"]) == ("quoting", "pm_new")
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = 5149 WHERE id = :i",
+                           {"o": ORDER, "i": pid})
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    rail = Rail().on("payment.method-view#submit", _methods(VISA, NEWEST, NEW_ACTIVE)).on(
+        "payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "approval_page_issued"
+    assert [p["payment_method_id"] for k, p, _ in rail.sent if k == "payment.token-setup#submit"] == ["pm_new"]
+
+
+async def test_with_the_choice_turned_off_mid_binding_the_new_card_is_still_the_only_card(monkeypatch):
     pid, _ = await _binding_new()
     monkeypatch.delenv(ledger.CARD_PICKER_ENABLED_ENV, raising=False)
     await _ago("next_poll_at", 1, purchase_id=pid)
-    rail = Rail().on("payment.method-view#submit", _methods(VISA, NEW_PENDING))
-    assert await _step(rail, pid) == "method_ready"
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA, NEW_PENDING)), pid) == "waiting_on_buyer"
+    assert (await _row(pid))["payment_method_id"] == "pm_new"
+
+
+async def test_a_saved_card_confirmation_never_lands_after_a_new_card_request():
+    pid = await _waiting(VISA, NEWEST)
+    text = (await _choice(pid))["options_text"]
+    assert await ledger.request_new_card(pid, AGENT, OWNER) is not None
+    assert await ledger.confirm_card_choice(pid, AGENT, OWNER, method_id="pm_visa", options_text=text) is None
     row = await _row(pid)
-    assert (row["state"], row["payment_method_id"], row["card_confirmed_at"]) == ("quoting", "pm_visa", None)
+    assert row["card_confirmed_at"] is None and row["payment_method_id"] == "pm_visa"
+
+
+async def test_claims_while_waiting_for_the_card_do_not_count_as_attempts():
+    pid = await _waiting(VISA, NEWEST)
+    before = (await _row(pid))["attempts"]
+    for _ in range(3):
+        await _claim(pid)
+        await ledger.release_claim(pid, W)
+    assert (await _row(pid))["attempts"] == before
+
+
+async def test_the_reconcile_confirms_the_new_card_before_moving_on():
+    pid, _ = await _binding_new()
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET pending_write = 'payment.method-add-required-card#bound', "
+        "pending_write_at = CURRENT_TIMESTAMP WHERE id = :i", {"i": pid})
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA, NEW_ACTIVE)), pid) == "method_ready"
+    row = await _row(pid)
+    assert (row["state"], row["payment_method_id"]) == ("quoting", "pm_new") and row["card_confirmed_at"] is not None
+
+
+async def test_an_exhausted_card_page_write_from_the_wait_fails_the_purchase():
+    pid = await _asked()
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET pending_write = 'payment.method-add#submit', pending_write_at = CURRENT_TIMESTAMP "
+        "WHERE id = :i", {"i": pid})
+    await _ago("pending_write_at", worker.RECONCILE_LIMIT_SECONDS + 60, purchase_id=pid)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert await _step(Rail(), pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("failed", "reconcile_exhausted")
+
+
+@pytest.mark.parametrize("change", [
+    "state = 'needs_payment_method'",
+    "pending_write = 'payment.method-add#submit'",
+    "payment_token_id = 'ptk_1'",
+    "contact_purged_at = CURRENT_TIMESTAMP",
+    "card_options = NULL",
+])
+async def test_request_new_card_refuses_a_row_past_the_wait(change):
+    pid = await _waiting(VISA, NEWEST)
+    await database.execute(f"UPDATE a2a_rail_purchases SET {change} WHERE id = :i", {"i": pid})
+    assert await ledger.request_new_card(pid, AGENT, OWNER) is None
+    assert (await _row(pid))["card_new_requested_at"] is None

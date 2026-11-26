@@ -1054,8 +1054,9 @@ async def park_for_card_choice_as_holder(
 # (a held row may be on its way to the token on the card it names: a worker whose dial is off mints without waiting, so
 # a card changed under it would be a token on a card the buyer did not pick, which the rail cannot void), and only on
 # EXACTLY the cards the caller read just before (`card_options` as read): a list the worker rewrote since is a refusal,
-# and the page re-reads. Sets the card, records the confirmation, clears the deadline (the row now waits on nobody) and makes the row
-# due at once.
+# and the page re-reads. Never after the buyer asked for a new card (migration 301: the two are exclusive in the SQL
+# itself, not only in the route's read). Sets the card, records the confirmation, clears the deadline (the row now waits
+# on nobody) and makes the row due at once.
 _CONFIRM_CARD_CHOICE_SQL = """
     UPDATE a2a_rail_purchases
        SET payment_method_id = :method_id,
@@ -1067,6 +1068,7 @@ _CONFIRM_CARD_CHOICE_SQL = """
      WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
        AND state = 'quoting' AND pending_write IS NULL AND payment_token_id IS NULL
        AND contact_purged_at IS NULL AND card_confirmed_at IS NULL AND claimed_by IS NULL
+       AND card_new_requested_at IS NULL
        AND card_options = :card_options
        AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
     RETURNING *
@@ -1606,7 +1608,9 @@ async def list_paying_checkouts(*, limit: int = 50) -> List[Dict[str, Any]]:
 #
 # House style (db/reap_agentic_ledger): an advisory SELECT of due candidates, then ONE conditional
 # UPDATE per candidate that re-checks the state, the lease and the due time. Waiting on the buyer is
-# not a failed attempt, so `attempts` does not move in the two buyer states.
+# not a failed attempt, so `attempts` does not move in the two buyer states, nor while a row waits for the buyer's card
+# (the card choice's park code, only ever written on a `quoting` row and replaced by every transition): a long wait
+# must not leave a later write no reconcile attempts.
 
 _SELECT_DUE_SQL = """
     SELECT id FROM a2a_rail_purchases
@@ -1623,6 +1627,7 @@ _CLAIM_SQL = """
        SET claimed_by = :worker_id,
            claimed_at = clock_timestamp(),
            attempts = CASE WHEN state IN ('needs_payment_method', 'awaiting_authorization')
+                OR last_error_code = 'card_choice_required'
                 THEN attempts ELSE attempts + 1 END,
            updated_at = clock_timestamp()
      WHERE id = :id

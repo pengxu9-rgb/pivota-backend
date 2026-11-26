@@ -509,7 +509,8 @@ async def _record_new_card(rail_id: str, agent_id: str, owner: str) -> Optional[
     if choice is None:
         # Nothing to choose any more: an earlier identical request (the worker already left for the card page) is fine.
         row = await a2a_ledger.get_purchase_for_owner(rail_id, agent_id, owner)
-        asked = row is not None and row.get("card_new_requested_at") is not None and row.get("card_confirmed_at") is None
+        asked = (row is not None and row.get("card_new_requested_at") is not None and row.get("card_confirmed_at") is None
+                 and row.get("state") in ("quoting", "needs_payment_method"))
         return None if asked else "card_choice_closed"
     if choice["confirmed"]:
         return "card_choice_closed"

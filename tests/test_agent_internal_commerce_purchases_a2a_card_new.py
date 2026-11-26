@@ -84,3 +84,11 @@ async def test_while_a_worker_holds_the_row_the_request_is_stale_and_writes_noth
     resp = await _ask(rail_id)
     assert (resp.status_code, _error(resp)) == (409, "card_choice_stale")
     assert (await _row(rail_id))["card_new_requested_at"] is None
+
+
+async def test_a_new_card_request_on_a_row_that_ended_is_closed_not_a_repeat():
+    rail_id = await _waiting()
+    assert (await _ask(rail_id)).status_code == 200
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'failed' WHERE id = :i", {"i": rail_id})
+    resp = await _ask(rail_id)
+    assert (resp.status_code, _error(resp)) == (409, "card_choice_closed")

@@ -764,8 +764,10 @@ async def _binding(s: _Step) -> str:
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting")
         return await _settled(s, moved, "method_ready")
-    # The buyer asked for a NEW card: another ACTIVE one never stands in for it.
-    other = None if _new_card_mode(s.row) else _active_method(methods)
+    # The buyer asked for a NEW card: another ACTIVE one never stands in for it, whether or not the new card is confirmed
+    # yet (a crash after the confirmation must not let a read that still lags fall back to an old card) and whatever the
+    # dial says now. Only the row's own new card is bound, and only it is minted on.
+    other = None if s.row.get("card_new_requested_at") is not None else _active_method(methods)
     if other:
         # The buyer has an ACTIVE card after all (bound through another purchase's page, say): use it.
         moved = await ledger.transition_as_holder(
