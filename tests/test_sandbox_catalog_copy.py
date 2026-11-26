@@ -255,3 +255,54 @@ def test_gcs_errors_are_refusals_with_the_status_only(monkeypatch):
     monkeypatch.setattr(httpx, "post", lambda *a, **k: R(412))
     with pytest.raises(C.CopyRefused, match="never overwrites"):
         store.put("20261125T0100Z/x.csv.gz", b"data")
+
+
+@pytest.mark.parametrize("name", sorted(C.NEVER_COPY_TABLES) + [
+    "buyer_addresses", "partner_tokens", "agent_session_log", "oauth_grants", "merchant_wallets",
+    "refund_requests", "stored_cards", "otp_codes", "x_ledger", "booking_notes", "auth_events", "secrets",
+])
+def test_identity_key_order_and_buyer_tables_are_never_copied(name):
+    assert C.never_copy(name)
+    assert name not in {s.name for s in C.CATALOG_TABLES}
+
+
+def test_no_copied_table_looks_like_one():
+    assert [s.name for s in C.CATALOG_TABLES if C.never_copy(s.name)] == []
+
+
+def test_the_importer_refuses_a_manifest_naming_one_even_with_a_spec_for_it():
+    spec = (C.TableSpec("catalog_offers", "x"),)
+    manifest = {"format_version": C.FORMAT_VERSION, "tables": [
+        {"name": "catalog_offers", "columns": ["offer_id"]}, {"name": "api_keys", "columns": ["key_hash"]}]}
+    with pytest.raises(C.CopyRefused, match="never copied: api_keys"):
+        C.validate_manifest(manifest, spec)
+    with pytest.raises(C.CopyRefused, match="never copied: agents"):
+        C.validate_manifest({"format_version": C.FORMAT_VERSION, "tables": []}, (C.TableSpec("agents", "x"),))
+
+
+async def test_the_export_refuses_a_spec_naming_one_before_reading_anything(tmp_path):
+    class NoDb:
+        def __getattr__(self, name):
+            raise AssertionError("read prod")
+
+    with pytest.raises(C.CopyRefused, match="never copied: agents,orders"):
+        await C.export_catalog(NoDb(), C.LocalDirStore(tmp_path), stamp="20261125T0100Z",
+                               specs=(C.TableSpec("orders", "x"), C.TableSpec("agents", "x")))
+
+
+@pytest.mark.parametrize("uri", ["gs://other-bucket/catalog", "gs://pivota-sandbox-catalog-drop-2/x",
+                                 "gs://pivota-sandbox-catalog-drop/../x", "s3://pivota-sandbox-catalog-drop/x"])
+def test_the_gcs_store_takes_only_the_pinned_drop_bucket(uri):
+    with pytest.raises(C.CopyRefused):
+        C.GcsStore(uri)
+
+
+def test_a_gcs_transport_error_is_a_refusal(monkeypatch):
+    import httpx
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "get", boom)
+    with pytest.raises(C.CopyRefused, match="unreachable for the metadata token"):
+        C.GcsStore("gs://pivota-sandbox-catalog-drop/catalog").get("x")
