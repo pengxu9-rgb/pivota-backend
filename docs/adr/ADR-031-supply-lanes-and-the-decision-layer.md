@@ -4,6 +4,45 @@
 
 **Decision owner:** Founder. **Runtime owners:** the gateway owner (request-time lanes, the price cache), the backend owner (identity, seller facts, records, scheduled lanes).
 
+## Amendment 1 (owner, 2026-11-26): live search serves in the same answer
+
+*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
+
+1. **Queue-first is withdrawn.** The owner's 2026-11-23 answer to question 4 (D8) is reversed. A seller or listing that a lane's `search` finds while answering may be shown in that same answer when both hold:
+   - its match is judged in the request and labelled `confirmed` or `likely` (ADR-032 Amendment 1);
+   - its seller passes the admission checks in the request (ADR-033 Amendment 1).
+
+   A seller that fails the checks, or could not be checked in time, is not shown.
+2. **Request-time search serves; it is no longer counted only** (phases 3 and 6).
+   - Platform-catalog and store-door `search` run in parallel for the product asked about.
+   - The budget for the whole `get_offers` call is 5 seconds (owner, 2026-11-26). A lane that has not answered by then is cut off, and its results may show on a later call.
+   - These reads ship only after lane reads have an egress of their own (D10; question 8 unchanged).
+3. **The storage rule is unchanged (D1).** After the answer is sent:
+   - from a door, we keep the pointer, our verdict, which fields agreed and a fingerprint of the inputs;
+   - from a platform catalog, we keep nothing until open dependency 1 is answered in writing, then the same as a door.
+
+   A later call about the same product answers from those stored decisions and reads the price live. Every cache stays inside its source's published window.
+4. **Every lane call still comes from one buyer request** (D10). No catalog is swept; demand alone decides what is searched.
+5. **Coverage gaps.** A product that no lane returns is recorded as demand and opens a coverage task for its brand: finding further stores or platforms.
+   - A model without search grounding may propose candidate stores.
+   - An agent checks each one through an allowed origin: the brand's published list of sellers, a feed, or a platform catalog.
+   - The standing rule on search-grounded results is unchanged.
+6. **D2 holds.** The gateway makes every lane call. The backend judges the candidates the gateway passes to it (ADR-032 Amendment 1). It calls models, and never a store or a platform.
+7. **A live offer is not a stored offer row.** It is served from the gateway's answer to that request.
+   - D8's stored-price gates (`has_price`, the recall join on a stored offer) do not apply to it.
+   - It never reaches a public or bulk surface.
+   - A lane still creates no stored listing; a stored row comes from a source we may keep, as before.
+8. **A seller a platform catalog returns is used only through its own door** (ADR-033 Amendment 1). Nothing is written from the catalog until open dependency 1 is answered.
+9. **Text below that this amendment overrides:**
+   - D5's `get_offers` row: 5 seconds for the whole call, not 3 seconds for 3 offers;
+   - D8's rule that a seller or listing first seen through a lane's `search` is not served in that answer;
+   - D12's catalog supply-lane switch, which gains a serving value;
+   - D13's rows for store-door variant sourcing and the platform catalog client;
+   - phases 3 and 6, where search was counted only;
+   - the answer to question 4.
+
+   The alternative "search every source on every request" stays rejected as the only design: stored decisions answer repeat calls.
+
 **Companion:** ADR-032 decides when two listings are the same sellable item. This ADR uses its result.
 
 **Direction already decided by the owner:**

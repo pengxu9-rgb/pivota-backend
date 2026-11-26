@@ -1,6 +1,6 @@
 # ADR-030: Pivota is the UCP/ACP platform; the checkout is the merchant's; card networks are only the credential layer
 
-**Status:** Proposed (draft 6), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later". Draft 6 applies D11 beyond the pilot, and records the answers to owner questions 2, 3 and 5. **Amended 2026-11-23 (amendment 1)** with one decision of the decision owner: a payment partner whose checkout request cannot start from the entry link may still complete orders (D7). See "Amendment 1" below.
+**Status:** Proposed (draft 6), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later". Draft 6 applies D11 beyond the pilot, and records the answers to owner questions 2, 3 and 5. **Amended 2026-11-23 (amendment 1)** with one decision of the decision owner: a payment partner whose checkout request cannot start from the entry link may still complete orders (D7). See "Amendment 1" below. **Amended 2026-11-26 (amendment 2):** facts read in a request may decide admission and an agent-paid purchase (D8). See "Amendment 2" below.
 
 **Decision owner:** Founder. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
@@ -46,6 +46,18 @@
   - its owner questions 1 (a card vault) and 3 (a platform protocol as a completion route) are answered "no" by amendment 1 and the 2026-11-10 rule, once the owner confirms (question 6 below).
 
   ADR-029 carries notes at each of these places that point here.
+
+## Amendment 2 (owner, 2026-11-26): facts read in a request may decide
+
+*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-031 Amendment 1, ADR-033 Amendment 1.*
+
+1. **D8's "Nothing is decided by a request-time fetch" is amended.** For a seller first seen in a request, two decisions may rest on what that seller's own door answers in the request:
+   - its admission (ADR-033 Amendment 1);
+   - an agent-paid purchase (ADR-029 Amendment 2).
+
+   What is read is stored at once as a fact, with its time.
+2. **The background job of D8 still runs** and refreshes every stored fact. A stored fact, when fresh, is used before any read in the request.
+3. **Only the gateway calls a merchant's door** (D2), unchanged.
 
 ## Amendment 1 (2026-11-23): a payment partner that cannot load the entry link
 

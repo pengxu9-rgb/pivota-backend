@@ -4,6 +4,24 @@
 
 **Decision owner:** Founder. **Runtime owners:** the backend's `offers.resolve` code owner and the agent gateway's `get_offers` code owner, to be named at acceptance. Both are needed: the backend cuts the offer list before the gateway sees it, and the gateway reads merchants live after that cut.
 
+## Amendment 1 (owner, 2026-11-26): offers found live are labelled, and only confirmed ones compete
+
+*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-033 Amendment 1.*
+
+1. **The best-offer filter gains a condition.** An offer is never the best offer unless it is `comparable`: it is for the listing asked about, or it is matched to that listing at variant grain, either live (`confirmed`, ADR-032 Amendment 1) or by a stored match.
+2. **Rule 0 keeps its one meaning, the fit tier.** A live `confirmed` match takes the value `exact`. A live `likely` match takes the value `loose`. Nothing new is added to the order, so this ships as part of version 1.
+3. **Each offer carries its match.** The fields are:
+   - `match.status`: `confirmed` or `likely`;
+   - `match.basis`: which fields agreed, and the source of each;
+   - `match.grain`: variant or family;
+   - `found_via`: the lane and the time it answered;
+   - `comparable`: true only for a match `confirmed` at variant grain.
+
+   `rank_facts` carries the match as rule `match`.
+4. **The answer says what was asked.** It names which sources were asked and which answered inside the budget. It flags a product that no source returned.
+5. **Recorded for D3, the later product ranking.** For `get_alternatives`, the owner defines a dupe as a product of another brand that does the same job, at any price (owner, 2026-11-26). A same-brand product that does the same job is an alternative, not a dupe. The relationship graph's rule that a dupe costs no more than the product is removed when D3 is built.
+6. **ADR-033 is accepted** (owner, 2026-11-26), with its own Amendment 1. The lines below that call it proposed are out of date.
+
 ## Related
 
 - **ADR-002 (accepted):** every statement to an agent carries its evidence type and provenance. Today `get_offers` emits `evidence.grade: null`, `evidence.method: 'merchant_reported'` and `evidence.sources: []` on every offer.

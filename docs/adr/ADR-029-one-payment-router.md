@@ -1,6 +1,6 @@
 # ADR-029: One purchase router for agent-paid orders on merchants not connected to Pivota
 
-**Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR. **Amended 2026-11-23 (amendment 1)** with two decisions of the decision owner: the order among payment partners (D6, order rule 3) and an agent-set preference for agents that are not test agents (D2). See "Amendment 1" below.
+**Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR. **Amended 2026-11-23 (amendment 1)** with two decisions of the decision owner: the order among payment partners (D6, order rule 3) and an agent-set preference for agents that are not test agents (D2). See "Amendment 1" below. **Amended 2026-11-26 (amendment 2):** agent-paid checkout at a seller first seen in the request (D6). See "Amendment 2" below.
 
 **Decision owner:** Founder. **Runtime owner of the router:** the payment orchestration code owner (to be named at acceptance).
 
@@ -11,6 +11,19 @@
 - **ADR-016:** Pivota is non-custodial.
 - **ADR-028:** Pivota completes the order on the merchant's checkout, D1 to D9. Unchanged, except where D6 below says how its rules are applied before any quote exists. Its D2 would be amended only if question 3 is answered yes.
 - **Payment orchestration P0 to P2c** (`services/payment_orchestration/`): the router (`router.choose_rail`), the unified purchase states (`rails.py`) and the parent ledger (`db/agent_purchase_ledger.py`).
+
+## Amendment 2 (owner, 2026-11-26): agent-paid checkout at a seller first seen in the request
+
+*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-030 Amendment 2, ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
+
+1. **An agent may pay at a seller found live, on its first sighting, and on a `likely` match** (owner, 2026-11-26).
+2. **The D6 fact filter still fails closed.** For a seller with no stored fact, the fact is read from that seller's own checkout answer at buy time: the checkout session opened through its door gives the payment handlers it accepts, the currency and the merchant's total. That answer stands in for `is_purchasable` for that one purchase, and is then stored as a fact.
+   - A missing, unreadable or ineligible answer still excludes every agent-paid path.
+   - Paths whose facts do not exist at all (the wallet fact, the payment-handler fact) stay excluded, as D6 says.
+3. **Unchanged:**
+   - ADR-028's MUSTs, the consent's ceiling and the path's cap;
+   - currency equals market;
+   - the buyer confirms the merchant's own item, variant and total before paying (ADR-028 D7). That confirmation is the last check against a wrong match.
 
 ## Amendment 1 (2026-11-23): the order among payment partners, and an agent-set preference
 
