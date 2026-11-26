@@ -161,7 +161,7 @@ async def test_the_self_heal_builds_the_same_purge_heartbeat_as_migration_299_an
     await ledger.record_contact_purge_heartbeat()
     await ledger.record_contact_purge_heartbeat()
     assert await ledger.contact_purge_is_alive() is True
-    await database.execute("UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = now() - interval '2701 seconds'")
+    await database.execute("UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = now() - interval '3001 seconds'")
     assert await ledger.contact_purge_is_alive() is False
     assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_contact_purge_heartbeat"))["n"] == 1
     await database.execute("DELETE FROM a2a_rail_contact_purge_heartbeat")

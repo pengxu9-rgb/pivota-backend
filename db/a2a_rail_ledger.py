@@ -1606,10 +1606,11 @@ _CONTACT_PURGE_ALIVE_SQL_SQLITE = """
     SELECT 1 AS alive FROM a2a_rail_contact_purge_heartbeat
      WHERE id = 1 AND ran_at > datetime('now', '-' || :max_age_seconds || ' seconds')
 """
-#: How old the purge's last finished run may be for it to count as running: three of its 15-minute
-#: slots. Stalled or switched off for longer and A2A creates stop; the 71 h threshold leaves the hour
-#: before 72 h for everything already open.
-CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS = 2700
+#: How old the purge's last finished run may be for it to count as running. Two missed runs put three
+#: 15-minute slots (2700 s) between stamps, and a run may start late (misfire grace) and take up to its
+#: 120 s deadline: 3000 s keeps a healthy-but-late purge from closing A2A creates. Stalled or switched
+#: off for longer and they close; the 71 h threshold leaves the hour before 72 h for what is open.
+CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS = 3000
 
 
 async def record_contact_purge_heartbeat() -> None:

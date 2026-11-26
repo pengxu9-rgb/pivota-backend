@@ -134,7 +134,7 @@ def test_the_file_holds_only_the_directory_freshness_and_contact_purge_definitio
 
 
 def test_the_contact_purge_policy_fires_when_the_create_route_closes(defs):
-    """Silent for 45 min = the create route's purge window (CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS):
+    """Silent for 50 min = the create route's purge window (CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS):
     the page and the closed rail start together. Present in the 24 h before, so it pages on a stop."""
     import db.a2a_rail_ledger as ledger
 
@@ -143,8 +143,8 @@ def test_the_contact_purge_policy_fires_when_the_create_route_closes(defs):
     query = condition["conditionPrometheusQueryLanguage"]["query"]
     metric = "logging_googleapis_com:user_a2a_rail_contact_purge_heartbeat"
     assert query.count(metric) == 2
-    assert "[23h15m] offset 45m" in query and "[45m]" in query and " unless " in query
-    assert ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS == 45 * 60
+    assert "[23h10m] offset 50m" in query and "[50m]" in query and " unless " in query
+    assert ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS == 50 * 60
 
 
 def test_an_unrelated_line_feeds_no_metric(defs):

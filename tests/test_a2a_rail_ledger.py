@@ -160,12 +160,12 @@ async def test_the_contact_purge_heartbeat_is_one_row_and_ages_out():
     await ledger.record_contact_purge_heartbeat()
     assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_contact_purge_heartbeat"))["n"] == 1
     assert await ledger.contact_purge_is_alive() is True
-    await database.execute("UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = datetime('now', '-2701 seconds')")
+    await database.execute("UPDATE a2a_rail_contact_purge_heartbeat SET ran_at = datetime('now', '-3001 seconds')")
     assert await ledger.contact_purge_is_alive() is False
-    assert await ledger.contact_purge_is_alive(max_age_seconds=3000) is True
+    assert await ledger.contact_purge_is_alive(max_age_seconds=3300) is True
     # the worker's heartbeat is a different row in a different table
     await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
-    assert await ledger.contact_purge_is_alive(max_age_seconds=3000) is True
+    assert await ledger.contact_purge_is_alive(max_age_seconds=3300) is True
     with pytest.raises(Exception):
         await database.execute("INSERT INTO a2a_rail_contact_purge_heartbeat (id, ran_at) VALUES (2, CURRENT_TIMESTAMP)")
 

@@ -318,7 +318,12 @@ async def _a2a_heartbeats_fresh() -> bool:
     stale one is logged by name; the agent sees the router's usual reason."""
     if not await a2a_ledger.worker_is_alive():
         return False
-    if not await a2a_ledger.contact_purge_is_alive():
+    try:
+        fresh = await a2a_ledger.contact_purge_is_alive()
+    except Exception as exc:  # noqa: BLE001 - named here; the caller's timeout covers both reads
+        logger.warning("agent_purchases: a2a contact purge heartbeat unreadable error_type=%s", type(exc).__name__)
+        return False
+    if not fresh:
         logger.warning("agent_purchases: a2a contact purge heartbeat stale; A2A creates closed")
         return False
     return True
@@ -334,7 +339,9 @@ async def _a2a_worker_alive(*, agent_id: str, preferred: Optional[str]) -> bool:
     try:
         return await asyncio.wait_for(_a2a_heartbeats_fresh(), _HEARTBEAT_READ_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - timeouts included
-        logger.warning("agent_purchases: a2a worker heartbeat unreadable error_type=%s", type(exc).__name__)
+        # the worker read failed, or the two reads together passed the timeout
+        logger.warning("agent_purchases: a2a worker heartbeat unreadable or heartbeat reads timed out error_type=%s",
+                       type(exc).__name__)
         return False
 
 

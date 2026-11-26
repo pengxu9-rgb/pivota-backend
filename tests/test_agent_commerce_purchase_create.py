@@ -650,12 +650,16 @@ async def test_a_stalled_contact_purge_refuses_an_explicit_a2a_choice(client, st
     await _nothing_written()
 
 
-async def test_an_unreadable_purge_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch):
+async def test_an_unreadable_purge_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch, caplog):
+    import logging
+
     async def broken(**_kw):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(a2a_ledger, "contact_purge_is_alive", broken)
-    assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    with caplog.at_level(logging.WARNING):
+        assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    assert "a2a contact purge heartbeat unreadable error_type=RuntimeError" in caplog.text, "the purge read is named"
     await _nothing_written()
 
 
@@ -663,8 +667,9 @@ def test_the_purge_heartbeat_window_outlives_two_missed_runs_and_ends_before_the
     from jobs import a2a_rail_contact_purge as purge_job
     from services.audit_scheduler import run_deadline_for
 
-    # Runs every 15 min (cron :03/:18/:33/:48) and may take its deadline: two missed runs stay open.
-    assert a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS >= 2 * 900 + run_deadline_for("a2a_rail_contact_purge")
+    # Runs every 15 min (cron :03/:18/:33/:48): two missed runs put three slots between stamps, and
+    # the late run may take its deadline. A window shorter than that closes A2A on a healthy purge.
+    assert a2a_ledger.CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS >= 3 * 900 + run_deadline_for("a2a_rail_contact_purge")
     # A purchase admitted on the last fresh stamp still has its contact purged at 71 h, before 72 h.
     assert purge_job.PURGE_AGE_SECONDS < 72 * 3600
 

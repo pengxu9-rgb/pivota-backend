@@ -20,7 +20,7 @@ id or a value.
 FAIL CLOSED. Every enabled run that finished its purge stamps its own heartbeat
 (db/a2a_rail_ledger.record_contact_purge_heartbeat, migration 299) and prints one summary line,
 `a2a_rail_contact_purge: {...}`, on the pivota logger. The create route opens no A2A purchase unless that
-heartbeat is under 45 minutes old (CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS), and the "went silent" alert
+heartbeat is under 50 minutes old (CONTACT_PURGE_HEARTBEAT_MAX_AGE_SECONDS), and the "went silent" alert
 in infra/gcp/monitoring/money_path_alerts.json reads the summary line. A disabled, failed or killed run
 stamps nothing and prints nothing, so the kill switch also stops new A2A purchases.
 
