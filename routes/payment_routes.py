@@ -19,7 +19,7 @@ import os
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 
-from config.platform import is_production
+from config.platform import is_production, is_sandbox
 from services.psp_payment_finalizer import finalize_payment_success
 
 logger = logging.getLogger("payment_routes")
@@ -33,10 +33,15 @@ def _unsigned_webhook_is_fatal() -> bool:
     webhook request — that inaccessibility is why this gate had no parity
     coverage. Off production the caller logs and falls through, which is the
     pre-existing behaviour.
+
+    The partner sandbox refuses too (S6): it is reachable by outside partners, and an unsigned event
+    reaches mark_order_paid. It has no Checkout.com account, so with no secret every event is
+    refused; with one, only a signed event passes, as in production.
     """
     return (
         os.getenv("ENVIRONMENT", "").lower() == "production"
         or is_production()
+        or is_sandbox()
     )
 
 

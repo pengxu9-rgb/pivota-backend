@@ -48,7 +48,7 @@ metadata, `scripts/inventory_legacy_test_merchants.py`) publishes `sandbox`. Not
 | call site | outside production | in the sandbox |
 |---|---|---|
 | `main.py` `_should_skip_heavy_startup_init` | heavy init runs unless `SKIP_HEAVY_STARTUP_INIT` | same as staging |
-| `main.py` `docs_viewer_allowed` / `require_docs_ui_enabled` | full internal OpenAPI and `/docs` served anonymously | **open, as on staging** — see follow-ups |
+| `main.py` `docs_viewer_allowed` / `require_docs_ui_enabled` | full internal OpenAPI and `/docs` served anonymously | **closed, as in production (S6)**: the full spec needs the admin key (an anonymous read gets the same 307 to the public partner spec), and `/docs` / `/redoc` answer 404. Partners reach the sandbox |
 | `main.py` robots.txt | disallow all | disallow all |
 | `utils/service_token.py` | weak-token length check prod-only | exempt (sandbox keys are freshly minted per the infra note) |
 | `utils/runtime_safety.refuse_in_production` (agent card issuance, Reap card-issuer webhooks) | open | open; Reap is the sandbox host (guard) |
@@ -58,7 +58,7 @@ metadata, `scripts/inventory_legacy_test_merchants.py`) publishes `sandbox`. Not
 | `routes/auth.py`, `routes/auth_routes.py` | demo logins if `ENABLE_INTERNAL_DEMO_FIXTURES` | **guard refuses the flag on** |
 | `routes/webhook_routes.py` Stripe livemode gate | test-mode events accepted | accepted (no live Stripe key allowed by the guard) |
 | `routes/billing_routes.py` | test-mode accepted | same |
-| `routes/payment_routes.py` | unsigned checkout webhook logged, not fatal, when no secret | **same as staging** — see follow-ups |
+| `routes/payment_routes.py` | unsigned checkout webhook logged, not fatal, when no secret | **fatal, as in production (S6)**: `_unsigned_webhook_is_fatal` adds `is_sandbox()`. The sandbox has no Checkout.com account, so with no secret every event is a 503; with one, only a signed event passes |
 | `routes/photos.py` | schema ensure on request | same as staging |
 | `services/reap_agentic_purchase.py` pilot scope unset | allowed outside prod | allowed |
 | `services/settlement_file_service.py` | no transfer unless `SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING=true` | **guard refuses that flag** |
@@ -73,12 +73,30 @@ admin/cleanup routes), `utils/startup_mode` (skips heavy DDL at boot), `db/datab
 (shared PEM required), `config/settings.py` (JWT), `services/audit_scheduler.py`,
 `config.platform.pytest_bypass_allowed` (test bypasses off).
 
+## `ENVIRONMENT` / `APP_ENV` read directly (bypassing `config/platform.py`)
+
+`utils/runtime_safety.py`, `utils/service_token.py`, `routes/webhook_routes.py` (Stripe livemode,
+Shopify strictness), `routes/payment_routes.py`, `routes/billing_routes.py`, `routes/shopify_setup.py`,
+`routes/photos.py`, `routes/refund_webhook_routes.py`, `routes/agent_shop_gateway.py` (`DEV_MODE`)
+and `config/sentry_config.py` (the environment tag) read these directly. The guard pins both to
+unset or `sandbox` (S1), so none of them sees `production` in the sandbox, and Sentry tags it
+`sandbox`.
+
+## Settings whose code default is a prod host (`config/settings.py`)
+
+Unset in the sandbox, these would call or link to prod. The two the server CALLS must be set
+(guard, S1): `PIVOTA_AGENT_INTERNAL_URL` (default `https://gateway.pivota.cc`: the beauty-search and
+observed-seller detail proxies, both flag-off by default, and the LLM probe) and
+`OUTBOUND_WARM_HANDOFF_RESOLVE_URL`. Set each to empty or an allowed sandbox URL. The rest are links
+shown to a person, never fetched by the server (portal base URLs, `CHECKOUT_SUCCESS_URL`,
+`CHECKOUT_CANCEL_URL`, `AGENT_ACP_CHECKOUT_URL_BASE`, `GOOGLE_OAUTH_REDIRECT_URI`): see follow-ups.
+
 ## Follow-ups (not in this change)
 
-1. The full internal OpenAPI is anonymously readable outside production. On a partner-reachable
-   sandbox web service that is a route map. Either keep the sandbox web service private (only the
-   gateway public), or close `docs_viewer_allowed` for the sandbox in its own PR.
-2. `routes/payment_routes.py` accepts an unsigned checkout webhook outside production. In the
-   sandbox that can only fake a simulated order in the sandbox's own database; set
-   `CHECKOUT_WEBHOOK_SECRET` there or close it for the sandbox.
-3. `proof_issuer_main.py` does not run the sandbox guard; it is not part of sandbox v0.
+1. `proof_issuer_main.py` does not run the sandbox guard; it is not part of sandbox v0.
+2. Display-only links that default to prod hosts (portal base URLs, checkout success/cancel,
+   `AGENT_ACP_CHECKOUT_URL_BASE`) would hand a partner a prod URL. No money and no prod write, but a
+   wrong link. Set them for the sandbox when the sandbox has those pages.
+3. `routes/agent_shop_gateway.py` mounts `/agent/shop/v1/dev/*` whenever `APP_ENV` is not
+   `production` (whether prod sets `APP_ENV` was not checked here). Read-only catalog debugging, not
+   sandbox-specific.
