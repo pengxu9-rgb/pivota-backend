@@ -306,6 +306,21 @@ _REFUSALS = [
     ("flag_payout", {"PARTNER_PAYOUT_EXECUTION_ENABLED": "true"}, "PARTNER_PAYOUT_EXECUTION_ENABLED"),
     ("store_reconcile_unset", {"STORE_LIFECYCLE_RECONCILE_ENABLED": None}, "STORE_LIFECYCLE_RECONCILE_ENABLED"),
     ("grounding_redirects_unset", {"AUDIT_RESOLVE_GROUNDING_REDIRECTS": None}, "AUDIT_RESOLVE_GROUNDING_REDIRECTS"),
+    # Review V8: more flag shapes, inverse flags, proxies, encodings, long TLDs, cloud credentials.
+    ("v8_flag_on_suffix", {"FOO_ON": "1"}, "FOO_ON"),
+    ("v8_use_live", {"USE_LIVE_PRICES": "true"}, "USE_LIVE_PRICES"),
+    ("v8_enable_live", {"ENABLE_LIVE_CHECKOUT": "1"}, "ENABLE_LIVE_CHECKOUT"),
+    ("v8_enable_prefix", {"ENABLE_SOMETHING_NEW": "yes"}, "ENABLE_SOMETHING_NEW"),
+    ("v8_allow", {"ALLOW_SHAKEOUT_ON_PROD": "true"}, "ALLOW_SHAKEOUT_ON_PROD"),
+    ("v8_inverse_disabled_false", {"FOO_DISABLED": "false"}, "FOO_DISABLED"),
+    ("v8_inverse_disable_zero", {"DISABLE_SAFETY_NET": "0"}, "DISABLE_SAFETY_NET"),
+    ("v8_grpc_proxy", {"grpc_proxy": "proxy:1080"}, "grpc_proxy"),
+    ("v8_socks_proxy", {"SOCKS5_PROXY": "proxy:1080"}, "SOCKS5_PROXY"),
+    ("v8_hex_url", {"FEATURE_BLOB": "68747470733a2f2f6576696c2e6578616d706c652f78"}, "FEATURE_BLOB"),
+    ("v8_long_tld", {"FEATURE_TARGET": "evil.international"}, "FEATURE_TARGET"),
+    ("v8_gcp_key_json", {"GOOGLE_APPLICATION_CREDENTIALS_JSON": SECRET}, "GOOGLE_APPLICATION_CREDENTIALS_JSON"),
+    ("v8_gcp_key_file", {"GOOGLE_APPLICATION_CREDENTIALS": "/secrets/key.json"}, "GOOGLE_APPLICATION_CREDENTIALS"),
+    ("v8_oauth_secret", {"GOOGLE_OAUTH_CLIENT_SECRET": SECRET}, "GOOGLE_OAUTH_CLIENT_SECRET"),
 ]
 
 
@@ -342,6 +357,9 @@ def test_each_bad_setting_is_refused_by_name_never_by_value(case, changes, setti
     {"VERTEX_AI_ENABLED": "false", "OPENAI_API_KEY": "", "OPENAI_MODEL": "gpt-4.1-mini"},
     {"SOME_SERVICE_URL": "", "SCHEDULE_AT": "10:30:00", "PROFILE_FILE": "config.json", "MODULE": "jobs.sandbox_copy"},
     {"FROM_EMAIL": "noreply@sandbox.agenpaz.com", "REAP_RETURN_URL_HOSTS": "sandbox.agenpaz.com, sandbox.mcp.pivota.cc:443"},
+    # Review V8: an inverse flag set to its SAFE side, the profile's serving flags, a hex secret.
+    {"IDENTITY_LIVE_READ_DISABLED": "true", "DISABLE_WEBHOOK_OUTBOX": "true", "ENABLE_STORELESS_BRAND_CATALOG": "1",
+     "ENABLE_BRAND_DIRECT_OFFER_TYPE": "true", "ENABLE_INTERNAL_DEMO_FIXTURES": "false", "SOME_SIGNING_SECRET": "ab" * 32},
 ])
 def test_the_safe_form_of_each_s1_setting_passes(changes):
     assert G.sandbox_violations(_with(**changes)) == []

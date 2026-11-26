@@ -98,8 +98,12 @@ shown to a person, never fetched by the server (portal base URLs, `CHECKOUT_SUCC
 gateway even when the setting is empty. Unrefused, the anonymous `POST /accounts/auth/aurora/exchange`
 would send the caller's bearer token to prod's `/v1/auth/me` and create a shop_user with the real email
 prod returns. In the sandbox the exchange answers 404 before any call and the monitor reports itself
-disabled. `tests/test_sandbox_prod_default_hosts.py` lists every prod-host URL literal in the code
-with what keeps it from prod in the sandbox, so a new fallback of this shape fails a test.
+disabled. `tests/test_sandbox_prod_default_hosts.py` lists every prod host named in any string in the
+code (URLs, bare host constants composed later, concatenation and f-string pieces, emails, User-Agent
+texts; pivota.cc/.ai, agenpaz/agenpas.com, reap.global, run.app and Railway hosts) with what keeps it
+from prod in the sandbox, so a new fallback of this shape fails a test. It found one more thing outside
+the sandbox's scope: `run_refund_migration.py` (a root one-off script, not imported by the app)
+hard-codes a legacy Railway DSN with its credential; see follow-ups.
 
 `config.settings.resolve_public_api_base_url` falls back to `https://api.pivota.cc` (managed-inbox
 receiver URLs, the MCP OAuth login redirect, OpenAPI servers). The guard requires its RESOLVED value
@@ -114,3 +118,6 @@ to be `https://sandbox.mcp.pivota.cc` (SF2), so `PUBLIC_API_BASE_URL` must be se
 3. `routes/agent_shop_gateway.py` mounts `/agent/shop/v1/dev/*` whenever `APP_ENV` is not
    `production` (whether prod sets `APP_ENV` was not checked here). Read-only catalog debugging, not
    sandbox-specific.
+4. `run_refund_migration.py` carries a hard-coded legacy Railway database URL including its password,
+   in a public repository: confirm that credential is revoked (Railway is no longer prod) and delete
+   the script. Not changed here (outside the sandbox).

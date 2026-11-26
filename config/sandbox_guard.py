@@ -66,9 +66,12 @@ POSITIVE CHECKS (S1: what a setting MUST be, not only what it must not be):
                      resolve to https on the sandbox gateway host (SF2). Code that falls back to a
                      prod host even when its setting is empty is refused in the sandbox at the
                      call site instead (tests/test_sandbox_prod_default_hosts.py lists them all).
-  flag_allowlist     a feature flag (*_ENABLED/_ENABLE/_ARMED/_APPLY/_LIVE) SET to anything but an off
-                     value must be in _FLAGS_ALLOWED_ON (the flags the sandbox profile turns on);
-                     flags that default ON when unset are listed and must be set off.
+  flag_allowlist     a feature flag (*_ENABLED/_ENABLE/_ARMED/_APPLY/_LIVE/_ON, ENABLE_*, USE_LIVE_*,
+                     any *ALLOW* name) SET to anything but an off value must be in _FLAGS_ALLOWED_ON
+                     (the flags the sandbox profile turns on); an inverse flag (*_DISABLED,
+                     DISABLE_*) set OFF turns its feature on and is refused too; flags that default ON
+                     when unset are listed and must be set off. Cloud key files / OAuth client secrets
+                     are refused (the sandbox uses its own service account).
   ai_search          no LLM or search API credential, model dials off, the keyless FX lookup off
                      (SF5: nothing in sandbox v0 calls a paid or third-party model/search API).
   money_default_on   the refund dials that default ON when unset are set to an explicit off value;
@@ -237,7 +240,7 @@ _AUTHORITY_RE = re.compile(r"(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*\.?|\[[0-9a-f:.]+\])(
 _ESCAPED_URL_RE = re.compile(r":\\+/|%3a%2f%2f|%3a//|:%2f%2f")
 #: A bare host anywhere in a value (no scheme): dotted labels ending in a letters-only label of 2-12
 #: characters (a TLD shape); file names are not hosts.
-_BARE_HOST_RE = re.compile(r"(?<![a-z0-9_.-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,12}))(?![a-z0-9_-])")
+_BARE_HOST_RE = re.compile(r"(?<![a-z0-9_.-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,63}))(?![a-z0-9_-])")
 _FILE_SUFFIXES = frozenset({"json", "yaml", "yml", "txt", "csv", "py", "js", "ts", "html", "htm", "sql", "gz",
                             "md", "log", "xml", "pem", "crt", "png", "jpg", "jpeg", "svg", "webp", "gif", "zip"})
 #: IPv6 and hex-encoded IPv4 literals (dotted IPv4 is _IPV4_TOKEN_RE). A bare decimal integer cannot
@@ -253,7 +256,9 @@ _HOST_NAME_RE = re.compile(
 #: Names whose value is a URL or a list of URLs: every item must be a URL (on the allowlist).
 _URL_NAME_RE = re.compile(r"(_URL|_URLS|_URI|_URIS|_BASE)$")
 #: Outbound proxies: none in the sandbox (a proxy is a way around every host check here).
-_PROXY_NAME_RE = re.compile(r"^(https?|all|ftp)_proxy$", re.IGNORECASE)
+_PROXY_NAME_RE = re.compile(r"^(https?|all|ftp|grpc|socks[45]?)_proxy$", re.IGNORECASE)
+#: A value that is hex and decodes to something holding a URL.
+_HEX_BLOB_RE = re.compile(r"(?:[0-9a-f]{2}){8,}\Z", re.IGNORECASE)
 #: Settings whose CODE DEFAULT is a prod host the server calls (config/settings.py). Unset means
 #: "call prod", so the sandbox must set each one: to empty (the feature has nowhere to go) or to an
 #: allowed sandbox URL.
@@ -325,6 +330,12 @@ _AI_SEARCH_CREDENTIAL_RE = re.compile(
     r"|SERPER|PERPLEXITY|MISTRAL|COHERE|GROQ|XAI|TOGETHER|FIREWORKS|OPENROUTER|BING|BRAVE|TAVILY|EXA|JINA"
     r"|FIRECRAWL|SCRAPINGBEE|APIFY|BROWSERLESS|CATALOG_INTELLIGENCE)_[A-Z0-9_]*(KEY|TOKEN|SECRET|CREDENTIAL)"
 )
+#: Cloud and OAuth credentials (review V8): the sandbox authenticates with its own service account
+#: only, so a key file, a key JSON or an OAuth client secret in its env is refused.
+_CLOUD_CREDENTIAL_RE = re.compile(
+    r"^GOOGLE_(APPLICATION_CREDENTIALS[A-Z0-9_]*|OAUTH_CLIENT_SECRET|CLIENT_SECRET|SERVICE_ACCOUNT[A-Z0-9_]*)$"
+    r"|_SERVICE_ACCOUNT_(KEY|JSON)$|^GCP_[A-Z0-9_]*(KEY|CREDENTIALS?)$"
+)
 #: Model-provider dials: off (Vertex/Gemini authenticate with the service account, no key needed).
 _AI_DIALS = ("VERTEX_AI_ENABLED", "GOOGLE_GENAI_USE_VERTEXAI")
 #: Keyless third-party egress that DEFAULTS ON when unset: each must be SET to an explicit off value.
@@ -339,12 +350,18 @@ _EGRESS_DEFAULT_ON = (
 #: to anything but an off value must be one reviewed for the sandbox. These are the flags the sandbox
 #: profile turns on (infra/gcp/sandbox/env/web.yaml + worker.yaml), plus partner webhook delivery.
 #: A flag nobody reviewed (e.g. a new *_CHECKOUT_ENABLED) is refused ON whatever its name says.
-_FLAG_NAME_RE = re.compile(r"_(ENABLED|ENABLE|ARMED|APPLY|LIVE)$")
+_FLAG_NAME_RE = re.compile(r"_(ENABLED|ENABLE|ARMED|APPLY|LIVE|ON)$|^(ENABLE|USE_LIVE|ENABLE_LIVE)_|(^|_)ALLOW(_|$)")
+#: An inverse flag (*_DISABLED, DISABLE_*) set to an explicit off value turns its feature ON (review V8).
+_INVERSE_FLAG_RE = re.compile(r"_DISABLED$|_DISABLE$|^DISABLE_")
+#: Inverse flags the sandbox may set off (none today).
+_INVERSE_FLAGS_ALLOWED_OFF: frozenset = frozenset()
 _FLAGS_ALLOWED_ON = frozenset({
     "AGENPAS_CONSENT_WRITE_ENABLED", "AGENPAS_INTERNAL_READ_ENABLED", "AGENT_EXTERNAL_SEED_CACHE_ENABLED",
     "AGENT_PURCHASE_LEDGER_ENABLED", "AGENT_SHOP_PIVOT_MULTI_SERVE_ENABLED", "AUDIT_WORKER_ENABLED",
     "PAYMENT_ORCHESTRATOR_ENABLED", "PROMETHEUS_METRICS_ENABLED", "REAP_AGENTIC_CART_LINK_ENABLED",
     "REAP_AGENTIC_CREATE_ENABLED", "REAP_AGENTIC_ENABLED", "REAP_AGENTIC_RECONCILE_ENABLED",
+    # Catalog / search behaviour the profile carries from staging (serving only, no egress).
+    "ENABLE_BRAND_DIRECT_OFFER_TYPE", "ENABLE_KBEAUTY_AGENT_DECISION_GATES", "ENABLE_STORELESS_BRAND_CATALOG",
     # Purchase webhooks to the partner's own registered endpoint (off by default outside production).
     "WEBHOOK_DELIVERY_ENABLED",
 })
@@ -489,6 +506,12 @@ def _encoded_url_rule(value: str) -> Optional[str]:
     import binascii
 
     for item in [value.strip()] + _items(value):
+        if _HEX_BLOB_RE.match(item):
+            try:
+                if b"://" in bytes.fromhex(item).lower():
+                    return "holds a hex-encoded URL"
+            except ValueError:
+                pass
         if not _BASE64_RE.match(item):
             continue
         padded = item + "=" * (-len(item) % 4)
@@ -653,11 +676,16 @@ def sandbox_violations(env: Mapping[str, str]) -> List[Violation]:
             continue  # the A2A rule above names these already
         if _FLAG_NAME_RE.search(name) and name not in _FLAGS_ALLOWED_ON and not _is_off(env.get(name) or ""):
             out.append(Violation(name, "feature flag ON but not reviewed for the sandbox (_FLAGS_ALLOWED_ON)"))
+        elif (_INVERSE_FLAG_RE.search(name) and name not in _INVERSE_FLAGS_ALLOWED_OFF and _val(env, name)
+              and _is_off(env.get(name) or "")):
+            out.append(Violation(name, "an inverse flag set off turns its feature ON; not reviewed for the sandbox"))
 
     # LLM / search credentials, model dials, keyless egress that defaults on (SF5).
     for name in sorted(env):
         if _AI_SEARCH_CREDENTIAL_RE.match(name) and (env.get(name) or "").strip():
             out.append(Violation(name, "LLM/search API credential: none is allowed in sandbox v0"))
+        elif _CLOUD_CREDENTIAL_RE.search(name) and (env.get(name) or "").strip():
+            out.append(Violation(name, "cloud/OAuth credential: the sandbox uses its own service account only"))
     for name in _AI_DIALS:
         if name in env and not _is_off(env.get(name) or ""):
             out.append(Violation(name, "model-provider dial must be off in sandbox v0"))
