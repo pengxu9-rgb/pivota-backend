@@ -15,13 +15,14 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db.database import IS_POSTGRES, database  # noqa: E402
 import db.a2a_rail_ledger as ledger  # noqa: E402
-from services.payment_orchestration import a2a_rail_worker as worker  # noqa: E402
+from services.payment_orchestration import a2a_rail_worker as worker, purchase_consent  # noqa: E402
 
 # The worker tests' fake rail, fixtures (autouse: the token dial and the clean tables) and helpers.
 from tests.test_a2a_rail_worker import (  # noqa: E402,F401
@@ -37,7 +38,9 @@ NEWEST = {**VISA, "id": "pm_newest", "last4": "4242", "created_at": "2026-11-20T
 
 @pytest.fixture(autouse=True)
 def picker_on(monkeypatch):
+    # The card choice runs only with the consent gate on too (the card is part of the buyer's approval step).
     monkeypatch.setenv(ledger.CARD_PICKER_ENABLED_ENV, "1")
+    monkeypatch.setenv(purchase_consent.GATE_ENV, "1")
 
 
 async def _waiting(*cards, method=VISA):
@@ -228,8 +231,8 @@ async def test_turning_the_dial_off_while_a_row_waits_mints_on_the_card_it_names
     assert (await _row(pid))["card_method_id"] == "pm_visa"
 
 
-async def test_a_row_read_without_the_card_choice_columns_mints_as_before(monkeypatch):
-    # A deferred heal: the worker never waits on columns it cannot write.
+async def test_a_row_read_without_the_card_choice_columns_is_parked_and_never_minted(monkeypatch):
+    # A deferred heal: the worker cannot record a confirmation, so it never mints without one (fail closed).
     pid = await _locked(VISA)
     real = ledger.claim_due_purchases
 
@@ -239,7 +242,47 @@ async def test_a_row_read_without_the_card_choice_columns_mints_as_before(monkey
 
     monkeypatch.setattr(ledger, "claim_due_purchases", without)
     rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "parked"
+    assert rail.actions() == []
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["payment_token_id"]) == (
+        "quoting", worker.CARD_CHOICE_SCHEMA_INCOMPLETE, None)
+
+
+async def test_the_dial_without_the_consent_gate_mints_as_before(monkeypatch):
+    monkeypatch.delenv(purchase_consent.GATE_ENV, raising=False)
+    pid = await _locked(VISA)
+    rail = Rail().on("payment.method-view#submit", _methods(VISA, NEWEST)).on("payment.token-setup#submit", _visa_page())
     assert await _step(rail, pid) == "approval_page_issued"
+    assert (await _row(pid))["card_options"] is None
+
+
+async def test_a_failed_card_read_while_waiting_still_ends_the_wait_when_the_choice_goes_off(monkeypatch):
+    pid = await _waiting(VISA, NEWEST)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert await _step(Rail().on("payment.method-view#submit", httpx.Response(503)), pid) != worker.CARD_CHOICE_REQUIRED
+    await ledger.release_claim(pid, W)
+    assert (await _row(pid))["last_error_code"] != worker.CARD_CHOICE_REQUIRED  # the read's code replaced the park's
+    monkeypatch.delenv(ledger.CARD_PICKER_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, raising=False)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert await _step(Rail(), pid) == "parked"
+    assert (await _row(pid))["buyer_action_expires_at"] is None
+
+
+async def test_a_confirmation_after_a_stale_claim_is_freed_never_lets_the_stale_worker_write():
+    pid = await _waiting(VISA, NEWEST)
+    text = (await _choice(pid))["options_text"]
+    await _claim(pid)  # a worker holds it, then dies mid-step
+    await _ago("claimed_at", worker.STALE_LEASE_SECONDS + 100, purchase_id=pid)
+    assert await ledger.requeue_stale_claims(lease_seconds=worker.STALE_LEASE_SECONDS) == 1
+    assert await ledger.confirm_card_choice(pid, AGENT, OWNER, method_id="pm_newest", options_text=text) is not None
+    # The stale worker comes back and tries its writes on the card it read: every one refused, nothing sent.
+    assert await ledger.mark_pending_write(pid, W, "payment.token-setup#submit") is None
+    assert await ledger.park_for_card_choice_as_holder(
+        pid, W, options=[VISA], default_method_id="pm_visa",
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=60), next_poll_at=datetime.now(timezone.utc)) is None
+    assert (await _row(pid))["payment_method_id"] == "pm_newest"
 
 
 async def test_the_park_refuses_a_default_that_is_not_offered_and_a_card_number_id():
@@ -256,6 +299,12 @@ async def test_the_park_refuses_a_default_that_is_not_offered_and_a_card_number_
     assert (await _row(pid))["card_options"] is None
 
 
+def test_a_card_the_rail_lists_twice_is_offered_once():
+    twice = [VISA, {**VISA, "created_at": "2026-09-01T00:00:00Z"}, NEWEST]
+    assert [o["id"] for o in worker._card_options(twice)] == ["pm_newest", "pm_visa"]
+    ledger.card_options_text(worker._card_options(twice))  # a list the ledger takes
+
+
 def test_the_worker_leaves_out_a_card_whose_id_the_ledger_refuses_and_caps_the_list():
     pan = {**VISA, "id": "4111111111111111"}
     many = [{**VISA, "id": f"pm_{i:02d}", "created_at": f"2026-10-{i + 1:02d}T00:00:00Z"} for i in range(12)]
@@ -264,10 +313,17 @@ def test_the_worker_leaves_out_a_card_whose_id_the_ledger_refuses_and_caps_the_l
     assert options[0]["id"] == "pm_11"  # newest first
 
 
-def test_a_card_handle_is_per_purchase_and_never_the_rail_id():
-    a, b = ledger.card_handle("ap_" + "1" * 24, "pm_visa"), ledger.card_handle("ap_" + "2" * 24, "pm_visa")
+def test_a_card_handle_is_keyed_per_purchase_and_never_the_rail_id():
+    import hashlib
+
+    key = "k" * 40
+    a, b = ledger.card_handle("ap_" + "1" * 24, "pm_visa", key), ledger.card_handle("ap_" + "2" * 24, "pm_visa", key)
     assert a != b and ledger.is_card_handle(a) and "pm_visa" not in a
+    assert ledger.card_handle("ap_" + "1" * 24, "pm_visa", "j" * 40) != a  # keyed: another key, another handle
+    assert a != hashlib.sha256(b"a2a-card:ap_" + b"1" * 24 + b":pm_visa").hexdigest()[:24]
     assert not ledger.is_card_handle("pm_visa") and not ledger.is_card_handle(a.upper())
+    with pytest.raises(ValueError):
+        ledger.card_handle("ap_" + "1" * 24, "pm_visa", "")
 
 
 def test_decode_refuses_what_the_code_would_not_write():
@@ -307,6 +363,14 @@ async def test_the_vic_order_waits_for_the_card_after_its_quote(monkeypatch):
     row = await _claim(pid)
     outcome = await worker._start_vic_order(worker._Step(_client(rail), row, W, vic=_Vic()))
     assert outcome == worker.CARD_CHOICE_REQUIRED and quoted == [pid]
+    # Once confirmed (another card), a fresh quote goes out and the order is built on the CONFIRMED card.
+    text = (await _choice(pid))["options_text"]
+    assert await ledger.confirm_card_choice(pid, AGENT, OWNER, method_id="pm_newest", options_text=text) is not None
+    built = []
+    monkeypatch.setattr(worker.vic_order, "build_order", lambda r: built.append(r.get("payment_method_id")) or None)
+    row = await _claim(pid)
+    await worker._start_vic_order(worker._Step(_client(Rail()), row, W, vic=_Vic()))
+    assert quoted == [pid, pid] and built == ["pm_newest"]
 
 
 

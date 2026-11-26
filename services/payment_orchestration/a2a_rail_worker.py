@@ -278,6 +278,9 @@ CARD_CHOICE_SECONDS = 1800
 #: makes it due at once, so this is a backstop, not the buyer's latency.
 POLL_CARD_CHOICE = 120
 CARD_CHOICE_REQUIRED = ledger.CARD_CHOICE_REQUIRED
+#: The park code while the card choice runs but the row was read without its columns (a deferred heal of migration
+#: 300): nothing is minted (it would be minted without the buyer's confirmation); the next tick after the heal goes on.
+CARD_CHOICE_SCHEMA_INCOMPLETE = "card_choice_schema_incomplete"
 
 ADD_METHOD = ("payment.method-add", "submit")
 BOUND = ("payment.method-add-required-card", "bound")
@@ -501,7 +504,11 @@ def _card_options(methods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     active = [m for m in methods if m.get("status") == "ACTIVE" and isinstance(m.get("id"), str) and m["id"]]
     active.sort(key=lambda m: _created_at(m.get("created_at")), reverse=True)
     out: List[Dict[str, Any]] = []
+    seen = set()
     for m in active:
+        if m["id"] in seen:
+            continue  # the rail listed one card twice: offered once (the newest entry), never a list the ledger refuses
+        seen.add(m["id"])
         option = {"id": m["id"], "network": m.get("payment_brand"), "last4": m.get("last4"),
                   "added_at": m.get("created_at")}
         try:
@@ -515,19 +522,25 @@ def _card_options(methods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _card_choice_ready(row: Mapping[str, Any]) -> bool:
-    """The row was read with the card-choice columns (migration 300). Without them (a deferred heal) nothing waits."""
+    """The row was read with the card-choice columns (migration 300)."""
     return "card_options" in row and "card_confirmed_at" in row
 
 
 def _needs_card_choice(row: Mapping[str, Any]) -> bool:
-    """The token may not be asked for yet: the dial is on and the buyer has not confirmed the card."""
-    return ledger.card_picker_enabled() and _card_choice_ready(row) and row.get("card_confirmed_at") is None
+    """The token may not be asked for yet: the card choice runs (its dial and the consent gate) and the buyer has not
+    confirmed the card. A row read WITHOUT the columns counts as unconfirmed: fail closed (`_await_card_choice` parks)."""
+    return ledger.card_picker_active() and (not _card_choice_ready(row) or row.get("card_confirmed_at") is None)
 
 
 async def _await_card_choice(s: _Step) -> str:
     """The order is locked and nothing is minted: wait for the buyer to confirm a card on the AgenPas page. Reads the
     buyer's cards (a read), offers the ACTIVE ones and names the default (the card the row names if still ACTIVE, else
-    the newest), then parks; the gateway's confirmation makes the row due at once. No card left: nothing can be minted."""
+    the newest), then parks; the gateway's confirmation makes the row due at once. No card left: nothing can be minted.
+    A row read without the card-choice columns (a deferred heal) is parked unread: never minted unconfirmed."""
+    if not _card_choice_ready(s.row):
+        logger.error("a2a_rail_worker: card choice columns missing purchase=%s; parked", s.id)
+        await s.release(POLL_PARKED, CARD_CHOICE_SCHEMA_INCOMPLETE)
+        return "parked"
     methods, read = await s.methods()
     if methods is None:
         return await _read_failed(s, read, "cards_read")
@@ -540,9 +553,9 @@ async def _await_card_choice(s: _Step) -> str:
     parked = await ledger.park_for_card_choice_as_holder(
         s.id, s.worker, options=options, default_method_id=default,
         expires_at=_later(CARD_CHOICE_SECONDS), next_poll_at=_later(POLL_CARD_CHOICE))
-    if parked is None:
-        return "lost"
-    return CARD_CHOICE_REQUIRED if parked.get("card_confirmed_at") is None else "card_confirmed"
+    # A confirmation cannot land while this worker holds the row (the confirmation requires an unheld row); the park's
+    # own CASE keeps one that somehow did.
+    return CARD_CHOICE_REQUIRED if parked is not None else "lost"
 
 
 # ── the steps ────────────────────────────────────────────────────────────────────────────────
@@ -2766,8 +2779,11 @@ def _token_step_off_reason() -> str:
 
 
 async def _quoting(s: _Step) -> str:
-    if s.row.get("last_error_code") == CARD_CHOICE_REQUIRED and not _needs_card_choice(s.row):
-        # Parked for the buyer's card, and the dial is off now: it no longer waits, so the wait's deadline goes.
+    if (
+        not ledger.card_picker_active() and s.row.get("card_options") and s.row.get("card_confirmed_at") is None
+        and s.row.get("buyer_action_expires_at") is not None and s.row.get("buyer_action_kind") is None
+    ):
+        # It waited for the buyer's card, and the choice is off now: it no longer waits, so the wait's deadline goes.
         s.row = await ledger.end_card_choice_wait_as_holder(s.id, s.worker) or s.row
     row = s.row
     if _vic_on(s) and not row.get("payment_token_id"):
@@ -2793,7 +2809,7 @@ async def _quoting(s: _Step) -> str:
             # The token would be relayed into a checkout that cannot be filled: no token is minted.
             return await _token_failed(s, "quoting", CHECKOUT_CONTACT_INCOMPLETE)
         if _needs_card_choice(row):
-            # The order is locked and nothing is minted: the buyer confirms the card first (the rail has no void).
+            # The order is locked and nothing is minted: the buyer confirms the card first (a token is bound to its card).
             return await _await_card_choice(s)
         return await _start_token(s)
     if (

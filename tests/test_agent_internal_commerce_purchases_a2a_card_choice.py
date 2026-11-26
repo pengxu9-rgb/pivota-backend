@@ -17,10 +17,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db.database import IS_POSTGRES, database  # noqa: E402
 import db.a2a_rail_ledger as a2a_ledger  # noqa: E402
+import db.agent_purchase_consents as consents_db  # noqa: E402
+from services.payment_orchestration import purchase_consent  # noqa: E402
 
 # The internal read's fixtures (autouse) and helpers; never a test function, so nothing is collected twice.
 from tests.test_agent_internal_commerce_purchases import (  # noqa: E402,F401
-    _REAL_ASYNC_CLIENT, INTERNAL, PUBLIC, _a2a, _db, _env, _get, _headers, _mounted, _no_network, _public, app,
+    _REAL_ASYNC_CLIENT, AGENT, INTERNAL, KEY, PUBLIC, _a2a, _db, _env, _get, _headers, _mounted, _no_network, _public,
+    app,
 )
 
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs from the _postgres file")
@@ -33,7 +36,21 @@ CARDS = [
 
 @pytest.fixture(autouse=True)
 def picker_on(monkeypatch):
+    # The card choice runs only with the consent gate on too.
     monkeypatch.setenv(a2a_ledger.CARD_PICKER_ENABLED_ENV, "1")
+    monkeypatch.setenv(purchase_consent.GATE_ENV, "1")
+
+
+async def _approval_consent(rail_id):
+    """The buyer accepted the approval step's terms (what POST .../consents records; placeholders)."""
+    from datetime import datetime, timezone
+
+    await consents_db.record(
+        rail="a2a", rail_purchase_id=rail_id, agent_id=AGENT, step="approval",
+        approval_epoch=purchase_consent.approval_epoch("a2a", "approval"),
+        terms_version="terms-test", privacy_version="privacy-test",
+        terms_url="https://legal.example/terms", privacy_url="https://legal.example/privacy",
+        offer_issued_at=datetime.now(timezone.utc))
 
 
 async def _post(url, **kwargs):
@@ -42,7 +59,7 @@ async def _post(url, **kwargs):
         return await http.post(url, **kwargs)
 
 
-async def _waiting(*, cards=CARDS, selected="pm_newest") -> str:
+async def _waiting(*, cards=CARDS, selected="pm_newest", consented=True) -> str:
     """An A2A purchase locked and waiting for the buyer's card (what the worker's park writes)."""
     rail_id = await _a2a(state="quoting")
     soon = "now() + INTERVAL '1800 seconds'" if IS_POSTGRES else "datetime('now', '+1800 seconds')"
@@ -50,11 +67,13 @@ async def _waiting(*, cards=CARDS, selected="pm_newest") -> str:
         "UPDATE a2a_rail_purchases SET card_options = :o, payment_method_id = :m, last_error_code = 'card_choice_required', "
         f"buyer_action_expires_at = {soon} WHERE id = :i",
         {"o": a2a_ledger.card_options_text(cards), "m": selected, "i": rail_id})
+    if consented:
+        await _approval_consent(rail_id)
     return rail_id
 
 
 def _handle(rail_id, method_id):
-    return a2a_ledger.card_handle(rail_id, method_id)
+    return a2a_ledger.card_handle(rail_id, method_id, KEY)
 
 
 async def _row(rail_id):
@@ -76,14 +95,15 @@ async def test_a_waiting_purchase_shows_the_buyers_cards_by_handle_and_nowhere_e
     assert "pm_newest" not in internal.text and "pm_older" not in internal.text  # never the rail's card ids
     public = await _public(f"{PUBLIC}/{rail_id}")
     assert "card_choice" not in public.json() and "1881" not in public.text
-    assert {k: v for k, v in internal.json().items() if k != "card_choice"} == public.json()
+    # Beside the consent block the gate adds, the choice is the body's only new member.
+    assert {k: v for k, v in internal.json().items() if k not in ("card_choice", "consent")} == public.json()
 
 
 async def test_the_dial_off_leaves_the_body_as_it_was_and_refuses_the_write(monkeypatch):
     rail_id = await _waiting()
     monkeypatch.delenv(a2a_ledger.CARD_PICKER_ENABLED_ENV, raising=False)
     internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+    assert internal.status_code == 200 and "card_choice" not in internal.json()
     resp = await _post(f"{INTERNAL}/{rail_id}/card-choice", headers=_headers(),
                        json={"handle": _handle(rail_id, "pm_older")})
     assert (resp.status_code, _error(resp)) == (409, "card_choice_unavailable")
@@ -202,3 +222,44 @@ async def test_a_confirmation_while_a_worker_holds_the_row_is_stale_and_writes_n
                        json={"handle": _handle(rail_id, "pm_older")})
     assert (resp.status_code, _error(resp)) == (409, "card_choice_stale")
     assert (await _row(rail_id))["card_confirmed_at"] is None
+
+
+async def test_the_dial_without_the_consent_gate_shows_no_choice_and_refuses_the_write(monkeypatch):
+    rail_id = await _waiting()
+    monkeypatch.delenv(purchase_consent.GATE_ENV, raising=False)
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200 and internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+    resp = await _post(f"{INTERNAL}/{rail_id}/card-choice", headers=_headers(),
+                       json={"handle": _handle(rail_id, "pm_older")})
+    assert (resp.status_code, _error(resp)) == (409, "card_choice_unavailable")
+
+
+async def test_no_card_is_recorded_before_the_approval_consent_and_a_failed_consent_read_fails_closed(monkeypatch):
+    rail_id = await _waiting(consented=False)
+    handle = _handle(rail_id, "pm_older")
+    resp = await _post(f"{INTERNAL}/{rail_id}/card-choice", headers=_headers(), json={"handle": handle})
+    assert (resp.status_code, _error(resp)) == (409, "consent_required")
+    assert (await _row(rail_id))["card_confirmed_at"] is None
+
+    async def failed(*args, **kwargs):
+        return purchase_consent.FAILED
+
+    with monkeypatch.context() as m:
+        m.setattr(purchase_consent, "snapshot", failed)
+        down = await _post(f"{INTERNAL}/{rail_id}/card-choice", headers=_headers(), json={"handle": handle})
+    assert down.status_code == 503
+    assert (await _row(rail_id))["card_confirmed_at"] is None
+    await _approval_consent(rail_id)
+    ok = await _post(f"{INTERNAL}/{rail_id}/card-choice", headers=_headers(), json={"handle": handle})
+    assert ok.status_code == 200, ok.text
+    assert (await _row(rail_id))["payment_method_id"] == "pm_older"
+
+
+async def test_the_handle_is_keyed_with_the_routers_key():
+    import hashlib
+
+    rail_id = await _waiting()
+    handles = [c["handle"] for c in (await _get(f"{INTERNAL}/{rail_id}", headers=_headers())).json()["card_choice"]["cards"]]
+    assert handles == [_handle(rail_id, "pm_newest"), _handle(rail_id, "pm_older")]
+    unkeyed = hashlib.sha256(f"a2a-card:{rail_id}:pm_older".encode()).hexdigest()[:24]
+    assert unkeyed not in handles

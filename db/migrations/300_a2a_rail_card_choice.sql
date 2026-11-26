@@ -2,14 +2,15 @@
 --
 -- With AGENPAS_CARD_PICKER_ENABLED on, the worker does not mint a token on the buyer's newest card on its own: the
 -- order is locked, then the purchase waits in `quoting` until the buyer confirms a card on the AgenPas page
--- (services/payment_orchestration/a2a_rail_worker `_await_card_choice`). The rail has no void, so the card cannot
--- change once the token is asked for: the choice is made before, or not at all.
+-- (services/payment_orchestration/a2a_rail_worker `_await_card_choice`). A token is bound to the card it was asked for
+-- on, so the card cannot change once the token is asked for: the choice is made before, or not at all.
 --
 --   card_options       the buyer's ACTIVE cards as the rail's own card list (`payment.method-list`) last named them,
 --                      newest first, written by the worker as the purchase starts waiting: per card its rail id,
 --                      network, last four and when it was added. One canonical JSON text, compared whole by the
 --                      choice's compare-and-swap. Display attributes and opaque ids only (the same three the
---                      codebase already keeps for the paying card, migration 298), never card data.
+--                      codebase already keeps for the paying card, migration 298, and kept the same way: not
+--                      cleared by a terminal state or the contact purge), never card data.
 --   card_confirmed_at  when the buyer confirmed the card the row names (db/a2a_rail_ledger.confirm_card_choice).
 --                      The worker mints only once it is set (while the dial is on).
 --

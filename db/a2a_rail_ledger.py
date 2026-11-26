@@ -71,6 +71,7 @@ address, the buyer page and the pending write, and clears the claim, in the same
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -887,14 +888,21 @@ async def get_payment_card_for_owner(
 # ── the buyer's card choice before the token (migration 300) ─────────────────────────────────
 #
 # With AGENPAS_CARD_PICKER_ENABLED on, the worker locks the order, then WAITS in `quoting` until the buyer confirms a
-# card on the AgenPas page; only then does it ask the rail for the token. The rail has no void, so the card is chosen
-# before the token is asked for, or not at all. The worker writes the buyer's ACTIVE cards (`card_options`) as the
+# card on the AgenPas page; only then does it ask the rail for the token. A token is bound to the card it was asked for
+# on (the purchase never swaps it for another card; only an ended purchase's orphan token is voided), so the card is
+# chosen before the token is asked for, or not at all. The worker writes the buyer's ACTIVE cards (`card_options`) as the
 # row starts waiting; the page reads them (`get_card_choice_for_owner`, no rail call) and the buyer's confirmation is a
-# compare-and-swap on exactly that list (`confirm_card_choice`). Display attributes and opaque rail ids only.
+# compare-and-swap on exactly the list the write read just before it (`confirm_card_choice`): a card's handle is fixed
+# for its purchase, so a handle the page showed still names the same card, and a card the worker dropped since is no
+# longer offered. Display attributes and opaque rail ids only.
 
-#: The dial. Read per call, on BOTH web (the page's read and write) and the worker (the wait). Turn it on on `web`
-#: FIRST, then the worker (web alone shows nothing: no row has options until the worker waits); off: the worker FIRST,
-#: then `web` (a waiting row then mints on the card it names). Worker on with web off strands rows until they expire.
+#: The dial. Read per call, on BOTH web (the page's read and write) and the worker (the wait). It counts only while the
+#: consent gate (purchase_consent.GATE_ENV) is on too, in the same process: the card is the buyer's approval step, so it
+#: is taken only after the buyer accepted the terms on our page (`card_picker_active`). Turn it on on `web` FIRST, then
+#: the worker (web alone shows nothing: no row has options until the worker waits); off: the worker FIRST, then `web` (a
+#: waiting row then mints on the card it names). Worker on with web off strands rows until they expire. And only while
+#: every A2A purchase's buyer is on the AgenPas page (the gateway's AGENPAS_CARD_PICKER_ENABLED): an agent sees only
+#: `locking` while a purchase waits, so a buyer who is not on the page is never asked and the purchase expires.
 CARD_PICKER_ENABLED_ENV = "AGENPAS_CARD_PICKER_ENABLED"
 #: The park code while the buyer has not confirmed.
 CARD_CHOICE_REQUIRED = "card_choice_required"
@@ -906,13 +914,26 @@ _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 
 def card_picker_enabled() -> bool:
+    """The dial alone. Callers ask `card_picker_active`, which also needs the consent gate."""
     return (os.getenv(CARD_PICKER_ENABLED_ENV) or "").strip().lower() in _TRUTHY
 
 
-def card_handle(purchase_id: str, method_id: str) -> str:
-    """The page's name for one of this purchase's cards: never the rail's card id itself, and different per purchase,
-    so a handle names nothing outside the purchase it was shown for."""
-    return hashlib.sha256(f"a2a-card:{purchase_id}:{method_id}".encode("utf-8")).hexdigest()[:24]
+def card_picker_active() -> bool:
+    """The card choice runs: its dial AND the consent gate are on (in this process)."""
+    from services.payment_orchestration import purchase_consent
+
+    return card_picker_enabled() and purchase_consent.gate_on()
+
+
+def card_handle(purchase_id: str, method_id: str, key: str) -> str:
+    """The page's name for one of this purchase's cards: an HMAC under a server key (the internal read's key), so it
+    can be neither reversed to the rail's card id (short, guessable ids included) nor computed by the page; different
+    per purchase, so a handle names nothing outside the purchase it was shown for. A rotated key changes every handle:
+    a page then re-reads (`card_choice_stale`)."""
+    if not key:
+        raise ValueError("a card handle needs a key")
+    message = f"a2a-card:{purchase_id}:{method_id}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()[:24]
 
 
 def is_card_handle(value: Any) -> bool:
@@ -1011,12 +1032,13 @@ async def park_for_card_choice_as_holder(
     return _purchase(await database.fetch_one(_PARK_FOR_CARD_CHOICE_SQL_SQLITE, values))
 
 
-# THE BUYER'S CONFIRMATION, a compare-and-swap. Owner-scoped like every agent read. Only while the row waits (`quoting`,
+# THE BUYER'S CONFIRMATION, a compare-and-swap. Owner-scoped like every agent read. The caller checked the buyer's
+# consent to the approval step first (routes/agent_internal_commerce_purchases: the card is part of what they approve). Only while the row waits (`quoting`,
 # no token, no pending write, never purged, not confirmed yet, the deadline not passed), only while NO worker holds it
 # (a held row may be on its way to the token on the card it names: a worker whose dial is off mints without waiting, so
 # a card changed under it would be a token on a card the buyer did not pick, which the rail cannot void), and only on
-# EXACTLY the cards the page showed (`card_options` as read): a list the worker rewrote since is a refusal, and the page
-# re-reads. Sets the card, records the confirmation, clears the deadline (the row now waits on nobody) and makes the row
+# EXACTLY the cards the caller read just before (`card_options` as read): a list the worker rewrote since is a refusal,
+# and the page re-reads. Sets the card, records the confirmation, clears the deadline (the row now waits on nobody) and makes the row
 # due at once.
 _CONFIRM_CARD_CHOICE_SQL = """
     UPDATE a2a_rail_purchases
@@ -1036,13 +1058,15 @@ _CONFIRM_CARD_CHOICE_SQL = """
 _CONFIRM_CARD_CHOICE_SQL_SQLITE = _CONFIRM_CARD_CHOICE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
 
 # The dial was turned off while the row waited: it no longer waits on the buyer, so the wait's deadline goes (else the
-# sweep would end it at 30 minutes as `buyer_action_expired`). Only the wait's own park: the held `quoting` row, no
-# buyer page, the park code still on it.
+# sweep would end it at 30 minutes as `buyer_action_expired`). Only the wait's own deadline: the held `quoting` row with
+# a card list and no confirmation, no buyer page (whatever code a later failed read left on it); its park code goes too.
 _END_CARD_CHOICE_WAIT_SQL = """
     UPDATE a2a_rail_purchases
-       SET buyer_action_expires_at = NULL, last_error_code = NULL, updated_at = clock_timestamp()
+       SET buyer_action_expires_at = NULL,
+           last_error_code = CASE WHEN last_error_code = 'card_choice_required' THEN NULL ELSE last_error_code END,
+           updated_at = clock_timestamp()
      WHERE id = :id AND claimed_by = :holder AND state = 'quoting' AND buyer_action_kind IS NULL
-       AND last_error_code = 'card_choice_required'
+       AND card_options IS NOT NULL AND card_confirmed_at IS NULL AND buyer_action_expires_at IS NOT NULL
     RETURNING *
 """
 _END_CARD_CHOICE_WAIT_SQL_SQLITE = _END_CARD_CHOICE_WAIT_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
