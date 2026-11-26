@@ -77,6 +77,14 @@ THE WRITE is a SECOND router with its OWN key and its OWN dial, so the read key 
          route is not registered (the OpenAPI schema is unchanged); turned off without a restart, the
          write answers the unknown-route 404 before the key is looked at.
 
+THE PRODUCT IMAGE (AGENPAS_PRODUCT_IMAGE_ENABLED, default off, read per request). On, a GET body, either rail,
+carries a top-level `product_image_url` (a clean public https URL) only when the catalog has an image that is
+surely of the variant bought (services/payment_orchestration/purchase_product_image: the bought sku's own image,
+or the product's for a one-variant product whose purchase names no variant; never a copied hero image).
+The gateway fetches it server-side for the page; the buyer's browser never loads a store's host. None, or a
+failed read: no field, never a 503. Never in the public route or the webhooks. Off: the body is byte for byte
+what it was.
+
 THE CARD (AGENPAS_PAYMENT_CARD_ENABLED, default off, read per request). On, a Reap-rail GET body carries a
 top-level `payment_card = {network, last4}` (network the partner's own word, e.g. "VISA", or null) once the
 purchase's checkout is bound to a card (awaiting_approval, processing, completed, under the dispatch journal:
@@ -114,6 +122,7 @@ import db.agent_purchase_consents as consents_db
 import db.agents as agents_db
 import db.agent_purchase_ledger as purchases
 import db.reap_agentic_ledger as reap_ledger
+import services.payment_orchestration.purchase_product_image as product_image
 import db.reap_continuation as continuation
 from routes import agent_commerce_purchases as public
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
@@ -134,6 +143,7 @@ _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 
 #: The card on the GET body (see THE CARD above). Read per request.
 AGENPAS_PAYMENT_CARD_ENABLED_ENV = "AGENPAS_PAYMENT_CARD_ENABLED"
+AGENPAS_PRODUCT_IMAGE_ENABLED_ENV = "AGENPAS_PRODUCT_IMAGE_ENABLED"
 
 
 def is_enabled() -> bool:
@@ -144,6 +154,10 @@ def payment_card_enabled() -> bool:
     return (os.getenv(AGENPAS_PAYMENT_CARD_ENABLED_ENV) or "").strip().lower() in _TRUTHY
 
 
+def product_image_enabled() -> bool:
+    return (os.getenv(AGENPAS_PRODUCT_IMAGE_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
 async def _payment_card(parent: Dict[str, Any], agent_id: str, owner: str) -> Optional[Dict[str, Any]]:
     """The Reap purchase's bound card, or None (another rail, no bound card, or a failed read: never a 503)."""
     if parent.get("rail") != "reap":
@@ -152,6 +166,17 @@ async def _payment_card(parent: Dict[str, Any], agent_id: str, owner: str) -> Op
         return await reap_ledger.get_payment_card_for_owner(str(parent["rail_purchase_id"]), agent_id, owner)
     except Exception as exc:  # noqa: BLE001 - the card is decoration: its fault drops it, never the body
         logger.warning("agent_internal_purchases: card read failed error_type=%s", type(exc).__name__)
+        return None
+
+
+async def _product_image(parent: Dict[str, Any], agent_id: str, owner: str) -> Optional[str]:
+    """The image URL of what the purchase bought (services/payment_orchestration/purchase_product_image), or
+    None: none that is surely the bought variant's, or a failed read (never a 503)."""
+    try:
+        return await product_image.product_image_for_owner(
+            str(parent.get("rail") or ""), str(parent["rail_purchase_id"]), agent_id, owner)
+    except Exception as exc:  # noqa: BLE001 - the image is decoration: its fault drops it, never the body
+        logger.warning("agent_internal_purchases: product image read failed error_type=%s", type(exc).__name__)
         return None
 
 
@@ -283,6 +308,10 @@ async def get_purchase_for_gateway(
     name = await _agent_display_name(agent_id)
     if name is not None:
         body["agent_display_name"] = name
+    if product_image_enabled():
+        image_url = await _product_image(parent, agent_id, owner)
+        if image_url is not None:
+            body["product_image_url"] = image_url
     return body
 
 
