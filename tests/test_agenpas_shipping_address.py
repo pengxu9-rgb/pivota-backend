@@ -750,3 +750,39 @@ async def test_an_address_line_2_equal_to_the_davv_cancels_before_the_confirm_fa
                                ("confirm",), kind="confirm"))
     relay = await ck._relay(ck._Provider(ck._token_result(), answer), setup=ck._setup(ceiling_minor=100000))
     assert relay.checkout.credential_fields_stripped >= 1
+
+
+# ── markets other than the US (services/payment_orchestration/a2a_markets.py) ─────────────────────────────
+
+
+JP_ADDRESS = {"firstName": "Hananeedle", "lastName": "Examplenee", "phone": "+81312345678",
+              "addressLine1": "1-1 Needle-cho", "city": "Needleda", "region": "13", "postalCode": "100-0001",
+              "country": "JP"}
+
+
+async def test_the_door_refuses_a_market_that_is_not_on_even_when_the_router_takes_the_rail(monkeypatch):
+    # The merchant is listed for JP and the shown currency is one the rail takes, so the router picks A2A; the
+    # door's own market check still refuses JP while A2A_RAIL_MARKETS does not name it.
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
+    resp = await _http("POST", BASE, json=_body(address=JP_ADDRESS))
+    assert resp.status_code == 400 and _error(resp) == "shipping_country_unsupported", resp.text
+    assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []  # nothing was opened
+    for value in JP_ADDRESS.values():
+        if len(value) > 3:
+            assert value not in resp.text
+
+
+async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,JP")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,JPY:30000")
+    monkeypatch.setitem(FACTS, "currency", "JPY")
+    monkeypatch.setitem(FACTS, "market_country", "JP")
+    resp = await _http("POST", BASE, json=_body(address=JP_ADDRESS, expected_currency="JPY"))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert (row["currency"], row["our_price_minor"]) == ("JPY", 4650)
+    assert row["shipping_address"]["region"] == "13" and row["shipping_address"]["country"] == "JP"
+    bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY",
+                                               idempotency_key="key-2"))
+    assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text

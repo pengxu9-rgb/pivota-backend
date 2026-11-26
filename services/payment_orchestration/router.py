@@ -22,8 +22,9 @@ the answer.
      offer_code_unsupported   the rail has no field for the buyer's offer code
      merchant_not_proven      (merchant, market) is not on A2A_RAIL_MERCHANTS: a merchant is routable
                               to this rail only after a live order there has been proven
-     currency_unsupported     the shown currency is not one the rail's token step can carry
-                              (a2a_rail.TOKEN_CURRENCIES: the rail's amount has no currency field)
+     currency_unsupported     the shown currency is not the currency of a market switched on for the
+                              rail (a2a_markets.enabled_currencies, `A2A_RAIL_MARKETS`: USD only by
+                              default; the rail's amount has no currency field)
      amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR names no cap at all: no cap, no rail
      agent_run_condition_unmet  only while PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`: the merchant
                               does not meet ADR-030 D11's run condition for this rail's checkout agent
@@ -57,7 +58,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Optional, Set, Tuple
 
-from services.payment_orchestration import a2a_rail
+from services.payment_orchestration import a2a_markets, a2a_rail
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ def a2a_unavailable_reason(
         return "offer_code_unsupported"
     if (str(merchant_domain or "").lower(), str(market_country or "").upper()) not in proven_merchants():
         return "merchant_not_proven"
-    if str(currency or "").upper() not in a2a_rail.TOKEN_CURRENCIES:
+    if str(currency or "").upper() not in a2a_markets.enabled_currencies():
         return "currency_unsupported"
     if not max_total_minor():
         return "amount_limit_unset"

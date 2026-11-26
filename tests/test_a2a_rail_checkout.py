@@ -4749,3 +4749,140 @@ async def test_a_rerun_with_the_same_ids_after_an_apply_past_the_cap_is_a_duplic
     # The recorded one now sorts after the other, past the cap of one: the rerun still reads it by its id.
     code, lines = await _d11_run_tool("backfill-captcha", "--by", D11_STAFF, "--purchase-ids", listed, "--apply")
     assert code == 0 and _d11_payloads(lines, d11_tool.BACKFILLED_PREFIX) == [{"recorded": 0, "duplicate": 1, "failed": 0}]
+
+
+# ── markets other than the US (services/payment_orchestration/a2a_markets.py) ─────────────────────────────
+
+
+JP_ADDRESS = {
+    "firstName": "Hana", "lastName": "Example", "phone": "+81312345678", "addressLine1": "1-1 Example-cho",
+    "city": "Chiyoda", "region": "13", "postalCode": "100-0001", "country": "JP",
+}
+JPY_ENV = {
+    "A2A_RAIL_MARKETS": "US,JP",
+    worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV: "1500,JPY:1000",
+    worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV: "1000,JPY:1500",
+    worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV: "20000,JPY:30000",
+    rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV: "USD:50000,JPY:30000",
+}
+
+
+@pytest.fixture
+def jp_on(monkeypatch):
+    for name, value in JPY_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("text,currency,minor", [
+    ("CA$25.00", "CAD", 2500), ("C$ 25.00", "CAD", 2500), ("CAD 25.00", "CAD", 2500), ("25.00 CAD", "CAD", 2500),
+    ("$25.00", "CAD", None), ("A$12.30", "AUD", 1230), ("AU$1,234.56", "AUD", 123456), ("A$12.30", "CAD", None),
+    ("NZ$9.90", "NZD", 990), ("S$9.90", "SGD", 990), ("SG$9.90", "SGD", 990), ("NT$330", "TWD", None),
+    ("JPY 1,500", "JPY", 1500), ("1,500円", "JPY", 1500), ("JP¥1500", "JPY", 1500), ("¥1,500", "JPY", None),
+    ("JPY 1,500.00", "JPY", None), ("₩15,000", "KRW", None), ("HK$10.00", "HKD", None), ("25.00", "CAD", None), ("CA$25.00", "USD", None),
+    ("€23,00", "EUR", None),
+])
+def test_a_total_outside_usd_is_read_only_by_a_mark_that_names_its_currency(text, currency, minor):
+    assert worker.checkout_total_minor(text, currency) == minor
+
+
+@pytest.mark.parametrize("country,state_needed", [
+    ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False),
+    ("GB", False),
+])
+def test_the_checkout_shipping_needs_a_state_only_where_the_market_requires_a_region(country, state_needed):
+    shipping = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
+                "country": country, "address1": "1 Main St", "city": "Somewhere", "zip_code": "12345"}
+    assert (a2a_rail.checkout_shipping(shipping) is None) is state_needed
+    assert a2a_rail.checkout_shipping({**shipping, "state": "XX"}) is not None
+
+
+def test_a_ceiling_outside_usd_needs_its_own_three_entries_and_is_in_its_minor_units(monkeypatch, jp_on):
+    row = {"currency": "JPY", "our_price_minor": 4650, "quantity": 2}
+    # yen are whole units: 9300 + 10% (930) + 1500 shipping
+    assert worker.checkout_ceiling(row) == (9300 + 930 + 1500, worker.CEILING_SOURCE_ALLOWANCE_V1)
+    assert worker.checkout_ceiling({"currency": "JPY", "our_price_minor": 1, "quantity": 1})[0] == 1 + 1 + 1500
+    for name in (worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, worker.A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV,
+                 worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV):
+        for value in ("1500", "", "JPY:x", "JPY:-1", "USD:1000"):  # a bare value is USD's, never JPY's
+            monkeypatch.setenv(name, value)
+            with pytest.raises(worker.CeilingRefused) as raised:
+                worker.checkout_ceiling(row)
+            assert (raised.value.code, raised.value.refused) == (worker.CHECKOUT_CEILING_UNCONFIGURED, True), (name, value)
+        monkeypatch.setenv(name, JPY_ENV[name])
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, "20000,JPY:11729")
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling(row)
+    assert raised.value.code == worker.CHECKOUT_CEILING_OVER_CAP
+
+
+def test_the_usd_ceiling_reads_as_before_and_a_usd_entry_wins_over_a_bare_value(monkeypatch, jp_on):
+    row = {"currency": "USD", "our_price_minor": 10000, "quantity": 1}
+    assert worker.checkout_ceiling(row)[0] == 10000 + 1500 + 1000  # the bare values, unchanged
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, "1500,USD:1000,JPY:1000")
+    assert worker.checkout_ceiling(row)[0] == 10000 + 1000 + 1000
+    monkeypatch.setenv(worker.A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, "JPY:1000")
+    assert worker.checkout_ceiling(row)[0] == 10000 + 1500 + 1000  # no USD entry: the USD default
+
+
+@pytest.mark.parametrize("markets", [None, "", "US", "CA"])
+def test_a_ceiling_in_a_currency_whose_market_is_not_on_is_refused(monkeypatch, jp_on, markets):
+    if markets is None:
+        monkeypatch.delenv("A2A_RAIL_MARKETS", raising=False)
+    else:
+        monkeypatch.setenv("A2A_RAIL_MARKETS", markets)
+    with pytest.raises(worker.CeilingRefused) as raised:
+        worker.checkout_ceiling({"currency": "JPY", "our_price_minor": 4650, "quantity": 1})
+    assert (raised.value.code, raised.value.refused) == (worker.CHECKOUT_CURRENCY_UNSUPPORTED, True)
+
+
+async def _jp_unlocked():
+    pid = (await ledger.create_purchase(
+        agent_id="agent_w", agent_user_ref_hash="h" * 64, merchant_domain="merchant.example",
+        checkout_url="https://merchant.example/cart/40000000001:1", currency="JPY", our_price_minor=4650,
+        buyer_email=EMAIL, shipping_address=JP_ADDRESS))["id"]
+    assert await _step(Rail().on("payment.method-view#submit", _methods(VISA)), pid) == "method_ready"
+    return pid
+
+
+@pytest.mark.usefixtures("jp_on")
+async def test_a_yen_purchase_locks_and_mints_in_whole_yen_and_completes_on_a_yen_total():
+    pid = await _jp_unlocked()
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "approval_page_issued"
+    expected = 4650 + 465 + 1500
+    row = await _row(pid)
+    assert (row["quoted_total_minor"], rail.payload("payment.token-setup#submit")["amount_cents"]) == (expected, expected)
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, pid)
+    rail = _approved(Rail())
+    assert await _step(rail, pid) == "placing"
+    setup = rail.payload("checkout.setup#submit")
+    assert (setup["shipping"]["country"], setup["shipping"]["state"], setup["shipping"]["zip_code"]) == (
+        "JP", "13", "100-0001")
+    rail = Rail().on("checkout.await#poll", _checkout_result(total="JPY 6,615"))
+    assert await _step(rail, pid) == "completed"
+    assert (await _row(pid))["final_total_minor"] == 6615
+
+
+@pytest.mark.parametrize("total,code", [("¥6,615", "checkout_total_unverified"), ("$66.15", "checkout_total_unverified"),
+                                        ("JPY 6,616", "checkout_total_over_approved")])
+@pytest.mark.usefixtures("jp_on")
+async def test_a_yen_total_that_does_not_read_as_yen_or_is_over_the_ceiling_is_held(total, code):
+    pid = await _jp_unlocked()
+    assert await _step(_lock_rail(), pid) == "approval_page_issued"
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, pid)
+    assert await _step(_approved(Rail()), pid) == "placing"
+    assert await _step(Rail().on("checkout.await#poll", _checkout_result(total=total)), pid) == code
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying", code)
+    assert await _step(Rail(), pid) == "checkout_held"  # held for a human: nothing more is read or sent
+
+
+async def test_a_yen_purchase_never_mints_while_its_market_is_off(monkeypatch, jp_on):
+    pid = await _jp_unlocked()
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = :o, quoted_total_minor = :t WHERE id = :i",
+                           {"o": ORDER, "t": TOTAL, "i": pid})
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US")
+    rail = _lock_rail()
+    assert await _step(rail, pid) == "failed"
+    assert "payment.token-setup#submit" not in rail.actions()
+    assert (await _row(pid))["last_error_code"] == "token_currency_unsupported"

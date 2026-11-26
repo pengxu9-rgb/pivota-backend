@@ -333,8 +333,8 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   Only with capture on does the worker wait for a missing contact, so only then does
   `POST /agent/v2/commerce/purchases` on the A2A rail accept a body without `buyer.email` and/or
   `buyer.shipping_address`, and only then does the view ask for it. One that is given is read by the Reap
-  rules, plus, for the US, a real state or DC in `region` and a ZIP (12345 or 12345-6789) in `postalCode`
-  (`invalid_address`). Capture off (any one of them off, e.g. this read dial on before the checkout dial):
+  rules, plus its market's region and postcode rules ("A2A markets" below; for the US, a real state or DC in
+  `region` and a ZIP, 12345 or 12345-6789, in `postalCode`) (`invalid_address`). Capture off (any one of them off, e.g. this read dial on before the checkout dial):
   both stay required and every answer is exactly as before. A request the router hands to Reap is parsed by
   Reap's own model, which still requires both.
 - **Turn capture on, in this order**: the read dial, the checkout step and the token step (each per its own
@@ -371,8 +371,9 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   body is read), and 503 when the consent table cannot be read. Stored `purchase.*` payloads that still carry the form are
   re-gated when they are sent, retried or listed. A terms / privacy version bump does not re-ask.
 - **Market.** The address's country; with no address, the one market of the purchase's own currency
-  (`expected_currency`), never a default: none (or several) is 400 `shipping_market_unknown`. The A2A pilot
-  is the US, in code: any other market on the A2A rail is 400 `shipping_country_unsupported`.
+  (`expected_currency`), never a default: none (or several) is 400 `shipping_market_unknown`. A market that is
+  not switched on for the A2A rail ("A2A markets" below; the US only by default) is 400
+  `shipping_country_unsupported`.
 - **Waiting.** The purchase stays `opened` (unified `routing`), and the worker sends NOTHING for it, not even
   a card read, until its email and address are complete. The email is listed first: the card binding needs
   it. `last_error_code` is `shipping_address_required`, and the deadline is 30 minutes from creation
@@ -385,10 +386,12 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
 - **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
   has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
   NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
-  `country`), never a stored value. The same names sit in `detail.shipping_address_required`.
+  `country`), never a stored value. `region` is listed only where the address's market requires one; with
+  no country yet, every field is listed. The same names sit in `detail.shipping_address_required`.
 - **Body.** Flat JSON: `email, firstName, lastName, phone, addressLine1, addressLine2, city, region,
   postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
-  in `fields_missing`); a part that is sent is read whole. US only. Region is one of the 50 states or DC.
+  in `fields_missing`); a part that is sent is read whole. The country must be a market switched on for the
+  rail, else `country: unsupported`; region and postcode follow that market's rules ("A2A markets" below).
 - **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
   deadline not passed, the contact never purged) and fills only an empty part. "Empty" is the waiting
   rule's: a stored address that lacks a required field counts as absent, so the form asks for the whole
@@ -502,6 +505,45 @@ plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
 **404 bodies differ on purpose**: `not_available` is this door being dark; `not_available_on_this_rail`
 is the door being on and an explicit rail choice that cannot be honoured (the Reap route's word for an
 unavailable rail). Neither names a reason, and neither opens anything.
+
+## A2A markets (`A2A_RAIL_MARKETS`)
+
+`services/payment_orchestration/a2a_markets.py` is the one table of the markets the A2A rail can take; the
+door, the address write, the router, the worker's token and ceiling steps and the checkout relay all read it.
+
+- **Switched on by config, one market at a time.** `A2A_RAIL_MARKETS` (comma-separated, read per call, on
+  web and worker alike) names the markets that are on. Unset or blank: the US only, exactly as before. A code
+  not in the table is ignored. Set to anything, it is the whole list (`CA` alone switches the US off).
+- **The table:** US, CA, AU, NZ, SG, JP. Each market's currency is the market registry's
+  (`config/market_registry.json`). Not yet in it: South Korea and Taiwan, which the rail can price only once the
+  Reap lane's market map (also the directory's list of Reap's agentic markets) is split; and Hong Kong, whose
+  addresses have no postcode while the provider's checkout requires `zip_code`.
+- **Addresses.** `region` is the ISO 3166-2 subdivision code without the country prefix. It is required in
+  the US, CA, AU and JP (and sent as `state`), optional in NZ, and refused in SG. Every market
+  needs a postcode in its own format.
+- **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
+  minor units (yen are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
+  already (`USD:3000,CAD:4000`). The ceiling's three envs (`A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS`,
+  `A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR`, `A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR`) take `CUR:value`
+  entries too. A bare value is USD's, as before, and the defaults are USD's only. Any other currency needs its
+  own entry in all three, or its purchases are refused `checkout_ceiling_unconfigured`.
+- **The final total.** The worker completes a checkout only on a total it can read in the purchase's currency
+  (`a2a_rail_worker.checkout_total_minor`). Outside USD it reads only marks that name one currency: the ISO
+  code ("CAD 25.00", "25.00 CAD") and symbols no other currency uses (CA$, C$, A$, AU$, NZ$, SG$, S$, JP¥,
+  円). A bare "$" or "¥" is not read. Any other spelling is held for a human
+  (`checkout_total_*`), never guessed.
+- **The confirm card and the setup prose** (`checkout_amounts`) are unchanged and read amounts as USD. A card
+  that shows no amount (the measured card) proceeds on the token cap. A card or prose that shows an amount in
+  another currency's code is refused before anything is submitted.
+
+**Before a market goes on**, in the sandbox, for that currency:
+1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor
+   units (the yen case decides between ×1 and ×100).
+2. One checkout end to end: the address fills the store's form (the region as `state`), and the
+   `checkout.result` total reads (`checkout_total_minor`) or is held.
+3. The ceiling's three entries set for its currency, and `A2A_RAIL_MAX_TOTAL_MINOR` too.
+
+Then add the market to `A2A_RAIL_MARKETS`, on web and worker, as its own go.
 
 ## Operations
 

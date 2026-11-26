@@ -90,7 +90,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 from urllib.parse import urlparse
 
 from config.platform import is_production as _platform_is_production
-from services.payment_orchestration import checkout_amounts
+from services.payment_orchestration import a2a_markets, checkout_amounts
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +109,11 @@ ALLOWED_HOST_SHA256: FrozenSet[str] = frozenset({
     "c91cff4b3b7cf1ed9344a5334df60dc9751db61743bd7a41d082c35345097d7b",
     "a88fafbb95893904e7dcc07c3937e4119093120255ea2ca530ac27b11e865b97",
 })
-#: The currencies a token may be requested in. The rail's `token-setup` takes `amount_cents` and no
-#: currency, so the amount is minor units of whatever currency the rail assumes; only USD has been
-#: measured. The router refuses other currencies at create (`currency_unsupported`), and the worker's
-#: token step refuses them again.
+#: The currency measured on the rail: USD. The rail's `token-setup` takes `amount_cents` and no currency,
+#: so the amount is minor units of whatever currency the rail assumes. The create route, the router and the
+#: worker's token and ceiling steps take the currencies of the markets switched on instead
+#: (a2a_markets.enabled_currencies: this set by default); each market is switched on only after a sandbox
+#: token in its currency echoes the cap. This set stays the VIC order step's (vic_order.ORDER_CURRENCIES).
 TOKEN_CURRENCIES: FrozenSet[str] = frozenset({"USD"})
 AGENT_ID = "base-orchestrator"
 MESSAGE_PATH = f"/a2a/agents/{AGENT_ID}/v1/message:send"
@@ -706,7 +707,8 @@ def parse_response(body: Any, *, card_code: Callable[[Any], bool] = has_card_cod
 
 #: The card brands the checkout skill takes (`card.brand`).
 CHECKOUT_CARD_BRANDS: FrozenSet[str] = frozenset({"visa", "mastercard"})
-#: The shipping fields the checkout skill takes (measured 2026-11-17). `state` is required for the US.
+#: The shipping fields the checkout skill takes (measured 2026-11-17). `state` is required for the US, and for
+#: every market whose region is required (a2a_markets.state_required).
 CHECKOUT_SHIPPING_REQUIRED: Tuple[str, ...] = (
     "email", "first_name", "last_name", "phone", "country", "address1", "city", "zip_code",
 )
@@ -783,7 +785,7 @@ def _clean_field(value: Any) -> Optional[str]:
 
 def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
     """The checkout skill's `shipping`, validated, or None. Only the skill's own keys; every required
-    one present; `state` for the US; no value that carries a card number (an address is never a way
+    one present; `state` where the market requires a region; no value that carries a card number (an address is never a way
     to send card data). Never raises, never logs (the values are the buyer's PII)."""
     if not isinstance(value, Mapping):
         return None
@@ -800,7 +802,7 @@ def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
         out[key] = text
     if any(key not in out for key in CHECKOUT_SHIPPING_REQUIRED) or not _COUNTRY_RE.match(out["country"]):
         return None
-    if out["country"] == "US" and "state" not in out:
+    if a2a_markets.state_required(out["country"]) and "state" not in out:
         return None
     return out
 
