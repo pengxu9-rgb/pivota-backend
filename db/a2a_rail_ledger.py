@@ -259,17 +259,30 @@ _HEAL_CHECKOUT_COLUMNS_PG = (
     " ADD COLUMN IF NOT EXISTS ceiling_source VARCHAR(32),"
     " ADD COLUMN IF NOT EXISTS checkout_lookups INTEGER"
 )
+# Migration 298: the paying card's two display attributes for the buyer page, and the card they belong to
+# (`record_payment_card_as_holder`, written as the token is minted on it). Display only, never PII, nullable, no
+# default; every other statement works on a table that does not have them yet. One guarded ALTER on Postgres, so the
+# three land together or not at all; SQLite one each.
+_HEAL_CARD_COLUMNS_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases"
+    " ADD COLUMN IF NOT EXISTS card_network VARCHAR(32),"
+    " ADD COLUMN IF NOT EXISTS card_last4 VARCHAR(4),"
+    " ADD COLUMN IF NOT EXISTS card_method_id VARCHAR(128)"
+)
 #: (column, SQLite heal), in migration order.
 _HEALED_COLUMNS_SQLITE = (
     ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
     ("ceiling_source", _ADD_CEILING_SOURCE_SQLITE),
     ("checkout_lookups", _ADD_CHECKOUT_LOOKUPS_SQLITE),
+    ("card_network", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_network VARCHAR(32)"),
+    ("card_last4", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_last4 VARCHAR(4)"),
+    ("card_method_id", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_method_id VARCHAR(128)"),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288 and 290. Idempotent; called at every startup.
+    """Self-heal parity with migrations 268, 278, 287, 288, 290 and 298. Idempotent; called at every startup.
     NOT 296 (a2a_rail_manual_resolution_audit): that table has no startup heal, on purpose (see its section)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
@@ -289,6 +302,13 @@ async def ensure_a2a_rail_schema() -> None:
                 await database.execute(statement)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("a2a_rail_ledger: checkout columns heal deferred to next boot error_type=%s",
+                               type(exc).__name__)
+        # The card columns, the same way: only the buyer page's card reads them, so a deferred heal hides the card.
+        for statement in guarded_add_columns(_HEAL_CARD_COLUMNS_PG + ";"):
+            try:
+                await database.execute(statement)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("a2a_rail_ledger: card columns heal deferred to next boot error_type=%s",
                                type(exc).__name__)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
@@ -757,6 +777,75 @@ async def clear_pending_write(purchase_id: str, worker_id: str, action: str) -> 
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_CLEAR_PENDING_WRITE_SQL, values))
     return _purchase(await database.fetch_one(_CLEAR_PENDING_WRITE_SQL_SQLITE, values))
+
+
+# ── the paying card's display attributes (migration 298) ─────────────────────────────────────
+
+#: A network name as the buyer may see it: the rail's own word (`visa`), a letter first, nothing else.
+_CARD_NETWORK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,31}\Z")
+_CARD_LAST4_RE = re.compile(r"^[0-9]{4}\Z")
+#: The states in which the recorded card IS the card paying: its token was minted on it (awaiting the buyer's
+#: approval of that token, paying with it, or paid). Never before: the buyer may still change the card.
+PAYMENT_CARD_STATES = ("awaiting_authorization", "paying", "completed")
+
+# Only on the held row, in `quoting` (the token step), and only for the card the row names: the card the token is
+# minted on. Never cleared afterwards: not by a terminal state, not by the contact purge (a network, four digits and an
+# opaque card id are display attributes, not cardholder data). The worker trusts the rail to mint on the card it named;
+# if the rail's own approval page ever let the buyer switch cards, the page would still name the earlier one.
+_RECORD_PAYMENT_CARD_SQL = """
+    UPDATE a2a_rail_purchases
+       SET card_network = :card_network,
+           card_last4 = :card_last4,
+           card_method_id = :card_method_id
+     WHERE id = :id AND state = 'quoting' AND claimed_by = :holder AND payment_method_id = :card_method_id
+    RETURNING id
+"""
+_SELECT_PAYMENT_CARD_FOR_OWNER_SQL = """
+    SELECT state, payment_method_id, card_method_id, card_network, card_last4
+      FROM a2a_rail_purchases
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+"""
+
+
+async def record_payment_card_as_holder(
+    purchase_id: str, worker_id: str, *, method_id: str, network: Any, last4: Any
+) -> bool:
+    """Record the paying card's network and last four, from the rail's own card list, on the held row whose card it
+    is. Nothing is written without exactly four digits; a network that is not a plain name is stored as NULL (the
+    page then says "Card"). True when the row took it. Display only: the caller never lets a fault stop a step."""
+    last4_text = str(last4 or "").strip() if isinstance(last4, str) else ""
+    if not _CARD_LAST4_RE.match(last4_text):
+        return False
+    network_text = str(network or "").strip() if isinstance(network, str) else ""
+    row = await database.fetch_one(_RECORD_PAYMENT_CARD_SQL, {
+        "id": purchase_id, "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "card_method_id": str(method_id), "card_last4": last4_text,
+        "card_network": network_text if _CARD_NETWORK_RE.match(network_text) else None,
+    })
+    return row is not None
+
+
+async def get_payment_card_for_owner(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str
+) -> Optional[Dict[str, Any]]:
+    """`{"network": str | None, "last4": "4242"}` for the card this owner's purchase is paying with, or None: not the
+    owner's, not yet in a PAYMENT_CARD_STATES state, no card recorded, or one recorded for ANOTHER card than the one
+    the row now names (the buyer changed card). Writes nothing."""
+    row = await database.fetch_one(_SELECT_PAYMENT_CARD_FOR_OWNER_SQL, {
+        "id": purchase_id, "agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash})
+    if row is None:
+        return None
+    row = dict(row)
+    if row.get("state") not in PAYMENT_CARD_STATES:
+        return None
+    method_id = str(row.get("payment_method_id") or "")
+    if not method_id or str(row.get("card_method_id") or "") != method_id:
+        return None
+    last4 = str(row.get("card_last4") or "")
+    if not _CARD_LAST4_RE.match(last4):
+        return None
+    network = str(row.get("card_network") or "")
+    return {"network": network if _CARD_NETWORK_RE.match(network) else None, "last4": last4}
 
 
 # The checkout path's order lock: Pivota's own order reference and the approval ceiling the token is
@@ -1396,8 +1485,11 @@ async def expire_overdue_purchases(
 # them, and the expiry sweep ends every pre-pay row within MAX_LIFETIME_SECONDS_DEFAULT; this purge is
 # the BACKSTOP for what neither reaches (a long `paying`, a row parked on a money result, which the sweep
 # never ends), in any state, without moving the state: such a row keeps its contact for up to
-# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick, so with the worker
-# switched off nothing purges; no purchase advances then either. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
+# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick AND, on its own
+# clock with no dependency on the rail's dials, in jobs/a2a_rail_contact_purge (71 h, every 15 min, on by
+# default, kill switch A2A_RAIL_CONTACT_PURGE_DISABLED): with the worker's dial off, that job still purges.
+# Postgres skips rows another purge (the tick, the job, a run-now) has locked: two purges never wait on
+# each other, and what one skips the other is already NULLing. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
@@ -1408,6 +1500,7 @@ _PURGE_CONTACT_SQL = """
                AND created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
              ORDER BY created_at
              LIMIT :limit
+             FOR UPDATE SKIP LOCKED
            )
        AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
     RETURNING id

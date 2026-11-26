@@ -172,7 +172,7 @@ async def test_ddl_backstop_matches_the_migration():
             ORDER BY indexname
             """
         )
-        return [tuple(r) for r in rows] + [tuple(r) for r in idx]
+        return [tuple(r._mapping.values()) for r in rows] + [tuple(r._mapping.values()) for r in idx]
 
     from_migration = await snapshot()
     await database.execute("DROP TABLE payment_grant_issuers")

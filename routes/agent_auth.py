@@ -97,6 +97,25 @@ def _build_internal_trusted_agent(api_key: str) -> Dict[str, Any]:
 
 
 _AGENT_API_KEY_RE = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")
+#: The partner sandbox's ONLY key shape (design N72GzumjqaW8h7SCE96jt7 step 5, mirrored from the
+#: gateway): the developer portal's test-environment keys. Accepted only under PIVOTA_ENV=sandbox,
+#: where live-shaped keys are refused; every other environment keeps _AGENT_API_KEY_RE unchanged.
+_SANDBOX_AGENT_API_KEY_RE = re.compile(r"^ak_test_[0-9a-f]{64}$")
+
+
+def agent_api_key_format_ok(api_key: str) -> bool:
+    """THE external agent-key format rule, for every reader (get_agent_context, the internal
+    introspect, the issuing-agent lookups, the gateway router's money gate).
+
+    Outside the sandbox: ``ak_<64 hex>`` or ``ak_live_<64 hex>``, exactly as before. Under
+    PIVOTA_ENV=sandbox: ``ak_test_<64 hex>`` only. A live key is refused there, so a prod key pasted
+    into a sandbox call fails on format before any lookup, and a test key stays refused everywhere
+    else."""
+    from config.platform import is_sandbox
+
+    if is_sandbox():
+        return bool(_SANDBOX_AGENT_API_KEY_RE.match(api_key))
+    return bool(_AGENT_API_KEY_RE.match(api_key))
 
 #: Agent identities that are PIVOTA'S OWN SERVICES, not agents a link can be issued to (ADR-025 D1).
 #: agent_982b1ea2df866206 ("Pivota Shopping") owns the gateway's PIVOTA_API_KEY: confirmed on
@@ -158,7 +177,7 @@ async def resolve_issuing_agent_id(api_key: Optional[str]) -> Optional[str]:
     candidate = str(api_key or "").strip()
     if not candidate or _is_internal_trusted_api_key(candidate):
         return None
-    if not _AGENT_API_KEY_RE.match(candidate):
+    if not agent_api_key_format_ok(candidate):
         return None
     try:
         agent = await get_agent_by_key(candidate)
@@ -205,7 +224,7 @@ async def _is_service_caller(api_key: Optional[str]) -> bool:
         return False
     if _is_internal_trusted_api_key(candidate):
         return True
-    if not _AGENT_API_KEY_RE.match(candidate):
+    if not agent_api_key_format_ok(candidate):
         return False
     try:
         agent = await get_agent_by_key(candidate)
@@ -440,9 +459,8 @@ async def get_agent_context(
         return context
 
     # 2. 验证 API Key 格式（支持 ak_live_ 前缀）
-    # 严格校验：ak_<64hex> 或 ak_live_<64hex>
-    import re
-    if not re.match(r"^ak_(live_)?[0-9a-f]{64}$", api_key):
+    # 严格校验：ak_<64hex> 或 ak_live_<64hex>；PIVOTA_ENV=sandbox 下只接受 ak_test_<64hex>
+    if not agent_api_key_format_ok(api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid API Key format"

@@ -65,7 +65,7 @@ async def _fingerprint():
     from db.database import database
 
     columns = [
-        tuple(r) for r in await database.fetch_all(
+        tuple(r._mapping.values()) for r in await database.fetch_all(
             """
             SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
               FROM information_schema.columns

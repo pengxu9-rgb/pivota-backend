@@ -1276,12 +1276,15 @@ def test_the_gate_and_the_proxy_read_one_format_rule():
     rule = "_agent_key_has_money_gate_format"
     for reader in ("_money_operation_refusal_reason", "_proxy_agent_api"):
         assert len(_calls_to(_function(tree, reader), rule)) == 1, reader
-    regex_readers = [
+    # The key shape is routes.agent_auth.agent_api_key_format_ok (sandbox-aware); here only the rule
+    # calls it, and no function reads the raw regex.
+    format_readers = [
         node.name for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(isinstance(n, ast.Name) and n.id == "_AGENT_API_KEY_RE" for n in ast.walk(node))
+        and any(isinstance(n, ast.Name) and n.id in ("agent_api_key_format_ok", "_AGENT_API_KEY_RE")
+                for n in ast.walk(node))
     ]
-    assert regex_readers == [rule]
+    assert format_readers == [rule]
 
 
 @pytest.mark.parametrize("operation", MONEY_OPERATIONS)

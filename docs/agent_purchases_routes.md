@@ -100,20 +100,56 @@ does not exist. Turning it on needs a restart.
   the page then says "not available right now", and the hosted page stays withheld. The versions and URLs
   appear only when configured; `offer` only while available and not yet satisfied. The read writes nothing:
   the offer is stateless (an HMAC, below).
+- With `AGENPAS_PRODUCT_IMAGE_ENABLED` on (default off, read per request), either rail's body carries
+  `"product_image_url": "https://..."` only when the catalog has an image that is surely of the variant
+  bought (`services/payment_orchestration/purchase_product_image`). The bought sku is the Reap row's
+  `variant_key`, or every sku naming the Shopify variant of a cart link (Reap `shopify:<n>`, the A2A
+  `checkout_url` line), never the `::canonical` placeholder, and only live (unsuppressed) rows. Their images
+  must agree. The sku's own image shows when it differs from the product's (the Shopify sync copies the hero
+  onto every sku). The product's image shows only for a one-variant product (counted over every sku row,
+  withdrawn ones too) whose purchase names no variant of its own (no variant title, or "Default Title").
+  The URL is a clean public https URL whose authority is exactly a host name, optionally `:443`
+  (`clean_product_image_url`); the AgenPas gateway fetches it server-side, and
+  the buyer's browser never loads a store's host. No field otherwise or when the read fails (the body is
+  still served). Never in the public route or the webhooks. Off: no field.
 - With `AGENPAS_PAYMENT_CARD_ENABLED` on (default off, read per request), a Reap-rail body whose checkout
   is bound to a card (`awaiting_buyer_authorization`, `placing`, `completed`, a row dispatched under the
   checkout journal) carries `"payment_card": {"network": "VISA", "last4": "4242"}`: the enrollment's own
-  two display attributes, the card the checkout was created with. `network` is the partner's word or
-  `null`; there is no field without exactly four digits, before the checkout exists, on the A2A rail, or
-  when the card read fails (the body is still served). Never in the public route or the webhooks. Off: no
-  field.
-- Either rail's body carries `"agent_display_name": "<name>"` only when Pivota has reviewed a name for the
-  purchase's agent (`agents.buyer_display_name`, migration 297, set by hand as a gated one-off; NULL for
-  every agent until then). Never `agents.agent_name`, which the agent's developer typed. No field when no
-  name is reviewed, the stored one fails the shape check (`db/agents.clean_buyer_display_name`: 1-64
-  characters, NFC, no control or format characters, at least one letter or digit) or the read fails (the
-  body is still served). No dial: a NULL column is the off position. Never in the public route or the
-  webhooks.
+  two display attributes, the card the checkout was created with. An A2A-rail body carries the same field
+  once the token is minted on the card (`awaiting_buyer_authorization`, `placing`, `completed`): the network
+  and last four from the rail's own card list, recorded for that card as the token is minted (migration 298),
+  shown only while the row still names that card; never the checkout answer's `cardLast4`, which is the
+  token's. The worker records it whether or not the dial is on (the dial gates only the read), and the
+  columns are not cleared by a terminal state or the contact purge (display attributes, not cardholder data).
+  The worker trusts the rail to mint the token on the card it named: if the rail's own approval page ever let
+  the buyer switch cards, the page would still name the earlier one. `network` is the partner's word or `null`; there is no field without exactly four digits, before
+  the card is bound, or when the card read fails (the body is still served). Never in the public route or
+  the webhooks. Off: no field.
+- Either rail's body carries `"agent_display_name": "<name>"`, the name the page shows as "Requested by":
+  - a name set by hand in `agents.buyer_display_name` (migration 297, a gated one-off) when that column
+    is not NULL. It wins over the portal name, and it never falls through to it: `''` hides a portal name
+    without the developer;
+  - otherwise the name the purchase's agent registered with in the developer portal (`agents.agent_name`,
+    the agent the API key belongs to), unless it is blocked (`db/agents.portal_name_is_blocked`): it
+    contains a term of `PORTAL_NAME_BLOCKED_TERMS` (payment brands, "bank", "secure", Pivota, AgenPaz)
+    after case, spaces, punctuation and accents are dropped and Cyrillic or Greek lookalike letters and
+    digit or symbol stand-ins (0 o, 3 e, 4 a, 5 s, 7 t, $ s, @ a) are read as the Latin letter they
+    imitate, and shapes that read alike match each other (i, l, capital I and 1 are one letter; rn is
+    m, cl is d, vv is w), the terms reduced the same way; it has a letter outside the allowlist (after NFKD, a Latin letter must be ASCII a-z or
+    A-Z, so small capitals, IPA, stroke or hook letters, ø, ß and ł refuse it; any other letter must be
+    Han/CJK, Hiragana, Katakana, Hangul, Cyrillic, Greek, Arabic, Hebrew, Thai or Devanagari); it mixes
+    Latin letters with Cyrillic or Greek ones (a name wholly in one script, or Latin with another allowed
+    script, passes); or it is a placeholder ("Agent", "Unknown").
+  - a rename hides it until checked again: `PUT /agents/{agent_id}`, the one path that changes
+    `agents.agent_name`, sets `buyer_display_name = ''` in the same transaction when the name changes and
+    the column is NULL. A gated one-off sets it back to NULL (or to a name) after a check. A hand-set
+    value is left as it is.
+  Never a fallback: not the user's full name, a legacy `name` column, "Agent" or "Unknown". No field when
+  neither gives a name, the name fails the shape check (`db/agents.clean_buyer_display_name`: 1-64
+  characters, NFC, no control or format characters, at least one letter or digit; never repaired) or the
+  read fails (the body is still served). No dial: every clean portal name shows on deploy. Never in the
+  public route or the webhooks. Accepted residual risk: a generic name that names no blocked term
+  ("Fraud Prevention Team", "Apple", a bank's own name) still shows.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/consents` (server to server, AgenPas)
 
@@ -244,6 +280,25 @@ consent step first.
 **Turn off**: unset `AGENPAS_CONSENT_GATE` on **`web` first, then the worker**; bodies are today's again at
 once. The records stay
 (insert-only: nothing updates or deletes them, no PII scrub touches them).
+
+## Buyer contact retention on the A2A rail (`A2A_RAIL_CONTACT_PURGE_DISABLED`)
+
+The buyer terms promise the email and shipping address are deleted when the purchase ends, and no later
+than 72 hours after it opens. A terminal write NULLs them; the worker's tick also purges any row older
+than 72 h. That tick only runs while `A2A_RAIL_WORKER_ENABLED` is on and the rail client is configured,
+so a second purge runs on its own clock: `jobs/a2a_rail_contact_purge.py`, scheduler id
+`a2a_rail_contact_purge`, cron at :03, :18, :33 and :48. It NULLs `buyer_email` and
+`shipping_address` on rows opened more than **71 h** ago, in any state, without moving the state, so a
+contact is gone by 71 h 15 min (72 h even with two runs missed in a row). It reads none of the rail's
+dials and makes no outside call; it logs counts only.
+
+- **On by default**, on the worker (where the scheduler registers jobs). `A2A_RAIL_CONTACT_PURGE_DISABLED`
+  (`1`, `true`, `on`, `yes`, read per run) is the kill switch; anything else, unset included, leaves it on.
+  Turning the rail's dials off does not stop this purge, and a rail rollback must leave it on.
+- On Postgres, two purges running at once (the tick, this job, a run-now) skip each other's locked rows
+  (`FOR UPDATE SKIP LOCKED`) instead of waiting.
+- A worker with `SCHEDULER_JOB_ALLOWLIST` set must name `a2a_rail_contact_purge` too, or the job is not started.
+- One forced run: `POST /admin/scheduler/jobs/a2a_rail_contact_purge/run-now`.
 
 ## `POST /agent/internal/commerce/purchases/{purchase_id}/shipping-address` (server to server, AgenPas)
 

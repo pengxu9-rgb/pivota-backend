@@ -19,12 +19,12 @@ from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
 from db.agents import AgentAuthLookupTransientError, agent_is_active, get_agent, get_agent_by_key
-from routes.agent_auth import verify_checkout_token_claims
+from routes.agent_auth import agent_api_key_format_ok, verify_checkout_token_claims
 from utils.transient_errors import db_busy_http_exception
 
 router = APIRouter(prefix="/agent/internal/auth", tags=["agent-internal-auth"])
 
-_API_KEY_PATTERN = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")
+_API_KEY_PATTERN = re.compile(r"^ak_(live_)?[0-9a-f]{64}$")  # kept for importers; the rule is agent_api_key_format_ok
 
 
 class IntrospectRequest(BaseModel):
@@ -86,8 +86,8 @@ async def introspect_agent_api_key(
     if not raw_key:
         return IntrospectResponse(valid=False, auth_source="missing")
 
-    # Keep the same external key format contract as get_agent_context.
-    if not _API_KEY_PATTERN.match(raw_key):
+    # Keep the same external key format contract as get_agent_context (ak_test_ only in the sandbox).
+    if not agent_api_key_format_ok(raw_key):
         return IntrospectResponse(valid=False, auth_source="format_invalid")
 
     metrics: Dict[str, Any] = {}
