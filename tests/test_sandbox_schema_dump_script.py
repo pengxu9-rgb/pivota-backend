@@ -278,6 +278,11 @@ def test_every_secret_kind_is_refused_by_the_dump_and_by_the_apply(harness, samp
     ("member", "member of another role"),
     ("create", "may CREATE in the database or a schema"),
     ("definer", "SECURITY DEFINER function"),
+    # the 8155964d4 review, (f)
+    ("rw", "session is not read-only"),
+    ("settings", "per-role settings"),
+    ("owns", "owns a function, type, schema, large object"),
+    ("lo", "may write a large object"),
     ("", "could not check the credential"),
     ("something else", "could not check the credential"),
 ])
@@ -298,5 +303,18 @@ def test_the_privilege_check_runs_before_the_dump_and_is_read_only(harness):
     for kind in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "USAGE", "CREATE", "EXECUTE"):
         assert "'%s'" % kind in calls
     for needle in ("relowner", "rolsuper", "pg_auth_members", "has_any_column_privilege", "has_sequence_privilege",
-                   "has_schema_privilege", "has_database_privilege", "prosecdef", "'S', 'v', 'f', 'm'"):
+                   "has_schema_privilege", "has_database_privilege", "prosecdef", "'S', 'v', 'f', 'm'",
+                   "transaction_read_only", "pg_db_role_setting", "pg_shdepend", "proowner", "typowner",
+                   "nspowner", "lomowner", "lomacl", "lo_compat_privileges",
+                   # unreachable while PGOPTIONS forces read-only; pinned so it is not lost
+                   "when pg_catalog.current_setting('transaction_read_only') <> 'on' then 'rw'"):
         assert needle in calls, needle
+
+
+def test_every_session_the_dump_opens_is_read_only(harness):
+    """A client option outranks the role's own default, so even a credential whose role is not read-only
+    can neither write nor lo_create nor ALTER anything in these sessions (8155964d4 review, (f))."""
+    done = harness()
+    assert done.returncode == 0, done.stderr
+    env = (harness.log / "pg_dump.env").read_text()
+    assert "default_transaction_read_only=on" in next(line for line in env.splitlines() if line.startswith("PGOPTIONS="))

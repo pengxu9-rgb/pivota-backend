@@ -138,7 +138,10 @@ PASSWORD_RAW="${BASH_REMATCH[4]:-}"
     "$(esc "$(urldecode "$PASSWORD_RAW")")" > "$PGPASSFILE" )
 unset DATABASE_URL DSN PASSWORD_RAW
 export PGAPPNAME=sandbox-schema-dump
-export PGOPTIONS="-c statement_timeout=120s -c idle_in_transaction_session_timeout=60s"
+# Every session is READ ONLY, whatever the role's defaults (a client option outranks a role setting): even a
+# credential that slipped past the check below could not write, create a large object or ALTER a role or a
+# function. The check then proves the session it runs in is read-only (8155964d4 review, (f)).
+export PGOPTIONS="-c statement_timeout=120s -c idle_in_transaction_session_timeout=60s -c default_transaction_read_only=on"
 # The dump must come from pg_dump of the SERVER's major version: a newer pg_dump writes settings an older
 # server rejects (pg_dump 17: SET transaction_timeout), and the sandbox apply refuses a mismatch too.
 PG_DUMP_VERSION=$(pg_dump --version | sed -nE 's/^pg_dump \(PostgreSQL\) ([0-9]+(\.[0-9]+)*).*/\1/p')
@@ -154,10 +157,15 @@ echo "dump_prod_schema: pg_dump $PG_DUMP_VERSION server_version_num=$SERVER_NUM 
 # TEMP comes in via PUBLIC, so THIS check is what makes a wrong credential (prod's full DATABASE_URL, say)
 # fail closed: a superuser, or a role that owns or may write any table, never dumps. Read-only query.
 WRITABLE=$(capped psql -XAtc "select case
+    when pg_catalog.current_setting('transaction_read_only') <> 'on' then 'rw'
     when (select rolsuper or rolcreaterole or rolcreatedb or rolreplication or rolbypassrls
             from pg_roles where rolname = current_user) then 'role'
     when exists (select 1 from pg_auth_members m join pg_roles r on r.oid = m.member
                   where r.rolname = current_user) then 'member'
+    -- a per-role setting other than the read-only default (ALTER ROLE ... SET persists across sessions)
+    when exists (select 1 from pg_db_role_setting s, unnest(s.setconfig) c
+                  where s.setrole = (select oid from pg_roles where rolname = current_user)
+                    and c <> 'default_transaction_read_only=on') then 'settings'
     when exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
                   where c.relkind in ('r', 'p', 'S', 'v', 'f', 'm')
                    -- system schemas excluded: PUBLIC may UPDATE pg_catalog.pg_settings (that is how SET works)
@@ -170,6 +178,19 @@ WRITABLE=$(capped psql -XAtc "select case
                                      or has_any_column_privilege(current_user, c.oid, 'UPDATE')
                                      or has_table_privilege(current_user, c.oid, 'DELETE')
                                      or has_table_privilege(current_user, c.oid, 'TRUNCATE') end)) then 'table'
+    -- owner of anything else: a function or type can be ALTERed (SECURITY DEFINER), a large object written
+    when exists (select 1 from pg_shdepend d where d.refclassid = 'pg_authid'::regclass and d.deptype = 'o'
+                  and d.refobjid = (select oid from pg_roles where rolname = current_user))
+      or exists (select 1 from pg_proc p where p.proowner = (select oid from pg_roles where rolname = current_user))
+      or exists (select 1 from pg_type t where t.typowner = (select oid from pg_roles where rolname = current_user))
+      or exists (select 1 from pg_namespace n where n.nspowner = (select oid from pg_roles where rolname = current_user))
+      or exists (select 1 from pg_largeobject_metadata l
+                  where l.lomowner = (select oid from pg_roles where rolname = current_user)) then 'owns'
+    -- a large object it may write: lo_compat_privileges lets anyone, an ACL lets it or PUBLIC
+    when pg_catalog.current_setting('lo_compat_privileges') <> 'off'
+      or exists (select 1 from pg_largeobject_metadata l, aclexplode(l.lomacl) a
+                  where a.privilege_type = 'UPDATE'
+                    and a.grantee in (0, (select oid from pg_roles where rolname = current_user))) then 'lo'
     when has_database_privilege(current_database(), 'CREATE')
       or exists (select 1 from pg_namespace n where n.nspname not like 'pg_temp%' and n.nspname not like 'pg_toast%'
                    and has_schema_privilege(current_user, n.oid, 'CREATE')) then 'create'
@@ -179,6 +200,10 @@ WRITABLE=$(capped psql -XAtc "select case
     else 'none' end") || die "could not check the credential's privileges" 3
 case "$WRITABLE" in
   none) ;;
+  rw) die "the dump's session is not read-only (default_transaction_read_only did not take effect)" 3 ;;
+  settings) die "the dump credential has per-role settings (ALTER ROLE ... SET) besides default_transaction_read_only=on" 3 ;;
+  owns) die "the dump credential owns a function, type, schema, large object or other object; use RUNBOOK 10a-role's read-only role" 3 ;;
+  lo) die "the dump credential may write a large object (an ACL, or lo_compat_privileges on)" 3 ;;
   role) die "the dump credential is a superuser or can create roles/databases; use RUNBOOK 10a-role's read-only role" 3 ;;
   member) die "the dump credential is a member of another role (SET ROLE would lend it that role's rights); use RUNBOOK 10a-role's read-only role" 3 ;;
   table) die "the dump credential owns or may write a table, view, sequence or column; use RUNBOOK 10a-role's read-only role" 3 ;;

@@ -94,7 +94,7 @@ def test_statements_split_only_at_top_level_semicolons():
     ("SET LOCAL lock_timeout = 0;", "outside pg_dump's preamble"),
     ("RESET ALL;", "outside pg_dump's preamble"),
     ("CREATE FUNCTION h() RETURNS int LANGUAGE plpython3u AS $$ return 1 $$;", "language other than"),
-    ("CREATE TYPE public.b (INPUT = f, OUTPUT = g);", "needing C code"),
+    ("CREATE TYPE public.b (INPUT = f, OUTPUT = g);", "needs C code"),
     ("CREATE TABLE z (a text DEFAULT 'unterminated);", "does not (scan|parse)"),
     ("CREATE FUNCTION k() AS $x$ never closed;", "does not (scan|parse)"),
     ("CREATE TABLE z (a int)", "no ';'"),
@@ -445,7 +445,13 @@ def test_the_bounds_pg_dump_writes_are_kept(statement):
     assert A.validate_schema_sql(_schema(statement)).statements
 
 
+# --- the 8155964d4 review: no dump-defined code is reachable at DDL time, by any route -------------------
+DOMAIN_F = ("CREATE FUNCTION public.f(int) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$BEGIN "
+            "PERFORM public.g(); RETURN true; END$$;\n")
+
+
 @pytest.mark.parametrize("statement", [
+    # Each is a position the server evaluates (or constant-folds) while the statement runs.
     "CREATE INDEX i ON public.t ((public.f()));",
     "CREATE INDEX i ON public.t (a) WHERE (public.g() > 1);",
     "CREATE INDEX i ON public.t ((1 OPERATOR(public.===) 2));",
@@ -453,22 +459,123 @@ def test_the_bounds_pg_dump_writes_are_kept(statement):
     "CREATE TABLE public.q (a int) PARTITION BY RANGE ((public.f()));",
     "CREATE STATISTICS s ON (public.f()), (a) FROM public.t;",
     "ALTER TABLE public.t ADD CONSTRAINT x EXCLUDE USING gist (a WITH =) WHERE ((public.g() > 1));",
+    # ... and those it does not evaluate today, refused anyway: no case analysis to get wrong.
+    "CREATE INDEX i ON public.t USING btree (public.f(a));",
+    "CREATE TABLE public.d (a int DEFAULT public.f());",
+    "CREATE TABLE public.c (a int CHECK (public.positive(a)));",
+    "CREATE TABLE public.c (a int GENERATED ALWAYS AS (public.f(a)) STORED);",
+    "CREATE POLICY p ON public.t USING (public.f(a));",
+    "CREATE TRIGGER t BEFORE INSERT ON public.t FOR EACH ROW WHEN (public.f(1)) EXECUTE FUNCTION public.tr();",
+    "CREATE FUNCTION public.h(x int DEFAULT public.f(1)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+    "ALTER TABLE ONLY public.t ALTER COLUMN a SET DEFAULT public.f();",
+    "CREATE TABLE public.c (a int CHECK (a = ANY (ARRAY[1]) AND a OPERATOR(public.<) 2));",
 ])
-def test_a_dump_function_on_constants_in_a_folded_expression_is_refused(statement):
-    with pytest.raises(A.SchemaRefused, match="folded, i.e. run, at create time"):
+def test_a_dump_function_or_operator_in_any_expression_position_is_refused(statement):
+    with pytest.raises(A.SchemaRefused, match="not pg_catalog's"):
         A.validate_schema_sql(_schema(statement))
 
 
 @pytest.mark.parametrize("statement", [
-    "CREATE INDEX i ON public.t USING btree (public.f(a));",                     # a column: not folded
-    "CREATE INDEX i ON public.t USING btree (lower(b)) WHERE (state = 'live'::public.offer_state);",
-    "CREATE INDEX i ON public.t USING gin (b public.gin_trgm_ops);",
-    "CREATE TABLE public.q (a int) PARTITION BY RANGE (a);",
-    "CREATE TABLE public.d (a int DEFAULT public.f(), b text DEFAULT gen_random_uuid()::text);",  # runs at INSERT
-    "CREATE TABLE public.c (a int CHECK (public.positive(a)));",
+    # A1: array_in -> domain_in runs the domain's CHECK while the DEFAULT is parsed.
+    "CREATE TABLE public.t1 (a int[] DEFAULT '{1}'::public.d[]);",
+    # A1': a composite's input runs its columns' inputs; in an index expression.
+    "CREATE INDEX i ON public.t ((('(1)'::public.comp IS NOT NULL)));",
+    "CREATE TABLE public.t1 (a int DEFAULT CAST('1' AS public.d));",
+    "CREATE TABLE public.t1 (a int CHECK (a = (public.d '1')));",  # a typed literal is a cast
 ])
-def test_column_expressions_and_insert_time_defaults_are_kept(statement):
+def test_a_cast_to_a_domain_or_composite_in_an_expression_is_refused(statement):
+    with pytest.raises(A.SchemaRefused, match="cast to a type that is not pg_catalog's or an enum"):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement,match", [
+    # A1/A5 at their root: a domain whose CHECK calls a dump function is refused where it is created, so
+    # no input function of any type the dump creates can reach one (a bare literal coerced to a domain or
+    # composite column, a bound coerced to a domain key).
+    (DOMAIN_F + "CREATE DOMAIN public.d AS integer CONSTRAINT c CHECK (public.f(VALUE));", "not pg_catalog's"),
+    ("CREATE DOMAIN public.d AS text CONSTRAINT c CHECK ((pg_catalog.query_to_xml('select 1', true, true, '') "
+     "IS NOT NULL));", "runs SQL"),
+    ("CREATE DOMAIN public.d AS text CONSTRAINT c CHECK ((pg_catalog.ts_stat('select 1') IS NOT NULL));", "runs SQL"),
+    ("CREATE TABLE public.c (a text CHECK (pg_catalog.domain_in(a::cstring, 0::oid, -1) IS NOT NULL));", "runs SQL"),
+    ("CREATE TABLE public.c (a text DEFAULT pg_catalog.set_config('role', 'x', true));", "runs SQL"),
+    # A2: an aggregate's INITCOND runs its STYPE's input.
+    ("CREATE AGGREGATE public.agg(integer) (SFUNC = int4pl, STYPE = public.d, INITCOND = '1');",
+     "CREATE AGGREGATE that is not reviewed"),
+    ("CREATE AGGREGATE public.agg(integer) (SFUNC = int4pl, STYPE = integer);", "CREATE AGGREGATE that is not reviewed"),
+    # A3: ALTER DOMAIN ADD CONSTRAINT runs the new CHECK over the domain's uses.
+    ("ALTER DOMAIN public.currency_code ADD CONSTRAINT c2 CHECK (public.f(1));", "ALTER DOMAIN"),
+    ("ALTER DOMAIN public.currency_code ADD CONSTRAINT c2 CHECK ((VALUE IS NOT NULL));", "ALTER DOMAIN"),
+    # A4: a validated CHECK added by ALTER is planned (constant-folded) on the spot, even on an empty table.
+    ("ALTER TABLE ONLY public.t ADD CONSTRAINT c CHECK ((id > 0));", "named NOT VALID form"),
+    ("ALTER TABLE ONLY public.t ADD CHECK ((id > 0)) NOT VALID;", "named NOT VALID form"),
+    ("ALTER TABLE ONLY public.t ADD CONSTRAINT c CHECK (public.f(1)) NOT VALID;", "not pg_catalog's"),
+    # A5: a partition key on a domain column (the bound is coerced to it).
+    ("CREATE TABLE public.p (a public.d) PARTITION BY LIST (a);", "partition key column"),
+    ("CREATE TABLE public.p (a integer) PARTITION BY LIST (b);", "partition key column"),
+    # A6: ATTACH of a table whose CHECK calls a dump function: refused where that table is created.
+    (DOMAIN_F + "CREATE TABLE public.p1 (a integer CONSTRAINT k CHECK (public.f(1)));\n"
+     "ALTER TABLE ONLY public.p ATTACH PARTITION public.p1 FOR VALUES IN (1);", "not pg_catalog's"),
+    # Ways to reach a dump function without naming it.
+    ("CREATE OPERATOR public.=== (FUNCTION = public.f, LEFTARG = integer, RIGHTARG = integer);", "CREATE OBJECT_OPERATOR"),
+    ("CREATE CAST (integer AS public.d) WITH FUNCTION public.f(integer) AS IMPLICIT;", "CREATE CAST"),
+    ("CREATE TYPE public.r AS RANGE (subtype = integer, subtype_diff = public.f);", "canonical or subtype_diff"),
+    ("CREATE TYPE public.r AS RANGE (subtype = integer, canonical = public.f);", "canonical or subtype_diff"),
+])
+def test_every_ddl_time_route_to_dump_code_is_refused(statement, match):
+    with pytest.raises(A.SchemaRefused, match=match):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement", [
+    # Audit bypass 1: a temp relation is searched before pg_catalog.
+    "CREATE TEMPORARY VIEW pg_roles AS SELECT (0)::oid AS oid, ('x')::name AS rolname WHERE false;",
+    "CREATE TEMP TABLE pg_attrdef (adrelid oid);",
+    "CREATE TEMPORARY SEQUENCE public_s;",
+    "CREATE VIEW pg_temp.pg_class AS SELECT 1 AS oid;",
+    "CREATE TABLE pg_temp_3.x (a int);",
+    "CREATE FUNCTION pg_temp.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+    "CREATE TABLE public.t2 (a int DEFAULT pg_temp.f());",
+    "CREATE UNLOGGED TABLE public.u (a int);\nCREATE TEMP TABLE x (a int) ON COMMIT DROP;",
+])
+def test_temp_objects_and_pg_temp_names_are_refused(statement):
+    with pytest.raises(A.SchemaRefused, match="TEMPORARY object or a pg_temp name"):
+        A.validate_schema_sql(_schema(statement))
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE TYPE public.offer_state AS ENUM ('live', 'paused');\n"
+    "CREATE TABLE public.o (state public.offer_state DEFAULT 'live'::public.offer_state NOT NULL, b text);\n"
+    "CREATE INDEX i ON public.o USING btree (lower(b)) WHERE (state = 'live'::public.offer_state);",
+    "CREATE INDEX i ON public.t USING gin (b public.gin_trgm_ops);",  # an extension's opclass: not an expression
+    "CREATE TABLE public.q (a int) PARTITION BY RANGE (a);",
+    "CREATE TABLE public.d (a int DEFAULT nextval('public.s'::regclass), b text DEFAULT (gen_random_uuid())::text);",
+    "CREATE TABLE public.c (a public.currency_code, b numeric CHECK ((b >= (0)::numeric)));",  # a domain COLUMN
+    "ALTER TABLE ONLY public.t ADD CONSTRAINT c CHECK ((id > 0)) NOT VALID;",  # pg_dump's form
+    # Not evaluated when created: a view's query, a function's body, a trigger's function.
+    "CREATE VIEW public.v AS SELECT public.f() AS x, ('(1)'::public.comp) AS y;",
+    "CREATE MATERIALIZED VIEW public.mv AS SELECT public.f() AS x WITH NO DATA;",
+    "CREATE FUNCTION public.h() RETURNS int LANGUAGE sql RETURN (public.f() + 1);",
+    "CREATE TRIGGER t BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.f();",
+    "CREATE TABLE public.r (a text DEFAULT 'pg_temp'::text);",  # a literal is not a name
+])
+def test_what_pg_dump_writes_for_columns_enums_and_bodies_is_kept(statement):
     assert A.validate_schema_sql(_schema(statement)).statements
+
+
+def test_a_reviewed_name_is_allowed_and_the_dump_may_not_define_it(monkeypatch):
+    monkeypatch.setattr(A, "EXPRESSION_NAMES_ALLOWED", frozenset({"public.uuid_generate_v4"}))
+    A.validate_schema_sql(_schema("CREATE TABLE public.u (a uuid DEFAULT public.uuid_generate_v4());"))
+    with pytest.raises(A.SchemaRefused, match="reviewed extension function's name"):
+        A.validate_schema_sql(_schema("CREATE FUNCTION public.uuid_generate_v4(int) RETURNS uuid LANGUAGE sql "
+                                      "AS $$ SELECT NULL::uuid $$;"))
+    monkeypatch.setattr(A, "AGGREGATES_ALLOWED", frozenset({"public.agg"}))
+    A.validate_schema_sql(_schema("CREATE AGGREGATE public.agg(integer) (SFUNC = int4pl, STYPE = integer);"))
+
+
+def test_the_plan_records_declared_row_security():
+    plan = A.validate_schema_sql(_schema("ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+                                         "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;"))
+    assert plan.row_security == {"public.t"} and plan.forced_row_security == {"public.t"}
 
 
 def test_a_security_definer_function_is_refused_and_invoker_is_kept():

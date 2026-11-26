@@ -52,7 +52,18 @@ plus prod's two migration ledgers. Code: `scripts/sandbox/dump_prod_schema.sh` (
   not a superuser and no CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS; a member of NO role (NOINHERIT does
   not stop SET ROLE; pg_write_all_data included); it owns nothing and may not INSERT/UPDATE (any column)/
   DELETE/TRUNCATE any table, view, foreign table or materialized view, nor USAGE/UPDATE a sequence; no
-  CREATE on the database or any schema; no EXECUTE on a SECURITY DEFINER function outside pg_catalog.
+  CREATE on the database or any schema; no EXECUTE on a SECURITY DEFINER function outside pg_catalog;
+  owns no function, type, schema, large object or other object (`pg_shdepend`, so ALTER FUNCTION ...
+  SECURITY DEFINER is out of reach); may write no large object (an ACL, or `lo_compat_privileges` on); no
+  per-role setting but `default_transaction_read_only=on`.
+* **Every session is READ ONLY**: `PGOPTIONS` carries `default_transaction_read_only=on`, which outranks the
+  role's own default, and the check above refuses a session where `transaction_read_only` is not on. So
+  even a credential that slipped past it cannot write, CREATE, or ALTER a role or a function.
+  **Accepted trade-off: `lo_create`.** A READ ONLY transaction still allows it (measured on PG15; not yet
+  measured on 17), and PUBLIC may EXECUTE it, so any prod role can create a large object. The dump's SQL is
+  fixed and never calls it. Closing it is a prod-wide `REVOKE EXECUTE ON FUNCTION lo_create(oid),
+  lo_creat(integer), lo_from_bytea(oid, bytea) FROM PUBLIC`, a prod change with its own gate and go,
+  not part of this job. The sandbox side counts large objects in its audit (any owner: must be 0).
   NOTE: if prod's `public` schema still grants CREATE to PUBLIC (a pre-15 default carried by a restore),
   this refuses even the right role; the fix is a gated prod REVOKE, never a weaker check.
 * These are a COARSE line-based filter. `dump_prod_schema.sh check <schema.sql> <ledgers.sql>` runs only
@@ -72,6 +83,10 @@ cloudsqlsuperuser, which the job refuses):
 CREATE ROLE sandbox_schema_apply LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB
   NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2 PASSWORD '<from its own secret>';
 GRANT CONNECT ON DATABASE <sandbox db> TO sandbox_schema_apply;
+-- No TEMP for anyone but who needs it: a temp relation is searched BEFORE pg_catalog, so it could stand in
+-- for a catalog the job reads. The job refuses a role that may create temp objects.
+REVOKE TEMPORARY ON DATABASE <sandbox db> FROM PUBLIC;
+GRANT TEMPORARY ON DATABASE <sandbox db> TO <app role>;  -- jobs/sandbox_catalog_copy.py stages in TEMP tables
 GRANT USAGE, CREATE ON SCHEMA public TO sandbox_schema_apply;   -- NOT CREATE ON DATABASE
 -- Extensions: the admin pre-creates the fixed list; the dump never creates one.
 CREATE EXTENSION IF NOT EXISTS pg_trgm  WITH SCHEMA public;   -- backend migrations
@@ -87,7 +102,8 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
   `ALTER ROLE sandbox_schema_apply NOLOGIN;`.
 * The job's own check, before anything runs (`role_refusal`): the connected role is not a superuser,
   cannot create roles or databases, has no REPLICATION or BYPASSRLS, is the session user, is a member of
-  NO role, has no CREATE on the database, and owns nothing yet (a rerun is refused, never merged into).
+  NO role, has no CREATE or TEMP on the database, has no per-role setting, and owns nothing yet
+  (including large objects; a rerun is refused, never merged into).
 
 ### The job
 
@@ -106,21 +122,42 @@ CREATE EXTENSION IF NOT EXISTS vector   WITH SCHEMA public;   -- gateway migrati
   sql only; no ownership change of any kind; CREATE SCHEMA without elements or AUTHORIZATION; no CREATE
   TABLE AS; a materialized view only WITH NO DATA; no rule; no trigger on a ledger table; ALTER TABLE
   subcommands from a fixed list; no SECURITY DEFINER function; partition bounds constants only (PostgreSQL
-  evaluates a bound at CREATE / ATTACH); no dump-defined function, operator or cast on constants in an
-  index, partition-key, statistics or partial/exclusion predicate expression (PostgreSQL constant-folds,
-  i.e. runs, those at create time; with `search_path` pinned to '' an unqualified name is pg_catalog's); no literal that looks like a secret or a person (in the parser's own
-  printout, so no comment). Ledger statements must be exactly the two explicit-column INSERT shapes,
+  evaluates a bound at CREATE / ATTACH); no TEMP / TEMPORARY object or `pg_temp` name anywhere; no
+  literal that looks like a secret or a person (in the parser's own printout, so no comment).
+* **No dump-defined code is reachable while the schema is created** (the 8155964d4 review). In EVERY
+  expression position (CHECK, a domain's constraint, DEFAULT, generated column, index / partition-key /
+  statistics expression, bound, predicate, policy, trigger WHEN, parameter default) a function or
+  operator must be pg_catalog's (an unqualified name is, with `search_path` ''), minus the few that run
+  SQL or another type's input (`query_to_xml` and kin, `ts_stat`, `ts_rewrite`, `set_config`, `*_in`/
+  `*_recv` of array/record/domain/range); a cast only to a pg_catalog type, an enum the dump creates, or
+  a name in the reviewed `EXPRESSION_NAMES_ALLOWED` (EMPTY: neither repo's migrations need one; the first
+  real dump's `check` names any prod has, each added only after review that it is an extension's). Since a
+  domain's constraints obey the same rule, the input function of every type the dump can create runs
+  built-in code only, so even a bare literal coerced into a domain or composite column reaches no
+  dump-defined function. Refused outright: CREATE OPERATOR, CREATE CAST, ALTER DOMAIN, CREATE AGGREGATE
+  unless reviewed by name (`AGGREGATES_ALLOWED`, empty), a range type with a canonical or subtype_diff
+  function, an ALTER TABLE ADD CHECK that is not pg_dump's named NOT VALID form, a partition key column
+  of a type that is not pg_catalog's or an enum. Function bodies, view queries, WITH NO DATA
+  materialized views and a trigger's function reference are not evaluated when created and are left
+  alone. Ledger statements must be exactly the two explicit-column INSERT shapes,
   one row of plain literals each, no quote, semicolon or backslash in a value.
 * One transaction with the apply's own `lock_timeout` 10s, `statement_timeout` 120s, idle 60s,
-  `standard_conforming_strings` on and `search_path` '' (checked unchanged after the schema), plus
+  `standard_conforming_strings` on, `row_security` off, `check_function_bodies` off and `search_path` ''
+  (checked unchanged after the schema; then the job's own SQL runs under `search_path = pg_catalog,
+  pg_temp` and `row_security` off, checked right before the ledger and again before the audit, and every
+  catalog it reads is named `pg_catalog.x`), plus
   CLIENT-side deadlines a statement cannot change: 120s per statement and 900s for the whole apply. Each statement runs ALONE through
   the extended protocol (the server refuses a string with two commands). Then: no ledger table may run
   code on INSERT (trigger, rule, expression/partial index, CHECK/FK, domain or generated column, row
   security, a default other than now()/nextval()); `standard_conforming_strings` re-asserted; the
   ledger rows; then a POST-APPLY AUDIT, the catch-all behind the parser: no rows in any table but the
-  ledgers; no GRANT on any table, column, function, type or schema the role owns; no default privileges;
-  no SECURITY DEFINER function; no large object; no rule but views' `_RETURN`; exactly the dump's
-  triggers and policies; no populated materialized view; no advanced sequence. Then the base-table count
+  ledgers (read with row security off, and past a declared FORCE inside a rolled-back savepoint, so a
+  policy can neither hide a row nor run); no GRANT on any table, column, function, type or schema the role
+  owns; no default privileges; no SECURITY DEFINER function; no large object at all; no per-role setting
+  (`pg_db_role_setting`); no temporary object; no rule but views' `_RETURN`; exactly the dump's triggers
+  and policies, and row security ENABLEd / FORCEd on exactly the tables the dump declares; no populated
+  materialized view; every sequence as created (`last_value` = its start, not called; `setval(s, n,
+  false)` included). Then the base-table count
   must equal the source's live count and the ledger rows the manifest's, or everything rolls back.
   `search_path` is restored. A server newer than the parser's major version (17) is refused.
 * Exit 0 = `DONE {...}`, exit 2 = `REFUSED: <rule>`.
