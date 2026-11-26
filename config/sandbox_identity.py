@@ -16,16 +16,24 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 from typing import List, Mapping, Optional, Tuple, Union
 
 #: The sandbox's GCP project.
 SANDBOX_PROJECT = "pivota-sandbox"
+#: The one-way drop between prod and the sandbox (catalog copy and schema dump). Pinned: the jobs refuse
+#: any other bucket. scripts/sandbox/dump_prod_schema.sh carries the same name (a test holds them equal).
+SANDBOX_DROP_BUCKET = "pivota-sandbox-catalog-drop"
 #: The sandbox Cloud SQL private range (sandbox-infra pins it), as (prefix length, sha256 of the masked
 #: network string str(ipaddress.ip_network("<addr>/<prefix>", strict=False))). The repo is public, so
 #: the range is not written here; an address is in it when its own masked network hashes the same.
 SANDBOX_DB_NETWORKS_SHA256 = ((20, "447f3aded69332bf20f941cf9f6eae4edcac48e2988f89b1da7a23d806a6404a"),)
 #: The sandbox Cloud SQL Auth Proxy socket directory prefix.
 SANDBOX_SQL_SOCKET_PREFIX = "/cloudsql/%s:" % SANDBOX_PROJECT
+#: The WHOLE socket path asyncpg will open: /cloudsql/<project>:<region>:<instance>/.s.PGSQL.<port>.
+#: Exact shape, not a prefix: `/cloudsql/pivota-sandbox:x/../../<anything>` passes a prefix test and
+#: opens any socket on the host (found while checking the controller's traversal question).
+_SANDBOX_SOCKET_RE = re.compile(r"^/cloudsql/%s:[a-z0-9-]+:[a-z0-9-]+/\.s\.PGSQL\.[0-9]{1,5}\Z" % re.escape(SANDBOX_PROJECT))  # \Z: `$` would allow a trailing newline
 
 Address = Union[str, Tuple[str, int]]
 
@@ -52,7 +60,7 @@ def database_addresses(dsn: str) -> List[Address]:
 
 def _address_ok(addr: Address) -> bool:
     if isinstance(addr, str):  # a unix socket path, e.g. /cloudsql/pivota-sandbox:us-west1:pg/.s.PGSQL.5432
-        return addr.startswith(SANDBOX_SQL_SOCKET_PREFIX)
+        return bool(_SANDBOX_SOCKET_RE.match(addr))
     host = addr[0]
     try:
         ip = ipaddress.ip_address(host)
