@@ -893,6 +893,82 @@ async def test_a_payer_named_scheme_without_the_payers_name_fails_before_any_wri
     assert (await _row(pid))["last_error_code"] == "token_payer_missing"
 
 
+# ── the paying card for the buyer page (migration 298) ─────────────────────────────────────
+
+
+async def test_the_token_step_records_the_card_it_mints_on_and_the_owner_read_names_it():
+    pid = await _approving(VISA)
+    row = await _row(pid)
+    assert (row["card_method_id"], row["card_network"], row["card_last4"]) == ("pm_visa", "visa", "4444")
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) == {"network": "visa", "last4": "4444"}
+    # The owner only.
+    assert await ledger.get_payment_card_for_owner(pid, "agent_other", "h" * 64) is None
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "x" * 64) is None
+
+
+@pytest.mark.parametrize("last4", [None, "", "444", "44444", "44a4", " 4444x", 4444])
+async def test_a_card_without_exactly_four_digits_is_not_recorded_and_the_token_step_goes_on(last4):
+    method = {**VISA, "last4": last4}
+    pid = await _approving(method)
+    row = await _row(pid)
+    assert row["state"] == "awaiting_authorization"
+    assert (row["card_method_id"], row["card_last4"]) == (None, None)
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) is None
+
+
+@pytest.mark.parametrize("brand, stored", [("visa", "visa"), ("<b>visa</b>", None), ("", None), ("9visa", None)])
+async def test_a_network_that_is_not_a_plain_name_is_stored_as_null(brand, stored):
+    pid = await _approving({**VISA, "payment_brand": brand} if brand else {k: v for k, v in VISA.items() if k != "payment_brand"})
+    assert (await _row(pid))["card_network"] == stored
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) == {"network": stored, "last4": "4444"}
+
+
+async def test_a_failed_card_record_never_stops_the_token_step(monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(ledger, "record_payment_card_as_holder", boom)
+    pid = await _approving(VISA)
+    assert (await _row(pid))["state"] == "awaiting_authorization"
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) is None
+
+
+async def test_the_card_is_named_only_once_its_token_is_minted_and_only_while_the_row_still_names_it():
+    pid = await _approving(VISA)
+    for state, shown in (("awaiting_authorization", True), ("paying", True), ("completed", True),
+                         ("quoting", False), ("needs_payment_method", False), ("failed", False)):
+        await database.execute("UPDATE a2a_rail_purchases SET state = :s WHERE id = :i", {"s": state, "i": pid})
+        card = await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64)
+        assert (card is not None) == shown, state
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'awaiting_authorization', "
+                           "payment_method_id = 'pm_other' WHERE id = :i", {"i": pid})
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) is None  # the buyer changed card
+
+
+# Shapes that survive storage on both dialects (Postgres trims trailing spaces that only overflow VARCHAR(4)).
+@pytest.mark.parametrize("stored", ["44a4", "444", " 444", "44 4", ""])
+async def test_a_stored_last4_without_exactly_four_digits_is_never_named(stored):
+    # Whatever wrote the column (a hand fix, an older build): the read checks the shape again.
+    pid = await _approving(VISA)
+    await database.execute("UPDATE a2a_rail_purchases SET card_last4 = :l WHERE id = :i", {"l": stored, "i": pid})
+    assert await ledger.get_payment_card_for_owner(pid, "agent_w", "h" * 64) is None
+
+
+async def test_the_card_is_recorded_only_on_the_held_row_and_only_for_the_card_it_names():
+    pid = await _locked(VISA)
+    await _claim(pid)
+    assert await ledger.record_payment_card_as_holder(pid, "w_other", method_id="pm_visa", network="visa", last4="4444") is False
+    assert await ledger.record_payment_card_as_holder(pid, W, method_id="pm_else", network="visa", last4="4444") is False
+    assert (await _row(pid))["card_last4"] is None
+    assert await ledger.record_payment_card_as_holder(pid, W, method_id="pm_visa", network="visa", last4="4444") is True
+    assert (await _row(pid))["card_last4"] == "4444"
+    # Only in `quoting`, the token step: never on a row that has moved on.
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'awaiting_authorization', card_last4 = NULL "
+                           "WHERE id = :i", {"i": pid})
+    assert await ledger.record_payment_card_as_holder(pid, W, method_id="pm_visa", network="visa", last4="4444") is False
+    assert (await _row(pid))["card_last4"] is None
+
+
 @pytest.mark.parametrize("listed", [[], [{**VISA, "status": "DISABLED"}]])
 async def test_a_card_that_is_gone_fails_the_token_step_before_any_write(listed):
     pid = await _locked()
