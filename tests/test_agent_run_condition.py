@@ -218,20 +218,36 @@ async def test_one_host_spelled_as_requests_name_it_reads_the_one_row(records, s
 
 
 async def test_a_missing_table_is_not_met(records):
-    """Before migrations 294 and 295 run, a rail whose filter is on takes nothing."""
+    """Before migrations 294 and 295 run, a rail whose filter is on takes nothing. The cause says it was a record
+    that could not be read, not a merchant's answer."""
     assert await facts.record_check(SHOP, POSITIVE_UCP)
     await database.execute(f"DROP TABLE {blocks.TABLE}")
-    assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.OPEN_BLOCK
+    assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.RECORD_UNREADABLE
     await database.execute(f"DROP TABLE {facts.TABLE}")
+    assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.RECORD_UNREADABLE
+
+
+async def test_a_definite_no_wins_over_a_record_that_cannot_be_read(records):
+    """An open block beside a missing fact table is the block: the worker's relay must fail on it, not wait."""
+    await _block("a2a")
+    await database.execute(f"DROP TABLE {facts.TABLE}")
+    assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.OPEN_BLOCK
+    assert await run_condition.unmet_cause("reap", SHOP) == run_condition.RECORD_UNREADABLE
+
+
+async def test_no_fact_is_a_definite_no_whatever_the_block_record_says(records):
+    await database.execute(f"DROP TABLE {blocks.TABLE}")
     assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.NO_CHECKOUT_FACT
 
 
-async def test_a_reader_that_raises_anyway_is_not_met(monkeypatch):
+async def test_a_reader_that_raises_anyway_is_not_met(monkeypatch, caplog):
     async def boom(*_a, **_k):
         raise RuntimeError("reader broke its promise")
 
-    monkeypatch.setattr(facts, "meets_run_condition", boom)
-    assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.NO_CHECKOUT_FACT
+    monkeypatch.setattr(facts, "run_condition_answer", boom)
+    with caplog.at_level("WARNING", logger=run_condition.__name__):
+        assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.RECORD_UNREADABLE
+    assert "read failed rail=a2a reader=checkout_fact error_type=RuntimeError" in caplog.text
 
 
 async def test_a_block_reader_that_raises_anyway_is_not_met(monkeypatch, caplog):
@@ -241,13 +257,13 @@ async def test_a_block_reader_that_raises_anyway_is_not_met(monkeypatch, caplog)
     async def boom(*_a, **_k):
         raise RuntimeError("reader broke its promise")
 
-    monkeypatch.setattr(facts, "meets_run_condition", yes)
-    monkeypatch.setattr(blocks, "is_clear", boom)
+    monkeypatch.setattr(facts, "run_condition_answer", yes)
+    monkeypatch.setattr(blocks, "clear_answer", boom)
     monkeypatch.setenv(RAILS_ENV, "a2a")
     with caplog.at_level("WARNING", logger=run_condition.__name__):
-        assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.NO_CHECKOUT_FACT
+        assert await run_condition.unmet_cause("a2a", SHOP) == run_condition.RECORD_UNREADABLE
         assert await run_condition.agent_may_run("a2a", SHOP, agent_id="agent_x") is False
-    assert "read failed rail=a2a error_type=RuntimeError" in caplog.text
+    assert "read failed rail=a2a reader=merchant_block error_type=RuntimeError" in caplog.text
     assert "reader broke its promise" not in caplog.text
 
 
@@ -255,18 +271,46 @@ async def test_nothing_is_read_while_the_rails_filter_is_off(monkeypatch):
     async def forbidden(*_a, **_k):
         raise AssertionError("read while off")
 
-    monkeypatch.setattr(facts, "meets_run_condition", forbidden)
-    monkeypatch.setattr(blocks, "is_clear", forbidden)
+    for module, name in ((facts, "meets_run_condition"), (facts, "run_condition_answer"),
+                         (blocks, "is_clear"), (blocks, "clear_answer")):
+        monkeypatch.setattr(module, name, forbidden)
     monkeypatch.setenv(RAILS_ENV, "reap")
     assert await run_condition.agent_may_run("a2a", SHOP, agent_id="agent_x") is True
+    assert await run_condition.enforced_unmet_cause("a2a", SHOP, agent_id="agent_x") is None
 
 
 async def test_a_failure_is_logged_with_its_cause_and_the_answer_says_only_no(monkeypatch, caplog):
     async def no(*_a, **_k):
         return False
 
-    monkeypatch.setattr(facts, "meets_run_condition", no)
+    monkeypatch.setattr(facts, "run_condition_answer", no)
     monkeypatch.setenv(RAILS_ENV, "a2a")
     with caplog.at_level("WARNING", logger=run_condition.__name__):
         assert await run_condition.agent_may_run("a2a", SHOP, agent_id="agent_x") is False
     assert f"rail=a2a merchant={SHOP} agent=agent_x cause={run_condition.NO_CHECKOUT_FACT}" in caplog.text
+
+
+@pytest.mark.parametrize("fact,clear,cause", [
+    (True, True, None),
+    (False, None, "no_checkout_fact"),
+    (None, False, "open_block"),
+    (True, False, "open_block"),
+    (None, True, "record_unreadable"),
+    (True, None, "record_unreadable"),
+    (None, None, "record_unreadable"),
+    ("yes", True, "record_unreadable"),  # an answer that is not a bool is not a yes
+])
+async def test_the_worker_is_told_the_cause_and_an_unreadable_record_apart(monkeypatch, caplog, fact, clear, cause):
+    async def _fact(*_a, **_k):
+        return fact
+
+    async def _clear(*_a, **_k):
+        return clear
+
+    monkeypatch.setattr(facts, "run_condition_answer", _fact)
+    monkeypatch.setattr(blocks, "clear_answer", _clear)
+    monkeypatch.setenv(RAILS_ENV, "a2a")
+    with caplog.at_level("WARNING", logger=run_condition.__name__):
+        assert await run_condition.enforced_unmet_cause("a2a", SHOP, agent_id="agent_x") == cause
+        assert await run_condition.agent_may_run("a2a", SHOP, agent_id="agent_x") is (cause is None)
+    assert (f"cause={cause}" in caplog.text) is (cause is not None)

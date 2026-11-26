@@ -62,9 +62,10 @@ FOR A CALLER ON A REQUEST PATH (services/payment_orchestration/agent_run_conditi
     one connection, so a cancelled read can disturb a sibling query on it. Read it before the
     request fans out, as the worker-heartbeat read is done.
 
-ONE READER. services/payment_orchestration/agent_run_condition.py calls `meets_run_condition` on the
-create path, only for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS (unset: nothing reads this). No
-worker reads it.
+ONE READER. services/payment_orchestration/agent_run_condition.py reads `run_condition_answer`, only
+for a rail on PARTNER_AGENT_RUN_CONDITION_RAILS (unset: nothing reads this): on the create path, and
+for the token rail worker's re-check. "Cannot tell" (None) is "not met" everywhere except at the
+worker's relay, which waits it out (services/payment_orchestration/a2a_rail_worker).
 
 NO STARTUP HEAL. Migration 294 is applied in production once, by hand, as a gated one-off. Nothing
 in db/schema_guard creates the table, so the code can be deployed before the table exists; that
@@ -310,11 +311,12 @@ async def get_fact(domain: Any) -> Optional[Dict[str, Any]]:
     return {column: record[column] for column in _FACT_COLUMNS} if record is not None else None
 
 
-async def meets_run_condition(domain: Any) -> bool:
-    """True only for a merchant with a fresh positive and no negative since (ADR-030 D11).
-
-    False for a missing row, a positive older than `max_age_days()`, a negative, an unusable
-    domain, a slow or failed read and a missing table. Never raises."""
+async def run_condition_answer(domain: Any) -> Optional[bool]:
+    """The read, with "cannot tell" kept apart. True for a fresh positive and no negative since.
+    False for a DEFINITE no: a missing row, a positive older than `max_age_days()`, a negative, an
+    unusable domain. None when the record could not be read: a slow or failed read, a missing
+    table. Never raises. Only a caller that may wait out a None reads this; every other caller
+    reads `meets_run_condition`."""
     key = normalize_domain(domain)
     if not key:
         return False
@@ -323,6 +325,14 @@ async def meets_run_condition(domain: Any) -> bool:
         record = await asyncio.wait_for(
             database.fetch_one(statement, {"merchant_domain": key, "max_age_days": max_age_days()}),
             READ_TIMEOUT_SECONDS)
-    except Exception:  # noqa: BLE001 - timeouts and a missing table included: no fact, no run
-        return False
+    except Exception:  # noqa: BLE001 - timeouts and a missing table included: cannot tell
+        return None
     return record is not None
+
+
+async def meets_run_condition(domain: Any) -> bool:
+    """True only for a merchant with a fresh positive and no negative since (ADR-030 D11).
+
+    False for a missing row, a positive older than `max_age_days()`, a negative, an unusable
+    domain, a slow or failed read and a missing table. Never raises."""
+    return await run_condition_answer(domain) is True
