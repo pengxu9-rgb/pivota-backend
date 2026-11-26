@@ -176,6 +176,38 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   none: they are counted, never silently dropped. A completed purchase's token was used to pay: not an
   orphan.
 
+── ADR-030 D11'S RUN CONDITION (dark: only while PARTNER_AGENT_RUN_CONDITION_RAILS names `a2a`) ─────
+
+  The create door checks the condition once (services/payment_orchestration/agent_run_condition). A
+  purchase then lives for minutes to hours, and a merchant can challenge the rail's agent on another
+  purchase meanwhile, so the worker checks again, and records a challenge it meets itself:
+
+  THE RE-CHECK runs right before each send that starts or continues the rail's work at the merchant, never
+                           on a read, a reconcile or a hold:
+                             the VIC quote (`_start_vic_order`; the rail prices the cart at the merchant),
+                             the token request (`_start_token`; nothing is minted for a closed merchant),
+                             the relay that carries the token into the merchant checkout (`_authorizing`,
+                             both the `paid` relay and the await poll's).
+                           Not met (no fresh protocol fact, an open challenge or block on this rail, or either
+                           record unreadable): nothing is sent, and the code is `merchant_not_eligible`, the
+                           create door's own answer for the same cause. Before the quote or the token (in
+                           `quoting`: no order, no token) the purchase is REFUSED; at the relay (a token minted,
+                           perhaps approved) it FAILS, like the relay's other pre-send failures, and the token
+                           stays on the rail as an orphan (counted below). A send already out (a VIC
+                           order at the rail, a checkout set up and confirmed in the same step) is not
+                           reached: nothing here can call it back.
+  THE CHALLENGE RECORD    the checkout's definite `captcha-failed` (success exactly false: nothing was
+                           submitted) records one event, kind `captcha`, source `worker`, for this purchase
+                           and this rail's merchant (db/partner_agent_merchant_blocks.record_block), BEFORE
+                           the purchase fails. A retry after a crash is the same event (one purchase, one
+                           event). The record closes the merchant to this rail's agent until an operator
+                           clears it on D11's evidence. A failed write is logged at ERROR (an operator
+                           records it by hand) and the purchase fails all the same. `form-error` and
+                           `pay-disabled` are not challenges; an ambiguous answer (a 403, a contradictory
+                           captcha with success true) is held as before and records nothing.
+  Off (the setting does not name `a2a`): nothing is read or written, and every step is exactly as before.
+  The setting is read in the WORKER's own environment: it must be set on the worker service as well as web.
+
 ── THE WRITE DISCIPLINE (the rail cannot deduplicate: a new idempotency key per call) ──────────
 
   1. `mark_pending_write` BEFORE the call. None means do not send (lost the row, or a write is already
@@ -211,7 +243,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail, a2a_shipping_address, checkout_amounts, vic_order
+import db.partner_agent_merchant_blocks as agent_blocks
+from services.payment_orchestration import a2a_rail, a2a_shipping_address, agent_run_condition, checkout_amounts, vic_order
 from services.payment_orchestration import router as rail_router
 
 logger = logging.getLogger(__name__)
@@ -691,8 +724,68 @@ async def _token_failed(s: _Step, from_state: str, code: str, *, resolves: Optio
     return await _settled(s, moved, "failed")
 
 
+#: This worker's rail, as PARTNER_AGENT_RUN_CONDITION_RAILS and the challenge record name it.
+RUN_CONDITION_RAIL = "a2a"
+#: A purchase whose merchant no longer meets the run condition ends with the create door's own answer for that
+#: cause: a code of its own would tell an agent which merchants are cleared (agent_run_condition's docstring).
+RUN_CONDITION_REFUSAL = "merchant_not_eligible"
+#: The checkout result status that is a merchant challenge, and the kind it is recorded as.
+_CHALLENGE_KINDS = {"captcha-failed": "captcha"}
+
+
+async def _run_condition_unmet(s: _Step) -> bool:
+    """False when the step may send (the setting does not name this rail: nothing is read; or the condition is met).
+    The cause of a True goes to agent_run_condition's WARNING line. Called right before a send, never on a read or a
+    reconcile (see the module docstring)."""
+    return not await agent_run_condition.agent_may_run(
+        RUN_CONDITION_RAIL, str(s.row.get("merchant_domain") or ""), agent_id=str(s.row.get("agent_id") or ""))
+
+
+async def _run_condition_refusal(s: _Step) -> Optional[str]:
+    """In `quoting`, before the VIC quote or the token request: None, or the purchase REFUSED with nothing sent (no
+    order and no token exist yet: tests/test_terminal_write_dispatch_invariant.py's pre-dispatch state)."""
+    if not await _run_condition_unmet(s):
+        return None
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason=RUN_CONDITION_REFUSAL)
+    return await _settled(s, moved, "refused")
+
+
+async def _run_condition_relay_failure(s: _Step) -> Optional[str]:
+    """In `awaiting_authorization`, before a relay would carry the token into the checkout: None, or the purchase
+    FAILED with nothing sent, the code `merchant_not_eligible`, like the relay's other pre-send failures. A token was
+    minted (and the buyer may have approved it), so the purchase did not merely never start: failed, not refused."""
+    if not await _run_condition_unmet(s):
+        return None
+    return await _token_failed(s, "awaiting_authorization", RUN_CONDITION_REFUSAL)
+
+
+async def _record_challenge(s: _Step, status: str) -> None:
+    """Record the merchant's challenge of this rail's agent, for this purchase (only while the setting names the
+    rail). Never raises; a write that did not land is logged at ERROR for an operator to record by hand."""
+    if not rail_router.run_condition_enforced(RUN_CONDITION_RAIL):
+        return
+    try:
+        recorded = await agent_blocks.record_block(
+            RUN_CONDITION_RAIL, s.row.get("merchant_domain"), _CHALLENGE_KINDS[status],
+            source=agent_blocks.SOURCE_WORKER, purchase_id=s.id)
+    except Exception as exc:  # noqa: BLE001 - record_block never raises; this is the backstop
+        logger.warning("a2a_rail_worker: challenge record raised purchase=%s error_type=%s", s.id, type(exc).__name__)
+        recorded = None
+    if recorded is None:
+        logger.error(
+            "a2a_rail_worker: merchant challenge NOT recorded purchase=%s merchant=%s kind=%s; record it by hand "
+            "(scripts/partner_agent_merchant_blocks.py)", s.id, s.row.get("merchant_domain"), _CHALLENGE_KINDS[status])
+        return
+    logger.warning("a2a_rail_worker: merchant challenge %s purchase=%s merchant=%s kind=%s",
+                   recorded, s.id, s.row.get("merchant_domain"), _CHALLENGE_KINDS[status])
+
+
 async def _start_token(s: _Step) -> str:
     """The order is locked: ask the rail for a token bound to it, for the locked total. Mints; never charges."""
+    refused = await _run_condition_refusal(s)
+    if refused is not None:
+        return refused
     methods, read = await s.methods()
     if methods is None:
         return await _read_failed(s, read, "cards_read")
@@ -816,6 +909,9 @@ async def _authorizing(s: _Step) -> str:
             return await _approval_answer(s, None, result, sent, variant)
         if not _relay_sendable(s, setup):
             return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
+        failed = await _run_condition_relay_failure(s)
+        if failed is not None:
+            return failed
         # Through the relay the poll may be followed by the setup (a write): recorded first.
         if await ledger.mark_pending_write(s.id, s.worker, CHECKOUT_SETUP_ACTION) is None:
             return "lost"
@@ -837,6 +933,9 @@ async def _authorizing(s: _Step) -> str:
     if setup is not None and not _relay_sendable(s, setup):
         return await _token_failed(s, "awaiting_authorization", CHECKOUT_RELAY_REFUSED)
     if setup is not None:
+        failed = await _run_condition_relay_failure(s)
+        if failed is not None:
+            return failed
         # Through the relay `paid` is recorded under its own name: a step cut while the relay is out is
         # then held (`_checkout_pending`), never reconciled by resending `paid` (a second setup).
         action = CHECKOUT_RELAY_PAID_ACTION
@@ -1194,6 +1293,9 @@ async def _start_vic_order(s: _Step) -> str:
         return await _token_failed(s, "quoting", "vic_contact_missing")
     if vic_order.items_amount(row) is None:
         return await _token_failed(s, "quoting", "vic_amount_invalid")
+    refused = await _run_condition_refusal(s)
+    if refused is not None:
+        return refused
     quoted = await _vic_quote(s)
     if quoted is not None:
         return quoted
@@ -2416,6 +2518,9 @@ async def _checkout_result(s: _Step, card: Any) -> str:
         if data.get("success") is not False:
             # "Not submitted" with `success` true (or missing): a contradictory answer. Held.
             return await _checkout_hold(s, CHECKOUT_RESULT_UNRECOGNISED)
+        if status in _CHALLENGE_KINDS:
+            # ADR-030 D11: the merchant challenged the rail's agent. Recorded before the purchase ends.
+            await _record_challenge(s, status)
         return await _checkout_failed(s, f"checkout_{status.replace('-', '_')}")
     if status in _CHECKOUT_UNKNOWN:
         return await _checkout_hold(s, _CHECKOUT_UNKNOWN[status])

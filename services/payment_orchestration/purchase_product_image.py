@@ -15,7 +15,9 @@ it is that variant's own:
   * a product with ONE variant (counted over EVERY sku row, withdrawn ones too: a shade withdrawn from the
     catalog is still a shade): the sku's own image when it differs from the product's; else the product's image,
     but only when the purchase names no variant of its own (no variant title, or Shopify's "Default Title"): a
-    product the catalog knows one named variant of may have more on the store;
+    product the catalog knows one named variant of may have more on the store. Accepted by the owner (2026-11-25):
+    a purchase that names no variant, on a product the catalog only ever synced one sku of, shows the product's
+    image even if the store has shades the catalog never saw (that is how a true one-variant product looks);
   * a product with several variants: the sku image only when it DIFFERS from the product's image (a copied
     hero is not the variant's own), never the product image.
 Anything else (no row, no catalog row, a suppressed row, no bought sku, too many skus, a URL that is not a
@@ -35,7 +37,8 @@ from db.database import database
 
 #: Longest image URL the page will name.
 PRODUCT_IMAGE_URL_MAX_CHARS = 2048
-#: A product with more live skus than this is not one whose bought variant can be named (the cart lane's cap).
+#: A product with more sku rows than this (withdrawn ones included) is not one whose bought variant can be named (the
+#: cart lane's cap).
 _MAX_SKUS = 50
 
 _REAP_ROW_SQL = """
