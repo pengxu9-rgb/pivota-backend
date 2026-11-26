@@ -20,13 +20,33 @@ python -m jobs.sandbox_catalog_copy      gs://pivota-sandbox-catalog-drop/  pyth
 * Prices keep their values. The gateway marks sandbox answers `sandbox: true` and treats copied
   prices as fresh (decision 4).
 
-## Tables copied (52)
+## Tables copied (50)
 
-Whole rows, minus the dropped columns. The export reads prod's own column list at run time and
-**refuses** any column whose name looks like personal data or a secret (email, phone, token, secret,
-api_key, contact, address, customer, buyer, employee, notes, `*_by*`, user_id, ...) unless the spec
-drops, replaces or classifies it. A new risky column in prod therefore stops the copy instead of
-leaking.
+Whole rows, minus the dropped columns. The export reads prod's own column list (and types) at run
+time and **refuses**, before anything is uploaded:
+
+* any column not classified in `jobs/sandbox_catalog_columns.py` (S3: fail closed). Every copied
+  column is listed there with a class (key, text, url, num, flag, time, json, replaced); 790 columns
+  over 50 tables, taken from both repos' DDL parsed with PostgreSQL's own parser (pivota-backend main
+  and the gateway's main e62b57681, which creates 18 of the tables). A column prod has and neither
+  repo declares stops the copy, naming the table and column;
+* any column whose name looks like personal data or a secret (email(s), phone(s), token, secret,
+  api/access/secret/private/signing key, contact, address, customer, buyer, employee, notes, comment,
+  `*_by*`, user_id/user_name/user_agent, session/session_id, cookie, authorization, bearer, jwt,
+  username, reviewer, actor, passport, card_number, cvv/cvc, pan, tax_id, webhook_url, raw_payload,
+  headers, ...) unless the spec drops, replaces or allows it;
+* a JSON-typed column that is not classified JSON, or the other way round.
+
+**JSON columns** (113) each carry the reason they are catalog data, and are copied through a
+person-key scrub in the export's own SELECT: at any depth, a key that names a person, a secret or
+free text (`*by` such as reviewed_by / createdBy, email, phone, token, secret, api_key, session_id,
+user/userId, customer_*, employee_*, reviewer*, contact*, names, address, ip, card fields, notes,
+comments, raw_payload, headers, webhook_url, ...) has its string value replaced by `"redacted"` and
+any other scalar by null. A string, not null: the gateway serves a `product_evidence` claim only when
+`reviewed_by` is a non-empty string. The export then parses its own output and refuses if any person
+key still holds anything else (for example an object, or a `\u`-escaped key in a `json` column); the
+import checks every file again before touching the database. The manifest (format 2) lists each
+table's `json_columns`; the import refuses format 1 (an export from before the scrub).
 
 | table | why | dropped / restricted |
 |---|---|---|
@@ -61,18 +81,21 @@ leaking.
 | table | why | dropped / classified |
 |---|---|---|
 | content_canonical_election | canonical listing per content key | |
-| catalog_source_quarantine | quarantined sources stay hidden | drops `created_by`, `revoked_by` |
+| catalog_source_quarantine | quarantined sources stay hidden | drops `created_by`, `revoked_by`; `reason` (ops free text) = a placeholder |
 | merchant_product_overlay | approved PDP content overlays | drops `approved_by` |
 | product_evidence | claims and required disclaimers | |
 | pdp_identity_listing (optional) | the PDP identity graph | `matched_by_rule` classified (a rule name) |
 | pdp_identity_override (optional) | identity overrides | drops `created_by` |
 | product_beauty_attributes (optional) | beauty attributes | drops `audit_notes` |
-| product_relationship_edges, relationship_candidate_labels, relgraph_reviewed_ingredient_evidence, relgraph_reviewed_seller_evidence (optional) | the relationship graph | |
+| relationship_candidate_labels, relgraph_reviewed_ingredient_evidence, relgraph_reviewed_seller_evidence (optional) | the relationship graph | `human_review` and the other JSON scrubbed |
 | aurora_product_intel_kb, aurora_ingredient_research_kb, aurora_travel_context_kb (optional) | product KBs | |
 | aurora_dupe_kb (optional) | dupe KB | drops `verified_by` |
 | taxonomy_view, taxonomy_view_category, canonical_category, category_localization (optional) | category taxonomy | `replaced_by_id` classified |
-| merchant_category_mapping, ops_category_override (optional) | category mapping and ops pins | drops `updated_by` |
-| brands (optional) | brands | |
+| merchant_category_mapping, ops_category_override (optional) | category mapping and ops pins | drops `updated_by`; `ops_category_override.reason` = a placeholder |
+
+Two names on the gateway's list are not copied: `product_relationship_edges` is a VIEW over
+`relationship_candidate_labels` (gateway migrations 046/051; it arrives with them, and an import
+cannot write a view), and `brands` is a CTE name inside one gateway query, not a table.
 
 `agent_pdp_view.refreshed_by_proposal_id` is classified (a proposal id); a DDL-wide check found it.
 
@@ -112,9 +135,10 @@ placeholder and `realtime_enabled=false` itself.
 
 ## Known limits
 
-* JSON columns (for example `catalog_merchants.metadata_json`) cannot be checked by column name.
-  The manifest reports `email_like_values` per table as a review signal; read it after the first
-  prod export.
-* A first prod export may refuse on a column name this list has not classified; that is the rule
-  working. Classify it (drop or `allow_risky` with a reason) in its own reviewed change.
+* The JSON scrub works on key names. A person's details under a catalog-named key (an email inside
+  a product description) are not caught by it; the manifest's `email_like_values` per table stays as
+  a review signal for the first prod export.
+* A first prod export may refuse on a column the classification does not list (prod drift), on a
+  risky name, or on a person key holding an object; that is the rule working. Classify, drop or
+  scrub it in its own reviewed change.
 * No markets filter yet (decision 5 is open): the copy carries every market.

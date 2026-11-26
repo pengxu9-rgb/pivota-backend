@@ -74,6 +74,13 @@ def test_merchant_stores_never_copies_the_store_credential_and_turns_live_fetch_
     ("first_name", True), ("shipping_address", True), ("customer_id", True),
     ("title", False), ("price_minor", False), ("card_network", False), ("extractor_version", False),
     ("merchant_id", False), ("keyword", False), ("by_line", True),
+    # S3: the names the 5d8e3aa73 review found passing.
+    ("emails", True), ("phones", True), ("session_id", True), ("sessions", True), ("user_agent", True),
+    ("auth_header", True), ("authorization", True), ("bearer_token", True), ("jwt", True), ("cookies", True),
+    ("access_key", True), ("secret_key", True), ("signing_key", True), ("user_name", True), ("username", True),
+    ("reviewer", True), ("actor", True), ("passport_no", True), ("card_number", True), ("cvv", True), ("pan", True),
+    ("tax_id", True), ("webhook_url", True), ("raw_payload", True), ("headers", True), ("comments", True),
+    ("product_key", False), ("content_key", False), ("kb_key", False), ("sku_key", False), ("headline", False),
 ])
 def test_column_risk_names(column, risky):
     assert C.column_is_risky(column) is risky
@@ -82,12 +89,12 @@ def test_column_risk_names(column, risky):
 def test_a_risky_unclassified_column_is_refused():
     spec = C.TableSpec("catalog_products", "x")
     with pytest.raises(C.CopyRefused, match="owner_email"):
-        C.plan_columns(spec, ["product_id", "owner_email"])
+        C.plan_columns(spec, ["product_key", "owner_email"])
 
 
 def test_dropped_columns_are_not_planned():
     spec = next(s for s in C.CATALOG_TABLES if s.name == "external_product_seeds")
-    assert [c for c, _ in C.plan_columns(spec, ["id", "url", "notes", "created_by_employee_id"])] == ["id", "url"]
+    assert [c for c, _ in C.plan_columns(spec, ["id", "domain", "notes", "created_by_employee_id"])] == ["id", "domain"]
 
 
 @pytest.fixture
@@ -180,7 +187,9 @@ def test_every_copied_table_s_known_columns_pass_the_export_rules():
     for spec in C.CATALOG_TABLES:
         columns = sorted(ddl.get(spec.name, ()))
         if columns:
-            C.plan_columns(spec, columns)
+            from jobs.sandbox_catalog_columns import JSON, column_class
+
+            C.plan_columns(spec, columns, {c: "jsonb" for c in columns if column_class(spec.name, c) == JSON})
             checked += 1
     assert checked >= 25  # most copied tables have backend DDL; the gateway-created ones may not
 
@@ -225,7 +234,7 @@ async def test_the_export_never_lists_the_drop(tmp_path):
 
         async def execute(self, *a): return "SET"
 
-        async def fetch(self, *a): return [{"column_name": "merchant_id"}]
+        async def fetch(self, *a): return [{"column_name": "merchant_id", "type_name": "varchar"}]
 
         async def fetchval(self, *a): return 1
 
@@ -310,3 +319,86 @@ def test_a_gcs_transport_error_is_a_refusal(monkeypatch):
     monkeypatch.setattr(httpx, "get", boom)
     with pytest.raises(C.CopyRefused, match="unreachable for the metadata token"):
         C.GcsStore("gs://pivota-sandbox-catalog-drop/catalog").get("x")
+
+
+# --- S3: every column classified (jobs/sandbox_catalog_columns.py) ---------------------------------
+
+from jobs import sandbox_catalog_columns as COLS  # noqa: E402
+
+
+def test_every_copied_table_is_classified_and_nothing_else_is():
+    assert set(COLS.COLUMNS) == {s.name for s in C.CATALOG_TABLES}
+
+
+def test_every_json_column_states_why_it_is_catalog_data():
+    for table, columns in COLS.COLUMNS.items():
+        for column, entry in columns.items():
+            if isinstance(entry, tuple):
+                assert entry[0] == COLS.JSON and len(entry[1].strip()) > 8, (table, column)
+            else:
+                assert entry in (COLS.KEY, COLS.TEXT, COLS.URL, COLS.NUM, COLS.FLAG, COLS.TIME, COLS.REPLACED), (table, column)
+
+
+def test_the_classification_agrees_with_the_specs():
+    for spec in C.CATALOG_TABLES:
+        classified = COLS.COLUMNS[spec.name]
+        assert not set(classified) & set(spec.drop), spec.name  # a dropped column is not also copied
+        if spec.keep is not None:
+            assert set(classified) <= set(spec.keep), spec.name
+        replaced = {c for c, e in classified.items() if e == COLS.REPLACED}
+        assert replaced == set(spec.replace) & set(classified), spec.name
+
+
+def test_the_json_columns_the_review_named_are_scrubbed():
+    for table, column in (("product_evidence", "claims"), ("agent_pdp_view", "evidence_profile"),
+                          ("relationship_candidate_labels", "human_review")):
+        assert COLS.column_class(table, column) == COLS.JSON, (table, column)
+
+
+def test_two_names_that_are_not_tables_are_not_copied():
+    names = {s.name for s in C.CATALOG_TABLES}
+    assert "brands" not in names  # a CTE name in one gateway query, not a table
+    assert "product_relationship_edges" not in names and "product_relationship_edges" in C.EXCLUDED_TABLES
+
+
+def test_ops_free_text_reasons_are_placeholders():
+    spec = {s.name: s for s in C.CATALOG_TABLES}
+    for table in ("catalog_source_quarantine", "ops_category_override"):
+        assert spec[table].replace["reason"] == "'withheld in the sandbox copy'"
+
+
+@pytest.mark.parametrize("key", [
+    "reviewed_by", "reviewedBy", "last_approved_by", "createdBy", "email", "Email", "billing_email", "emails",
+    "phone", "phone_number", "contact_phone", "password", "api_key", "apiKey", "access_token", "refresh_token",
+    "client_secret", "authorization", "cookie", "session_id", "sessionId", "user_id", "userId", "username",
+    "user_agent", "customer", "customer_name", "buyer_email", "employee_id", "reviewer", "reviewer_name",
+    "actor_id", "owner_email", "author_name", "contact", "first_name", "last_name", "address", "ip",
+    "ip_address", "card_number", "cvv", "pan", "iban", "notes", "note", "comments", "raw_payload", "headers",
+    "webhook_url",
+])
+def test_person_keys_are_recognised(key):
+    assert C.PERSON_KEY_RE.match(key)
+
+
+@pytest.mark.parametrize("key", [
+    "claim_text", "evidence_grade", "review_status", "review_source_url", "title", "price", "product_key",
+    "shade_name", "brand", "ingredients", "market", "currency", "image_url", "source_ref", "decision",
+    "display_name", "verdict", "category", "tier",
+])
+def test_catalog_keys_are_left_alone(key):
+    assert not C.PERSON_KEY_RE.match(key)
+
+
+def test_person_values_reports_paths_never_values():
+    value = {"a": [{"reviewer": {"id": "staff-1"}}, {"email": None}, {"notes": "redacted"}], "userId": 3}
+    assert C.person_values(value) == ["$.a[0].reviewer", "$.userId"]
+
+
+def test_a_json_typed_column_must_be_classified_json():
+    spec = next(s for s in C.CATALOG_TABLES if s.name == "catalog_merchants")
+    with pytest.raises(C.CopyRefused, match="is classified JSON but its type is text"):
+        C.plan_columns(spec, ["merchant_id", "metadata_json"], {"metadata_json": "text"})
+    with pytest.raises(C.CopyRefused, match="not classified JSON"):
+        C.plan_columns(spec, ["merchant_id", "merchant_name"], {"merchant_name": "jsonb"})
+    with pytest.raises(C.CopyRefused, match="type is unknown"):
+        C.plan_columns(spec, ["merchant_id", "metadata_json"])

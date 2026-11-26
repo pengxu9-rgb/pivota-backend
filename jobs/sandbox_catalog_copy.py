@@ -10,9 +10,12 @@ cannot read back, the sandbox reads objects and writes only its own database.
 
 EXPORT (prod). One REPEATABLE READ, READ ONLY transaction, so every table comes from the same
 snapshot and the job is incapable of writing to prod's database. Per table it reads prod's own
-column list, removes the columns the spec drops, REFUSES if any remaining column name looks like
-personal data or a secret (see RISKY_COLUMN_TOKENS) and the spec has not classified it, then
-streams ``COPY (SELECT ...) TO STDOUT (FORMAT csv)`` into ``<prefix>/<stamp>/<table>.csv.gz``.
+column list and types, removes the columns the spec drops, REFUSES if any remaining column is not
+classified in jobs/sandbox_catalog_columns.py (S3: fail closed) or its name looks like personal data
+or a secret (see RISKY_COLUMN_TOKENS) and the spec has not allowed it, then runs
+``COPY (SELECT ...) TO STDOUT (FORMAT csv)`` into ``<prefix>/<stamp>/<table>.csv.gz``. Every JSON
+column goes through the person-key scrub (scrub_select) in that SELECT, and the export parses its
+own output before uploading anything (assert_json_scrubbed).
 ``<prefix>/<stamp>/_MANIFEST.json`` (columns, row counts, sha256 per file, the commit) is written
 LAST, so a stamp without a manifest is an unfinished export and is never imported. Objects are
 created with ifGenerationMatch=0: an export never overwrites anything.
@@ -20,7 +23,7 @@ created with ifGenerationMatch=0: an export never overwrites anything.
 IMPORT (sandbox). Refuses unless PIVOTA_ENV=sandbox and config.sandbox_guard passes (which also
 refuses a DATABASE_URL naming a prod host, project or IP). Picks the newest stamp that has a
 manifest, re-applies the export's column rules to the manifest (it does not trust the export),
-checks every file's sha256 and row count, then in ONE transaction: stages each table, deletes the
+checks every file's sha256 and row count and every JSON value against the scrub, then in ONE transaction: stages each table, deletes the
 sandbox rows the new copy no longer has (children first), upserts the rest (parents first), bumps
 serial sequences, and checks each table's row count equals the manifest's. Any mismatch rolls the
 whole import back and the previous copy stays.
@@ -53,7 +56,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("pivota.sandbox_catalog_copy")
 
-FORMAT_VERSION = 1
+#: 2: every column classified (jobs/sandbox_catalog_columns.py) and JSON columns scrubbed (S3). A format-1
+#: export predates the scrub, so the importer refuses it.
+FORMAT_VERSION = 2
 MANIFEST_NAME = "_MANIFEST.json"
 _STAMP_RE = re.compile(r"^\d{8}T\d{4}Z$")
 
@@ -123,7 +128,9 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     #     gateway's own migrations or has no DDL in either repo: absent in prod = recorded. -----
     TableSpec("content_canonical_election", "which listing is canonical per content key (search, PDP route ids)"),
     TableSpec("catalog_source_quarantine", "quarantined sources the serving lanes keep hidden",
-              drop=("created_by", "revoked_by")),
+              drop=("created_by", "revoked_by"),
+              # ops' free-text reason: a placeholder keeps a NOT NULL column satisfied.
+              replace={"reason": "'withheld in the sandbox copy'"}),
     TableSpec("merchant_product_overlay", "approved PDP content overlays", drop=("approved_by",)),
     TableSpec("product_evidence", "product claims and required disclaimers per market"),
     TableSpec("pdp_identity_listing", "the PDP identity graph's listings (search, discovery, recommendations)",
@@ -131,7 +138,6 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     TableSpec("pdp_identity_override", "identity graph overrides", drop=("created_by",), optional=True),
     TableSpec("product_beauty_attributes", "beauty attributes on PDP and recommendations", drop=("audit_notes",),
               optional=True),
-    TableSpec("product_relationship_edges", "product relationship graph edges", optional=True),
     TableSpec("relationship_candidate_labels", "relationship graph labels", optional=True),
     TableSpec("relgraph_reviewed_ingredient_evidence", "reviewed ingredient evidence for the graph", optional=True),
     TableSpec("relgraph_reviewed_seller_evidence", "reviewed seller evidence for the graph", optional=True),
@@ -146,8 +152,8 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     TableSpec("category_localization", "category names per locale", optional=True),
     TableSpec("merchant_category_mapping", "merchant category -> canonical category", drop=("updated_by",),
               optional=True),
-    TableSpec("ops_category_override", "category pins/hides set by ops", drop=("updated_by",), optional=True),
-    TableSpec("brands", "brands the relationship graph recalls", optional=True),
+    TableSpec("ops_category_override", "category pins/hides set by ops", drop=("updated_by",), optional=True,
+              replace={"reason": "'withheld in the sandbox copy'"}),
     # --- purchase readiness (Reap path) ---------------------------------------------------
     TableSpec("merchant_purchasability", "whether a merchant can take an agent purchase", optional=True,
               allow_risky={"card_available": "whether the store accepts cards, not a card"}),
@@ -197,6 +203,8 @@ EXCLUDED_TABLES: Mapping[str, str] = {
     "media_assets": "uploads",
     "commissions": "money",
     # Read by the gateway directly, NOT copied (gateway-db-tables-read.md):
+    "product_relationship_edges": "a VIEW over relationship_candidate_labels (gateway migration 046/051), which is "
+                                  "copied; the view arrives with the gateway's migrations, and an import cannot write a view",
     "pdp_identity_review_queue": "a review workflow with free-text reviewer notes; serving reads the graph, not the queue",
     "reco_label_suggestions": "carries session_id / request_id (linkable to users)",
     "creator_category_override": "keyed by creator_id; creators are real people",
@@ -254,12 +262,21 @@ def _assert_no_never_copy(names: Iterable[str], where: str) -> None:
 #: A column whose name has one of these tokens (split on "_") is refused unless dropped or
 #: classified in allow_risky. "_by" anywhere (created_by, decided_by_*) is staff identity.
 RISKY_COLUMN_TOKENS = frozenset({
-    "email", "phone", "password", "passwd", "secret", "token", "tokens", "credential", "credentials",
-    "kyc", "ssn", "address", "customer", "buyer", "employee", "iban", "contact", "notes", "note",
-    "by", "ip", "dob", "birthday",
+    "email", "emails", "phone", "phones", "password", "passwords", "passwd", "secret", "secrets", "token",
+    "tokens", "credential", "credentials", "kyc", "ssn", "address", "addresses", "customer", "customers",
+    "buyer", "buyers", "employee", "employees", "iban", "contact", "contacts", "notes", "note", "by", "ip",
+    "dob", "birthday",
+    # S3 (5d8e3aa73 review): plurals above, and auth material, people, documents, cards, raw payloads.
+    "cookie", "cookies", "authorization", "auth", "bearer", "jwt", "session", "sessions", "apikey",
+    "username", "usernames", "reviewer", "reviewers", "actor", "actors", "passport", "cvv", "cvc", "pan",
+    "headers", "comment", "comments", "remark", "remarks", "memo",
 })
-RISKY_COLUMN_PAIRS = frozenset({("api", "key"), ("private", "key"), ("user", "id"), ("first", "name"),
-                                ("last", "name"), ("full", "name"), ("account", "number")})
+RISKY_COLUMN_PAIRS = frozenset({
+    ("api", "key"), ("private", "key"), ("access", "key"), ("secret", "key"), ("signing", "key"),
+    ("user", "id"), ("user", "name"), ("user", "agent"), ("session", "id"), ("first", "name"),
+    ("last", "name"), ("full", "name"), ("account", "number"), ("card", "number"), ("tax", "id"),
+    ("national", "id"), ("id", "number"), ("webhook", "url"), ("raw", "payload"),
+})
 
 
 _assert_no_never_copy((s.name for s in CATALOG_TABLES), "CATALOG_TABLES")
@@ -272,12 +289,107 @@ def column_is_risky(column: str) -> bool:
     return any(pair in RISKY_COLUMN_PAIRS for pair in zip(parts, parts[1:]))
 
 
-def plan_columns(spec: TableSpec, existing: Sequence[str]) -> List[Tuple[str, str]]:
+# --- JSON: the person-key scrub (S3) -------------------------------------------------------------
+#: A JSON key (matched whole, any case, at any depth) that names a person, a secret or free text. Its
+#: string value becomes "redacted" (a string: the gateway serves an evidence claim only with a string
+#: reviewed_by) and any other scalar becomes null. ONE pattern for the SQL scrub and the Python check.
+#: Non-capturing groups only: the SQL replacement refers to the key as \1.
+_PERSON_KEY_ALTERNATION = "|".join((
+    # Broad on purpose (a key like "hobby" is redacted too): a missed person costs more than a lost tag.
+    r"[a-z0-9_]*by",                                   # reviewed_by, createdBy, last_approved_by, verified_by
+    r"[a-z0-9_]*e_?mails?", r"[a-z0-9_]*phones?", r"phone_?numbers?", r"mobile",
+    r"tel", r"pass_?words?", r"passwd", r"pwd", r"[a-z0-9_]*secrets?", r"[a-z0-9_]*tokens?",
+    r"api_?keys?", r"access_?keys?", r"private_?keys?", r"signing_?keys?", r"secret_?keys?",
+    r"credentials?", r"authorization", r"auth", r"bearer", r"jwt", r"cookies?", r"set_?cookie",
+    r"sessions?", r"session_?ids?", r"users?", r"user_?ids?", r"user_?names?", r"user_?agent",
+    r"customers?", r"customer_?[a-z0-9_]+", r"buyers?", r"buyer_?[a-z0-9_]+", r"employees?",
+    r"employee_?[a-z0-9_]+", r"staff", r"staff_?[a-z0-9_]+", r"reviewers?", r"reviewer_?[a-z0-9_]+",
+    r"actors?", r"actor_?ids?", r"operators?", r"operator_?ids?", r"owners?", r"owner_?(?:id|email|name)",
+    r"authors?", r"author_?(?:id|email|name)", r"contacts?", r"contact_?[a-z0-9_]+", r"first_?name",
+    r"last_?name", r"full_?name", r"given_?name", r"family_?name", r"address(?:es)?", r"street",
+    r"postal_?code", r"zip_?code", r"ip", r"ip_?address", r"remote_?addr", r"x_?forwarded_?for",
+    r"card_?numbers?", r"pan", r"cvv", r"cvc", r"iban", r"account_?numbers?", r"ssn", r"dob", r"birthday",
+    r"birth_?date", r"notes?", r"comments?", r"remarks?", r"memo", r"raw_?payload", r"headers",
+    r"webhook_?url", r"webhook_?secret",
+))
+PERSON_KEY_RE = re.compile(r"(?:%s)\Z" % _PERSON_KEY_ALTERNATION, re.IGNORECASE)
+REDACTED = "redacted"
+#: SQL (PostgreSQL ARE, flags 'gi'): a person key followed by a JSON string, then by any other scalar.
+_SQL_STRING_VALUE = r'"(%s)"(\s*:\s*)"(?:[^"\\]|\\.)*"' % _PERSON_KEY_ALTERNATION
+_SQL_OTHER_SCALAR = r'"(%s)"(\s*:\s*)(?:-?[0-9][0-9.eE+-]*|true|false)' % _PERSON_KEY_ALTERNATION
+
+
+def _sql_literal(text: str) -> str:
+    return "'%s'" % text.replace("'", "''")
+
+
+def scrub_select(column: str, data_type: str) -> str:
+    """The SELECT expression that copies JSON column ``column`` with its person keys scrubbed."""
+    if data_type not in ("json", "jsonb"):
+        raise CopyRefused("column %s is classified JSON but its type is %s" % (column, data_type))
+    inner = "regexp_replace(%s::text, %s, %s, 'gi')" % (
+        _q(column), _sql_literal(_SQL_STRING_VALUE), _sql_literal('"\\1"\\2"%s"' % REDACTED))
+    outer = "regexp_replace(%s, %s, %s, 'gi')" % (
+        inner, _sql_literal(_SQL_OTHER_SCALAR), _sql_literal('"\\1"\\2null'))
+    return "(%s)::%s AS %s" % (outer, data_type, _q(column))
+
+
+def person_values(value: Any, path: str = "$") -> List[str]:
+    """JSON paths where a person key still holds something other than null or "redacted"."""
+    found: List[str] = []
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            here = "%s.%s" % (path, key)
+            if PERSON_KEY_RE.match(str(key)) and inner is not None and inner != REDACTED:
+                found.append(here)
+            else:
+                found.extend(person_values(inner, here))
+    elif isinstance(value, list):
+        for index, inner in enumerate(value):
+            found.extend(person_values(inner, "%s[%d]" % (path, index)))
+    return found
+
+
+def assert_json_scrubbed(table: str, raw: bytes, columns: Sequence[str], json_columns: Sequence[str]) -> None:
+    """Refuse when any JSON value in the CSV ``raw`` still names a person. The message names the table,
+    the column and the JSON path, never the value."""
+    wanted = [i for i, c in enumerate(columns) if c in set(json_columns)]
+    if not wanted:
+        return
+    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
+        for i in wanted:
+            cell = row[i] if i < len(row) else ""
+            if cell == "":
+                continue  # SQL NULL (a JSON value is never the empty string)
+            try:
+                value = json.loads(cell)
+            except ValueError:
+                raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
+            hits = person_values(value)
+            if hits:
+                raise CopyRefused("table %s column %s: a person key survived the scrub at %s"
+                                  % (table, columns[i], hits[0]))
+
+
+def json_columns_of(spec: TableSpec, columns: Sequence[str]) -> List[str]:
+    from jobs.sandbox_catalog_columns import JSON as _JSON, column_class
+
+    return [c for c in columns if column_class(spec.name, c) == _JSON]
+
+
+def plan_columns(spec: TableSpec, existing: Sequence[str],
+                 types: Optional[Mapping[str, str]] = None) -> List[Tuple[str, str]]:
     """``[(column, select_expression)]`` to copy from a table whose columns are ``existing``.
 
-    Raises CopyRefused when a kept column does not exist, or a remaining column looks risky and is
-    neither dropped, replaced nor classified. The order follows ``existing`` (the table's own).
+    Raises CopyRefused when a remaining column is not classified in jobs/sandbox_catalog_columns.py
+    (fail closed, S3), when a JSON-typed column is not classified JSON (so it would skip the scrub) or
+    the other way round, or when a column looks risky by name and is neither dropped, replaced nor
+    allowed in the spec. ``types`` maps column -> PostgreSQL type name (json, jsonb, text, ...); the
+    export always passes it. The order follows ``existing`` (the table's own).
     """
+    from jobs.sandbox_catalog_columns import JSON as _JSON, column_class
+
+    types = dict(types or {})
     if spec.keep is not None:
         # A kept column the source lacks (is_test, realtime_enabled arrived by migration) is simply
         # not copied; the sandbox column's default applies.
@@ -294,6 +406,23 @@ def plan_columns(spec: TableSpec, existing: Sequence[str]) -> List[Tuple[str, st
                 "table %s column %s looks like personal data or a secret; drop it or classify it "
                 "in CATALOG_TABLES before copying" % (spec.name, column)
             )
+        cls = column_class(spec.name, column)
+        if cls is None:
+            raise CopyRefused(
+                "table %s column %s is not classified in jobs/sandbox_catalog_columns.py; classify "
+                "or drop it before copying" % (spec.name, column)
+            )
+        data_type = types.get(column)
+        is_json_type = data_type in ("json", "jsonb")
+        if cls == _JSON or is_json_type:
+            if cls != _JSON:
+                raise CopyRefused("table %s column %s is %s but not classified JSON (it would skip the "
+                                  "scrub)" % (spec.name, column, data_type))
+            if data_type is None:
+                raise CopyRefused("table %s column %s is classified JSON but its type is unknown"
+                                  % (spec.name, column))
+            out.append((column, scrub_select(column, data_type)))
+            continue
         out.append((column, _q(column)))
     if not out:
         raise CopyRefused("table %s: no columns left to copy" % spec.name)
@@ -453,6 +582,22 @@ async def _table_columns(conn, schema: str, table: str, *, copyable_only: bool =
     return [r["column_name"] for r in rows]
 
 
+async def _table_column_types(conn, schema: str, table: str) -> Dict[str, str]:
+    """column -> its type name as PostgreSQL spells it (json, jsonb, text, integer, ...)."""
+    rows = await conn.fetch(
+        """
+        SELECT a.attname AS column_name, t.typname AS type_name
+          FROM pg_catalog.pg_attribute a
+          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+         WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped
+        """,
+        schema, table,
+    )
+    return {r["column_name"]: r["type_name"] for r in rows}
+
+
 _EMAIL_RE = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
@@ -495,7 +640,7 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
                     absent.append(spec.name)
                     continue
                 raise CopyRefused("table %s does not exist in the source" % spec.name)
-            plan = plan_columns(spec, existing)
+            plan = plan_columns(spec, existing, await _table_column_types(conn, schema, spec.name))
             query = "SELECT %s FROM %s.%s" % (", ".join(e for _, e in plan), _q(schema), _q(spec.name))
             buf = io.BytesIO()
             await conn.copy_from_query(query, output=buf, format="csv")
@@ -503,12 +648,17 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
             rows = await conn.fetchval("SELECT count(*) FROM %s.%s" % (_q(schema), _q(spec.name)))
             if _count_csv_records(raw) != rows:
                 raise CopyRefused("table %s: CSV record count differs from the snapshot's" % spec.name)
+            # The scrub ran in SQL; check its output HERE, before anything is uploaded (S3).
+            planned = [c for c, _ in plan]
+            json_cols = json_columns_of(spec, planned)
+            assert_json_scrubbed(spec.name, raw, planned, json_cols)
             data = _gzip(raw)
             fname = "%s/%s.csv.gz" % (stamp, spec.name)
             files.append((fname, data))
             tables.append({
                 "name": spec.name,
-                "columns": [c for c, _ in plan],
+                "columns": planned,
+                "json_columns": json_cols,
                 "rows": int(rows),
                 "file": fname,
                 "bytes": len(data),
@@ -564,6 +714,10 @@ def validate_manifest(manifest: Mapping[str, Any], specs: Sequence[TableSpec] = 
         columns = list(entry.get("columns") or [])
         if not columns:
             raise CopyRefused("manifest table %s has no columns" % name)
+        from jobs.sandbox_catalog_columns import column_class
+
+        if list(entry.get("json_columns") or []) != json_columns_of(spec, columns):
+            raise CopyRefused("manifest table %s: its JSON columns are not the classified ones" % name)
         for column in columns:
             if column in spec.drop:
                 raise CopyRefused("manifest table %s carries dropped column %s" % (name, column))
@@ -571,6 +725,8 @@ def validate_manifest(manifest: Mapping[str, Any], specs: Sequence[TableSpec] = 
                 raise CopyRefused("manifest table %s carries column %s outside its keep list" % (name, column))
             if column_is_risky(column) and column not in spec.allow_risky and column not in spec.replace:
                 raise CopyRefused("manifest table %s carries risky column %s" % (name, column))
+            if column_class(name, column) is None and column not in spec.replace:
+                raise CopyRefused("manifest table %s carries unclassified column %s" % (name, column))
     absent = set(manifest.get("absent_optional_tables") or [])
     for spec in specs:
         if spec.name not in seen and not (spec.optional and spec.name in absent):
@@ -664,6 +820,8 @@ async def import_catalog(conn, store, *, stamp: Optional[str] = None,
         raw = gzip.decompress(data)
         if _count_csv_records(raw) != entry.get("rows"):
             raise CopyRefused("table %s: file row count does not match the manifest" % name)
+        # The importer does not trust the export's scrub either.
+        assert_json_scrubbed(name, raw, entry["columns"], json_columns_of(_spec_by_name(specs)[name], entry["columns"]))
         payloads[name] = raw
 
     order = await _fk_order(conn, schema, list(entries))

@@ -53,6 +53,25 @@ TABLES = ("catalog_merchants", "catalog_products", "catalog_offers", "external_p
           "merchant_onboarding", "merchant_stores")
 SPECS = [s for s in C.CATALOG_TABLES if s.name in TABLES]
 
+#: The stand-in tables below are smaller than prod's and carry a few columns of their own; classify
+#: those for these tests only. Every other column is classified by the REAL jobs/sandbox_catalog_columns.py.
+from jobs import sandbox_catalog_columns as _COLS  # noqa: E402
+
+_TEST_ONLY_CLASSES = {
+    "catalog_products": {"product_id": _COLS.KEY, "tags": _COLS.TEXT, "attrs": (_COLS.JSON, "test attributes")},
+    "catalog_offers": {"product_id": _COLS.KEY, "price": _COLS.NUM, "stock": _COLS.NUM},
+    "external_product_seeds": {"url": _COLS.URL},
+}
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_classes(monkeypatch):
+    merged = {t: dict(c) for t, c in _COLS.COLUMNS.items()}
+    for table, extra in _TEST_ONLY_CLASSES.items():
+        merged[table].update(extra)
+    monkeypatch.setattr(_COLS, "COLUMNS", merged)
+    yield merged
+
 DDL = """
 CREATE TABLE {s}.merchant_onboarding (
   id SERIAL PRIMARY KEY, merchant_id VARCHAR(50) UNIQUE, business_name VARCHAR(255) NOT NULL,
@@ -357,5 +376,99 @@ async def test_import_rolls_back_when_the_sandbox_ends_up_with_other_rows_than_t
     store = C.LocalDirStore(tmp_path)
     await _export(db, store)
     with pytest.raises(C.CopyRefused, match="rows after import"):
+        await _import(db, store)
+    assert await db.fetchval("SELECT count(*) FROM %s.catalog_merchants" % DST) == 0
+
+
+# --- S3: every column classified, JSON scrubbed at both ends ----------------------------------------
+
+
+async def test_json_person_keys_are_redacted_before_they_leave_prod(db, tmp_path):
+    await db.execute(f"""UPDATE {SRC}.catalog_merchants SET metadata_json =
+        '{{"tier": "a", "reviewed_by": "staff-42", "items": [{{"email": "owner@realbrand.example", "n": 1}}],
+           "userId": 7}}' WHERE merchant_id = 'm1';
+        UPDATE {SRC}.catalog_products SET attrs = '{{"claims": [{{"claim_text": "hydrating",
+           "reviewedBy": "staff-42", "notes": "internal note SECRET"}}]}}' WHERE product_id = 'p1';""")
+    store = C.LocalDirStore(tmp_path)
+    manifest = await _export(db, store)
+    blob = b"".join(gzip.decompress(store.get(n)) for n in store.list("") if n.endswith(".gz"))
+    for secret in ("staff-42", "owner@realbrand.example", "internal note SECRET"):
+        assert secret.encode() not in blob, secret
+    merchants = next(t for t in manifest["tables"] if t["name"] == "catalog_merchants")
+    assert merchants["json_columns"] == ["metadata_json"]
+    await _import(db, store)
+    meta = json.loads(await db.fetchval("SELECT metadata_json FROM %s.catalog_merchants WHERE merchant_id='m1'" % DST))
+    assert meta == {"tier": "a", "reviewed_by": "redacted", "items": [{"email": "redacted", "n": 1}], "userId": None}
+    attrs = json.loads(await db.fetchval("SELECT attrs FROM %s.catalog_products WHERE product_id='p1'" % DST))
+    assert attrs == {"claims": [{"claim_text": "hydrating", "reviewedBy": "redacted", "notes": "redacted"}]}
+
+
+async def test_a_person_key_holding_an_object_stops_the_export_before_any_upload(db, tmp_path):
+    await db.execute(f"""UPDATE {SRC}.catalog_merchants SET metadata_json =
+        '{{"reviewer": {{"id": "staff-42"}}}}' WHERE merchant_id = 'm1'""")
+    store = C.LocalDirStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match=r"catalog_merchants column metadata_json: a person key survived the scrub at \$\.reviewer") as excinfo:
+        await _export(db, store)
+    assert "staff-42" not in str(excinfo.value)
+    assert store.list("") == []
+
+
+async def test_a_column_prod_gains_unclassified_stops_the_export(db, tmp_path):
+    await db.execute("ALTER TABLE %s.catalog_products ADD COLUMN shiny_new_field TEXT" % SRC)
+    store = C.LocalDirStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match="catalog_products column shiny_new_field is not classified"):
+        await _export(db, store)
+    assert store.list("") == []
+
+
+async def test_a_json_column_classified_as_text_is_refused(db, tmp_path, _stand_in_classes):
+    _stand_in_classes["catalog_merchants"]["metadata_json"] = _COLS.TEXT
+    store = C.LocalDirStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match="metadata_json is jsonb but not classified JSON"):
+        await _export(db, store)
+    assert store.list("") == []
+
+
+async def test_the_import_refuses_a_file_whose_json_was_not_scrubbed(db, tmp_path):
+    """The importer does not trust the export's scrub: a file carrying a person value (sha and row
+    count made to match) is refused before the database is touched."""
+    import hashlib
+
+    store = C.LocalDirStore(tmp_path)
+    stamp = "20261125T0100Z"
+    await _export(db, store, stamp)
+    name = "%s/catalog_merchants.csv.gz" % stamp
+    raw = gzip.decompress(store.get(name)).replace(b'{""tier"": ""a""}', b'{""tier"": ""a"", ""reviewed_by"": ""staff-42""}')
+    assert b"staff-42" in raw
+    data = gzip.compress(raw)
+    (tmp_path / name).write_bytes(data)
+    _rewrite_manifest(tmp_path, stamp, lambda m: next(t for t in m["tables"] if t["name"] == "catalog_merchants")
+                      .update(sha256=hashlib.sha256(data).hexdigest()))
+    with pytest.raises(C.CopyRefused, match="survived the scrub"):
+        await _import(db, store)
+    assert await db.fetchval("SELECT count(*) FROM %s.catalog_merchants" % DST) == 0
+
+
+@pytest.mark.parametrize("tamper,match", [
+    ("format_1", "format_version is not 2"),
+    ("json_columns", "JSON columns are not the classified ones"),
+    ("unclassified", "unclassified column"),
+])
+async def test_the_import_re_applies_the_s3_rules_to_the_manifest(db, tmp_path, tamper, match):
+    store = C.LocalDirStore(tmp_path)
+    stamp = "20261125T0100Z"
+    await _export(db, store, stamp)
+
+    def mutate(m):
+        merchants = next(t for t in m["tables"] if t["name"] == "catalog_merchants")
+        if tamper == "format_1":
+            m["format_version"] = 1
+        elif tamper == "json_columns":
+            merchants["json_columns"] = []
+        elif tamper == "unclassified":
+            merchants["columns"].append("shiny_new_field")
+
+    _rewrite_manifest(tmp_path, stamp, mutate)
+    with pytest.raises(C.CopyRefused, match=match):
         await _import(db, store)
     assert await db.fetchval("SELECT count(*) FROM %s.catalog_merchants" % DST) == 0
