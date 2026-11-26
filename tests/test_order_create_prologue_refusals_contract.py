@@ -682,8 +682,10 @@ _CALLS_IN_THE_DEPENDENCIES: Dict[str, str] = {
     **{name: _PURE for name in (
         "<expr>.strip", "AgentContext", "AgentUserContext", "ValueError", "agent.get",
         "auth_metrics.get", "bearer.scheme.lower", "bool", "context.agent.get", "current_user.get", "hasattr",
-        "int", "isinstance", "max", "msg.lower", "re.match", "str", "secret_fingerprint",
+        "int", "isinstance", "max", "msg.lower", "str", "secret_fingerprint",
         "_build_internal_trusted_agent", "_is_internal_trusted_api_key", "agent_is_active", "pytest_bypass_allowed",
+        # routes.agent_auth's key-format rule: a regex match, plus PIVOTA_ENV for the sandbox's ak_test_ shape.
+        "agent_api_key_format_ok",
     )},
     **{name: _REFUSAL for name in ("HTTPException", "db_busy_http_exception")},
     **{name: "logging, a clock or a pause" for name in (
