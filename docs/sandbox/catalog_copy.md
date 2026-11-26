@@ -47,9 +47,12 @@ uploaded (`scrub_csv`):
   notes, comments, reason, rationale; card fields, raw_payload, headers, webhook_url, ...) has a
   string value replaced by `"redacted"` (a string: the gateway serves a `product_evidence` claim
   only when `reviewed_by` is a non-empty string) and ANY other value, objects and arrays included,
-  by null. A JSON column of product data keeps a product's or option's `name` and its `handle`;
-* email- and phone-shaped parts of every other JSON string and of every text column become
-  `[redacted]` (a brand's support address in a description, a contact under a catalog-named key);
+  by null. A JSON column of product data keeps `name` and `handle` at the product level, in the
+  items of a top-level array, and under option paths (options, variants, values, breadcrumb, ...);
+  elsewhere (reviews[].name, seller.handle) they are redacted;
+* email- and phone-shaped parts of every other JSON string, every JSON key and every text column
+  become `[redacted]` (a brand's support address in a description, a contact under a catalog-named
+  key); a JSON object with a repeated key is always rewritten from its parsed value;
 * the export then checks its own output and refuses on anything left, and on an email-shaped value
   in any other column (a key or URL); the manifest's `email_like_values` is 0 by construction and
   the import refuses one that is not;
@@ -154,4 +157,10 @@ placeholder and `realtime_enabled=false` itself.
 * A first prod export may refuse on a column the classification does not list (prod drift), on a
   risky name, or on a person key holding an object; that is the rule working. Classify, drop or
   scrub it in its own reviewed change.
+* Nothing streams yet (S5): each table is held in memory, about 5-8x its size, and a table whose
+  COPY output passes 1 GiB is refused (MAX_TABLE_COPY_BYTES) rather than running the job out of memory.
+* Phones are recognised only with context: an international number written with "+", or a number
+  right after a phone word (tel, phone, call, mobile, fax, whatsapp, contact, and the Korean, Japanese
+  and Chinese words). A bare digit group (a SKU, GTIN, year, size or price) is never redacted, so a
+  phone written that way in free text is not caught. Emails exclude image names such as `hero@2x.png`.
 * No markets filter yet (decision 5 is open): the copy carries every market.

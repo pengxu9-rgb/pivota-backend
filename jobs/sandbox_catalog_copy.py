@@ -61,6 +61,10 @@ logger = logging.getLogger("pivota.sandbox_catalog_copy")
 #: export predates the scrub, so the importer refuses it.
 FORMAT_VERSION = 2
 MANIFEST_NAME = "_MANIFEST.json"
+#: Nothing streams yet (S5 is open): a table's COPY output, its scrubbed copy and its gzip are all held
+#: in memory, about 5-8x the table. A table whose COPY output passes this cap is refused, so a large
+#: table fails loudly instead of the job running out of memory (review V6).
+MAX_TABLE_COPY_BYTES = 1 << 30
 _STAMP_RE = re.compile(r"^\d{8}T\d{4}Z$")
 
 
@@ -327,21 +331,52 @@ REDACTED = "redacted"
 #: Email- and phone-shaped substrings, redacted in every text and JSON string value (SF3: a person's
 #: address under a catalog-named key such as note2). The email check is a GATE on every column: after
 #: the scrub the export carries none, or it refuses.
-_EMAIL_TEXT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PHONE_TEXT_RE = re.compile(
-    r"(?<![\w+])(?:\+\d{1,3}[ .-]?)?(?:\(\d{1,4}\)[ .-]?)?\d{2,4}[ -]\d{3,4}[ -]\d{3,4}(?!\w)"
-    r"|(?<![\w+])\+\d[\d ().-]{7,16}\d(?!\w)"
-    r"|(?<![\w+])\(\d{1,4}\)[ .-]?\d{3,4}[ -]\d{4}(?!\w)"
-)
+#: An EMAIL is local@domain.tld where the "tld" is not an image/file extension and the domain does not
+#: start with a pixel-density label: `hero@2x.png` and Shopify's `_480x480@2x.jpg` are image names
+#: (review V1), and refusing on them would stop every export with a retina image URL.
+_EMAIL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])")
+_NOT_A_TLD = frozenset({"png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff", "ico", "heic",
+                        "mp4", "webm", "mov", "pdf", "css", "js"})
+_DENSITY_LABEL_RE = re.compile(r"\d+(?:\.\d+)?x\.", re.IGNORECASE)
+#: A PHONE needs context (review V2: SKUs, GTINs, years, sizes and prices are digit groups too):
+#: an international number written with "+", or a number right after a phone word (tel/phone/call/
+#: mobile/fax/whatsapp/contact and their Korean, Japanese and Chinese forms). A bare digit group is
+#: never a phone here.
+_PHONE_INTL_RE = re.compile(r"(?<![\w+])\+\d{1,3}(?:[ .()/-]{0,2}\d){6,14}(?!\w)")
+_PHONE_WORDS = r"(?:(?<![A-Za-z])(?:tel|tele|phone|telephone|call|mobile|cell|fax|whatsapp|contact)(?![A-Za-z])|전화|연락처|휴대폰|電話|電話番号|联系电话|电话|手机)"
+_PHONE_CONTEXT_RE = re.compile(
+    r"(" + _PHONE_WORDS + r"[\s:：.#-]{0,4}(?:(?:no|number|num|#)\.?[\s:：#-]{0,3})?(?:us\s+)?(?:at\s+|on\s+)?)"
+    r"(\+?\(?\d[\d ().-]{5,18}\d)", re.IGNORECASE)
 REDACTED_TEXT = "[redacted]"
 
 
+def _is_email(match: "re.Match") -> bool:
+    return match.group(2).lower() not in _NOT_A_TLD and not _DENSITY_LABEL_RE.match(match.group(1))
+
+
+def _redact_once(text: str) -> str:
+    text = _EMAIL_CANDIDATE_RE.sub(lambda m: REDACTED_TEXT if _is_email(m) else m.group(0), text)
+    text = _PHONE_INTL_RE.sub(REDACTED_TEXT, text)
+    return _PHONE_CONTEXT_RE.sub(lambda m: m.group(1) + REDACTED_TEXT, text)
+
+
 def redact_text(text: str) -> str:
-    return _PHONE_TEXT_RE.sub(REDACTED_TEXT, _EMAIL_TEXT_RE.sub(REDACTED_TEXT, text))
+    """Email/phone-shaped parts -> [redacted]; repeated until nothing changes (review V5: a redaction
+    can expose the next match, as in +395809844+0577444923)."""
+    for _ in range(8):
+        new = _redact_once(text)
+        if new == text:
+            return text
+        text = new
+    return text
+
+
+def has_email(text: str) -> bool:
+    return any(_is_email(m) for m in _EMAIL_CANDIDATE_RE.finditer(text))
 
 
 def _text_hits(text: str) -> bool:
-    return bool(_EMAIL_TEXT_RE.search(text) or _PHONE_TEXT_RE.search(text))
+    return has_email(text) or bool(_PHONE_INTL_RE.search(text) or _PHONE_CONTEXT_RE.search(text))
 
 
 class _RawNumber:
@@ -353,39 +388,80 @@ class _RawNumber:
         self.text = text
 
 
+class _DuplicateKeys(dict):
+    """A JSON object whose source text repeated a key (review V4): json.loads keeps the last, so the
+    cell is always rewritten from the parsed value, never copied as its original bytes."""
+
+
+def _pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            out = _DuplicateKeys(out)
+        out[key] = value
+    return out
+
+
+def _has_duplicates(value: Any) -> bool:
+    if isinstance(value, _DuplicateKeys):
+        return True
+    if isinstance(value, dict):
+        return any(_has_duplicates(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_duplicates(v) for v in value)
+    return False
+
+
 def _loads(cell: str) -> Any:
-    return json.loads(cell, parse_float=_RawNumber, parse_int=_RawNumber)
+    return json.loads(cell, parse_float=_RawNumber, parse_int=_RawNumber, object_pairs_hook=_pairs)
 
 
 def _dumps(value: Any) -> str:
     if isinstance(value, dict):
-        return "{" + ", ".join("%s: %s" % (json.dumps(str(k), ensure_ascii=False), _dumps(v))
-                               for k, v in value.items()) + "}"
+        return "{" + ", ".join("%s: %s" % (_dumps(str(k)), _dumps(v)) for k, v in value.items()) + "}"
     if isinstance(value, list):
         return "[" + ", ".join(_dumps(v) for v in value) + "]"
     if isinstance(value, _RawNumber):
         return value.text
+    if isinstance(value, str) and any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+        return json.dumps(value, ensure_ascii=True)  # a lone surrogate stays an escape (review V5)
     return json.dumps(value, ensure_ascii=False)
 
 
-def scrub_json(value: Any, keep_keys: Iterable[str] = ()) -> Tuple[Any, bool]:
-    """(scrubbed value, changed). Person keys: a string -> "redacted", anything else -> null; every
-    other string has its email/phone-shaped parts redacted."""
-    keep = set(keep_keys)
+#: Where a product-data column's PRODUCT_KEYS (name, handle) are kept (review V7): the top-level
+#: object, the items of a top-level array, and the items under these option-like keys. Anywhere else
+#: (reviews[].name, seller.handle) they are redacted like in every other column.
+_PRODUCT_SCOPE_KEYS = frozenset({"options", "variants", "option_values", "values", "breadcrumb",
+                                 "itemlistelement", "items"})
+
+
+def _key_out(key: Any, taken: set) -> str:
+    text = str(key)
+    if _text_hits(text):  # review V3: an email or phone as an object KEY
+        text = redact_text(text)
+        base, n = text, 2
+        while text in taken:
+            text, n = "%s#%d" % (base, n), n + 1
+    return text
+
+
+def _scrub(value: Any, keep: set, scope: bool) -> Tuple[Any, bool]:
     if isinstance(value, dict):
-        out, changed = {}, False
+        out, changed = {}, isinstance(value, _DuplicateKeys)
         for key, inner in value.items():
-            if PERSON_KEY_RE.match(str(key)) and str(key) not in keep:
+            new_key = _key_out(key, set(out))
+            changed = changed or new_key != key
+            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
                 new = inner if inner is None or inner == REDACTED else (REDACTED if isinstance(inner, str) else None)
                 changed = changed or new is not inner
-                out[key] = new
+                out[new_key] = new
             else:
-                new, c = scrub_json(inner, keep)
-                out[key] = new
+                new, c = _scrub(inner, keep, scope and str(key).lower() in _PRODUCT_SCOPE_KEYS)
+                out[new_key] = new
                 changed = changed or c
         return out, changed
     if isinstance(value, list):
-        pairs = [scrub_json(v, keep) for v in value]
+        pairs = [_scrub(v, keep, scope) for v in value]
         return [p[0] for p in pairs], any(p[1] for p in pairs)
     if isinstance(value, str):
         new = redact_text(value)
@@ -393,24 +469,36 @@ def scrub_json(value: Any, keep_keys: Iterable[str] = ()) -> Tuple[Any, bool]:
     return value, False
 
 
-def person_values(value: Any, keep_keys: Iterable[str] = (), path: str = "$") -> List[str]:
-    """JSON paths where a person key still holds something other than null or "redacted", or a string
-    still holds an email- or phone-shaped part."""
-    keep = set(keep_keys)
+def scrub_json(value: Any, keep_keys: Iterable[str] = ()) -> Tuple[Any, bool]:
+    """(scrubbed value, changed). Person keys: a string -> "redacted", anything else -> null; every
+    other string, and every key, has its email/phone-shaped parts redacted."""
+    return _scrub(value, set(keep_keys), True)
+
+
+def _person_values(value: Any, keep: set, scope: bool, path: str) -> List[str]:
     found: List[str] = []
     if isinstance(value, dict):
         for key, inner in value.items():
             here = "%s.%s" % (path, key)
-            if PERSON_KEY_RE.match(str(key)) and str(key) not in keep and inner is not None and inner != REDACTED:
-                found.append(here)
+            if _text_hits(str(key)):
+                found.append("%s.<key>" % path)
+            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
+                if inner is not None and inner != REDACTED:
+                    found.append(here)
             else:
-                found.extend(person_values(inner, keep, here))
+                found.extend(_person_values(inner, keep, scope and str(key).lower() in _PRODUCT_SCOPE_KEYS, here))
     elif isinstance(value, list):
         for index, inner in enumerate(value):
-            found.extend(person_values(inner, keep, "%s[%d]" % (path, index)))
+            found.extend(_person_values(inner, keep, scope, "%s[%d]" % (path, index)))
     elif isinstance(value, str) and _text_hits(value):
         found.append(path)
     return found
+
+
+def person_values(value: Any, keep_keys: Iterable[str] = (), path: str = "$") -> List[str]:
+    """JSON paths where a person key still holds something other than null or "redacted", or a key or
+    string still holds an email- or phone-shaped part. Paths only, never values."""
+    return _person_values(value, set(keep_keys), True, path)
 
 
 def _csv_field(value: Optional[str]) -> str:
@@ -440,7 +528,7 @@ def scrub_csv(table: str, raw: bytes, null_token: str, columns: Sequence[str]) -
                 except ValueError:
                     raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
                 new, changed = scrub_json(value, keeps[i])
-                if changed:
+                if changed or _has_duplicates(value):
                     cells[i] = _dumps(new)
             elif classes[i] == _TEXT:
                 cells[i] = redact_text(cell)
@@ -469,6 +557,9 @@ def assert_scrubbed(table: str, raw: bytes, columns: Sequence[str]) -> int:
                     value = _loads(cell)
                 except ValueError:
                     raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
+                if _has_duplicates(value):
+                    raise CopyRefused("table %s column %s holds a JSON object with a repeated key"
+                                      % (table, columns[i]))
                 hits = person_values(value, keeps[i])
                 if hits:
                     raise CopyRefused("table %s column %s: a person key or contact detail survived the "
@@ -476,7 +567,7 @@ def assert_scrubbed(table: str, raw: bytes, columns: Sequence[str]) -> int:
             elif classes[i] == _TEXT and _text_hits(cell):
                 raise CopyRefused("table %s column %s: an email- or phone-shaped value survived the scrub"
                                   % (table, columns[i]))
-            elif _EMAIL_TEXT_RE.search(cell):
+            elif has_email(cell):
                 raise CopyRefused("table %s column %s holds an email-shaped value" % (table, columns[i]))
     return 0
 
@@ -774,6 +865,9 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
             null_token = "__sandbox_copy_null_%s__" % secrets.token_hex(16)
             buf = io.BytesIO()
             await conn.copy_from_query(query, output=buf, format="csv", null=null_token)
+            if buf.tell() > MAX_TABLE_COPY_BYTES:
+                raise CopyRefused("table %s: %d bytes exceeds the in-memory copy cap (streaming is S5)"
+                                  % (spec.name, buf.tell()))
             planned = [c for c, _ in plan]
             # The scrub (S3): every JSON and text column, here, before anything is uploaded; then the
             # export checks its own output and refuses if anything is left.

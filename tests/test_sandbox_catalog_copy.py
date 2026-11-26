@@ -475,3 +475,101 @@ async def test_the_export_query_and_its_count_both_carry_the_where(tmp_path):
     spec = (next(s for s in C.CATALOG_TABLES if s.name == "aurora_ingredient_research_kb"),)
     await C.export_catalog(FakeConn(), C.LocalDirStore(tmp_path), stamp="20261126T0100Z", specs=spec)
     assert len(seen) == 2 and all(q.endswith("WHERE status = 'ready' AND char_length(query_norm) <= 64") for q in seen)
+
+
+# --- review of c91b5a209: value false positives (V1, V2), keys (V3), duplicates (V4), V5, V7 ----------
+
+
+@pytest.mark.parametrize("text", [
+    # V1: retina image names are not emails
+    "hero@2x.png", "https://cdn.shopify.com/s/files/1/x_480x480@2x.jpg?v=1", "a.jpg 1x, a@2x.jpg 2x",
+    "img/logo@3x.webp", "banner@1.5x.avif",
+    # V2: identifiers, years, sizes and prices are digit groups, not phones
+    "1234-5678-9012", "ABC-1234-567-890", "Compatible with 2020 2021 2022 models", "250 500 750 ml",
+    "Price 1299 1499 1999", "978 316 1484 100", "012 3456 7890", "Model (2020) 2021-2022",
+    "contact lens solution 360 ml", "Size 100 ml, 2026-11-26, GTIN 8809123456789, SPF 50+",
+])
+def test_catalog_text_that_only_looks_like_contact_details_is_left_alone(text):
+    assert C.redact_text(text) == text
+    assert not C._text_hits(text)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("a@b.co", "[redacted]"), ("x@y.uk", "[redacted]"),          # the TLD {2,} mutant: two letters count
+    ("+44 20 7946 0958", "[redacted]"),                          # the international branch, no phone word
+    ("Tel: (02) 555-0100", "Tel: [redacted]"), ("call us at (415) 555-0100", "call us at [redacted]"),
+    ("phone number 555 010 0199", "phone number [redacted]"), ("전화 010-1234-5678", "전화 [redacted]"),
+    ("電話: 03-1234-5678", "電話: [redacted]"), ("whatsapp +86 138 0013 8000", "whatsapp [redacted]"),
+    ("+395809844+0577444923", "[redacted][redacted]"),           # V5: idempotent
+])
+def test_real_contact_details_are_redacted_and_the_result_is_stable(text, expected):
+    assert C.redact_text(text) == expected
+    assert C.redact_text(expected) == expected and not C._text_hits(expected)
+
+
+def test_an_email_or_phone_as_a_json_key_is_redacted_and_checked():
+    value = {"votes": {"jane.doe@gmail.com": 1, "x@y.example": 2, "+44 20 7946 0958": 3, "ok": 4}}
+    new, changed = C.scrub_json(value)
+    assert changed and new == {"votes": {"[redacted]": 1, "[redacted]#2": 2, "[redacted]#3": 3, "ok": 4}}
+    assert C.person_values(new) == []
+    assert C.person_values(value) == ["$.votes.<key>"] * 3
+
+
+def test_a_json_cell_with_a_repeated_key_is_always_rewritten():
+    raw = '"m1","{""tier"": ""a"", ""tier"": null}"\n'.encode()
+    out = C.scrub_csv("catalog_merchants", raw, "__null__", ["merchant_id", "metadata_json"]).decode()
+    assert out == '"m1","{""tier"": null}"\n'
+    C.assert_scrubbed("catalog_merchants", out.encode(), ["merchant_id", "metadata_json"])
+    with pytest.raises(C.CopyRefused, match="repeated key"):
+        C.assert_scrubbed("catalog_merchants", raw, ["merchant_id", "metadata_json"])
+
+
+def test_a_lone_surrogate_stays_an_escape():
+    raw = '"m1","{""tier"": ""\\\\ud800"", ""reviewed_by"": ""x""}"\n'.encode()
+    out = C.scrub_csv("catalog_merchants", raw, "__null__", ["merchant_id", "metadata_json"]).decode()
+    assert '\\ud800' in out and '""reviewed_by"": ""redacted""' in out
+
+
+def test_a_record_with_the_wrong_field_count_is_refused():
+    with pytest.raises(C.CopyRefused, match="has 3 fields, expected 2"):
+        C.scrub_csv("catalog_merchants", b'"m1","{}","extra"\n', "__null__", ["merchant_id", "metadata_json"])
+
+
+def test_product_keys_are_kept_only_at_the_product_level_and_option_paths():
+    value = {"name": "Lip Tint", "handle": "lip-tint", "options": [{"name": "Shade", "values": [{"name": "Red"}]}],
+             "variants": [{"name": "Red / 5g"}], "reviews": [{"name": "Jane D.", "text": "nice"}],
+             "seller": {"handle": "@jane", "name": "Jane's shop"}}
+    new, _ = C.scrub_json(value, COLS.PRODUCT_KEYS)
+    assert new["name"] == "Lip Tint" and new["handle"] == "lip-tint"
+    assert new["options"] == [{"name": "Shade", "values": [{"name": "Red"}]}] and new["variants"] == [{"name": "Red / 5g"}]
+    assert new["reviews"] == [{"name": "redacted", "text": "nice"}]
+    assert new["seller"] == {"handle": "redacted", "name": "redacted"}
+    top_list = [{"name": "Home"}, {"name": "Skincare"}]  # a column that IS a list (breadcrumb, offers)
+    assert C.scrub_json(top_list, COLS.PRODUCT_KEYS)[0] == top_list
+
+
+async def test_a_table_past_the_in_memory_cap_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(C, "MAX_TABLE_COPY_BYTES", 4)
+
+    class FakeConn:
+        def transaction(self, **kw):
+            class T:
+                async def __aenter__(self): return None
+                async def __aexit__(self, *a): return False
+            return T()
+
+        async def execute(self, *a): return "SET"
+
+        async def fetch(self, *a):
+            return [{"column_name": "merchant_id", "type_name": "varchar", "type_kind": "b",
+                     "base_name": None, "elem_name": None, "base_elem_name": None}]
+
+        async def fetchval(self, *a): return 1
+
+        async def copy_from_query(self, query, output, **kw):
+            output.write(b"m1234567\n")
+
+    store = C.LocalDirStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match="in-memory copy cap"):
+        await C.export_catalog(FakeConn(), store, stamp="20261126T0100Z", specs=(C.TableSpec("catalog_merchants", "x"),))
+    assert store.list("") == []

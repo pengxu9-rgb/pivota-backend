@@ -537,3 +537,27 @@ async def test_the_import_re_applies_the_s3_rules_to_the_manifest(db, tmp_path, 
     with pytest.raises(C.CopyRefused, match=match):
         await _import(db, store)
     assert await db.fetchval("SELECT count(*) FROM %s.catalog_merchants" % DST) == 0
+
+
+async def test_retina_image_urls_and_catalog_digit_groups_survive_the_export(db, tmp_path):
+    """Review V1/V2: the value pass must not refuse or damage catalog data."""
+    await db.execute(f"""UPDATE {SRC}.external_product_seeds SET url = 'https://cdn.shopify.com/s/files/1/x_480x480@2x.jpg?v=1'
+        WHERE url = 'https://shop.example/x';
+        UPDATE {SRC}.catalog_products SET description = 'Compatible with 2020 2021 2022 models, 250 500 750 ml',
+          attrs = '{{"srcset": "a.jpg 1x, a@2x.jpg 2x", "barcode": "012 3456 7890"}}' WHERE product_id = 'p1'""")
+    store = C.LocalDirStore(tmp_path)
+    await _export(db, store)
+    await _import(db, store)
+    assert await db.fetchval("SELECT count(*) FROM %s.external_product_seeds WHERE url LIKE '%%@2x.jpg%%'" % DST) == 1
+    row = await db.fetchrow("SELECT description, attrs FROM %s.catalog_products WHERE product_id='p1'" % DST)
+    assert row["description"] == "Compatible with 2020 2021 2022 models, 250 500 750 ml"
+    assert json.loads(row["attrs"]) == {"srcset": "a.jpg 1x, a@2x.jpg 2x", "barcode": "012 3456 7890"}
+
+
+async def test_an_email_used_as_a_json_key_does_not_leave_prod(db, tmp_path):
+    await db.execute(f"""UPDATE {SRC}.catalog_merchants SET metadata_json =
+        '{{"votes": {{"jane.doe@person.example": 1}}}}' WHERE merchant_id = 'm1'""")
+    store = C.LocalDirStore(tmp_path)
+    await _export(db, store)
+    blob = b"".join(gzip.decompress(store.get(n)) for n in store.list("") if n.endswith(".gz"))
+    assert b"jane.doe@person.example" not in blob
