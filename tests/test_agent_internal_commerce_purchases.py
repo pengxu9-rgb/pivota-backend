@@ -522,13 +522,14 @@ async def test_a_stored_last4_that_is_not_four_digits_shows_no_card(monkeypatch,
     assert answer.status_code == 200 and "payment_card" not in answer.json()
 
 
-# ── the agent's reviewed name (agents.buyer_display_name, migration 297) ─────────────────────────
+# ── the agent's name: set by hand (agents.buyer_display_name, mig 297), else the portal name ─────
 
 
-async def _agent_row(agent_id: str = AGENT, *, agent_name: str = "Self Declared Name",
+async def _agent_row(agent_id: str = AGENT, *, agent_name: str = "Registered Assistant",
                      reviewed: Optional[str] = None) -> None:
     """One agents row for this file's agent id, built from the model when the table is missing, with the
-    column the boot heal adds (re-run here: the fixture's heal ran before this table may have existed)."""
+    column the boot heal adds (re-run here: the fixture's heal ran before this table may have existed).
+    `agent_name` is the name the agent registered with in the developer portal."""
     from sqlalchemy.dialects import postgresql, sqlite
     from sqlalchemy.schema import CreateTable
 
@@ -550,55 +551,94 @@ async def _agent_rows():
     await database.execute("DELETE FROM agents WHERE agent_id IN (:a, :b)", {"a": AGENT, "b": OTHER_AGENT})
 
 
-async def test_a_reviewed_name_is_on_the_body_for_either_rail_and_never_on_the_public_route(_agent_rows):
-    await _agent_row(reviewed="Example Assistant")
+async def _shown_name(rail_id: Optional[str] = None) -> Optional[str]:
+    rail_id = rail_id or await _reap()
+    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
+    assert internal.status_code == 200, internal.text
+    body = internal.json()
+    if "agent_display_name" not in body:
+        # No name: the body is exactly the public one.
+        assert body == (await _public(f"{PUBLIC}/{rail_id}")).json()
+    return body.get("agent_display_name")
+
+
+@pytest.mark.parametrize("registered, reviewed, shown", [
+    ("Example Assistant", None, "Example Assistant"),        # the portal name
+    ("Example Assistant", "Hand Set Name", "Hand Set Name"),  # a name set by hand wins
+])
+async def test_the_name_is_on_the_body_for_either_rail_and_never_on_the_public_route(
+        _agent_rows, registered, reviewed, shown):
+    await _agent_row(agent_name=registered, reviewed=reviewed)
     for rail_id in (await _reap(), await _a2a()):
         internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
         assert internal.status_code == 200, internal.text
-        assert internal.json()["agent_display_name"] == "Example Assistant"
+        assert internal.json()["agent_display_name"] == shown
         public = await _public(f"{PUBLIC}/{rail_id}")
         assert public.status_code == 200 and "agent_display_name" not in public.json()
-        assert "Example Assistant" not in public.text
+        assert shown not in public.text
         # Nothing else changed: the body is the public one plus the name.
         assert {k: v for k, v in internal.json().items() if k != "agent_display_name"} == public.json()
 
 
-async def test_the_self_declared_agent_name_is_never_shown(_agent_rows):
-    await _agent_row(agent_name="Your Bank", reviewed=None)
-    rail_id = await _reap()
-    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
-    assert "Your Bank" not in internal.text
-    assert internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+@pytest.mark.parametrize("reviewed", ["", "   ", "!!!", "Two  Spaces"])
+async def test_a_hand_set_value_that_is_not_a_name_hides_the_portal_name_and_never_falls_through(
+        _agent_rows, reviewed):
+    await _agent_row(agent_name="Example Assistant", reviewed=reviewed)
+    assert await _shown_name() is None
+
+
+@pytest.mark.parametrize("registered", [
+    "Your Bank", "VISA Helper", "Master-Card Agent", "American Express Concierge", "A.M.E.X", "Discover Deals",
+    "Apple Pay Assistant", "google pay", "Pay Pal", "Stripe Bot", "Pivota", "Pivota Official", "AgenPaz",
+    "AgenPas Checkout", "Secure Checkout", "Ｖｉｓａ", "Vísa Shopper", "Agent", "Unknown", "unknown agent", "UNKNOWN",
+])
+async def test_a_blocked_portal_name_shows_nothing(_agent_rows, registered):
+    await _agent_row(agent_name=registered, reviewed=None)
+    assert await _shown_name() is None
+
+
+async def test_a_hand_set_name_corrects_a_blocked_portal_name(_agent_rows):
+    await _agent_row(agent_name="Secure Bank Agent", reviewed="Example Assistant")
+    assert await _shown_name() == "Example Assistant"
+
+
+@pytest.mark.parametrize("stored", ["   ", "\u202eknaB ruoY", "Example\u200bAssistant", "Line\nBreak", "Two  Spaces",
+                                    "!!!", "Tab\tName", "x" * 65])
+@pytest.mark.parametrize("source", ["hand_set", "portal"])
+async def test_a_stored_name_without_a_names_shape_is_not_shown(_agent_rows, stored, source):
+    if source == "hand_set":
+        await _agent_row(agent_name="Example Assistant", reviewed=stored)
+    else:
+        await _agent_row(agent_name=stored, reviewed=None)
+    assert await _shown_name() is None
+
+
+@pytest.mark.parametrize("source", ["hand_set", "portal"])
+async def test_a_stored_name_is_trimmed(_agent_rows, source):
+    if source == "hand_set":
+        await _agent_row(agent_name="Other Name", reviewed="  Example Assistant ")
+    else:
+        await _agent_row(agent_name="  Example Assistant ", reviewed=None)
+    assert await _shown_name() == "Example Assistant"
 
 
 async def test_no_agent_row_means_no_name():
+    assert await _shown_name() is None
+
+
+async def test_another_agents_name_is_never_used(_agent_rows):
+    # Only the purchase's own agent row counts: another agent's portal or hand-set name never stands in.
+    await _agent_row(OTHER_AGENT, agent_name="Other Assistant", reviewed="Other Hand Set")
+    assert await _shown_name() is None
+
+
+async def test_no_registered_name_means_no_fallback(_agent_rows):
+    # A portal name without a name's shape shows nothing: never a placeholder, never another field.
+    await _agent_row(agent_name="!!!", reviewed=None)
     rail_id = await _reap()
-    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
-
-
-async def test_another_agents_reviewed_name_is_never_used(_agent_rows):
-    await _agent_row(OTHER_AGENT, reviewed="Other Assistant")
-    await _agent_row(AGENT, reviewed=None)
-    rail_id = await _reap()
-    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
-
-
-@pytest.mark.parametrize("stored", ["   ", "‮knaB ruoY", "Example​Assistant", "Line\nBreak", "Two  Spaces",
-                                    "!!!", "Tab\tName"])
-async def test_a_stored_name_without_a_names_shape_is_not_shown(_agent_rows, stored):
-    await _agent_row(reviewed=stored)
-    rail_id = await _reap()
-    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
-
-
-async def test_a_stored_name_is_trimmed(_agent_rows):
-    await _agent_row(reviewed="  Example Assistant ")
-    internal = await _get(f"{INTERNAL}/{await _reap()}", headers=_headers())
-    assert internal.json()["agent_display_name"] == "Example Assistant"
+    assert await _shown_name(rail_id) is None
+    text = (await _get(f"{INTERNAL}/{rail_id}", headers=_headers())).text
+    assert '"Agent"' not in text and '"Unknown"' not in text
 
 
 async def test_a_name_read_fault_drops_the_name_never_the_body(monkeypatch, _agent_rows):
@@ -610,10 +650,192 @@ async def test_a_name_read_fault_drops_the_name_never_the_body(monkeypatch, _age
         raise RuntimeError("agents read down")
 
     monkeypatch.setattr(agents_db, "get_buyer_display_name", boom)
-    rail_id = await _reap()
-    internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
-    assert internal.status_code == 200 and "agent_display_name" not in internal.json()
-    assert internal.json() == (await _public(f"{PUBLIC}/{rail_id}")).json()
+    assert await _shown_name() is None
+
+
+@pytest.mark.parametrize("name", [
+    "Visa", "visa", "V-I-S-A", "Ｖｉｓａ", "Vísa", "Revisa Assistant", "MasterCard", "Master Card", "AMEX",
+    "American  Express", "Discover", "Apple Pay", "ApplePay", "Google Pay", "PayPal", "Stripe", "Pivota",
+    "pivota.ai", "AgenPaz", "Agen Paz", "AgenPas", "First Bank", "Banking Bot", "Secure", "SecureCheckout",
+    "Agent", "Unknown", "Unknown Agent", "agent!",
+    # Lookalike letters (Cyrillic or Greek for Latin), alone or mixed in: folded before matching.
+    "V\u0456sa", "\u0420aypal", "M\u0430stercard", "Str\u0456pe", "\u0405ecure Pay", "\u0420\u0430\u0443\u0440\u0430\u04cf",
+    "\u0392\u0391\u039d\u039a",
+    # Digit and symbol stand-ins: 0 o, 1 i and l, 3 e, 4 a, 5 s, 7 t, $ s, @ a.
+    "V1sa Checkout", "Paypa1", "P1vota", "B4nk", "$tripe", "@mex", "5ecure", "Di5c0ver", "S3cure", "S7ripe", "Ag3nt",
+    # Latin letters that are not ASCII, and letters of scripts outside the allowlist.
+    "\u1d20\u026a\ua731\u1d00", "\u0299\u1d00\u0274\u1d0b", "\u13d9isa", "\u13daripe", "\u054ftripe", "payp\u0561l",
+    "\ua4d1aypal", "\u0251mex", "\u028bisa", "S\u0167ripe",
+    # Wholly Greek: the capitals that complete a term are folded too.
+    "\u03a1\u0391\u03a5\u03a1\u0391\u039b",
+    # Shapes that read as one another: capital I or 1 for l (and l for i), rn for m, cl for d, vv for w.
+    "PayPaI", "AppIePay", "GoogIePay", "VIsa", "Vlsa", "Arnex", "rnastercard", "Cliscover", "VVisa", "StRiPe",
+    "A g e n P a z", "Unknovvn",
+])
+def test_portal_name_is_blocked(name):
+    import db.agents as agents_db
+
+    assert agents_db.portal_name_is_blocked(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "Example Assistant", "Shopping Agent", "示例助手", "Agent Ñandú", "Assistant 2", "Payment Helper", "Aurora",
+    # Latin mixed with a script that is not a lookalike one, and names wholly in Cyrillic or Greek.
+    "Meitu 美图", "示例 Shop", "Пример", "Παράδειγμα", "Пример Παράδειγμα", "Ａｕｒｏｒａ", "Agent 47",
+    # Accented Latin (the accent decomposes off an ASCII letter) and every allowed script.
+    "Shopping Helper", "Café Helper", "佐々木 Shop", "カード・ラボ", "ﾊﾟﾝ屋", "한국 쇼핑", "متجر", "חנות", "ร้านค้า", "दुकान",
+])
+def test_a_plain_portal_name_is_not_blocked(name):
+    import db.agents as agents_db
+
+    assert agents_db.portal_name_is_blocked(name) is False
+
+
+@pytest.mark.parametrize("name", [
+    "Ex\u0430mple Assistant",            # Latin with one Cyrillic a
+    "\u0391urora",                        # Greek capital alpha, then Latin
+    "\uff25\uff58\u0430\uff4d\uff50\uff4c\uff45",  # fullwidth Latin (read as Latin) with a Cyrillic a
+    "Shop \u041c\u0430\u0433\u0430\u0437\u0438\u043d",  # a Latin word next to a Cyrillic one
+])
+def test_a_portal_name_mixing_latin_with_a_lookalike_script_is_refused(name):
+    import db.agents as agents_db
+
+    assert agents_db.portal_name_mixes_lookalike_scripts(name) is True
+    assert agents_db.portal_name_is_blocked(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    # Latin letters that are not ASCII a-z / A-Z after NFKD: small capitals, IPA, stroke letters, ø, ß, ł.
+    "\u1d00urora", "\u0251urora", "Au\u0280ora", "S\u00f8ren Helper", "Stra\u00dfe Shop", "\u0141ukas Helper",
+    "Ca\u0167 Shop",
+    # Scripts outside the allowlist, alone or with Latin: Cherokee, Armenian, Lisu, Canadian syllabics, Bopomofo.
+    "\u13aa\u13b3\u13a9", "\u053d\u0561\u0576\u0578\u0582\u0569", "\ua4d0\ua4f3\ua4e0", "\u1455\u144e",
+    "\u3105\u3106", "\u13aaurora",
+    # A modifier letter is not a letter of an allowed script.
+    "Shop\u02bcs",
+])
+def test_a_letter_outside_the_allowlist_refuses_a_portal_name(name):
+    import db.agents as agents_db
+
+    assert agents_db._portal_name_letters_allowed(name) is False
+    assert agents_db.portal_name_is_blocked(name) is True
+
+
+async def test_a_portal_name_outside_the_allowlist_shows_nothing_but_a_hand_set_one_shows(_agent_rows):
+    await _agent_row(agent_name="S\u00f8ren Helper", reviewed=None)
+    assert await _shown_name() is None
+    await _agent_row(agent_name="Example Assistant", reviewed="S\u00f8ren Helper")
+    assert await _shown_name() == "S\u00f8ren Helper"
+
+
+@pytest.mark.parametrize("name", ["Meitu 美图", "Пример", "Παράδειγμα", "Пример Παράδειγμα", "Example", "Ａｕｒｏｒａ"])
+def test_one_script_or_latin_with_another_script_is_not_a_mix(name):
+    import db.agents as agents_db
+
+    assert agents_db.portal_name_mixes_lookalike_scripts(name) is False
+
+
+async def test_a_mixed_script_portal_name_shows_nothing_but_a_hand_set_one_shows(_agent_rows):
+    await _agent_row(agent_name="Ex\u0430mple Assistant", reviewed=None)
+    assert await _shown_name() is None
+    # The block list and the mix rule are for portal names: a name set by hand is the reviewed one.
+    await _agent_row(agent_name="Example Assistant", reviewed="Ex\u0430mple Assistant")
+    assert await _shown_name() == "Ex\u0430mple Assistant"
+
+
+def test_the_block_list_is_kept_in_one_place():
+    import db.agents as agents_db
+
+    assert set(agents_db.PORTAL_NAME_BLOCKED_TERMS) == {
+        "visa", "mastercard", "amex", "americanexpress", "discover", "applepay", "googlepay", "paypal", "stripe",
+        "pivota", "agenpaz", "agenpas", "bank", "secure",
+    }
+    # Each term is matched by its skeleton, reduced exactly as a name is; the plain term itself is blocked.
+    assert agents_db._BLOCKED_TERM_SKELETONS == tuple(
+        agents_db._name_skeleton(term) for term in agents_db.PORTAL_NAME_BLOCKED_TERMS)
+    assert all(agents_db.portal_name_is_blocked(term) for term in agents_db.PORTAL_NAME_BLOCKED_TERMS)
+
+
+@pytest.mark.parametrize("a, b", [
+    ("PayPaI", "paypal"), ("V1sa", "visa"), ("Vlsa", "visa"), ("Arnex", "amex"), ("Cliscover", "discover"),
+    ("VVebshop", "webshop"), ("Ｐаy-PaI", "paypal"),
+])
+def test_shapes_that_read_alike_share_a_skeleton(a, b):
+    import db.agents as agents_db
+
+    assert agents_db._name_skeleton(a) == agents_db._name_skeleton(b)
+
+
+# ── a rename hides the portal name until checked again (PUT /agents/{agent_id}, the one writer) ─
+
+
+async def _put_agent(body: dict, *, role: str = "agent"):
+    from utils.auth import get_current_user
+
+    user = {"role": role, "email": "owner@example.test", "user_id": "u-1"}
+    if role == "agent":
+        user["agent_id"] = AGENT
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with _REAL_ASYNC_CLIENT(transport=transport, base_url="http://test") as http:
+            return await http.put(f"/agents/{AGENT}", json=body)
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+async def _stored_names() -> dict:
+    row = await database.fetch_one(
+        "SELECT agent_name, buyer_display_name FROM agents WHERE agent_id = :a", {"a": AGENT})
+    return dict(row)
+
+
+@pytest.mark.parametrize("role", ["agent", "admin"])
+async def test_a_rename_hides_the_portal_name_until_checked_again(_agent_rows, role):
+    await _agent_row(agent_name="Example Assistant", reviewed=None)
+    assert await _shown_name() == "Example Assistant"
+    answer = await _put_agent({"agent_name": "Renamed Assistant"}, role=role)
+    assert answer.status_code == 200, answer.text
+    assert await _stored_names() == {"agent_name": "Renamed Assistant", "buyer_display_name": ""}
+    assert await _shown_name() is None
+    # The gated one-off's check: back to NULL, and the new portal name shows.
+    await database.execute("UPDATE agents SET buyer_display_name = NULL WHERE agent_id = :a", {"a": AGENT})
+    assert await _shown_name() == "Renamed Assistant"
+
+
+async def test_a_put_with_the_same_name_does_not_hide_it(_agent_rows):
+    await _agent_row(agent_name="Example Assistant", reviewed=None)
+    answer = await _put_agent({"agent_name": "Example Assistant", "description": "new words"})
+    assert answer.status_code == 200, answer.text
+    assert (await _stored_names())["buyer_display_name"] is None
+    assert await _shown_name() == "Example Assistant"
+
+
+async def test_a_put_without_a_name_does_not_hide_it(_agent_rows):
+    await _agent_row(agent_name="Example Assistant", reviewed=None)
+    answer = await _put_agent({"description": "new words"})
+    assert answer.status_code == 200, answer.text
+    assert await _shown_name() == "Example Assistant"
+
+
+@pytest.mark.parametrize("reviewed, shown", [("Hand Set Name", "Hand Set Name"), ("", None)])
+async def test_a_rename_leaves_a_hand_set_value_as_it_is(_agent_rows, reviewed, shown):
+    await _agent_row(agent_name="Example Assistant", reviewed=reviewed)
+    answer = await _put_agent({"agent_name": "Renamed Assistant"})
+    assert answer.status_code == 200, answer.text
+    assert (await _stored_names())["buyer_display_name"] == reviewed
+    assert await _shown_name() == shown
+
+
+async def test_a_failed_hide_fails_the_rename(monkeypatch, _agent_rows):
+    import routes.agent_management as agent_management
+
+    await _agent_row(agent_name="Example Assistant", reviewed=None)
+    monkeypatch.setattr(agent_management, "portal_name_rename_hide",
+                        lambda agent_id, new_name: ("UPDATE no_such_table SET x = 1", {}))
+    answer = await _put_agent({"agent_name": "Renamed Assistant"})
+    assert answer.status_code == 500
+    assert await _stored_names() == {"agent_name": "Example Assistant", "buyer_display_name": None}
 
 
 def test_the_reviewed_name_column_is_not_on_the_agents_model():

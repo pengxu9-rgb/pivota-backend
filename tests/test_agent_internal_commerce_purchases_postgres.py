@@ -116,5 +116,92 @@ async def test_unknown_ids_and_the_wrong_rail_are_none():
     assert await purchases.get_by_rail_id_for_agent("reap", rail_id, AGENT) is None
 
 
+async def test_the_agent_name_read_and_the_rename_hide_run_on_postgres():
+    """db/agents.get_buyer_display_name's SELECT and portal_name_rename_hide's UPDATE are raw SQL on a column
+    the model does not have: here they run on the production dialect, on the table the model builds plus the
+    column the boot heal adds."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    import db.agents as agents_db
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    await database.execute(str(CreateTable(agents_db.agents, if_not_exists=True).compile(dialect=postgresql.dialect())))
+    await ensure_required_schema_light()  # the heal adds buyer_display_name now that agents exists
+    await database.execute("DELETE FROM agents WHERE agent_id = :a", {"a": AGENT})
+    try:
+        await database.execute(
+            "INSERT INTO agents (agent_id, agent_name, agent_type, api_key, api_key_hash, is_active) "
+            "VALUES (:a, 'Example Assistant', 'custom', :k, :h, TRUE)",
+            {"a": AGENT, "k": f"redacted:{AGENT}", "h": "0" * 64})
+        assert await agents_db.get_buyer_display_name(AGENT) == "Example Assistant"
+        # The same name: nothing hidden.
+        await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Example Assistant"))
+        assert await agents_db.get_buyer_display_name(AGENT) == "Example Assistant"
+        # A rename, as PUT /agents/{agent_id} runs it: the hide, then the write, in one transaction.
+        async with database.transaction():
+            await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Renamed Assistant"))
+            await database.execute("UPDATE agents SET agent_name = 'Renamed Assistant' WHERE agent_id = :a",
+                                   {"a": AGENT})
+        row = await database.fetch_one("SELECT buyer_display_name FROM agents WHERE agent_id = :a", {"a": AGENT})
+        assert dict(row)["buyer_display_name"] == ""
+        assert await agents_db.get_buyer_display_name(AGENT) is None
+        # A hand-set name is left as it is by a later rename, and decides.
+        await database.execute("UPDATE agents SET buyer_display_name = 'Hand Set Name' WHERE agent_id = :a",
+                               {"a": AGENT})
+        await database.execute(*agents_db.portal_name_rename_hide(AGENT, "Third Name"))
+        assert await agents_db.get_buyer_display_name(AGENT) == "Hand Set Name"
+        assert await agents_db.get_buyer_display_name(OTHER_AGENT) is None
+    finally:
+        await database.execute("DELETE FROM agents WHERE agent_id = :a", {"a": AGENT})
+
+
+async def test_the_product_image_reads_run_on_postgres():
+    """services/payment_orchestration/purchase_product_image's raw SQL (the owner-scoped rail rows, the catalog
+    product and its skus) on the production dialect, on the catalog tables the model builds."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    import db.a2a_rail_ledger as a2a_ledger
+    import services.payment_orchestration.purchase_product_image as product_image
+    from db.catalog import catalog_products, catalog_skus
+    from db.database import database
+    from services.commerce_attribution_service import new_click_id
+    from services.outbound_links_service import build_shopify_cart_permalink
+
+    for table in (catalog_products, catalog_skus):
+        await database.execute(str(CreateTable(table, if_not_exists=True).compile(dialect=postgresql.dialect())))
+    pk = "pk_image_pg_gate"
+    rose, plum = "https://cdn.example.com/rose.jpg", "https://cdn.example.com/plum.jpg"
+
+    async def _clean():
+        await database.execute("DELETE FROM catalog_skus WHERE product_key = :pk", {"pk": pk})
+        await database.execute("DELETE FROM catalog_products WHERE product_key = :pk", {"pk": pk})
+
+    await _clean()
+    try:
+        await database.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, image_url) "
+            "VALUES (:pk, 'm_1', 'shopify', '1001', 'Placeholder Serum', 'https://cdn.example.com/hero.jpg')",
+            {"pk": pk})
+        for sku_key, variant_id, image in ((f"{pk}::v:1", "40000000001", rose), (f"{pk}::v:2", "40000000002", plum)):
+            await database.execute(
+                "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+                "source_variant_id, title, image_url) VALUES (:sk, :pk, 'm_1', 'shopify', '1001', :vid, :title, :img)",
+                {"sk": sku_key, "pk": pk, "vid": variant_id, "title": sku_key, "img": image})
+        cart_url = build_shopify_cart_permalink(shop_domain="merchant.example", variant_id="40000000002",
+                                                click_id=new_click_id(), quantity=1, country="US")
+        row = await a2a_ledger.create_purchase(
+            agent_id=AGENT, agent_user_ref_hash=OWNER, merchant_domain="merchant.example", checkout_url=cart_url,
+            currency="USD", our_price_minor=4650, product_key=pk)
+        assert await product_image.product_image_for_owner("a2a", row["id"], AGENT, OWNER) == plum
+        assert await product_image.product_image_for_owner("a2a", row["id"], OTHER_AGENT, OWNER) is None
+        # The Reap row read runs too (no such row: None).
+        assert await product_image.product_image_for_owner("reap", "rp_" + "0" * 24, AGENT, OWNER) is None
+    finally:
+        await _clean()
+
+
 def test_this_module_does_not_import_main():
     assert "main" not in sys.modules
