@@ -180,6 +180,13 @@ def test_every_prod_host_literal_is_classified():
         "prod host(s) named in code but not reviewed for the sandbox; classify each in INVENTORY: %s" % unclassified)
 
 
+def test_the_scan_finds_what_it_should():
+    found = _scan()
+    assert ("routes/accounts_orders_api.py", "gateway.pivota.cc") in found
+    assert ("services/reap_agentic_client.py", "api.pivota.cc") in found  # a bare host tuple
+    assert len(found) >= 90
+
+
 @pytest.mark.parametrize("value,host", [
     ("agent.pivota.cc", "agent.pivota.cc"),                       # a bare host constant
     ("{scheme}://api.pivota.cc/x", "api.pivota.cc"),              # an f-string / format piece

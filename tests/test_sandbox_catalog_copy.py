@@ -525,7 +525,7 @@ def test_a_json_cell_with_a_repeated_key_is_always_rewritten():
 
 
 def test_a_lone_surrogate_stays_an_escape():
-    raw = '"m1","{""tier"": ""\\\\ud800"", ""reviewed_by"": ""x""}"\n'.encode()
+    raw = '"m1","{""tier"": ""\\ud800"", ""reviewed_by"": ""x""}"\n'.encode()  # JSON text: "\ud800"
     out = C.scrub_csv("catalog_merchants", raw, "__null__", ["merchant_id", "metadata_json"]).decode()
     assert '\\ud800' in out and '""reviewed_by"": ""redacted""' in out
 

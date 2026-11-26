@@ -331,13 +331,12 @@ REDACTED = "redacted"
 #: Email- and phone-shaped substrings, redacted in every text and JSON string value (SF3: a person's
 #: address under a catalog-named key such as note2). The email check is a GATE on every column: after
 #: the scrub the export carries none, or it refuses.
-#: An EMAIL is local@domain.tld where the "tld" is not an image/file extension and the domain does not
-#: start with a pixel-density label: `hero@2x.png` and Shopify's `_480x480@2x.jpg` are image names
-#: (review V1), and refusing on them would stop every export with a retina image URL.
+#: An EMAIL is local@domain.tld where the "tld" is not an image/file extension: `hero@2x.png` and
+#: Shopify's `_480x480@2x.jpg` are image names (review V1), and refusing on them would stop every
+#: export with a retina image URL.
 _EMAIL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])")
 _NOT_A_TLD = frozenset({"png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff", "ico", "heic",
                         "mp4", "webm", "mov", "pdf", "css", "js"})
-_DENSITY_LABEL_RE = re.compile(r"\d+(?:\.\d+)?x\.", re.IGNORECASE)
 #: A PHONE needs context (review V2: SKUs, GTINs, years, sizes and prices are digit groups too):
 #: an international number written with "+", or a number right after a phone word (tel/phone/call/
 #: mobile/fax/whatsapp/contact and their Korean, Japanese and Chinese forms). A bare digit group is
@@ -351,7 +350,7 @@ REDACTED_TEXT = "[redacted]"
 
 
 def _is_email(match: "re.Match") -> bool:
-    return match.group(2).lower() not in _NOT_A_TLD and not _DENSITY_LABEL_RE.match(match.group(1))
+    return match.group(2).lower() not in _NOT_A_TLD
 
 
 def _redact_once(text: str) -> str:
@@ -528,7 +527,7 @@ def scrub_csv(table: str, raw: bytes, null_token: str, columns: Sequence[str]) -
                 except ValueError:
                     raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
                 new, changed = scrub_json(value, keeps[i])
-                if changed or _has_duplicates(value):
+                if changed:  # a repeated key counts as a change (_scrub), so it is always rewritten
                     cells[i] = _dumps(new)
             elif classes[i] == _TEXT:
                 cells[i] = redact_text(cell)
