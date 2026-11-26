@@ -3,7 +3,7 @@ Configuration settings for Pivota Infrastructure
 """
 import logging
 import os
-from typing import Optional
+from typing import Mapping, Optional
 from urllib.parse import urlparse
 from pydantic_settings import BaseSettings
 
@@ -47,12 +47,15 @@ def _is_legacy_public_api_host(value: str) -> bool:
     return host in LEGACY_PUBLIC_API_HOSTS
 
 
-def resolve_public_api_base_url() -> str:
+def resolve_public_api_base_url(env: Optional[Mapping[str, str]] = None) -> str:
+    """``env`` defaults to os.environ (every caller); the sandbox guard passes its own mapping so it
+    checks the exact URL this returns there (SF2)."""
+    source = os.environ if env is None else env
     for candidate in (
-        os.getenv("PUBLIC_API_BASE_URL"),
-        os.getenv("PUBLIC_BASE_URL"),
-        os.getenv("APP_URL"),
-        os.getenv("BASE_URL"),
+        source.get("PUBLIC_API_BASE_URL"),
+        source.get("PUBLIC_BASE_URL"),
+        source.get("APP_URL"),
+        source.get("BASE_URL"),
         DEFAULT_PUBLIC_API_BASE_URL,
     ):
         normalized = _normalize_public_url(candidate)

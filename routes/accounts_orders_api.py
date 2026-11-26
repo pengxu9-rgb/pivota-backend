@@ -908,7 +908,19 @@ def _resolve_aurora_email_from_auth_me_payload(payload: Any) -> Optional[str]:
     return None
 
 
+def _refuse_aurora_exchange_in_sandbox() -> None:
+    """The partner sandbox has no Aurora upstream of its own, and AURORA_BFF_BASE falls back to PROD's
+    gateway even when set to empty (`or DEFAULT_AURORA_BFF_BASE`). Unrefused, an anonymous caller's
+    bearer token would go to prod's /v1/auth/me and a shop_user would be created with the real email
+    prod returns. So the exchange does not exist there (S6/SF1). Other environments are unchanged."""
+    from config.platform import is_sandbox
+
+    if is_sandbox():
+        raise _error(status.HTTP_404_NOT_FOUND, "NOT_FOUND", "Not found")
+
+
 async def _fetch_aurora_auth_me(*, aurora_token: str, aurora_uid: str) -> Dict[str, Any]:
+    _refuse_aurora_exchange_in_sandbox()  # second lock: the only outbound call to AURORA_BFF_BASE
     trace_id = f"accounts_aurora_exchange_{uuid.uuid4().hex[:16]}"
     headers = {
         "Authorization": f"Bearer {aurora_token}",
@@ -2392,6 +2404,7 @@ async def aurora_exchange_login(body: AuroraExchangeRequest):
     """
     Exchange an Aurora auth session for Accounts cookies (orders/account surfaces).
     """
+    _refuse_aurora_exchange_in_sandbox()
     await _ensure_database_connected()
     aurora_token = str(body.aurora_token or "").strip()
     aurora_uid = str(body.aurora_uid or "").strip()

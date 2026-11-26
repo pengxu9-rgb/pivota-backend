@@ -462,6 +462,7 @@ from config.platform import (
     deployment_id as platform_deployment_id,
     git_branch as platform_git_branch,
     is_production,
+    is_sandbox,
     platform_metadata,
     raw_environment_label,
     require_platform_env,
@@ -813,8 +814,11 @@ def docs_viewer_allowed(x_admin_key: Optional[str]) -> bool:
 
     It also fails closed when no key is configured at all - an empty expected value must never match
     an empty header.
+
+    The partner sandbox is guarded like production (S6): outside partners reach it, so the full
+    internal map is not theirs to read there either.
     """
-    if not is_production():
+    if not is_production() and not is_sandbox():
         return True
     expected = (os.getenv("ADMIN_API_KEY") or os.getenv("PROMOTIONS_ADMIN_KEY") or "").strip()
     supplied = (x_admin_key or "").strip()
@@ -831,9 +835,10 @@ async def require_docs_ui_enabled() -> None:
     X-ADMIN-KEY header to that fetch - so an admin-gated Swagger page in production renders
     "Failed to load API definition". Serving a page that cannot work is worse than not serving
     one: it reads as a broken API rather than a deliberate closure, and it still advertises that
-    the surface exists. Admins read the spec with curl and the key.
+    the surface exists. Admins read the spec with curl and the key. The partner sandbox serves
+    none either (S6), for the same reason docs_viewer_allowed guards it.
     """
-    if is_production():
+    if is_production() or is_sandbox():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 

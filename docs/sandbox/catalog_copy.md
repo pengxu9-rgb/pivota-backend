@@ -20,13 +20,50 @@ python -m jobs.sandbox_catalog_copy      gs://pivota-sandbox-catalog-drop/  pyth
 * Prices keep their values. The gateway marks sandbox answers `sandbox: true` and treats copied
   prices as fresh (decision 4).
 
-## Tables copied (52)
+## Tables copied (50)
 
-Whole rows, minus the dropped columns. The export reads prod's own column list at run time and
-**refuses** any column whose name looks like personal data or a secret (email, phone, token, secret,
-api_key, contact, address, customer, buyer, employee, notes, `*_by*`, user_id, ...) unless the spec
-drops, replaces or classifies it. A new risky column in prod therefore stops the copy instead of
-leaking.
+Whole rows, minus the dropped columns. The export reads prod's own column list (and types) at run
+time and **refuses**, before anything is uploaded:
+
+* any column not classified in `jobs/sandbox_catalog_columns.py` (S3: fail closed). Every copied
+  column is listed there with a class (key, text, url, num, flag, time, json, replaced); 790 columns
+  over 50 tables, taken from both repos' DDL parsed with PostgreSQL's own parser (pivota-backend main
+  and the gateway's main e62b57681, which creates 18 of the tables). A column prod has and neither
+  repo declares stops the copy, naming the table and column;
+* any column whose name looks like personal data or a secret (email(s), phone(s), token, secret,
+  api/access/secret/private/signing key, contact, address, customer, buyer, employee, notes, comment,
+  `*_by*`, user_id/user_name/user_agent, session/session_id, cookie, authorization, bearer, jwt,
+  username, reviewer, actor, passport, card_number, cvv/cvc, pan, tax_id, webhook_url, raw_payload,
+  headers, ...) unless the spec drops, replaces or allows it;
+* a JSON-typed column that is not classified JSON, or the other way round.
+
+**JSON columns** (113) each carry the reason they are catalog data. The export reads each table
+with `COPY ... (FORMAT csv, NULL <a random token>)` and scrubs it in Python before anything is
+uploaded (`scrub_csv`):
+
+* at any depth, a key that names a person, a secret, a request or free text (`*by` / `*_by_*` such as
+  reviewed_by, createdBy, signed_by_name; `*mail*`, `*address*`, `*phone*`, mobile*; token, secret,
+  api_key, session/request/trace id; user, customer_*, employee_*, reviewer*, contact*, name, handle;
+  notes, comments, reason, rationale; card fields, raw_payload, headers, webhook_url, ...) has a
+  string value replaced by `"redacted"` (a string: the gateway serves a `product_evidence` claim
+  only when `reviewed_by` is a non-empty string) and ANY other value, objects and arrays included,
+  by null. A JSON column of product data keeps `name` and `handle` at the product level, in the
+  items of a top-level array, and under option paths (options, variants, values, breadcrumb, ...);
+  elsewhere (reviews[].name, seller.handle) they are redacted;
+* email- and phone-shaped parts of every other JSON string, every JSON key and every text column
+  become `[redacted]` (a brand's support address in a description, a contact under a catalog-named
+  key); a JSON object with a repeated key is always rewritten from its parsed value;
+* the export then checks its own output and refuses on anything left, and on an email-shaped value
+  in any other column (a key or URL); the manifest's `email_like_values` is 0 by construction and
+  the import refuses one that is not;
+* a rewritten JSON cell keeps its numbers' own text (2.50 stays 2.50); an untouched cell keeps its
+  bytes. NULL and the empty string stay distinct;
+* an array of JSON or a domain over JSON is refused (review it first).
+
+The import checks every file again before touching the database. The manifest (format 2) lists
+each table's `json_columns`; the import refuses format 1 (an export from before the scrub).
+`aurora_ingredient_research_kb` copies only `status = 'ready'` rows with a `query_norm` of at most 64
+characters (it is built from a user's ingredient query).
 
 | table | why | dropped / restricted |
 |---|---|---|
@@ -61,18 +98,21 @@ leaking.
 | table | why | dropped / classified |
 |---|---|---|
 | content_canonical_election | canonical listing per content key | |
-| catalog_source_quarantine | quarantined sources stay hidden | drops `created_by`, `revoked_by` |
+| catalog_source_quarantine | quarantined sources stay hidden | drops `created_by`, `revoked_by`; `reason` (ops free text) = a placeholder |
 | merchant_product_overlay | approved PDP content overlays | drops `approved_by` |
 | product_evidence | claims and required disclaimers | |
 | pdp_identity_listing (optional) | the PDP identity graph | `matched_by_rule` classified (a rule name) |
 | pdp_identity_override (optional) | identity overrides | drops `created_by` |
 | product_beauty_attributes (optional) | beauty attributes | drops `audit_notes` |
-| product_relationship_edges, relationship_candidate_labels, relgraph_reviewed_ingredient_evidence, relgraph_reviewed_seller_evidence (optional) | the relationship graph | |
+| relationship_candidate_labels, relgraph_reviewed_ingredient_evidence, relgraph_reviewed_seller_evidence (optional) | the relationship graph | `human_review` and the other JSON scrubbed |
 | aurora_product_intel_kb, aurora_ingredient_research_kb, aurora_travel_context_kb (optional) | product KBs | |
 | aurora_dupe_kb (optional) | dupe KB | drops `verified_by` |
 | taxonomy_view, taxonomy_view_category, canonical_category, category_localization (optional) | category taxonomy | `replaced_by_id` classified |
-| merchant_category_mapping, ops_category_override (optional) | category mapping and ops pins | drops `updated_by` |
-| brands (optional) | brands | |
+| merchant_category_mapping, ops_category_override (optional) | category mapping and ops pins | drops `updated_by`; `ops_category_override.reason` = a placeholder |
+
+Two names on the gateway's list are not copied: `product_relationship_edges` is a VIEW over
+`relationship_candidate_labels` (gateway migrations 046/051; it arrives with them, and an import
+cannot write a view), and `brands` is a CTE name inside one gateway query, not a table.
 
 `agent_pdp_view.refreshed_by_proposal_id` is classified (a proposal id); a DDL-wide check found it.
 
@@ -112,9 +152,15 @@ placeholder and `realtime_enabled=false` itself.
 
 ## Known limits
 
-* JSON columns (for example `catalog_merchants.metadata_json`) cannot be checked by column name.
-  The manifest reports `email_like_values` per table as a review signal; read it after the first
-  prod export.
-* A first prod export may refuse on a column name this list has not classified; that is the rule
-  working. Classify it (drop or `allow_risky` with a reason) in its own reviewed change.
+* The scrub knows people by key names and by email/phone shapes. A person's name under a
+  catalog-named key (free text that is neither) is not caught; the key list is broad for that reason.
+* A first prod export may refuse on a column the classification does not list (prod drift), on a
+  risky name, or on a person key holding an object; that is the rule working. Classify, drop or
+  scrub it in its own reviewed change.
+* Nothing streams yet (S5): each table is held in memory, about 5-8x its size, and a table whose
+  COPY output passes 1 GiB is refused (MAX_TABLE_COPY_BYTES) rather than running the job out of memory.
+* Phones are recognised only with context: an international number written with "+", or a number
+  right after a phone word (tel, phone, call, mobile, fax, whatsapp, contact, and the Korean, Japanese
+  and Chinese words). A bare digit group (a SKU, GTIN, year, size or price) is never redacted, so a
+  phone written that way in free text is not caught. Emails exclude image names such as `hero@2x.png`.
 * No markets filter yet (decision 5 is open): the copy carries every market.

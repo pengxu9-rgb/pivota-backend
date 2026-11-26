@@ -10,9 +10,12 @@ cannot read back, the sandbox reads objects and writes only its own database.
 
 EXPORT (prod). One REPEATABLE READ, READ ONLY transaction, so every table comes from the same
 snapshot and the job is incapable of writing to prod's database. Per table it reads prod's own
-column list, removes the columns the spec drops, REFUSES if any remaining column name looks like
-personal data or a secret (see RISKY_COLUMN_TOKENS) and the spec has not classified it, then
-streams ``COPY (SELECT ...) TO STDOUT (FORMAT csv)`` into ``<prefix>/<stamp>/<table>.csv.gz``.
+column list and types, removes the columns the spec drops, REFUSES if any remaining column is not
+classified in jobs/sandbox_catalog_columns.py (S3: fail closed) or its name looks like personal data
+or a secret (see RISKY_COLUMN_TOKENS) and the spec has not allowed it, then runs
+``COPY (SELECT ...) TO STDOUT (FORMAT csv)``, scrubs every JSON and text column in Python
+(scrub_csv: person keys, email/phone-shaped values), checks its own output (assert_scrubbed) and
+only then writes ``<prefix>/<stamp>/<table>.csv.gz``.
 ``<prefix>/<stamp>/_MANIFEST.json`` (columns, row counts, sha256 per file, the commit) is written
 LAST, so a stamp without a manifest is an unfinished export and is never imported. Objects are
 created with ifGenerationMatch=0: an export never overwrites anything.
@@ -20,7 +23,7 @@ created with ifGenerationMatch=0: an export never overwrites anything.
 IMPORT (sandbox). Refuses unless PIVOTA_ENV=sandbox and config.sandbox_guard passes (which also
 refuses a DATABASE_URL naming a prod host, project or IP). Picks the newest stamp that has a
 manifest, re-applies the export's column rules to the manifest (it does not trust the export),
-checks every file's sha256 and row count, then in ONE transaction: stages each table, deletes the
+checks every file's sha256 and row count and every JSON value against the scrub, then in ONE transaction: stages each table, deletes the
 sandbox rows the new copy no longer has (children first), upserts the rest (parents first), bumps
 serial sequences, and checks each table's row count equals the manifest's. Any mismatch rolls the
 whole import back and the previous copy stays.
@@ -46,6 +49,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,8 +57,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("pivota.sandbox_catalog_copy")
 
-FORMAT_VERSION = 1
+#: 2: every column classified (jobs/sandbox_catalog_columns.py) and JSON columns scrubbed (S3). A format-1
+#: export predates the scrub, so the importer refuses it.
+FORMAT_VERSION = 2
 MANIFEST_NAME = "_MANIFEST.json"
+#: Nothing streams yet (S5 is open): a table's COPY output, its scrubbed copy and its gzip are all held
+#: in memory, about 5-8x the table. A table whose COPY output passes this cap is refused, so a large
+#: table fails loudly instead of the job running out of memory (review V6).
+MAX_TABLE_COPY_BYTES = 1 << 30
 _STAMP_RE = re.compile(r"^\d{8}T\d{4}Z$")
 
 
@@ -82,6 +92,8 @@ class TableSpec:
     allow_risky: Mapping[str, str] = field(default_factory=dict)
     #: Table created at runtime by a schema guard; absent in prod = recorded, not fatal.
     optional: bool = False
+    #: A SQL predicate: only matching rows are copied (the export's SELECT and its count both use it).
+    where: Optional[str] = None
 
 
 CATALOG_TABLES: Tuple[TableSpec, ...] = (
@@ -123,7 +135,9 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     #     gateway's own migrations or has no DDL in either repo: absent in prod = recorded. -----
     TableSpec("content_canonical_election", "which listing is canonical per content key (search, PDP route ids)"),
     TableSpec("catalog_source_quarantine", "quarantined sources the serving lanes keep hidden",
-              drop=("created_by", "revoked_by")),
+              drop=("created_by", "revoked_by"),
+              # ops' free-text reason: a placeholder keeps a NOT NULL column satisfied.
+              replace={"reason": "'withheld in the sandbox copy'"}),
     TableSpec("merchant_product_overlay", "approved PDP content overlays", drop=("approved_by",)),
     TableSpec("product_evidence", "product claims and required disclaimers per market"),
     TableSpec("pdp_identity_listing", "the PDP identity graph's listings (search, discovery, recommendations)",
@@ -131,13 +145,15 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     TableSpec("pdp_identity_override", "identity graph overrides", drop=("created_by",), optional=True),
     TableSpec("product_beauty_attributes", "beauty attributes on PDP and recommendations", drop=("audit_notes",),
               optional=True),
-    TableSpec("product_relationship_edges", "product relationship graph edges", optional=True),
     TableSpec("relationship_candidate_labels", "relationship graph labels", optional=True),
     TableSpec("relgraph_reviewed_ingredient_evidence", "reviewed ingredient evidence for the graph", optional=True),
     TableSpec("relgraph_reviewed_seller_evidence", "reviewed seller evidence for the graph", optional=True),
     TableSpec("aurora_product_intel_kb", "product intelligence KB the serving index reads", optional=True),
     TableSpec("aurora_dupe_kb", "dupe/alternative KB", drop=("verified_by",), optional=True),
-    TableSpec("aurora_ingredient_research_kb", "ingredient research KB", optional=True),
+    TableSpec("aurora_ingredient_research_kb", "ingredient research KB", optional=True,
+              # query_norm is built from a user's Aurora ingredient query: only finished rows, and only
+              # short ones (an ingredient name, not a message), are copied; the value scrub applies too.
+              where="status = 'ready' AND char_length(query_norm) <= 64"),
     TableSpec("aurora_travel_context_kb", "travel-context product KB (destinations, not travellers)", optional=True),
     TableSpec("taxonomy_view", "category taxonomy views", optional=True),
     TableSpec("taxonomy_view_category", "categories per taxonomy view", optional=True),
@@ -146,8 +162,8 @@ CATALOG_TABLES: Tuple[TableSpec, ...] = (
     TableSpec("category_localization", "category names per locale", optional=True),
     TableSpec("merchant_category_mapping", "merchant category -> canonical category", drop=("updated_by",),
               optional=True),
-    TableSpec("ops_category_override", "category pins/hides set by ops", drop=("updated_by",), optional=True),
-    TableSpec("brands", "brands the relationship graph recalls", optional=True),
+    TableSpec("ops_category_override", "category pins/hides set by ops", drop=("updated_by",), optional=True,
+              replace={"reason": "'withheld in the sandbox copy'"}),
     # --- purchase readiness (Reap path) ---------------------------------------------------
     TableSpec("merchant_purchasability", "whether a merchant can take an agent purchase", optional=True,
               allow_risky={"card_available": "whether the store accepts cards, not a card"}),
@@ -197,6 +213,8 @@ EXCLUDED_TABLES: Mapping[str, str] = {
     "media_assets": "uploads",
     "commissions": "money",
     # Read by the gateway directly, NOT copied (gateway-db-tables-read.md):
+    "product_relationship_edges": "a VIEW over relationship_candidate_labels (gateway migration 046/051), which is "
+                                  "copied; the view arrives with the gateway's migrations, and an import cannot write a view",
     "pdp_identity_review_queue": "a review workflow with free-text reviewer notes; serving reads the graph, not the queue",
     "reco_label_suggestions": "carries session_id / request_id (linkable to users)",
     "creator_category_override": "keyed by creator_id; creators are real people",
@@ -254,12 +272,21 @@ def _assert_no_never_copy(names: Iterable[str], where: str) -> None:
 #: A column whose name has one of these tokens (split on "_") is refused unless dropped or
 #: classified in allow_risky. "_by" anywhere (created_by, decided_by_*) is staff identity.
 RISKY_COLUMN_TOKENS = frozenset({
-    "email", "phone", "password", "passwd", "secret", "token", "tokens", "credential", "credentials",
-    "kyc", "ssn", "address", "customer", "buyer", "employee", "iban", "contact", "notes", "note",
-    "by", "ip", "dob", "birthday",
+    "email", "emails", "phone", "phones", "password", "passwords", "passwd", "secret", "secrets", "token",
+    "tokens", "credential", "credentials", "kyc", "ssn", "address", "addresses", "customer", "customers",
+    "buyer", "buyers", "employee", "employees", "iban", "contact", "contacts", "notes", "note", "by", "ip",
+    "dob", "birthday",
+    # S3 (5d8e3aa73 review): plurals above, and auth material, people, documents, cards, raw payloads.
+    "cookie", "cookies", "authorization", "auth", "bearer", "jwt", "session", "sessions", "apikey",
+    "username", "usernames", "reviewer", "reviewers", "actor", "actors", "passport", "cvv", "cvc", "pan",
+    "headers", "comment", "comments", "remark", "remarks", "memo",
 })
-RISKY_COLUMN_PAIRS = frozenset({("api", "key"), ("private", "key"), ("user", "id"), ("first", "name"),
-                                ("last", "name"), ("full", "name"), ("account", "number")})
+RISKY_COLUMN_PAIRS = frozenset({
+    ("api", "key"), ("private", "key"), ("access", "key"), ("secret", "key"), ("signing", "key"),
+    ("user", "id"), ("user", "name"), ("user", "agent"), ("session", "id"), ("first", "name"),
+    ("last", "name"), ("full", "name"), ("account", "number"), ("card", "number"), ("tax", "id"),
+    ("national", "id"), ("id", "number"), ("webhook", "url"), ("raw", "payload"),
+})
 
 
 _assert_no_never_copy((s.name for s in CATALOG_TABLES), "CATALOG_TABLES")
@@ -272,12 +299,297 @@ def column_is_risky(column: str) -> bool:
     return any(pair in RISKY_COLUMN_PAIRS for pair in zip(parts, parts[1:]))
 
 
-def plan_columns(spec: TableSpec, existing: Sequence[str]) -> List[Tuple[str, str]]:
+# --- The scrub (S3, review SF3/SF4): person keys, and email/phone values, in Python ------------------
+#: A JSON key (matched whole, any case, at any depth) that names a person, a secret, an identifier of
+#: a request, or free text. Under it, a string becomes "redacted" (a string: the gateway serves an
+#: evidence claim only with a string reviewed_by) and ANY other value, objects and arrays included,
+#: becomes null (SF4: a whole reviewer_decisions array goes, the export does not refuse on it).
+#: Broad on purpose: a missed person costs more than a lost tag. A JSON column whose content is product
+#: data may keep a few named keys (jobs/sandbox_catalog_columns.py: "name", "handle" of a product).
+_PERSON_KEY_ALTERNATION = "|".join((
+    r"[a-z0-9_-]*_?by(?:_[a-z0-9_-]+)?",               # reviewed_by, createdBy, signed_by_name
+    r"[a-z0-9_-]*mail[a-z0-9_-]*",                     # email, emailAddress, E-mail, mail
+    r"[a-z0-9_-]*address[a-z0-9_-]*",                  # address, shipping_address, ip_address
+    r"[a-z0-9_-]*phone[a-z0-9_-]*", r"mobile[a-z0-9_-]*", r"tel",
+    r"pass_?words?", r"passwd", r"pwd", r"[a-z0-9_-]*secrets?", r"[a-z0-9_-]*tokens?",
+    r"api_?keys?", r"access_?keys?", r"private_?keys?", r"signing_?keys?", r"secret_?keys?",
+    r"credentials?", r"authorization", r"auth", r"bearer", r"jwt", r"cookies?", r"set_?cookie",
+    r"sessions?", r"session_?ids?", r"request_?ids?", r"trace_?ids?", r"span_?ids?", r"correlation_?ids?",
+    r"users?", r"user_?ids?", r"user_?names?", r"user_?agent",
+    r"customers?", r"customer_?[a-z0-9_]+", r"buyers?", r"buyer_?[a-z0-9_]+", r"employees?",
+    r"employee_?[a-z0-9_]+", r"staff", r"staff_?[a-z0-9_]+", r"reviewers?", r"reviewer_?[a-z0-9_]+",
+    r"actors?", r"actor_?ids?", r"operators?", r"operator_?ids?", r"owners?", r"owner_?(?:id|email|name)",
+    r"authors?", r"author_?(?:id|email|name)", r"contacts?", r"contact_?[a-z0-9_]+",
+    r"names?", r"first_?name", r"last_?name", r"full_?name", r"given_?name", r"family_?name", r"handles?",
+    r"street", r"postal_?code", r"zip_?code", r"ip", r"remote_?addr", r"x_?forwarded_?for",
+    r"card_?numbers?", r"pan", r"cvv", r"cvc", r"iban", r"account_?numbers?", r"ssn", r"dob", r"birthday",
+    r"birth_?date", r"[a-z0-9_-]*_?notes?", r"[a-z0-9_-]*_?comments?", r"remarks?", r"memo",
+    r"reasons?", r"rationales?", r"raw_?payload", r"headers", r"webhook_?url", r"webhook_?secret",
+))
+PERSON_KEY_RE = re.compile(r"(?:%s)\Z" % _PERSON_KEY_ALTERNATION, re.IGNORECASE)
+REDACTED = "redacted"
+#: Email- and phone-shaped substrings, redacted in every text and JSON string value (SF3: a person's
+#: address under a catalog-named key such as note2). The email check is a GATE on every column: after
+#: the scrub the export carries none, or it refuses.
+#: An EMAIL is local@domain.tld where the "tld" is not an image/file extension: `hero@2x.png` and
+#: Shopify's `_480x480@2x.jpg` are image names (review V1), and refusing on them would stop every
+#: export with a retina image URL.
+_EMAIL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])")
+_NOT_A_TLD = frozenset({"png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff", "ico", "heic",
+                        "mp4", "webm", "mov", "pdf", "css", "js"})
+#: A PHONE needs context (review V2: SKUs, GTINs, years, sizes and prices are digit groups too):
+#: an international number written with "+", or a number right after a phone word (tel/phone/call/
+#: mobile/fax/whatsapp/contact and their Korean, Japanese and Chinese forms). A bare digit group is
+#: never a phone here.
+_PHONE_INTL_RE = re.compile(r"(?<![\w+])\+\d{1,3}(?:[ .()/-]{0,2}\d){6,14}(?!\w)")
+_PHONE_WORDS = r"(?:(?<![A-Za-z])(?:tel|tele|phone|telephone|call|mobile|cell|fax|whatsapp|contact)(?![A-Za-z])|전화|연락처|휴대폰|電話|電話番号|联系电话|电话|手机)"
+_PHONE_CONTEXT_RE = re.compile(
+    r"(" + _PHONE_WORDS + r"[\s:：.#-]{0,4}(?:(?:no|number|num|#)\.?[\s:：#-]{0,3})?(?:us\s+)?(?:at\s+|on\s+)?)"
+    r"(\+?\(?\d[\d ().-]{5,18}\d)", re.IGNORECASE)
+REDACTED_TEXT = "[redacted]"
+
+
+def _is_email(match: "re.Match") -> bool:
+    return match.group(2).lower() not in _NOT_A_TLD
+
+
+def _redact_once(text: str) -> str:
+    text = _EMAIL_CANDIDATE_RE.sub(lambda m: REDACTED_TEXT if _is_email(m) else m.group(0), text)
+    text = _PHONE_INTL_RE.sub(REDACTED_TEXT, text)
+    return _PHONE_CONTEXT_RE.sub(lambda m: m.group(1) + REDACTED_TEXT, text)
+
+
+def redact_text(text: str) -> str:
+    """Email/phone-shaped parts -> [redacted]; repeated until nothing changes (review V5: a redaction
+    can expose the next match, as in +395809844+0577444923)."""
+    for _ in range(8):
+        new = _redact_once(text)
+        if new == text:
+            return text
+        text = new
+    return text
+
+
+def has_email(text: str) -> bool:
+    return any(_is_email(m) for m in _EMAIL_CANDIDATE_RE.finditer(text))
+
+
+def _text_hits(text: str) -> bool:
+    return has_email(text) or bool(_PHONE_INTL_RE.search(text) or _PHONE_CONTEXT_RE.search(text))
+
+
+class _RawNumber:
+    """A JSON number kept as its own text, so a rewritten value keeps 2.50 as 2.50."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _DuplicateKeys(dict):
+    """A JSON object whose source text repeated a key (review V4): json.loads keeps the last, so the
+    cell is always rewritten from the parsed value, never copied as its original bytes."""
+
+
+def _pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            out = _DuplicateKeys(out)
+        out[key] = value
+    return out
+
+
+def _has_duplicates(value: Any) -> bool:
+    if isinstance(value, _DuplicateKeys):
+        return True
+    if isinstance(value, dict):
+        return any(_has_duplicates(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_duplicates(v) for v in value)
+    return False
+
+
+def _loads(cell: str) -> Any:
+    return json.loads(cell, parse_float=_RawNumber, parse_int=_RawNumber, object_pairs_hook=_pairs)
+
+
+def _dumps(value: Any) -> str:
+    if isinstance(value, dict):
+        return "{" + ", ".join("%s: %s" % (_dumps(str(k)), _dumps(v)) for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_dumps(v) for v in value) + "]"
+    if isinstance(value, _RawNumber):
+        return value.text
+    if isinstance(value, str) and any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+        return json.dumps(value, ensure_ascii=True)  # a lone surrogate stays an escape (review V5)
+    return json.dumps(value, ensure_ascii=False)
+
+
+#: Where a product-data column's PRODUCT_KEYS (name, handle) are kept (review V7): the top-level
+#: object, the items of a top-level array, and the items under these option-like keys. Anywhere else
+#: (reviews[].name, seller.handle) they are redacted like in every other column.
+_PRODUCT_SCOPE_KEYS = frozenset({"options", "variants", "option_values", "values", "breadcrumb",
+                                 "itemlistelement", "items"})
+
+
+def _key_out(key: Any, taken: set) -> str:
+    text = str(key)
+    if _text_hits(text):  # review V3: an email or phone as an object KEY
+        text = redact_text(text)
+        base, n = text, 2
+        while text in taken:
+            text, n = "%s#%d" % (base, n), n + 1
+    return text
+
+
+def _scrub(value: Any, keep: set, scope: bool) -> Tuple[Any, bool]:
+    if isinstance(value, dict):
+        out, changed = {}, isinstance(value, _DuplicateKeys)
+        for key, inner in value.items():
+            new_key = _key_out(key, set(out))
+            changed = changed or new_key != key
+            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
+                new = inner if inner is None or inner == REDACTED else (REDACTED if isinstance(inner, str) else None)
+                changed = changed or new is not inner
+                out[new_key] = new
+            else:
+                new, c = _scrub(inner, keep, scope and str(key).lower() in _PRODUCT_SCOPE_KEYS)
+                out[new_key] = new
+                changed = changed or c
+        return out, changed
+    if isinstance(value, list):
+        pairs = [_scrub(v, keep, scope) for v in value]
+        return [p[0] for p in pairs], any(p[1] for p in pairs)
+    if isinstance(value, str):
+        new = redact_text(value)
+        return new, new != value
+    return value, False
+
+
+def scrub_json(value: Any, keep_keys: Iterable[str] = ()) -> Tuple[Any, bool]:
+    """(scrubbed value, changed). Person keys: a string -> "redacted", anything else -> null; every
+    other string, and every key, has its email/phone-shaped parts redacted."""
+    return _scrub(value, set(keep_keys), True)
+
+
+def _person_values(value: Any, keep: set, scope: bool, path: str) -> List[str]:
+    found: List[str] = []
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            here = "%s.%s" % (path, key)
+            if _text_hits(str(key)):
+                found.append("%s.<key>" % path)
+            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
+                if inner is not None and inner != REDACTED:
+                    found.append(here)
+            else:
+                found.extend(_person_values(inner, keep, scope and str(key).lower() in _PRODUCT_SCOPE_KEYS, here))
+    elif isinstance(value, list):
+        for index, inner in enumerate(value):
+            found.extend(_person_values(inner, keep, scope, "%s[%d]" % (path, index)))
+    elif isinstance(value, str) and _text_hits(value):
+        found.append(path)
+    return found
+
+
+def person_values(value: Any, keep_keys: Iterable[str] = (), path: str = "$") -> List[str]:
+    """JSON paths where a person key still holds something other than null or "redacted", or a key or
+    string still holds an email- or phone-shaped part. Paths only, never values."""
+    return _person_values(value, set(keep_keys), True, path)
+
+
+def _csv_field(value: Optional[str]) -> str:
+    return "" if value is None else '"%s"' % value.replace('"', '""')
+
+
+def scrub_csv(table: str, raw: bytes, null_token: str, columns: Sequence[str]) -> bytes:
+    """Re-write a ``COPY ... (FORMAT csv, NULL null_token)`` result with every JSON and text column
+    scrubbed. Output: standard CSV (NULL = an empty unquoted field, every other value quoted), which
+    ``COPY FROM (FORMAT csv)`` reads back exactly."""
+    from jobs.sandbox_catalog_columns import JSON as _JSON, TEXT as _TEXT, column_class, json_keep_keys
+
+    classes = [column_class(table, c) for c in columns]
+    keeps = [json_keep_keys(table, c) for c in columns]
+    out = io.StringIO()
+    csv.field_size_limit(sys.maxsize)
+    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
+        if len(row) != len(columns):
+            raise CopyRefused("table %s: a CSV record has %d fields, expected %d" % (table, len(row), len(columns)))
+        cells: List[Optional[str]] = [None if v == null_token else v for v in row]
+        for i, cell in enumerate(cells):
+            if cell is None:
+                continue
+            if classes[i] == _JSON:
+                try:
+                    value = _loads(cell)
+                except ValueError:
+                    raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
+                new, changed = scrub_json(value, keeps[i])
+                if changed:  # a repeated key counts as a change (_scrub), so it is always rewritten
+                    cells[i] = _dumps(new)
+            elif classes[i] == _TEXT:
+                cells[i] = redact_text(cell)
+        out.write(",".join(_csv_field(c) for c in cells) + "\n")
+    return out.getvalue().encode("utf-8")
+
+
+def assert_scrubbed(table: str, raw: bytes, columns: Sequence[str]) -> int:
+    """Refuse when the CSV ``raw`` still names a person: a person key holding a value or an
+    email/phone-shaped string in a JSON column, an email/phone in a text column, or an email in ANY
+    other column. A REPLACED column holds the spec's own placeholder and is skipped. Names the table,
+    the column and the JSON path, never the value. Returns the email-shaped values found (0, or it
+    raised): the manifest's email_like_values."""
+    from jobs.sandbox_catalog_columns import JSON as _JSON, REPLACED as _REPLACED, TEXT as _TEXT
+    from jobs.sandbox_catalog_columns import column_class, json_keep_keys
+
+    classes = [column_class(table, c) for c in columns]
+    keeps = [json_keep_keys(table, c) for c in columns]
+    csv.field_size_limit(sys.maxsize)
+    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
+        for i, cell in enumerate(row[: len(columns)]):
+            if cell == "" or classes[i] == _REPLACED:
+                continue
+            if classes[i] == _JSON:
+                try:
+                    value = _loads(cell)
+                except ValueError:
+                    raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
+                if _has_duplicates(value):
+                    raise CopyRefused("table %s column %s holds a JSON object with a repeated key"
+                                      % (table, columns[i]))
+                hits = person_values(value, keeps[i])
+                if hits:
+                    raise CopyRefused("table %s column %s: a person key or contact detail survived the "
+                                      "scrub at %s" % (table, columns[i], hits[0]))
+            elif classes[i] == _TEXT and _text_hits(cell):
+                raise CopyRefused("table %s column %s: an email- or phone-shaped value survived the scrub"
+                                  % (table, columns[i]))
+            elif has_email(cell):
+                raise CopyRefused("table %s column %s holds an email-shaped value" % (table, columns[i]))
+    return 0
+
+
+def json_columns_of(spec: TableSpec, columns: Sequence[str]) -> List[str]:
+    from jobs.sandbox_catalog_columns import JSON as _JSON, column_class
+
+    return [c for c in columns if column_class(spec.name, c) == _JSON]
+
+
+def plan_columns(spec: TableSpec, existing: Sequence[str],
+                 types: Optional[Mapping[str, str]] = None) -> List[Tuple[str, str]]:
     """``[(column, select_expression)]`` to copy from a table whose columns are ``existing``.
 
-    Raises CopyRefused when a kept column does not exist, or a remaining column looks risky and is
-    neither dropped, replaced nor classified. The order follows ``existing`` (the table's own).
+    Raises CopyRefused when a remaining column is not classified in jobs/sandbox_catalog_columns.py
+    (fail closed, S3), when a JSON-typed column is not classified JSON (so it would skip the scrub) or
+    the other way round, or when a column looks risky by name and is neither dropped, replaced nor
+    allowed in the spec. ``types`` maps column -> PostgreSQL type name (json, jsonb, text, ...); the
+    export always passes it. The order follows ``existing`` (the table's own).
     """
+    from jobs.sandbox_catalog_columns import JSON as _JSON, column_class
+
+    types = dict(types or {})
     if spec.keep is not None:
         # A kept column the source lacks (is_test, realtime_enabled arrived by migration) is simply
         # not copied; the sandbox column's default applies.
@@ -294,6 +606,32 @@ def plan_columns(spec: TableSpec, existing: Sequence[str]) -> List[Tuple[str, st
                 "table %s column %s looks like personal data or a secret; drop it or classify it "
                 "in CATALOG_TABLES before copying" % (spec.name, column)
             )
+        cls = column_class(spec.name, column)
+        if cls is None:
+            raise CopyRefused(
+                "table %s column %s is not classified in jobs/sandbox_catalog_columns.py; classify "
+                "or drop it before copying" % (spec.name, column)
+            )
+        data_type = types.get(column)
+        is_json_type = data_type in ("json", "jsonb")
+        if data_type is not None and data_type.startswith("unsupported:") and cls == _JSON:
+            raise CopyRefused("table %s column %s is a JSON container type (%s); review it before copying"
+                              % (spec.name, column, data_type[len("unsupported:"):]))
+        if cls == _JSON or is_json_type:
+            if cls != _JSON:
+                raise CopyRefused("table %s column %s is %s but not classified JSON (it would skip the "
+                                  "scrub)" % (spec.name, column, data_type))
+            if data_type is None:
+                raise CopyRefused("table %s column %s is classified JSON but its type is unknown"
+                                  % (spec.name, column))
+            if data_type not in ("json", "jsonb"):
+                raise CopyRefused("table %s column %s is classified JSON but its type is %s"
+                                  % (spec.name, column, data_type))
+            out.append((column, _q(column)))  # scrubbed in Python before upload (scrub_csv)
+            continue
+        if data_type is not None and data_type.startswith("unsupported:"):
+            raise CopyRefused("table %s column %s is a JSON container type (%s); review it before copying"
+                              % (spec.name, column, data_type[len("unsupported:"):]))
         out.append((column, _q(column)))
     if not out:
         raise CopyRefused("table %s: no columns left to copy" % spec.name)
@@ -453,10 +791,35 @@ async def _table_columns(conn, schema: str, table: str, *, copyable_only: bool =
     return [r["column_name"] for r in rows]
 
 
-_EMAIL_RE = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+async def _table_column_types(conn, schema: str, table: str) -> Dict[str, str]:
+    """column -> its type name as PostgreSQL spells it (json, jsonb, text, integer, ...). An array of
+    JSON, or a domain over JSON (or over a JSON array), is ``unsupported:<type>``: plan_columns refuses
+    it rather than copy it past the scrub (review nit)."""
+    rows = await conn.fetch(
+        """
+        SELECT a.attname AS column_name, t.typname AS type_name, t.typtype AS type_kind,
+               bt.typname AS base_name, et.typname AS elem_name, bet.typname AS base_elem_name
+          FROM pg_catalog.pg_attribute a
+          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+          LEFT JOIN pg_catalog.pg_type bt ON bt.oid = t.typbasetype AND t.typtype = 'd'
+          LEFT JOIN pg_catalog.pg_type et ON et.oid = t.typelem AND t.typlen = -1
+          LEFT JOIN pg_catalog.pg_type bet ON bet.oid = bt.typelem AND bt.typlen = -1
+         WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped
+        """,
+        schema, table,
+    )
+    out: Dict[str, str] = {}
+    for r in rows:
+        name = r["type_name"]
+        around = {r["base_name"], r["elem_name"], r["base_elem_name"]} & {"json", "jsonb"}
+        out[r["column_name"]] = "unsupported:%s" % name if around else name
+    return out
 
 
 def _count_csv_records(raw: bytes) -> int:
+    csv.field_size_limit(sys.maxsize)  # a product payload can exceed csv's 128 KiB default
     return sum(1 for _ in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")))
 
 
@@ -495,27 +858,38 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
                     absent.append(spec.name)
                     continue
                 raise CopyRefused("table %s does not exist in the source" % spec.name)
-            plan = plan_columns(spec, existing)
-            query = "SELECT %s FROM %s.%s" % (", ".join(e for _, e in plan), _q(schema), _q(spec.name))
+            plan = plan_columns(spec, existing, await _table_column_types(conn, schema, spec.name))
+            where = " WHERE %s" % spec.where if spec.where else ""
+            query = "SELECT %s FROM %s.%s%s" % (", ".join(e for _, e in plan), _q(schema), _q(spec.name), where)
+            null_token = "__sandbox_copy_null_%s__" % secrets.token_hex(16)
             buf = io.BytesIO()
-            await conn.copy_from_query(query, output=buf, format="csv")
-            raw = buf.getvalue()
-            rows = await conn.fetchval("SELECT count(*) FROM %s.%s" % (_q(schema), _q(spec.name)))
+            await conn.copy_from_query(query, output=buf, format="csv", null=null_token)
+            if buf.tell() > MAX_TABLE_COPY_BYTES:
+                raise CopyRefused("table %s: %d bytes exceeds the in-memory copy cap (streaming is S5)"
+                                  % (spec.name, buf.tell()))
+            planned = [c for c, _ in plan]
+            # The scrub (S3): every JSON and text column, here, before anything is uploaded; then the
+            # export checks its own output and refuses if anything is left.
+            raw = scrub_csv(spec.name, buf.getvalue(), null_token, planned)
+            email_like = assert_scrubbed(spec.name, raw, planned)
+            rows = await conn.fetchval("SELECT count(*) FROM %s.%s%s" % (_q(schema), _q(spec.name), where))
             if _count_csv_records(raw) != rows:
                 raise CopyRefused("table %s: CSV record count differs from the snapshot's" % spec.name)
+            json_cols = json_columns_of(spec, planned)
             data = _gzip(raw)
             fname = "%s/%s.csv.gz" % (stamp, spec.name)
             files.append((fname, data))
             tables.append({
                 "name": spec.name,
-                "columns": [c for c, _ in plan],
+                "columns": planned,
+                "json_columns": json_cols,
                 "rows": int(rows),
                 "file": fname,
                 "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(),
-                # A review signal only (JSON blobs cannot be checked by column name): how many
-                # email-shaped strings the copied values hold. Brand support addresses count too.
-                "email_like_values": len(_EMAIL_RE.findall(raw)),
+                # A gate now (SF3), not a review signal: after the scrub the copy holds no
+                # email-shaped value anywhere, and the importer refuses a manifest saying otherwise.
+                "email_like_values": email_like,
             })
     for fname, data in files:
         store.put(fname, data)
@@ -564,6 +938,12 @@ def validate_manifest(manifest: Mapping[str, Any], specs: Sequence[TableSpec] = 
         columns = list(entry.get("columns") or [])
         if not columns:
             raise CopyRefused("manifest table %s has no columns" % name)
+        from jobs.sandbox_catalog_columns import column_class
+
+        if entry.get("email_like_values") != 0:
+            raise CopyRefused("manifest table %s reports email-shaped values; the copy carries none" % name)
+        if list(entry.get("json_columns") or []) != json_columns_of(spec, columns):
+            raise CopyRefused("manifest table %s: its JSON columns are not the classified ones" % name)
         for column in columns:
             if column in spec.drop:
                 raise CopyRefused("manifest table %s carries dropped column %s" % (name, column))
@@ -571,6 +951,8 @@ def validate_manifest(manifest: Mapping[str, Any], specs: Sequence[TableSpec] = 
                 raise CopyRefused("manifest table %s carries column %s outside its keep list" % (name, column))
             if column_is_risky(column) and column not in spec.allow_risky and column not in spec.replace:
                 raise CopyRefused("manifest table %s carries risky column %s" % (name, column))
+            if column_class(name, column) is None and column not in spec.replace:
+                raise CopyRefused("manifest table %s carries unclassified column %s" % (name, column))
     absent = set(manifest.get("absent_optional_tables") or [])
     for spec in specs:
         if spec.name not in seen and not (spec.optional and spec.name in absent):
@@ -664,6 +1046,8 @@ async def import_catalog(conn, store, *, stamp: Optional[str] = None,
         raw = gzip.decompress(data)
         if _count_csv_records(raw) != entry.get("rows"):
             raise CopyRefused("table %s: file row count does not match the manifest" % name)
+        # The importer does not trust the export's scrub either.
+        assert_scrubbed(name, raw, entry["columns"])
         payloads[name] = raw
 
     order = await _fk_order(conn, schema, list(entries))
