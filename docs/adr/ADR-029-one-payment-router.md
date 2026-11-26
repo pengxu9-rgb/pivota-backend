@@ -14,12 +14,15 @@
 
 ## Amendment 2 (owner, 2026-11-26): agent-paid checkout at a seller first seen in the request
 
-*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-030 Amendment 2, ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
+*Decided by the owner on 2026-11-26; this ADR stays Proposed. Where it conflicts with the text below, this amendment governs. Companions: ADR-030 Amendment 2, ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
 
-1. **An agent may pay at a seller found live, on its first sighting, and on a `likely` match** (owner, 2026-11-26).
+1. **An agent may pay at a seller found live, on its first sighting, and on a `likely` match** (owner, 2026-11-26). The seller's ADR-033 live checks must have passed in the same request; the full checks do not have to finish first.
 2. **The D6 fact filter still fails closed.** For a seller with no stored fact, the fact is read from that seller's own checkout answer at buy time: the checkout session opened through its door gives the payment handlers it accepts, the currency and the merchant's total. That answer stands in for `is_purchasable` for that one purchase, and is then stored as a fact.
+   - **Which paths:** only `card_held_by_rail`, `network_token` and `card_number`. Each is allowed only when the checkout answer lists a card handler that accepts that credential type, in the market's currency.
+   - **Still excluded:** `wallet_at_checkout`, and Shop MCP and merchant protocol completion. Their facts do not exist, as D6 says, and a checkout answer does not supply them.
    - A missing, unreadable or ineligible answer still excludes every agent-paid path.
-   - Paths whose facts do not exist at all (the wallet fact, the payment-handler fact) stay excluded, as D6 says.
+   - **Switch.** A new `FIRST_SIGHT_AGENT_CHECKOUT` (off, on), off by default, gates this amendment. Each D8 dial still applies.
+   - **Overrides** D6's line that these three paths need a fresh ELIGIBLE fact from the buyer vantage, for a seller with no stored fact only.
 3. **Unchanged:**
    - ADR-028's MUSTs, the consent's ceiling and the path's cap;
    - currency equals market;

@@ -6,24 +6,30 @@
 
 ## Amendment 1 (owner, 2026-11-26): agents run the checks and admit
 
-*Accepted with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-034 Amendment 1.*
+*Decided by the owner on 2026-11-26 and accepted with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-030 Amendment 2, ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-034 Amendment 1.*
 
 1. **Agents admit a `verified_retailer`.** S3 is amended, and the owner's 2026-11-23 answers to questions 1 and 3 are changed: an agent run takes the place of a person's choice, and a seller a lane returns can be shown once it passes.
 2. **Two stages of checks** (owner, 2026-11-26):
    - **Live checks, inside the request**, from the seller's own door: the store answers; its prices are in the market's currency; the brand is in the store's own listings and in stock; the seller is not excluded, quarantined or a test merchant; and where a brand publishes a list of sellers for that market, the seller is on it. All pass: the seller is admitted at once, and its record is written at once.
-   - **Full checks, right after the answer:** the published legal identity, contact details, and shipping and returns policies of S3. A failure withdraws the admission and removes the seller's offers.
+   - **Full checks, right after the answer:** the published legal identity, contact details, and shipping and returns policies of S3. A failure withdraws the admission: the seller is served in no later answer, and its stored pointers and decisions are marked withdrawn. Its live offers were never stored. An order already placed is not affected.
    - **Held for a person, and not shown until decided:** a marketplace host, or a check that fails or cannot be read.
+   - **Payment does not wait for the full checks.** This follows from the owner's two answers of 2026-11-26: admit on the live checks, and agent checkout at once. An agent-paid purchase at a first-seen seller is allowed only when that seller's live checks passed in the same request (ADR-029 Amendment 2). A seller whose live checks did not pass cannot be paid.
+   - **Switch.** Agent admission is gated by a new `SELLER_ADMISSION_AGENT` (off, report, on). `report` runs the checks and records them, and serves nothing.
 3. **A seller a platform catalog returns is admitted only through its own door.** The gateway reads that seller's own door, and the admission is our decision on the door's answer. A catalog seller with no door is not admitted until ADR-031's open dependency 1 is answered. Nothing from the catalog's content is written (ADR-031 D1).
 4. **The origin rule stays.** For an ingest job, a domain whose stated origin is search-grounded model output is still refused. A domain proposed by a model without search grounding counts only after an agent confirms it through an allowed origin: the brand's published list of sellers, a feed, or a platform catalog.
 5. **What stays "never evidence".** A platform's eligibility for its catalog, and a model's opinion of whether a seller is trustworthy, remain never evidence. The agents check stated facts and record the source of each; that is not a model's inference about trust.
 6. **Text below that this amendment overrides:**
-   - the ADR-030 D8 line under "Builds on" and S1's "decided offline": an admission may now be decided in a request, on the live checks;
+   - the ADR-030 D8 line under "Decisions this ADR follows" and S1's "decided offline": an admission may now be decided in a request, on the live checks;
+   - S7's lane table: a store's door is called for a seller found in an answer to run the live checks, before it is admitted, and a catalog seller is not dropped but taken to its own door (item 3);
+   - S3's "outside the queued-job case" exception under "Never evidence": it also covers an agent run that records its checks;
    - S2's `verified_retailer` row ("a person chose") and `unverified` row ("counted only");
    - S3's person's-choice lines, and the rule that a job queued by an automated session admits nothing (an agent run that records its checks now counts);
-   - the risks that new coverage grows only as fast as people review it, and that the work is manual;
+   - the risks that new coverage grows only as fast as people review it, and that the work is manual, and the consequence that comparison coverage grows only as fast as sellers are reviewed;
+   - phase 3's link to ADR-031's phase 6: it is now keyed to ADR-031 Amendment 1. `enforce_new` is done before any live seller is served;
+   - the rejected alternative "treating any queued job as a person's choice": it stays rejected, and an agent run counts only when it records its checks and their sources;
    - the answers to questions 1 and 3.
 
-   Everything else stands: tiers, exclusions, the database rule, and the phases. Phase 3 (`enforce_new`) is done before any live seller is served.
+   Everything else stands: tiers, exclusions, the database rule and the phases.
 
 **Companions:** ADR-031 decides how supply is read through lanes. ADR-032 decides when two listings are the same sellable item. This ADR decides which sellers may be shown as an offer for a brand. ADR-031 D8 says a seller first seen through a lane "needs a seller record so the exclusions can be applied"; this ADR says what those exclusions are.
 

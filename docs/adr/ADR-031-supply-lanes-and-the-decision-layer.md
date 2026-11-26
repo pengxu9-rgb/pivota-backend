@@ -6,7 +6,7 @@
 
 ## Amendment 1 (owner, 2026-11-26): live search serves in the same answer
 
-*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
+*Decided by the owner on 2026-11-26; this ADR stays Proposed. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-030 Amendment 2, ADR-032 Amendment 1, ADR-033 Amendment 1, ADR-034 Amendment 1.*
 
 1. **Queue-first is withdrawn.** The owner's 2026-11-23 answer to question 4 (D8) is reversed. A seller or listing that a lane's `search` finds while answering may be shown in that same answer when both hold:
    - its match is judged in the request and labelled `confirmed` or `likely` (ADR-032 Amendment 1);
@@ -17,6 +17,8 @@
    - Platform-catalog and store-door `search` run in parallel for the product asked about.
    - The budget for the whole `get_offers` call is 5 seconds (owner, 2026-11-26). A lane that has not answered by then is cut off, and its results may show on a later call.
    - These reads ship only after lane reads have an egress of their own (D10; question 8 unchanged).
+   - D5's caps hold: no live read without a declared market, and a cap on the offers read per call. A cap on the stores searched per call is added; its value is written in the change that turns serving on.
+   - **Switch.** D12's catalog supply-lane switch gains a `serve` value. A new `LIVE_LANE_SERVE` (off, shadow, on) gates serving from any lane. It may be on only while ADR-032's `IDENTITY_REQUEST_JUDGE` is on and ADR-033's `SELLER_ADMISSION` is at `enforce_new` or above.
 3. **The storage rule is unchanged (D1).** After the answer is sent:
    - from a door, we keep the pointer, our verdict, which fields agreed and a fingerprint of the inputs;
    - from a platform catalog, we keep nothing until open dependency 1 is answered in writing, then the same as a door.
@@ -34,6 +36,8 @@
    - A lane still creates no stored listing; a stored row comes from a source we may keep, as before.
 8. **A seller a platform catalog returns is used only through its own door** (ADR-033 Amendment 1). Nothing is written from the catalog until open dependency 1 is answered.
 9. **Text below that this amendment overrides:**
+   - the ADR-030 line under "Decisions this ADR follows" ("eligibility is a stored fact"): for a seller first seen in a request, ADR-030 Amendment 2 applies;
+   - the ADR-007, ADR-018 and ADR-012 line there, and D8's "Nothing in this ADR changes a stored-price gate": both still hold for stored offers; a live offer falls outside them under item 7;
    - D5's `get_offers` row: 5 seconds for the whole call, not 3 seconds for 3 offers;
    - D8's rule that a seller or listing first seen through a lane's `search` is not served in that answer;
    - D12's catalog supply-lane switch, which gains a serving value;
@@ -41,7 +45,7 @@
    - phases 3 and 6, where search was counted only;
    - the answer to question 4.
 
-   The alternative "search every source on every request" stays rejected as the only design: stored decisions answer repeat calls.
+   The alternative "search every source on every request" stays rejected as the only design: stored decisions answer repeat calls. Its reason that a seller cannot be served before its facts are stored no longer holds (ADR-030 Amendment 2).
 
 **Companion:** ADR-032 decides when two listings are the same sellable item. This ADR uses its result.
 

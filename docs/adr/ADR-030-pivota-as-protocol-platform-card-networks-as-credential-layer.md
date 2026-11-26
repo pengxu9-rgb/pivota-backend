@@ -49,7 +49,7 @@
 
 ## Amendment 2 (owner, 2026-11-26): facts read in a request may decide
 
-*Proposed with this ADR. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-031 Amendment 1, ADR-033 Amendment 1.*
+*Decided by the owner on 2026-11-26; this ADR stays Proposed. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-031 Amendment 1, ADR-033 Amendment 1.*
 
 1. **D8's "Nothing is decided by a request-time fetch" is amended.** For a seller first seen in a request, two decisions may rest on what that seller's own door answers in the request:
    - its admission (ADR-033 Amendment 1);
@@ -58,6 +58,10 @@
    What is read is stored at once as a fact, with its time.
 2. **The background job of D8 still runs** and refreshes every stored fact. A stored fact, when fresh, is used before any read in the request.
 3. **Only the gateway calls a merchant's door** (D2), unchanged.
+4. **Switches.** This amendment acts only through ADR-033's `SELLER_ADMISSION_AGENT` and ADR-029's `FIRST_SIGHT_AGENT_CHECKOUT`. With both off, D8 reads as before.
+5. **Text below that this amendment overrides,** for a seller first seen in a request only:
+   - D8's "Eligibility is a stored fact … Nothing is decided by a request-time fetch";
+   - D11's condition that the protocol is "read from the stored fact (D8), never from a request-time fetch".
 
 ## Amendment 1 (2026-11-23): a payment partner that cannot load the entry link
 
