@@ -1,0 +1,43 @@
+# Partner sandbox: Cloud Run `agenpaz` (PIVOTA-Agent image, AgenPaz page only) behind
+# https://@@AGENPAZ_HOST@@. AGENPAS_PUBLIC_BASE_URL makes that host exclusive: the image answers
+# only /agenpas routes there (PIVOTA-Agent src/agenpas/config.js).
+# Rendered by deploy_sandbox.sh, checked by check_profile.py. Based on staging `agenpas`.
+# Secrets are mounted from ../secrets/agenpaz.list.
+
+PIVOTA_ENV: "sandbox"
+# Second identity signal, rendered from config.sh SANDBOX_PROJECT: the gateway boot check and the
+# backend guard both read it, and the deploy reads it back off every new revision.
+GOOGLE_CLOUD_PROJECT: "@@SANDBOX_PROJECT@@"
+# Same image as the gateway, so the same boot check applies: no NODE_ENV=production|test, consent on
+# for the reap rail, and every live-read / image-cache switch off (the job runner explicitly).
+AGENPAS_ENABLED: "1"
+# Same image as the gateway: no request may start the gateway's migrations (RUNBOOK step 10b).
+DB_AUTO_MIGRATE: "false"
+SKIP_DB_MIGRATIONS: "true"
+# No LLM calls: the gateway boot check requires LLM_KILL_SWITCH exactly "true" and Vertex off.
+LLM_KILL_SWITCH: "true"
+VERTEX_AI_ENABLED: "false"
+AGENPAS_PUBLIC_BASE_URL: "@@AGENPAZ_PUBLIC_URL@@"
+PIVOTA_API_BASE: "@@WEB_URL@@"
+AGENPAS_CONSENT_ENABLED: "true"
+AGENPAS_RAILS: "reap"
+AGENPAS_LEGAL_HOSTS: "pivota.cc,merchant.pivota.cc"
+# The Reap sandbox's hosted card page host, exactly as staging lists it. The A2A provider's dev
+# host that staging also lists is dropped: no A2A rail here.
+AGENPAS_HOSTED_HOSTS: "sandbox.collect.prava.space"
+# Off in v0: the page's address form posts to a backend write that is A2A-gated today. The page
+# then says "go back to the chat to add your address"; partners send the address in start_purchase.
+AGENPAS_COLLECT_SHIPPING: "0"
+
+# Live reads and store fetches: off (the boot check requires CATALOG_IMAGE_CACHE_JOB_RUNNER_ENABLED explicitly).
+UCP_LIVE_OFFER_READ: "0"
+UCP_LIVE_SEARCH_READ: "0"
+UCP_LIVE_PRODUCT_READ: "0"
+UCP_LIVE_PDP_READ: "0"
+GET_OFFERS_LIVE_CART: "0"
+CAFE24_CATALOG_SEARCH: "0"
+MERCHANT_VARIANT_SOURCING_ENABLED: "0"
+SERVE_LIVE_MERCHANT_PRICE: "0"
+PDP_IDENTITY_GRAPH_AUTO_ENABLE_LIVE: "0"
+CATALOG_IMAGE_CACHE_BOOTSTRAP_ENABLED: "false"
+CATALOG_IMAGE_CACHE_JOB_RUNNER_ENABLED: "false"
