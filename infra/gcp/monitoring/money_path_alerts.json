@@ -1,8 +1,8 @@
 {
   "_about": [
-    "Freshness alert DEFINITIONS (FIX_PLAN R-03, over the protocol directory). Data only: nothing in the repo applies this file on deploy.",
+    "Freshness alert DEFINITIONS (FIX_PLAN R-03, over the protocol directory), and the A2A buyer-contact purge's went-silent alert. Data only: nothing in the repo applies this file on deploy.",
     "Apply with ALERT_EMAIL=... infra/gcp/apply_money_path_alerts.sh prod|staging (ALERT_EMAIL is required for both); it creates or updates each log metric, then each policy, and never deletes anything. On staging it renames every \"prod:\" display name to \"staging:\" (as setup_monitoring.sh does), and on an update it keeps the policy's current `enabled` value, so a policy an operator disabled stays disabled.",
-    "Every metric filter keys on lines written by utils/money_alerts.py (or the check's own summary line) through the pivota logger, which Cloud Run stores as textPayload; tests/test_money_path_alerts.py and tests/test_freshness_directory_check.py evaluate each filter against lines the real producers emit.",
+    "Every metric filter keys on lines written by utils/money_alerts.py (or the check's own summary line) through the pivota logger, which Cloud Run stores as textPayload; tests/test_money_path_alerts.py, tests/test_freshness_directory_check.py and tests/test_a2a_rail_contact_purge.py evaluate each filter against lines the real producers emit.",
     "${CHANNEL} is replaced by the apply script with the email notification channel for ALERT_EMAIL (setup_monitoring.sh creates it)."
   ],
   "log_metrics": [
@@ -25,6 +25,11 @@
       "name": "freshness_directory_check_unavailable",
       "description": "R-03: one line per protocol-directory freshness check tick that could not read its population (the directory build failed or took over 15 s, a read failed, or a sweep lane was unreadable)",
       "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"freshness_directory_check_unavailable: {\""
+    },
+    {
+      "name": "a2a_rail_contact_purge_heartbeat",
+      "description": "One line per finished run of the A2A buyer-contact purge (jobs/a2a_rail_contact_purge, every 15 min on the worker); a disabled, failed or killed run writes none (input of the went-silent policy).",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"a2a_rail_contact_purge: {\""
     }
   ],
   "alert_policies": [
@@ -127,6 +132,31 @@
       ],
       "alertStrategy": {
         "autoClose": "10800s"
+      }
+    },
+    {
+      "displayName": "prod: A2A contact purge went silent",
+      "documentation": {
+        "content": "The A2A buyer-contact purge (jobs/a2a_rail_contact_purge, cron :03/:18/:33/:48 on the worker) printed its per-run summary in the last 24 hours and none for 50 minutes. The buyer terms promise the buyer's email and shipping address are deleted within 72 hours, so the create route already refuses every new A2A purchase while the purge's heartbeat (a2a_rail_contact_purge_heartbeat, migration 299) is over 50 minutes old: purchases go to Reap, or an explicit A2A choice is answered 404. Purchases already open keep their deadline: the purge threshold is 71 h. Check, in order: A2A_RAIL_CONTACT_PURGE_DISABLED on the worker (the kill switch: set means the stop is deliberate), /__scheduler_health (a2a_rail_contact_purge: paused, stalled, failing), SCHEDULER_JOB_ALLOWLIST (it must name a2a_rail_contact_purge), the worker's database. One forced run: POST /admin/scheduler/jobs/a2a_rail_contact_purge/run-now. A purge that never ran in the last 24 hours does not page here; it still closes A2A creates. Definitions: infra/gcp/monitoring/money_path_alerts.json.",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "summary line present in the last 24h, absent for 50m",
+          "conditionPrometheusQueryLanguage": {
+            "query": "(sum(sum_over_time(logging_googleapis_com:user_a2a_rail_contact_purge_heartbeat{monitored_resource=\"cloud_run_revision\"}[23h10m] offset 50m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_a2a_rail_contact_purge_heartbeat{monitored_resource=\"cloud_run_revision\"}[50m])) > 0)",
+            "duration": "300s",
+            "evaluationInterval": "60s",
+            "disableMetricValidation": true
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "3600s"
       }
     }
   ]

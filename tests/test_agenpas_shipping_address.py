@@ -85,7 +85,7 @@ CAPTURE_ENV = {
 }
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
            "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs",
-           "a2a_rail_worker_heartbeat")
+           "a2a_rail_worker_heartbeat", "a2a_rail_contact_purge_heartbeat")
 
 
 @pytest.fixture(autouse=True)
@@ -97,12 +97,14 @@ async def _db():
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         await ensure_required_schema_light()
         await a2a_ledger.record_worker_heartbeat()
+        await a2a_ledger.record_contact_purge_heartbeat()
         yield
         return
     await ensure_required_schema_light()
     for table in _TABLES:
         await database.execute(f"DELETE FROM {table}")
     await a2a_ledger.record_worker_heartbeat()
+    await a2a_ledger.record_contact_purge_heartbeat()
     try:
         yield
     finally:

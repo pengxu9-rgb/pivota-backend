@@ -8,7 +8,6 @@ minutes, with a deadline and run-now; and the schedule arithmetic keeps the 72 h
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 
@@ -32,7 +31,7 @@ _RAIL_ENV = ("A2A_RAIL_WORKER_ENABLED", "A2A_RAIL_ENABLED", "A2A_RAIL_BASE_URL",
 async def _db():
     if not database.is_connected:
         await database.connect()
-    for table in ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs"):
+    for table in ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "a2a_rail_contact_purge_heartbeat"):
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
     yield
@@ -111,14 +110,64 @@ async def test_a_backlog_is_bounded_per_run_and_finishes_over_runs(monkeypatch):
     assert await job.run_a2a_rail_contact_purge() == {"contact_purged": 0, "batches": 1}
 
 
-async def test_logs_counts_never_a_value(monkeypatch, caplog):
+async def test_every_finished_run_stamps_the_heartbeat_and_prints_counts_only():
+    """The real producer's line, under production's logging state, read off the pivota stdout handler."""
+    from pivota_log_capture import capture_pivota_stdout, pivota_lines, root_as_in_prod
+
     pid = await _opened(90)
-    with caplog.at_level(logging.DEBUG):
+    assert await ledger.contact_purge_is_alive() is False
+    with root_as_in_prod(), capture_pivota_stdout() as out:
         await job.run_a2a_rail_contact_purge()
-    text = caplog.text
-    assert "contact_purged" in text
+        await job.run_a2a_rail_contact_purge()  # an idle run is a heartbeat too
+    lines = [line for line in pivota_lines(out) if job.SUMMARY_PREFIX in line]
+    assert len(lines) == 2, pivota_lines(out)
+    assert lines[0].endswith('a2a_rail_contact_purge: {"batches":1,"contact_purged":1}')
+    assert lines[1].endswith('a2a_rail_contact_purge: {"batches":1,"contact_purged":0}')
     for secret in (EMAIL, STREET, pid):
-        assert secret not in text
+        assert all(secret not in line for line in pivota_lines(out))
+    assert await ledger.contact_purge_is_alive() is True
+    # the alert's metric filter, evaluated whole, counts exactly these lines
+    import json
+    from pathlib import Path
+    from test_reap_rail_alerts import matches
+
+    defs = json.loads((Path(__file__).resolve().parents[1] / "infra/gcp/monitoring/money_path_alerts.json").read_text())
+    beat = next(m["filter"] for m in defs["log_metrics"] if m["name"] == "a2a_rail_contact_purge_heartbeat")
+    entry = lambda line: {"resource.type": "cloud_run_revision", "resource.labels.service_name": "worker",  # noqa: E731
+                          "textPayload": line}
+    assert [matches(beat, entry(line)) for line in pivota_lines(out)].count(True) == 2
+
+
+async def test_a_disabled_or_failed_run_stamps_nothing_and_prints_nothing(monkeypatch):
+    from pivota_log_capture import capture_pivota_stdout, pivota_lines, root_as_in_prod
+
+    monkeypatch.setenv(job.DISABLED_ENV, "1")
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        assert await job.run_a2a_rail_contact_purge() == {"skipped": "disabled"}
+    monkeypatch.delenv(job.DISABLED_ENV)
+
+    async def broken(**_kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(ledger, "purge_stale_contact", broken)
+    with root_as_in_prod(), capture_pivota_stdout() as out2:
+        with pytest.raises(RuntimeError):
+            await job.run_a2a_rail_contact_purge()
+    assert not [l for l in pivota_lines(out) + pivota_lines(out2) if job.SUMMARY_PREFIX in l]
+    assert await ledger.contact_purge_is_alive() is False
+
+
+async def test_a_failed_heartbeat_write_prints_no_summary(monkeypatch):
+    from pivota_log_capture import capture_pivota_stdout, pivota_lines, root_as_in_prod
+
+    async def broken():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(ledger, "record_contact_purge_heartbeat", broken)
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        result = await job.run_a2a_rail_contact_purge()
+    assert result == {"contact_purged": 0, "batches": 1, "heartbeat": "failed"}
+    assert not [l for l in pivota_lines(out) if job.SUMMARY_PREFIX in l], "no stamp, no alert heartbeat"
 
 
 def test_the_schedule_keeps_the_72_hour_promise():

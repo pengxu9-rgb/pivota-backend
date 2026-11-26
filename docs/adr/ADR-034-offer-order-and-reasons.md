@@ -4,6 +4,28 @@
 
 **Decision owner:** Founder. **Runtime owners:** the backend's `offers.resolve` code owner and the agent gateway's `get_offers` code owner, to be named at acceptance. Both are needed: the backend cuts the offer list before the gateway sees it, and the gateway reads merchants live after that cut.
 
+## Amendment 1 (owner, 2026-11-26): offers found live are labelled, and only confirmed ones compete
+
+*Decided by the owner on 2026-11-26; this ADR stays Proposed. Where it conflicts with the text below, this amendment governs. Companions: ADR-029 Amendment 2, ADR-031 Amendment 1, ADR-032 Amendment 1, ADR-033 Amendment 1.*
+
+1. **The best-offer filter gains a condition.** An offer is never the best offer unless it is `comparable`: it is for the listing asked about, or it is matched to that listing at variant grain, either live (`confirmed`, ADR-032 Amendment 1) or by a stored match.
+2. **Rule 0 keeps its one meaning, the fit tier.** A live `confirmed` match takes the value `exact`. A live `likely` match takes the value `loose`. Nothing new is added to the order, so this ships as part of version 1.
+3. **Each offer carries its match.** The fields are:
+   - `match.status`: `confirmed` or `likely`;
+   - `match.basis`: which fields agreed, and the source of each;
+   - `match.grain`: variant or family;
+   - `found_via`: the lane and the time it answered;
+   - `comparable`: as item 1 defines it.
+
+   `rank_facts` carries the match as rule `match`.
+4. **The answer says what was asked.** It names the kinds of source that were asked (our catalog, a platform catalog, store doors) and whether each answered inside the budget. It never names a seller, and never one that was not admitted. It flags a product that no source returned.
+5. **Recorded for D3, the later product ranking.** For `get_alternatives`, the owner defines a dupe as a product of another brand that does the same job, at any price (owner, 2026-11-26). A same-brand product that does the same job is an alternative, not a dupe. The relationship graph's rule that a dupe costs no more than the product is removed when D3 is built.
+6. **ADR-033 is accepted** (owner, 2026-11-26), with its own Amendment 1. The "Related" entry and the admitted-sellers filter below are updated to say so.
+7. **Switch.** The match fields and the new filter condition ride the gateway switch this ADR already names for its reason fields. Serving live offers at all is gated by ADR-031's `LIVE_LANE_SERVE`.
+8. **Text below that this amendment overrides:**
+   - the best-offer filter, which gains item 1's condition;
+   - rule 0's row and the `match` value types: a live `confirmed` match takes the value `exact`, and a live `likely` match takes `loose` (item 2).
+
 ## Related
 
 - **ADR-002 (accepted):** every statement to an agent carries its evidence type and provenance. Today `get_offers` emits `evidence.grade: null`, `evidence.method: 'merchant_reported'` and `evidence.sources: []` on every offer.
@@ -21,7 +43,7 @@
   - a completable offer ranks above every click-out, even at a higher price;
   - among completable offers, ADR-027 Q6 orders them;
   - Phase C switches this on per market after the completion success rate is measured.
-- **ADR-033 (proposed):**
+- **ADR-033 (accepted 2026-11-26, with Amendment 1):**
   - only admitted sellers are offered;
   - the admission tier stays internal;
   - an agent is never told which seller was left out or why;
@@ -90,7 +112,7 @@ One order governs both the list and the best offer, for `get_offers`. From P2, `
 
 **Filters, before ordering:**
 
-- Only admitted sellers for the brand and the buyer's market, once ADR-033 is accepted and built.
+- Only admitted sellers for the brand and the buyer's market, once ADR-033 (accepted 2026-11-26) is built.
 - Only offers in the buyer market's currency (ADR-026, built).
   - In a market the registry marks domestic-only, only domestic offers (not built).
 - One retailer counts as one seller (ADR-026, not built), and its domestic storefront is preferred.
