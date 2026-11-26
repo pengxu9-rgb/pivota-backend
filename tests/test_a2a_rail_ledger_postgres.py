@@ -28,6 +28,7 @@ _MIGRATION_278 = _REPO / "db/migrations/278_a2a_rail_worker_heartbeat.sql"
 _MIGRATION_287 = _REPO / "db/migrations/287_a2a_rail_checkout_task_id.sql"
 _MIGRATION_288 = _REPO / "db/migrations/288_a2a_rail_ceiling_source.sql"
 _MIGRATION_290 = _REPO / "db/migrations/290_a2a_rail_checkout_lookups.sql"
+_MIGRATION_298 = _REPO / "db/migrations/298_a2a_rail_payment_card.sql"
 AGENT = "agent_a2a_pg"
 PAGE = "https://pay.rail.test/approve/1"
 
@@ -64,7 +65,8 @@ async def _db():
 async def _fingerprint(table):
     from db.database import database
 
-    columns = [tuple(r) for r in await database.fetch_all(
+    # The VALUES (a `databases` row iterates its column labels, so tuple(r) compared only the column count).
+    columns = [tuple(r._mapping.values()) for r in await database.fetch_all(
         "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default "
         "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :t "
         "ORDER BY column_name", {"t": table})]
@@ -92,7 +94,7 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
 
     for table in _TABLES:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
-    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288, _MIGRATION_290):
+    for migration in (_MIGRATION, _MIGRATION_287, _MIGRATION_288, _MIGRATION_290, _MIGRATION_298):
         for statement in split_statements(migration.read_text(encoding="utf-8")):
             await database.execute(statement)
     from_migration = [await _fingerprint(t) for t in _TABLES]
@@ -102,6 +104,11 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
     assert await database.fetch_one(
         "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
         "AND column_name = 'ceiling_source' AND data_type = 'character varying' AND character_maximum_length = 32")
+    for column, width in (("card_network", 32), ("card_last4", 4), ("card_method_id", 128)):
+        assert await database.fetch_one(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = 'a2a_rail_purchases' "
+            "AND column_name = :c AND data_type = 'character varying' AND character_maximum_length = :w",
+            {"c": column, "w": width}), column
     assert [name for name, _ in from_migration[0][2]] == [
         "ck_a2a_rail_purchases_action", "ck_a2a_rail_purchases_price",
         "ck_a2a_rail_purchases_quantity", "ck_a2a_rail_purchases_state"]
@@ -481,3 +488,19 @@ async def test_the_sweep_does_not_expire_a_row_requoted_while_it_waited():
     finally:
         await worker.close()
     assert (await ledger.get_purchase_internal(pid))["state"] == "quoting"
+
+
+async def test_the_payment_card_record_and_read_run_on_postgres():
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    pid = await _stale_awaiting_authorization()
+    await database.execute("UPDATE a2a_rail_purchases SET payment_method_id = 'pm_visa' WHERE id = :i", {"i": pid})
+    # Only in `quoting` (the token step): a row that has moved on takes nothing.
+    assert await ledger.record_payment_card_as_holder(pid, "w1", method_id="pm_visa", network="visa", last4="4444") is False
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'quoting' WHERE id = :i", {"i": pid})
+    assert await ledger.record_payment_card_as_holder(pid, "w1", method_id="pm_visa", network="visa", last4="4444") is True
+    assert await ledger.record_payment_card_as_holder(pid, "w2", method_id="pm_visa", network="visa", last4="4444") is False
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'awaiting_authorization' WHERE id = :i", {"i": pid})
+    assert await ledger.get_payment_card_for_owner(pid, AGENT, "r" * 64) == {"network": "visa", "last4": "4444"}
+    assert await ledger.get_payment_card_for_owner(pid, AGENT, "x" * 64) is None
