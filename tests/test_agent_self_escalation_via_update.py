@@ -84,6 +84,16 @@ class _UpdateSpy:
     async def fetch_val(self, *a, **kw):
         return self.stored_webhook_url
 
+    def transaction(self):
+        # The update runs in a transaction (the rename hide and the write land together).
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def _tx():
+            yield
+
+        return _tx()
+
     async def fetch_one(self, *a, **kw):
         return None
 
