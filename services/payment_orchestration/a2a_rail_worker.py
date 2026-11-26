@@ -530,6 +530,24 @@ def _card_choice_ready(row: Mapping[str, Any]) -> bool:
     return "card_options" in row and "card_confirmed_at" in row
 
 
+def _new_card_mode(row: Mapping[str, Any]) -> bool:
+    """The buyer asked for a new card from the card choice (migration 301) and none is confirmed yet: the binding waits
+    for THAT card (never another ACTIVE one), and it becomes the confirmed card once bound."""
+    return (
+        ledger.card_picker_active() and row.get("card_new_requested_at") is not None
+        and row.get("card_confirmed_at") is None
+    )
+
+
+async def _confirm_new_card(s: _Step) -> bool:
+    """Before a binding moves back to `quoting`: in new-card mode, take the bound card as the buyer's confirmed card.
+    False when that write lost its race (the step must not move the row)."""
+    if not _new_card_mode(s.row):
+        return True
+    method_id = str(s.row.get("payment_method_id") or "")
+    return bool(method_id) and await ledger.confirm_new_card_as_holder(s.id, s.worker, method_id=method_id) is not None
+
+
 def _needs_card_choice(row: Mapping[str, Any]) -> bool:
     """The token may not be asked for yet: the card choice runs (its dial and the consent gate) and the buyer has not
     confirmed the card. A row read WITHOUT the columns counts as unconfirmed: fail closed (`_await_card_choice` parks)."""
@@ -545,6 +563,12 @@ async def _await_card_choice(s: _Step) -> str:
         logger.error("a2a_rail_worker: card choice columns missing purchase=%s; parked", s.id)
         await s.release(POLL_PARKED, CARD_CHOICE_SCHEMA_INCOMPLETE)
         return "parked"
+    if s.row.get("card_new_requested_at") is not None:
+        # The buyer chose "Add a new card": leave the wait for the rail's card page (nothing is minted; the binding comes
+        # back to `quoting`, which locks the order again and asks for the token on the new card).
+        if not s.row.get("buyer_email"):
+            return await _token_failed(s, "quoting", "buyer_email_required")
+        return await _start_binding(s, from_state="quoting")
     methods, read = await s.methods()
     if methods is None:
         return await _read_failed(s, read, "cards_read")
@@ -735,10 +759,13 @@ async def _binding(s: _Step) -> str:
     method = _method(methods, s.row.get("payment_method_id"))
     status = str((method or {}).get("status") or "")
     if status == "ACTIVE":
+        if not await _confirm_new_card(s):
+            return "lost"
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting")
         return await _settled(s, moved, "method_ready")
-    other = _active_method(methods)
+    # The buyer asked for a NEW card: another ACTIVE one never stands in for it.
+    other = None if _new_card_mode(s.row) else _active_method(methods)
     if other:
         # The buyer has an ACTIVE card after all (bound through another purchase's page, say): use it.
         moved = await ledger.transition_as_holder(
@@ -765,6 +792,8 @@ async def _send_bound(s: _Step, count: int) -> str:
     result = await s.send(BOUND)
     card = result.card("payment.method-add-await-card") if result.ok else None
     if card is not None and card.data.get("status") == "ACTIVE":
+        if not await _confirm_new_card(s):
+            return "lost"
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", resolves_write=action)
         return await _settled(s, moved, "method_ready")
@@ -1183,7 +1212,7 @@ async def _reconcile(s: _Step) -> str:
     if (recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS) or (
         int(s.row.get("attempts") or 0) > MAX_OPENED_ATTEMPTS
     ):
-        if state not in ("opened", "needs_payment_method"):  # pragma: no cover - the only states binding writes come from
+        if state not in ("opened", "needs_payment_method", "quoting"):  # pragma: no cover - where binding writes come from
             await s.release(POLL_PARKED, "pending_write_unreconcilable")
             return "pending_write_unreconcilable"
         moved = await ledger.transition_as_holder(
@@ -1203,6 +1232,8 @@ async def _reconcile(s: _Step) -> str:
     elif state == "needs_payment_method":
         method = _method(methods, s.row.get("payment_method_id"))
         if (method or {}).get("status") == "ACTIVE":
+            if not await _confirm_new_card(s):
+                return "lost"
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", resolves_write=action)
             return await _settled(s, moved, "method_ready")

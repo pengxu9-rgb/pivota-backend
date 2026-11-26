@@ -97,7 +97,9 @@ TERMINAL_STATES: FrozenSet[str] = frozenset({"completed", "failed", "refused", "
 ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
     "opened": frozenset({"needs_payment_method", "quoting", "refused", "failed", "expired"}),
     "needs_payment_method": frozenset({"quoting", "expired", "failed"}),
-    "quoting": frozenset({"awaiting_authorization", "refused", "failed", "expired"}),
+    # -> needs_payment_method: the buyer picked "Add a new card" on the card choice (migration 301), only before any
+    # token (the transition refuses a row with one); the binding brings it back to `quoting`, which locks again.
+    "quoting": frozenset({"awaiting_authorization", "needs_payment_method", "refused", "failed", "expired"}),
     # NO -> quoting (re-quote) edge: nothing wrote it, and the AgenPas approval consent
     # (db/agent_purchase_consents, services/payment_orchestration/purchase_consent.approval_epoch) binds to the
     # purchase's one approval. Re-adding needs an approval epoch on agent_purchase_consents.
@@ -293,6 +295,11 @@ _HEAL_CARD_CHOICE_COLUMNS_PG = (
     " ADD COLUMN IF NOT EXISTS card_options TEXT,"
     " ADD COLUMN IF NOT EXISTS card_confirmed_at TIMESTAMPTZ"
 )
+# Migration 301: the buyer asked for a new card from the card choice (`request_new_card`). Nullable, no default; only
+# the new-card path reads it (a missing column reads as "not asked"; the write then fails, a 503).
+_HEAL_CARD_NEW_COLUMN_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases ADD COLUMN IF NOT EXISTS card_new_requested_at TIMESTAMPTZ"
+)
 #: (column, SQLite heal), in migration order.
 _HEALED_COLUMNS_SQLITE = (
     ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
@@ -303,12 +310,13 @@ _HEALED_COLUMNS_SQLITE = (
     ("card_method_id", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_method_id VARCHAR(128)"),
     ("card_options", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_options TEXT"),
     ("card_confirmed_at", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_confirmed_at TIMESTAMP"),
+    ("card_new_requested_at", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_new_requested_at TIMESTAMP"),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288, 290, 298, 299 and 300. Idempotent; called at every startup.
+    """Self-heal parity with migrations 268, 278, 287, 288, 290, 298, 299, 300 and 301. Idempotent; called at every startup.
     NOT 296 (a2a_rail_manual_resolution_audit): that table has no startup heal, on purpose (see its section)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
@@ -345,6 +353,12 @@ async def ensure_a2a_rail_schema() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("a2a_rail_ledger: card choice columns heal deferred to next boot error_type=%s",
                                type(exc).__name__)
+        for statement in guarded_add_columns(_HEAL_CARD_NEW_COLUMN_PG + ";"):
+            try:
+                await database.execute(statement)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("a2a_rail_ledger: card new column heal deferred to next boot error_type=%s",
+                               type(exc).__name__)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
@@ -362,7 +376,8 @@ async def ensure_a2a_rail_schema() -> None:
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
 
 _TS_COLUMNS = (
-    "contact_purged_at", "consented_at", "card_confirmed_at", "buyer_action_expires_at", "pending_write_at",
+    "contact_purged_at", "consented_at", "card_confirmed_at", "card_new_requested_at", "buyer_action_expires_at",
+    "pending_write_at",
     "next_poll_at", "claimed_at",
     "created_at", "updated_at", "state_entered_at", "terminal_at",
 )
@@ -655,6 +670,7 @@ _TRANSITION_SQL = """
        AND claimed_by = :holder
        AND (pending_write IS NULL OR pending_write = :resolves_write)
        AND (:to_state_probe <> 'quoting' OR (payment_token_id IS NULL AND contact_purged_at IS NULL))
+       AND (:to_state_probe <> 'needs_payment_method' OR payment_token_id IS NULL)
     RETURNING *
 """
 # SQLite must not see CAST(... AS TIMESTAMPTZ): an unknown type name gets NUMERIC affinity and stores
@@ -1080,23 +1096,17 @@ async def end_card_choice_wait_as_holder(purchase_id: str, worker_id: str) -> Op
     return _purchase(await database.fetch_one(_END_CARD_CHOICE_WAIT_SQL_SQLITE, values))
 
 
-_SELECT_CARD_CHOICE_FOR_OWNER_SQL = """
-    SELECT state, payment_method_id, payment_token_id, pending_write, contact_purged_at, card_options,
-           card_confirmed_at, buyer_action_expires_at
-      FROM a2a_rail_purchases
-     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
-"""
-
-
 async def get_card_choice_for_owner(
     purchase_id: str, agent_id: str, agent_user_ref_hash: str
 ) -> Optional[Dict[str, Any]]:
     """The choice this owner's purchase offers, or None (not the owner's, not waiting on a card, none recorded):
-    `{"options": [...], "options_text": <the stored text>, "selected": <rail id>, "confirmed": bool, "expires_at"}`.
+    `{"options": [...], "options_text": <the stored text>, "selected": <rail id>, "confirmed": bool, "expires_at",
+    "new_card": bool}` (`new_card`: the buyer asked to add a new card, migration 301).
     A row past its token (or its deadline) offers nothing. Writes nothing, calls no rail."""
     if not _ID_RE.match(str(purchase_id or "")):
         return None
-    row = await database.fetch_one(_SELECT_CARD_CHOICE_FOR_OWNER_SQL, {
+    # The whole row (owner-scoped): a column a deferred heal has not added yet (301) reads as None, never a failed read.
+    row = await database.fetch_one(_SELECT_PURCHASE_FOR_OWNER_SQL, {
         "id": purchase_id, "agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash})
     if row is None:
         return None
@@ -1112,7 +1122,64 @@ async def get_card_choice_for_owner(
     if not confirmed and isinstance(expires_at, datetime) and expires_at <= datetime.now(timezone.utc):
         return None
     return {"options": options, "options_text": row["card_options"], "selected": selected,
-            "confirmed": confirmed, "expires_at": expires_at}
+            "confirmed": confirmed, "expires_at": expires_at,
+            "new_card": row.get("card_new_requested_at") is not None}
+
+
+# THE BUYER ASKS FOR A NEW CARD instead of a saved one (migration 301): the same conditions as the confirmation (waiting,
+# unheld, no token, no pending write, not purged, not confirmed, the deadline not passed, a card list offered), recorded
+# once (a repeat keeps the first time). The row is due at once: the worker then leaves the wait for the card page.
+_REQUEST_NEW_CARD_SQL = """
+    UPDATE a2a_rail_purchases
+       SET card_new_requested_at = COALESCE(card_new_requested_at, clock_timestamp()),
+           last_error_code = CASE WHEN last_error_code = 'card_choice_required' THEN NULL ELSE last_error_code END,
+           next_poll_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+       AND state = 'quoting' AND pending_write IS NULL AND payment_token_id IS NULL
+       AND contact_purged_at IS NULL AND card_confirmed_at IS NULL AND claimed_by IS NULL
+       AND card_options IS NOT NULL
+       AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
+    RETURNING *
+"""
+_REQUEST_NEW_CARD_SQL_SQLITE = _REQUEST_NEW_CARD_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def request_new_card(purchase_id: str, agent_id: str, agent_user_ref_hash: str) -> Optional[Dict[str, Any]]:
+    """Record that the buyer asked for a new card (the SQL above). None when the row is not this owner's or no longer
+    waits: the caller re-reads to tell a repeat from a refusal."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    values = {"id": purchase_id, "agent_id": str(agent_id or "").strip(),
+              "agent_user_ref_hash": str(agent_user_ref_hash or "").strip()}
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_REQUEST_NEW_CARD_SQL, values))
+    return _purchase(await database.fetch_one(_REQUEST_NEW_CARD_SQL_SQLITE, values))
+
+
+# THE NEW CARD IS THE BUYER'S CONFIRMED CARD once it is bound: they chose "Add card and approve". On the held
+# `needs_payment_method` row that asked for it, before it moves back to `quoting` (so a crash in between leaves a
+# confirmed row the next tick moves on, never an unconfirmed one that would ask for another card).
+_CONFIRM_NEW_CARD_SQL = """
+    UPDATE a2a_rail_purchases
+       SET card_confirmed_at = clock_timestamp(), updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'needs_payment_method' AND payment_method_id = :method_id
+       AND card_new_requested_at IS NOT NULL AND card_confirmed_at IS NULL AND payment_token_id IS NULL
+    RETURNING *
+"""
+_CONFIRM_NEW_CARD_SQL_SQLITE = _CONFIRM_NEW_CARD_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def confirm_new_card_as_holder(purchase_id: str, worker_id: str, *, method_id: str) -> Optional[Dict[str, Any]]:
+    """Take the newly bound card as the confirmed one (the SQL above). None when the row is not held, not binding the
+    card it names, did not ask for a new card, or is confirmed already."""
+    values = {"id": _require(_ID_RE, purchase_id, "purchase_id"), "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+              "method_id": _rail_ref(method_id, "method_id")}
+    if values["method_id"] is None:
+        raise ValueError("method_id is required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_CONFIRM_NEW_CARD_SQL, values))
+    return _purchase(await database.fetch_one(_CONFIRM_NEW_CARD_SQL_SQLITE, values))
 
 
 async def confirm_card_choice(

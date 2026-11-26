@@ -458,7 +458,15 @@ like the shipping-address write.
 - **Consent first**, before the body is read: the buyer must have accepted the approval step's terms on the AgenPas
   page (a consent row for (a2a, rail purchase, `approval`, its epoch), the same read and rule as the views' gate).
   None: 409 `consent_required`. A failed consent read: 503 (fail closed).
-- Body, exactly `{"handle": "<24 hex>"}`, at most 256 bytes: a handle from the read's `card_choice.cards`.
+- Body, exactly `{"handle": "<24 hex>"}`, at most 256 bytes: a handle from the read's `card_choice.cards`. Or
+  exactly `{"new_card": true}`: the buyer chose "Add a new card" (migration 301 `card_new_requested_at`, the same
+  conditions as a confirmation). The worker then leaves the wait for the rail's card page (`quoting` ->
+  `needs_payment_method`, only before any token; the transition refuses a row with one), binds THAT card (another
+  ACTIVE card never stands in for it), takes it as the confirmed card before moving back to `quoting` (the buyer
+  chose "Add card and approve"), locks the order again and asks for the token on it. The card page has its own
+  terms (`card_binding`) and deadline; a card that fails to bind ends the purchase as before. The read's
+  `card_choice.new_card` is true once asked. A repeat is a 200; a saved card after it, or a new card after a saved
+  one was confirmed, is 409 `card_choice_closed`.
 - A compare-and-swap (`db/a2a_rail_ledger.confirm_card_choice`) on exactly the cards the write read just before
   it (a handle is fixed for its purchase, so a handle the page showed still names the same card), only while
   the purchase waits (`quoting`, no token, no pending write, not purged, not confirmed, the deadline not passed) and
