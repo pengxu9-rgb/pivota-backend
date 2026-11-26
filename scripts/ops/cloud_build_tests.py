@@ -74,6 +74,25 @@ def _literal_env(env: Optional[dict], where: str, provided: set) -> Dict[str, st
 
 
 _PIP_INSTALL = "python -m pip install --upgrade pip\npip install -r requirements.txt -r requirements-dev.txt\n"
+#: postgres-dialect-gate.yml's PG15-client step, as it was when the runner decided not to run it.
+_PG_CLIENT_INSTALL = (
+    'set -euo pipefail\n'
+    'pkg="postgresql-client-${PG_CLIENT_MAJOR}"\n'
+    'candidate() { apt-cache policy "$pkg" 2>/dev/null | awk \'/Candidate:/ {print $2}\'; }\n'
+    'if [[ "$(candidate)" == "" || "$(candidate)" == "(none)" ]]; then\n'
+    '  sudo apt-get update -q\n'
+    'fi\n'
+    'if [[ "$(candidate)" == "" || "$(candidate)" == "(none)" ]]; then\n'
+    '  # apt.postgresql.org, via the script postgresql-common ships for exactly this.\n'
+    '  sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y\n'
+    'fi\n'
+    'sudo apt-get install -y -q --no-install-recommends "$pkg"\n'
+    'bin="/usr/lib/postgresql/${PG_CLIENT_MAJOR}/bin"\n'
+    'got="$("$bin/pg_dump" --version)"\n'
+    'echo "$got"\n'
+    '[[ "$got" == "pg_dump (PostgreSQL) ${PG_CLIENT_MAJOR}."* ]] || { echo "::error::$bin/pg_dump is not ${PG_CLIENT_MAJOR}.x"; exit 1; }\n'
+    'test -x "$bin/psql"\n'
+)
 
 #: EVERY `run:` step of the four CI jobs this runner stands in for. RUNS: executed here, by the
 #: selector the build config passes to `step` (a step `id`, or a prefix of its `name`), with the
@@ -95,7 +114,12 @@ RUNS: Dict[tuple, Dict[str, Optional[str]]] = {
 NOT_RUN: Dict[tuple, Dict[str, tuple]] = {
     (SWEEP_WF, "sweep-shard"): {"Install dependencies": ("the build's deps step installs exactly this", _PIP_INSTALL)},
     (SWEEP_WF, "sweep"): {"Run Shopify Web Pixel mapper contract": ("a node test; not covered here", None)},
-    (GATE_WF, "shard"): {"Install deps": ("the build's deps step installs exactly this", _PIP_INSTALL)},
+    (GATE_WF, "shard"): {
+        "Install deps": ("the build's deps step installs exactly this", _PIP_INSTALL),
+        "Install pg_dump/psql of the service": (
+            "the build's postgres step installs postgresql-15 from the PostgreSQL apt repository, and its "
+            "postgresql-client-15 dependency is this step's /usr/lib/postgresql/15/bin", _PG_CLIENT_INSTALL),
+    },
     (GATE_WF, "postgres-dialect-gate"): {},
 }
 _STEP_KEYS = {"name", "id", "run", "env", "shell", "if"}
