@@ -53,9 +53,7 @@ INVENTORY = {
     ('config/settings.py', 'employee.pivota.cc'): (DISPLAY, 'a link, label or text handed to a person or a client, never fetched by the server'),
     ('config/settings.py', 'gateway.pivota.cc'): (GUARD_REQUIRED, 'PIVOTA_AGENT_INTERNAL_URL and OUTBOUND_WARM_HANDOFF_RESOLVE_URL defaults; the guard requires both settings'),
     ('config/settings.py', 'merchant.pivota.cc'): (DISPLAY, 'a link, label or text handed to a person or a client, never fetched by the server'),
-    ('config/settings.py', 'pivota-backend-production.up.railway.app'): (GUARD_RESOLVED, 'LEGACY_PUBLIC_API_HOSTS: the resolver skips these, the guard refuses Railway hosts'),
     ('config/settings.py', 'pivota.ai'): (DISPLAY, 'a sender/support address or link in an email; the guard refuses every email-provider key'),
-    ('config/settings.py', 'web-production-fedb.up.railway.app'): (GUARD_RESOLVED, 'LEGACY_PUBLIC_API_HOSTS: the resolver skips these, the guard refuses Railway hosts'),
     ('jobs/enrichment_cart_variant_proof.py', 'pivota.cc'): (BEHIND_REFUSED_FLAG, "our crawler's User-Agent text; every crawl/live-read/fetch flag is refused ON"),
     ('jobs/scheduled_audit_job.py', 'merchant.pivota.cc'): (DISPLAY, 'a link, label or text handed to a person or a client, never fetched by the server'),
     ('middleware/cors.py', 'admin.pivota.cc'): (DISPLAY, 'a browser origin allowed by CORS, never fetched'),
@@ -128,6 +126,14 @@ INVENTORY = {
     ('services/verifiers/frontend_agent_cite.py', 'pivota.cc'): (DISPLAY, 'a link, label or text handed to a person or a client, never fetched by the server'),
     ('utils/error_codes.py', 'api.pivota.cc'): (DISPLAY, 'a link, label or text handed to a person or a client, never fetched by the server'),
 }
+
+# The two legacy backend hosts are named only in config/settings.py (tests/test_legacy_backend_url_guard.py
+# keeps them out of every other file), so their entries are built from that list, not spelled here.
+from config.settings import LEGACY_PUBLIC_API_HOSTS as _LEGACY_HOSTS  # noqa: E402
+
+for _host in _LEGACY_HOSTS:
+    INVENTORY[("config/settings.py", _host)] = (
+        GUARD_RESOLVED, "LEGACY_PUBLIC_API_HOSTS: the resolver skips these, the guard refuses Railway hosts")
 
 _ZONES = r"(?:pivota\.cc|pivota\.ai|agenpaz\.com|agenpas\.com|reap\.global|run\.app|railway\.app|railway\.internal|rlwy\.net)"
 _HOST_RE = re.compile(r"(?<![a-z0-9.-])((?:[a-z0-9-]+\.)*" + _ZONES + r")(?![a-z0-9-])", re.IGNORECASE)
