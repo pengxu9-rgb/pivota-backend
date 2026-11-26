@@ -86,6 +86,7 @@ _RUNNABLE_JOB_IDS = frozenset(
         # that arming worked would be a log line up to 30s later.
         "agent_purchase_events",   # idempotent: detection is unique per state, hand-over is claimed
         "a2a_rail_purchase_poll",  # idempotent: every step is claimed and every write is write-ahead
+        "a2a_rail_contact_purge",  # idempotent: NULLs contact on rows past the age, nothing else
         "reap_agentic_purchase_poll",
     }
 )

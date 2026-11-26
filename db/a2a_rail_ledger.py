@@ -1396,8 +1396,9 @@ async def expire_overdue_purchases(
 # them, and the expiry sweep ends every pre-pay row within MAX_LIFETIME_SECONDS_DEFAULT; this purge is
 # the BACKSTOP for what neither reaches (a long `paying`, a row parked on a money result, which the sweep
 # never ends), in any state, without moving the state: such a row keeps its contact for up to
-# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick, so with the worker
-# switched off nothing purges; no purchase advances then either. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
+# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick AND, on its own
+# clock with no dependency on the rail's dials, in jobs/a2a_rail_contact_purge (71 h, every 15 min, behind
+# A2A_RAIL_CONTACT_PURGE_ENABLED): with the worker's dial off, that job still purges. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
