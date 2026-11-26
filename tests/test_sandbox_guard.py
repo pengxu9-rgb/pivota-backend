@@ -362,6 +362,11 @@ def test_the_flags_the_profile_turns_on_are_allowed_and_any_flag_may_be_off():
     ({"REDIS_CLUSTER_NODES": "cache-a"}, "REDIS_CLUSTER_NODES", "no Redis"),
     ({"REDIS_URL": "redis://cache.example.com:6379"}, "REDIS_URL", "no Redis"),
     ({"SOME_NEW_FEATURE_ENABLED": "1"}, "SOME_NEW_FEATURE_ENABLED", "not reviewed for the sandbox"),
+    ({"GOOGLE_GENAI_USE_VERTEXAI": "true"}, "GOOGLE_GENAI_USE_VERTEXAI", "model-provider dial"),
+    # An escaped URL is refused even when it names an allowed host (it hides from every other check).
+    ({"FEATURE_TARGET": "https:\\/\\/sandbox.mcp.pivota.cc\\/x"}, "FEATURE_TARGET", "escaped or percent-encoded"),
+    # A scheme-relative URL to a single-label host: no TLD shape for the bare-host rule to see.
+    ({"FEATURE_TARGET": "//evil:8080/x"}, "FEATURE_TARGET", "not on the sandbox's allowlist"),
     ({"SOME_SERVICE_URL": "http://evil.example\\@sandbox.mcp.pivota.cc/x"}, "SOME_SERVICE_URL", "credentials or an unusual authority"),
 ])
 def test_the_positive_rule_itself_refuses(changes, setting, rule):

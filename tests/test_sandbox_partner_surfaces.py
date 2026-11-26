@@ -196,6 +196,12 @@ def no_outbound(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_sandbox_has_no_aurora_exchange(monkeypatch, no_outbound):
+    import routes.accounts_orders_api as accounts
+
+    async def no_db():
+        raise AssertionError("the route reached the database before refusing")
+
+    monkeypatch.setattr(accounts, "_ensure_database_connected", no_db)
     monkeypatch.setenv("PIVOTA_ENV", "sandbox")
     transport = httpx.ASGITransport(app=main.app)
     async with _TestClient(transport=transport, base_url="http://test") as client:
