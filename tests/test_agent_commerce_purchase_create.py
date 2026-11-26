@@ -1244,7 +1244,7 @@ class _RunConditionReads:
     """Stand-ins for the two record reads (the readers' own suites own what they read), recording
     every call. `fact` and `clear` are the answers."""
 
-    def __init__(self, monkeypatch, *, fact: bool = True, clear: bool = True):
+    def __init__(self, monkeypatch, *, fact: Optional[bool] = True, clear: Optional[bool] = True):
         import db.merchant_agent_checkout_facts as checkout_facts
         import db.partner_agent_merchant_blocks as agent_blocks
 
@@ -1258,16 +1258,19 @@ class _RunConditionReads:
             self.calls.append(("clear", rail, domain))
             return self.clear
 
-        monkeypatch.setattr(checkout_facts, "meets_run_condition", _fact)
-        monkeypatch.setattr(agent_blocks, "is_clear", _clear)
+        monkeypatch.setattr(checkout_facts, "run_condition_answer", _fact)
+        monkeypatch.setattr(agent_blocks, "clear_answer", _clear)
 
 
-@pytest.mark.parametrize("unmet", ["no_fact", "open_block"])
+@pytest.mark.parametrize("unmet", ["no_fact", "open_block", "fact_unreadable", "block_unreadable"])
 async def test_without_a_choice_a_merchant_failing_the_run_condition_goes_to_reap(client, stubs, monkeypatch, unmet):
     """A drop, not a refusal: the record is per rail, so the other partner may still take it (and applies
-    its own filter there). The decision names the reason and the rule set that had it."""
+    its own filter there). The decision names the reason and the rule set that had it. A record that cannot
+    be read is a drop at the door too: only the worker's relay waits one out."""
     monkeypatch.setenv(rail_router.PARTNER_AGENT_RUN_CONDITION_RAILS_ENV, "a2a")
-    reads = _RunConditionReads(monkeypatch, fact=unmet != "no_fact", clear=unmet != "open_block")
+    reads = _RunConditionReads(
+        monkeypatch, fact={"no_fact": False, "fact_unreadable": None}.get(unmet, True),
+        clear={"open_block": False, "block_unreadable": None}.get(unmet, True))
     resp = await client.post(BASE, body())
     assert resp.json() == {"handled_by": "reap"}
     assert stubs.reap_routing == [{
