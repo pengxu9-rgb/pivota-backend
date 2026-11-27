@@ -1169,17 +1169,6 @@
    "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c8be3bbe966093a9",
-   "file": "routes/agent_commerce_reap.py",
-   "scope": "<module>",
-   "kind": "c",
-   "shape": "map",
-   "literal": "market->currency AU=AUD,CA=CAD,GB=GBP,HK=HKD,JP=JPY,NZ=NZD,SG=SGD,US=USD",
-   "expr": "market->currency AU=AUD,CA=CAD,GB=GBP,HK=HKD,JP=JPY,NZ=NZD,SG=SGD,US=USD",
-   "occurrence": 0,
-   "origin": "2026-11-12"
-  },
-  {
    "fingerprint": "d52fc163c1f31cfb",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",

@@ -70,8 +70,11 @@ address, the buyer page and the pending write, and clears the claim, in the same
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -281,6 +284,15 @@ _HEAL_CARD_COLUMNS_PG = (
     " ADD COLUMN IF NOT EXISTS card_last4 VARCHAR(4),"
     " ADD COLUMN IF NOT EXISTS card_method_id VARCHAR(128)"
 )
+# Migration 300: the buyer's card choice before the token (`park_for_card_choice_as_holder`,
+# `confirm_card_choice`): the ACTIVE cards the buyer may pick from, and when they confirmed one. Nullable, no
+# default; only the card-choice wait reads them (dark: AGENPAS_CARD_PICKER_ENABLED). One guarded ALTER on Postgres,
+# so the two land together or not at all; SQLite one each.
+_HEAL_CARD_CHOICE_COLUMNS_PG = (
+    "ALTER TABLE IF EXISTS a2a_rail_purchases"
+    " ADD COLUMN IF NOT EXISTS card_options TEXT,"
+    " ADD COLUMN IF NOT EXISTS card_confirmed_at TIMESTAMPTZ"
+)
 #: (column, SQLite heal), in migration order.
 _HEALED_COLUMNS_SQLITE = (
     ("checkout_task_id", _ADD_CHECKOUT_TASK_ID_SQLITE),
@@ -289,12 +301,14 @@ _HEALED_COLUMNS_SQLITE = (
     ("card_network", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_network VARCHAR(32)"),
     ("card_last4", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_last4 VARCHAR(4)"),
     ("card_method_id", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_method_id VARCHAR(128)"),
+    ("card_options", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_options TEXT"),
+    ("card_confirmed_at", "ALTER TABLE a2a_rail_purchases ADD COLUMN card_confirmed_at TIMESTAMP"),
 )
 _SQLITE_PURCHASE_COLUMNS = "SELECT name FROM pragma_table_info('a2a_rail_purchases')"
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migrations 268, 278, 287, 288, 290, 298 and 299. Idempotent; called at every startup.
+    """Self-heal parity with migrations 268, 278, 287, 288, 290, 298, 299 and 300. Idempotent; called at every startup.
     NOT 296 (a2a_rail_manual_resolution_audit): that table has no startup heal, on purpose (see its section)."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
@@ -323,6 +337,14 @@ async def ensure_a2a_rail_schema() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("a2a_rail_ledger: card columns heal deferred to next boot error_type=%s",
                                type(exc).__name__)
+        # The card-choice columns, the same way: only the dark card-choice wait needs them. The worker never waits
+        # on a row read without them (`a2a_rail_worker._card_choice_ready`), so a deferred heal mints as before.
+        for statement in guarded_add_columns(_HEAL_CARD_CHOICE_COLUMNS_PG + ";"):
+            try:
+                await database.execute(statement)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("a2a_rail_ledger: card choice columns heal deferred to next boot error_type=%s",
+                               type(exc).__name__)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
@@ -340,7 +362,8 @@ async def ensure_a2a_rail_schema() -> None:
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
 
 _TS_COLUMNS = (
-    "contact_purged_at", "consented_at", "buyer_action_expires_at", "pending_write_at", "next_poll_at", "claimed_at",
+    "contact_purged_at", "consented_at", "card_confirmed_at", "buyer_action_expires_at", "pending_write_at",
+    "next_poll_at", "claimed_at",
     "created_at", "updated_at", "state_entered_at", "terminal_at",
 )
 
@@ -860,6 +883,258 @@ async def get_payment_card_for_owner(
         return None
     network = str(row.get("card_network") or "")
     return {"network": network if _CARD_NETWORK_RE.match(network) else None, "last4": last4}
+
+
+# ── the buyer's card choice before the token (migration 300) ─────────────────────────────────
+#
+# With AGENPAS_CARD_PICKER_ENABLED on, the worker locks the order, then WAITS in `quoting` until the buyer confirms a
+# card on the AgenPas page; only then does it ask the rail for the token. A token is bound to the card it was asked for
+# on (the purchase never swaps it for another card; only an ended purchase's orphan token is voided), so the card is
+# chosen before the token is asked for, or not at all. The worker writes the buyer's ACTIVE cards (`card_options`) as the
+# row starts waiting; the page reads them (`get_card_choice_for_owner`, no rail call) and the buyer's confirmation is a
+# compare-and-swap on exactly the list the write read just before it (`confirm_card_choice`): a card's handle is fixed
+# for its purchase, so a handle the page showed still names the same card, and a card the worker dropped since is no
+# longer offered. Display attributes and opaque rail ids only.
+
+#: The dial. Read per call, on BOTH web (the page's read and write) and the worker (the wait). It counts only while the
+#: consent gate (purchase_consent.GATE_ENV) is on too, in the same process: the card is the buyer's approval step, so it
+#: is taken only after the buyer accepted the terms on our page (`card_picker_active`). Turn it on on `web` FIRST, then
+#: the worker (web alone shows nothing: no row has options until the worker waits); off: the worker FIRST, then `web` (a
+#: waiting row then mints on the card it names). Worker on with web off strands rows until they expire. And only while
+#: every A2A purchase's buyer is on the AgenPas page (the gateway's AGENPAS_CARD_PICKER_ENABLED): an agent sees only
+#: `locking` while a purchase waits, so a buyer who is not on the page is never asked and the purchase expires.
+CARD_PICKER_ENABLED_ENV = "AGENPAS_CARD_PICKER_ENABLED"
+#: The park code while the buyer has not confirmed.
+CARD_CHOICE_REQUIRED = "card_choice_required"
+#: The most cards one choice offers, newest first.
+CARD_OPTIONS_MAX = 10
+_CARD_ADDED_AT_RE = re.compile(r"^[0-9T:.+\-Z ]{1,40}\Z")
+_CARD_HANDLE_RE = re.compile(r"^[0-9a-f]{24}\Z")
+_TRUTHY = frozenset({"1", "true", "on", "yes"})
+
+
+def card_picker_enabled() -> bool:
+    """The dial alone. Callers ask `card_picker_active`, which also needs the consent gate."""
+    return (os.getenv(CARD_PICKER_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+def card_picker_active() -> bool:
+    """The card choice runs: its dial AND the consent gate are on (in this process)."""
+    from services.payment_orchestration import purchase_consent
+
+    return card_picker_enabled() and purchase_consent.gate_on()
+
+
+def card_handle(purchase_id: str, method_id: str, key: str) -> str:
+    """The page's name for one of this purchase's cards: an HMAC under a server key (the internal read's key), so it
+    can be neither reversed to the rail's card id (short, guessable ids included) nor computed by the page; different
+    per purchase, so a handle names nothing outside the purchase it was shown for. A rotated key changes every handle:
+    a page then re-reads (`card_choice_stale`)."""
+    if not key:
+        raise ValueError("a card handle needs a key")
+    message = f"a2a-card:{purchase_id}:{method_id}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()[:24]
+
+
+def is_card_handle(value: Any) -> bool:
+    return isinstance(value, str) and bool(_CARD_HANDLE_RE.match(value))
+
+
+def _card_option(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """One card as the choice keeps it. The id must be a rail id (never a card number: `_rail_ref` refuses one); the
+    network, last four and date are kept only in their display shapes, else None."""
+    method_id = _rail_ref(raw.get("id"), "card option id")
+    if method_id is None:
+        raise ValueError("card option id is required")
+    network, last4, added = raw.get("network"), raw.get("last4"), raw.get("added_at")
+    return {
+        "id": method_id,
+        "network": network if isinstance(network, str) and _CARD_NETWORK_RE.match(network) else None,
+        "last4": last4 if isinstance(last4, str) and _CARD_LAST4_RE.match(last4) else None,
+        "added_at": added if isinstance(added, str) and _CARD_ADDED_AT_RE.match(added) else None,
+    }
+
+
+def card_options_text(options: Iterable[Mapping[str, Any]]) -> str:
+    """The canonical text the row keeps (and the compare-and-swap compares): 1..CARD_OPTIONS_MAX cards, ids unique."""
+    cleaned = [_card_option(o) for o in options]
+    if not 1 <= len(cleaned) <= CARD_OPTIONS_MAX:
+        raise ValueError("card options must name 1..10 cards")
+    if len({o["id"] for o in cleaned}) != len(cleaned):
+        raise ValueError("card option ids must be unique")
+    return json.dumps(cleaned, sort_keys=True, separators=(",", ":"))
+
+
+def decode_card_options(text: Any) -> Optional[List[Dict[str, Any]]]:
+    """The cards a row offers, or None (none recorded, or a value this code would not have written)."""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        raw = json.loads(text)
+        if not isinstance(raw, list) or not all(isinstance(o, dict) for o in raw):
+            return None
+        options = [_card_option(o) for o in raw]
+    except (ValueError, TypeError):
+        return None
+    return options if 1 <= len(options) <= CARD_OPTIONS_MAX else None
+
+
+# Park the held row for the buyer's choice: the cards written, the card the row names set to the default (both only
+# while unconfirmed), the deadline set once (never moved later), the claim given back in the same statement. When the
+# buyer confirmed meanwhile (the write below landed while the worker read the rail), nothing of theirs is touched and the
+# row is due at once.
+_PARK_FOR_CARD_CHOICE_SQL = """
+    UPDATE a2a_rail_purchases
+       SET card_options = CASE WHEN card_confirmed_at IS NULL THEN :card_options ELSE card_options END,
+           payment_method_id = CASE WHEN card_confirmed_at IS NULL THEN :default_method_id ELSE payment_method_id END,
+           buyer_action_expires_at = CASE WHEN card_confirmed_at IS NULL
+                THEN COALESCE(buyer_action_expires_at, CAST(:expires_at AS TIMESTAMPTZ)) ELSE buyer_action_expires_at END,
+           last_error_code = CASE WHEN card_confirmed_at IS NULL THEN 'card_choice_required' ELSE NULL END,
+           next_poll_at = CASE WHEN card_confirmed_at IS NULL
+                THEN CAST(:next_poll_at AS TIMESTAMPTZ) ELSE clock_timestamp() END,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'quoting' AND pending_write IS NULL
+       AND payment_token_id IS NULL
+    RETURNING *
+"""
+_PARK_FOR_CARD_CHOICE_SQL_SQLITE = (
+    _PARK_FOR_CARD_CHOICE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+    .replace("CAST(:expires_at AS TIMESTAMPTZ)", ":expires_at")
+    .replace("CAST(:next_poll_at AS TIMESTAMPTZ)", ":next_poll_at")
+)
+
+
+async def park_for_card_choice_as_holder(
+    purchase_id: str, worker_id: str, *, options: Iterable[Mapping[str, Any]], default_method_id: str,
+    expires_at: Any, next_poll_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Park a held `quoting` row (order locked, no token, no pending write) until the buyer confirms a card: see the SQL
+    above. `default_method_id` must be one of `options`. None when the row is not held, not in that state, or has a
+    pending write or a token."""
+    text = card_options_text(options)
+    default = _rail_ref(default_method_id, "default_method_id")
+    if default is None or default not in {o["id"] for o in json.loads(text)}:
+        raise ValueError("default_method_id must be one of the options")
+    values = {
+        "id": _require(_ID_RE, purchase_id, "purchase_id"),
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "card_options": text,
+        "default_method_id": default,
+        "expires_at": _bind_dt(expires_at),
+        "next_poll_at": _bind_dt(next_poll_at),
+    }
+    if values["expires_at"] is None or values["next_poll_at"] is None:
+        raise ValueError("expires_at and next_poll_at are required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_PARK_FOR_CARD_CHOICE_SQL, values))
+    return _purchase(await database.fetch_one(_PARK_FOR_CARD_CHOICE_SQL_SQLITE, values))
+
+
+# THE BUYER'S CONFIRMATION, a compare-and-swap. Owner-scoped like every agent read. The caller checked the buyer's
+# consent to the approval step first (routes/agent_internal_commerce_purchases: the card is part of what they approve). Only while the row waits (`quoting`,
+# no token, no pending write, never purged, not confirmed yet, the deadline not passed), only while NO worker holds it
+# (a held row may be on its way to the token on the card it names: a worker whose dial is off mints without waiting, so
+# a card changed under it would be a token on a card the buyer did not pick, which the rail cannot void), and only on
+# EXACTLY the cards the caller read just before (`card_options` as read): a list the worker rewrote since is a refusal,
+# and the page re-reads. Sets the card, records the confirmation, clears the deadline (the row now waits on nobody) and makes the row
+# due at once.
+_CONFIRM_CARD_CHOICE_SQL = """
+    UPDATE a2a_rail_purchases
+       SET payment_method_id = :method_id,
+           card_confirmed_at = clock_timestamp(),
+           buyer_action_expires_at = CASE WHEN buyer_action_kind IS NULL THEN NULL ELSE buyer_action_expires_at END,
+           last_error_code = CASE WHEN last_error_code = 'card_choice_required' THEN NULL ELSE last_error_code END,
+           next_poll_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+       AND state = 'quoting' AND pending_write IS NULL AND payment_token_id IS NULL
+       AND contact_purged_at IS NULL AND card_confirmed_at IS NULL AND claimed_by IS NULL
+       AND card_options = :card_options
+       AND (buyer_action_expires_at IS NULL OR buyer_action_expires_at > clock_timestamp())
+    RETURNING *
+"""
+_CONFIRM_CARD_CHOICE_SQL_SQLITE = _CONFIRM_CARD_CHOICE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+# The dial was turned off while the row waited: it no longer waits on the buyer, so the wait's deadline goes (else the
+# sweep would end it at 30 minutes as `buyer_action_expired`). Only the wait's own deadline: the held `quoting` row with
+# a card list and no confirmation, no buyer page (whatever code a later failed read left on it); its park code goes too.
+_END_CARD_CHOICE_WAIT_SQL = """
+    UPDATE a2a_rail_purchases
+       SET buyer_action_expires_at = NULL,
+           last_error_code = CASE WHEN last_error_code = 'card_choice_required' THEN NULL ELSE last_error_code END,
+           updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'quoting' AND buyer_action_kind IS NULL
+       AND card_options IS NOT NULL AND card_confirmed_at IS NULL AND buyer_action_expires_at IS NOT NULL
+    RETURNING *
+"""
+_END_CARD_CHOICE_WAIT_SQL_SQLITE = _END_CARD_CHOICE_WAIT_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def end_card_choice_wait_as_holder(purchase_id: str, worker_id: str) -> Optional[Dict[str, Any]]:
+    """Drop the wait's deadline and park code from a held row that no longer waits (the SQL above); None otherwise."""
+    values = {"id": _require(_ID_RE, purchase_id, "purchase_id"), "holder": _require(_WORKER_RE, worker_id, "worker_id")}
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_END_CARD_CHOICE_WAIT_SQL, values))
+    return _purchase(await database.fetch_one(_END_CARD_CHOICE_WAIT_SQL_SQLITE, values))
+
+
+_SELECT_CARD_CHOICE_FOR_OWNER_SQL = """
+    SELECT state, payment_method_id, payment_token_id, pending_write, contact_purged_at, card_options,
+           card_confirmed_at, buyer_action_expires_at
+      FROM a2a_rail_purchases
+     WHERE id = :id AND agent_id = :agent_id AND agent_user_ref_hash = :agent_user_ref_hash
+"""
+
+
+async def get_card_choice_for_owner(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str
+) -> Optional[Dict[str, Any]]:
+    """The choice this owner's purchase offers, or None (not the owner's, not waiting on a card, none recorded):
+    `{"options": [...], "options_text": <the stored text>, "selected": <rail id>, "confirmed": bool, "expires_at"}`.
+    A row past its token (or its deadline) offers nothing. Writes nothing, calls no rail."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    row = await database.fetch_one(_SELECT_CARD_CHOICE_FOR_OWNER_SQL, {
+        "id": purchase_id, "agent_id": agent_id, "agent_user_ref_hash": agent_user_ref_hash})
+    if row is None:
+        return None
+    row = dict(row)
+    if row.get("state") != "quoting" or row.get("payment_token_id") or row.get("contact_purged_at"):
+        return None
+    options = decode_card_options(row.get("card_options"))
+    selected = str(row.get("payment_method_id") or "")
+    if options is None or selected not in {o["id"] for o in options}:
+        return None
+    expires_at = _decode_dt(row.get("buyer_action_expires_at"))
+    confirmed = row.get("card_confirmed_at") is not None
+    if not confirmed and isinstance(expires_at, datetime) and expires_at <= datetime.now(timezone.utc):
+        return None
+    return {"options": options, "options_text": row["card_options"], "selected": selected,
+            "confirmed": confirmed, "expires_at": expires_at}
+
+
+async def confirm_card_choice(
+    purchase_id: str, agent_id: str, agent_user_ref_hash: str, *, method_id: str, options_text: str
+) -> Optional[Dict[str, Any]]:
+    """Record the buyer's card (the compare-and-swap above). `method_id` must be one of the cards in `options_text`, the
+    stored list the caller read. None when the row is not this owner's or no longer waits with exactly those cards: the
+    caller re-reads to tell an identical repeat (the same card, already confirmed) from a conflict."""
+    if not _ID_RE.match(str(purchase_id or "")):
+        return None
+    method = _rail_ref(method_id, "method_id")
+    options = decode_card_options(options_text)
+    if method is None or options is None or method not in {o["id"] for o in options}:
+        raise ValueError("method_id must be one of the options")
+    values = {
+        "id": purchase_id, "agent_id": str(agent_id or "").strip(),
+        "agent_user_ref_hash": str(agent_user_ref_hash or "").strip(),
+        "method_id": method, "card_options": options_text,
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_CONFIRM_CARD_CHOICE_SQL, values))
+    return _purchase(await database.fetch_one(_CONFIRM_CARD_CHOICE_SQL_SQLITE, values))
 
 
 # The checkout path's order lock: Pivota's own order reference and the approval ceiling the token is

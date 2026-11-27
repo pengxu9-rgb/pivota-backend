@@ -96,6 +96,32 @@ THE CARD (AGENPAS_PAYMENT_CARD_ENABLED, default off, read per request). On, a GE
 Never in the public route or the webhooks: only the buyer's page shows it. A failed card read drops the field (the page
 shows no card), never the body. Off: the body is byte for byte what it was.
 
+THE CARD CHOICE (AGENPAS_CARD_PICKER_ENABLED, default off, read per request, and only with AGENPAS_CONSENT_GATE on too;
+db/a2a_rail_ledger has the design). On,
+an A2A-rail purchase whose order is locked waits, before any token is asked for, for the buyer to confirm a card; while
+it waits, a GET body carries a top-level
+`card_choice = {confirmed, expires_at, cards: [{handle, network, last4, added_at, selected}]}`: the buyer's ACTIVE cards
+as the worker last read them from the rail (newest first; `selected` is the card the purchase will be paid with unless
+the buyer picks another). `handle` names a card for THIS purchase only (an HMAC under this router's key, never the
+rail's card id). No field
+otherwise (another rail, no card list recorded, past the token or the deadline) or when the read fails (never a 503).
+Never in the public route or the webhooks.
+
+`POST /agent/internal/commerce/purchases/{purchase_id}/card-choice`: the buyer's confirmation, from the page's Approve.
+SAME router as the read (its dial, key and scoping, like the shipping-address write).
+  BODY   exactly `{"handle": "<24 hex>"}`, at most 256 bytes (else 400 {"error": "invalid_card_choice"}).
+  CONSENT checked before the body is read: no consent row for (a2a, rail purchase, approval, its epoch) is 409
+         {"error": "consent_required"} (the page offers the terms first); a failed consent read is a 503.
+  WRITE  a compare-and-swap (db/a2a_rail_ledger.confirm_card_choice) on exactly the cards it read just before (a
+         handle is fixed for its purchase): sets the card, records the confirmation and makes the row due at once (the
+         worker then asks for the token on it).
+  ANSWER 200 the unified view with its `card_choice` (confirmed) | 409 {"error": "card_choice_unavailable"} (the dial
+         off) | 409 {"error": "consent_required"} | 409 {"error": "card_choice_closed"} (not an A2A purchase, not waiting on a card, or already confirmed
+         with another card; the same card again is a 200) | 409 {"error": "card_choice_stale"} (the handle is not one
+         of the cards the purchase now offers, the list changed, or the worker holds the purchase this moment:
+         re-read and send again) | 400 | 404 | 401 | 503. A 4xx is re-wrapped by ErrorHandlerMiddleware (the
+         gateway reads `detail.error`). Calls no rail; nothing of the body is logged.
+
 THE AGENT'S NAME. A GET body, either rail, carries a top-level `agent_display_name` (a string), the page's
 "Requested by" line: the name set by hand in agents.buyer_display_name (migration 297, a gated one-off) when that
 column is not NULL (it wins, and never falls through: '' hides a portal name), else the name the purchase's agent
@@ -128,6 +154,7 @@ import db.reap_agentic_ledger as reap_ledger
 import services.payment_orchestration.purchase_product_image as product_image
 import db.reap_continuation as continuation
 from routes import agent_commerce_purchases as public
+from services.payment_orchestration import a2a_markets
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import purchase_consent
 from services.payment_orchestration.rails import RAIL_ID_PREFIX
@@ -184,6 +211,38 @@ async def _product_image(parent: Dict[str, Any], agent_id: str, owner: str) -> O
     except Exception as exc:  # noqa: BLE001 - the image is decoration: its fault drops it, never the body
         logger.warning("agent_internal_purchases: product image read failed error_type=%s", type(exc).__name__)
         return None
+
+
+def _handle_key() -> str:
+    """The key card handles are keyed with: this router's own key (the route answered, so it is configured)."""
+    return str(os.getenv(INTERNAL_KEY_ENV) or "").strip()
+
+
+def _card_choice_view(purchase_id: str, choice: Dict[str, Any]) -> Dict[str, Any]:
+    expires_at = choice.get("expires_at")
+    return {
+        "confirmed": bool(choice.get("confirmed")),
+        "expires_at": expires_at.isoformat() if isinstance(expires_at, datetime) else None,
+        "cards": [
+            {"handle": a2a_ledger.card_handle(purchase_id, o["id"], _handle_key()), "network": o.get("network"),
+             "last4": o.get("last4"), "added_at": o.get("added_at"), "selected": o["id"] == choice.get("selected")}
+            for o in choice["options"]
+        ],
+    }
+
+
+async def _card_choice(parent: Dict[str, Any], agent_id: str, owner: str) -> Optional[Dict[str, Any]]:
+    """The card choice the purchase offers (see THE CARD CHOICE above), or None: another rail, nothing to choose, or a
+    failed read (never a 503)."""
+    if str(parent.get("rail") or "") != "a2a":
+        return None
+    rail_id = str(parent["rail_purchase_id"])
+    try:
+        choice = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
+    except Exception as exc:  # noqa: BLE001 - the choice is the page's: its fault drops it, never the body
+        logger.warning("agent_internal_purchases: card choice read failed error_type=%s", type(exc).__name__)
+        return None
+    return _card_choice_view(rail_id, choice) if choice is not None else None
 
 
 async def _agent_display_name(agent_id: str) -> Optional[str]:
@@ -318,6 +377,10 @@ async def get_purchase_for_gateway(
         image_url = await _product_image(parent, agent_id, owner)
         if image_url is not None:
             body["product_image_url"] = image_url
+    if a2a_ledger.card_picker_active():
+        choice = await _card_choice(parent, agent_id, owner)
+        if choice is not None:
+            body["card_choice"] = choice
     return body
 
 
@@ -388,7 +451,8 @@ async def submit_shipping_address_for_gateway(
     replaces = shipping_capture.incomplete_address(row.get("shipping_address"))
     email, address, field_errors = shipping_capture.read_submission(
         body, email_required=not row.get("buyer_email"),
-        address_required=shipping_capture.address_missing(row.get("shipping_address")))
+        address_required=shipping_capture.address_missing(row.get("shipping_address")),
+        market=a2a_markets.market_for_currency(row.get("currency")))
     if field_errors:
         # The app's "already normalised" error shape (`status` + `error`), which ErrorHandlerMiddleware passes
         # through with its status: a 422 stays a 422 (a FastAPI-default 422 would be re-nested as a 400).
@@ -413,6 +477,112 @@ async def submit_shipping_address_for_gateway(
         logger.warning("agent_internal_purchases: view failed error_type=%s", type(exc).__name__)
         return _unavailable()
     return error if error is not None else view  # 200: the unified view, encoded as the read encodes it
+
+
+# ── the card choice write ────────────────────────────────────────────────────────────────────
+
+_CARD_CHOICE_BODY_MAX_BYTES = 256
+
+
+def _card_choice_refusal(error: str) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"error": error})
+
+
+async def _confirmed_with(rail_id: str, agent_id: str, owner: str, handle: str) -> bool:
+    """The purchase already confirmed THIS card (a repeat that lands after the worker moved on): the same card again
+    is the same answer, never a conflict."""
+    row = await a2a_ledger.get_purchase_for_owner(rail_id, agent_id, owner)
+    method_id = str((row or {}).get("payment_method_id") or "")
+    return bool(row and row.get("card_confirmed_at") is not None and method_id
+                and a2a_ledger.card_handle(rail_id, method_id, _handle_key()) == handle)
+
+
+async def _record_card_choice(rail_id: str, agent_id: str, owner: str, handle: str) -> Optional[str]:
+    """Record the buyer's card. None when it is recorded (now, or by an identical earlier call); else the refusal."""
+    choice = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
+    if choice is None:
+        # Nothing to choose any more: a repeat of the confirmed card (after the worker moved on) is the same answer.
+        return None if await _confirmed_with(rail_id, agent_id, owner, handle) else "card_choice_closed"
+    key = _handle_key()
+    method_id = next((o["id"] for o in choice["options"] if a2a_ledger.card_handle(rail_id, o["id"], key) == handle), None)
+    if method_id is None:
+        return "card_choice_stale"
+    if choice["confirmed"]:
+        return None if method_id == choice["selected"] else "card_choice_closed"
+    written = await a2a_ledger.confirm_card_choice(
+        rail_id, agent_id, owner, method_id=method_id, options_text=choice["options_text"])
+    if written is not None or await _confirmed_with(rail_id, agent_id, owner, handle):
+        return None
+    current = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
+    # Still waiting: the list changed under the page (re-read). Otherwise it moved on or another card was confirmed.
+    return "card_choice_stale" if current is not None and not current["confirmed"] else "card_choice_closed"
+
+
+@router.post("/{purchase_id}/card-choice")
+async def confirm_card_choice_for_gateway(
+    purchase_id: str,
+    request: Request,
+    x_agenpas_agent_id: Optional[str] = Header(None, alias="X-Agenpas-Agent-Id"),
+    x_agenpas_agent_user_ref: Optional[str] = Header(None, alias="X-Agenpas-Agent-User-Ref"),
+):
+    del x_agenpas_agent_user_ref  # ignored for scoping, as on the read; never logged
+    agent_id = str(x_agenpas_agent_id or "").strip()
+    if not _AGENT_ID_RE.match(agent_id):
+        return JSONResponse(status_code=400, content={"error": "agent_id_required"})
+    purchase_id = str(purchase_id or "").strip()
+    if not purchases.is_enabled() or not public._PURCHASE_ID_RE.fullmatch(purchase_id):
+        return _not_found()
+    try:
+        parent = await _parent_for_agent(purchase_id, agent_id)
+    except Exception as exc:  # noqa: BLE001 - any ledger fault is "say nothing, retry", never a 500
+        logger.warning("agent_internal_purchases: card choice parent read failed error_type=%s", type(exc).__name__)
+        return _unavailable()
+    owner = str((parent or {}).get("agent_user_ref_hash") or "")
+    if parent is None or not owner:
+        return _not_found()
+    if not a2a_ledger.card_picker_active():
+        return _card_choice_refusal("card_choice_unavailable")
+    if parent.get("rail") != "a2a":
+        return _card_choice_refusal("card_choice_closed")
+    rail_id = str(parent["rail_purchase_id"])
+    # The card is part of what the buyer approves: no card is recorded before the buyer accepted the approval step's
+    # terms on the AgenPas page. THE SAME read and rule as the views' gate (purchase_consent.snapshot + satisfied), before
+    # the body is read: a failed read is a 503 (fail closed), no consent a 409. (The choice runs only with the gate on.)
+    consents = await purchase_consent.snapshot(agent_id, [("a2a", rail_id)])
+    if consents is purchase_consent.FAILED:
+        return _unavailable()
+    if not purchase_consent.satisfied(consents, "a2a", rail_id, purchase_consent.STEP_FOR_STATE["locking"]):
+        return _card_choice_refusal("consent_required")
+    raw = await request.body()
+    handle = None
+    if len(raw) <= _CARD_CHOICE_BODY_MAX_BYTES:
+        try:
+            body = json.loads(raw)
+        except Exception:  # noqa: BLE001 - the parser's message can quote the body
+            body = None
+        if isinstance(body, dict) and set(body) == {"handle"} and a2a_ledger.is_card_handle(body["handle"]):
+            handle = body["handle"]
+    if handle is None:
+        return JSONResponse(status_code=400, content={"error": "invalid_card_choice"})
+    try:
+        refused = await _record_card_choice(rail_id, agent_id, owner, handle)
+        if refused is not None:
+            return _card_choice_refusal(refused)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_internal_purchases: card choice write failed error_type=%s", type(exc).__name__)
+        return _unavailable()
+    parent = {k: v for k, v in parent.items() if k != "agent_user_ref_hash"}
+    try:
+        view, error = await public._unified_for(parent, agent_id, owner)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_internal_purchases: view failed error_type=%s", type(exc).__name__)
+        return _unavailable()
+    if error is not None:
+        return error
+    confirmed = await _card_choice(parent, agent_id, owner)
+    if confirmed is not None:
+        view["card_choice"] = confirmed
+    return view  # 200: the unified view, encoded as the read encodes it
 
 
 # ── the consent write ────────────────────────────────────────────────────────────────────────
