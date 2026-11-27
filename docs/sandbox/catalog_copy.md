@@ -194,6 +194,38 @@ What the run line should still weigh:
   the sink keeps the refusal and the export raises it after the COPY. `statement_timeout` and the
   deadline bound that COPY.
 
+## Prod run: the catalog-only role (infra Q3)
+
+The export never runs on the app's `DATABASE_URL`. It reads prod as `sandbox_catalog_export`: CONNECT,
+USAGE on `public`, a read-only default, and SELECT on the catalog tables that exist, granted only for the
+run. The export itself refuses a catalog table it cannot read whole (no table-level SELECT, row-level
+security, or not a plain table), so a missing or partial grant is a refusal, never a short copy.
+
+Once, by the owner in an admin psql (in SQL, not `gcloud sql users create`, which would make it a member
+of `cloudsqlsuperuser`):
+```sql
+CREATE ROLE sandbox_catalog_export NOLOGIN NOINHERIT;
+ALTER ROLE sandbox_catalog_export SET default_transaction_read_only = on;
+GRANT CONNECT ON DATABASE pivota TO sandbox_catalog_export;
+GRANT USAGE ON SCHEMA public TO sandbox_catalog_export;
+```
+and the secret, with no version and no binding:
+`gcloud secrets create CATALOG_EXPORT_DATABASE_URL --project pivota-prod --replication-policy=automatic`.
+
+Per run, in order, each a gated step through the PR controller:
+
+| Step | Who | What |
+|---|---|---|
+| R3 | a one-off as the catalog tables' OWNER (the app's `DATABASE_URL`) | `python -m jobs.sandbox_catalog_export_role grant`: one transaction that checks the role reads nothing yet (the last R6 finished), that no catalog table is readable by PUBLIC, and that this connection owns every catalog table; then grants SELECT on each, then runs checks 1 to 10 (no membership or dangerous attribute, no write or create, no other role setting, owns nothing, no large object, reads nothing outside the list, every catalog entry a plain table it can read, no row-level security). Any failure rolls the grants back: exit 3. |
+| R4 | the owner, psql | `\password sandbox_catalog_export`, `ALTER ROLE ... LOGIN`, then `read -rs DSN && printf %s "$DSN" \| gcloud secrets versions add CATALOG_EXPORT_DATABASE_URL --project pivota-prod --data-file=-`; note the version NUMBER |
+| R5 | operator | `APPLY=1 infra/gcp/sandbox/catalog_export_prod.sh <backend image by digest> <version number>`: grants `sa-sandbox-export` the secret, deploys and executes `python -m jobs.sandbox_catalog_copy export` with `DATABASE_URL=CATALOG_EXPORT_DATABASE_URL:<number>`, and removes the grant and deletes the job from an EXIT trap on every path |
+| R6, always | the owner, psql; then a one-off as the owner | `ALTER ROLE sandbox_catalog_export NOLOGIN PASSWORD NULL;` and `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'sandbox_catalog_export';` (needs `pg_signal_backend`), then `python -m jobs.sandbox_catalog_export_role revoke`: the REVOKE (by the same owner, or it does nothing), committed, then a hard re-read (nothing readable, no session, LOGIN off; else exit 3 and the next run is blocked); then `gcloud secrets versions disable <number> --secret CATALOG_EXPORT_DATABASE_URL --project pivota-prod` |
+
+Checks 4 (SECURITY DEFINER functions it can execute) and 5b (database-wide settings) are printed for a
+person to read. Checks 2, 7 and 8b use PostgreSQL 17 functions, and `grant` refuses an older server.
+Tests: `tests/test_sandbox_catalog_export_role_postgres.py` (each refusal on a real PostgreSQL) and the
+catalog-export section of `tests/test_sandbox_infra.py` (the script, against a fake gcloud).
+
 ## Known limits
 
 * The scrub knows people by key names and by email/phone shapes. A person's name under a
