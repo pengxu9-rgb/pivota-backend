@@ -831,3 +831,45 @@ async def test_the_source_killing_an_idle_export_is_a_named_refusal(db, tmp_path
         if not victim.is_closed():
             await victim.close()
     assert _files(tmp_path) == []
+
+
+async def test_nothing_reaches_an_upload_after_the_deadline_on_a_real_connection(db, tmp_path, monkeypatch):
+    """The review's probe: a forced 4 s scrub on a 0.5 s deadline wrote its block into the unfinished
+    upload before the abort. Now the block is dropped when its worker thread returns."""
+    import time
+
+    real_scrub = C._TableScrub.scrub
+
+    def slow_scrub(self, text, null_token):
+        if self.table == "catalog_products":
+            time.sleep(2)
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+    writes = []
+
+    class Store(C.LocalDirStore):
+        def open_writer(self, name):
+            writer = super().open_writer(name)
+            real_write = writer.write
+
+            def write(data):
+                writes.append((time.monotonic(), name))
+                real_write(data)
+
+            writer.write = write
+            return writer
+
+    victim = await _connect()
+    spy = _TerminateSpy(victim)
+    try:
+        with pytest.raises(C.CopyRefused, match="passed its 0.5s deadline; nothing was written"):
+            await C.export_catalog(spy, Store(tmp_path), stamp="20261127T0100Z", specs=SPECS, schema=SRC,
+                                   deadline_seconds=0.5)
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert spy.terminated_at is not None
+    assert [w for w in writes if w[0] >= spy.terminated_at] == []
+    assert not any(name.endswith("/catalog_products.csv.gz") for _, name in writes)
+    assert _files(tmp_path) == []

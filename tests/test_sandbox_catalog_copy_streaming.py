@@ -836,3 +836,88 @@ def test_main_leaves_the_process_wide_log_levels_alone(monkeypatch):
     assert C.main(["export"]) == 2
     assert {n: (logging.getLogger(n).level, logging.getLogger(n).isEnabledFor(logging.INFO))
             for n in before} == before
+
+
+# --- follow-ups to the S5 review: nothing is written after the deadline; a long JSON key costs
+# --- no backtracking ----------------------------------------------------------------------------
+
+
+class _CountingStore(C.LocalDirStore):
+    """A local store whose writers record every write."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.writes = []
+
+    def open_writer(self, name):
+        writer = super().open_writer(name)
+        real_write, writes = writer.write, self.writes
+
+        def write(data):
+            writes.append(len(data))
+            real_write(data)
+
+        writer.write = write
+        return writer
+
+
+async def test_a_block_scrubbed_past_the_deadline_is_dropped_and_no_later_one_is_scrubbed(tmp_path, monkeypatch):
+    import time
+
+    real_scrub = C._TableScrub.scrub
+    scrubbed = []
+
+    def slow_scrub(self, text, null_token):
+        scrubbed.append(text)
+        time.sleep(0.6)  # the deadline fires while this block is in its worker thread
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+
+    async def two_blocks(conn, output):  # this fake keeps sending after the terminate
+        await output(b"m1\n")
+        await output(b"m2\n")
+
+    store = _CountingStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match="passed its 0.2s deadline; nothing was written"):
+        await C.export_catalog(_FakeConn(copy=two_blocks), store, stamp="20261127T0100Z", specs=_SPEC,
+                               deadline_seconds=0.2)
+    assert len(scrubbed) == 1  # the second block is never scrubbed
+    assert store.writes == []  # the first one's output is dropped, and nothing is flushed
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+async def test_before_the_deadline_the_sink_writes_as_before(tmp_path):
+    store = _CountingStore(tmp_path)
+    await C.export_catalog(_FakeConn(rows=b"m1\nm2\n"), store, stamp="20261127T0100Z", specs=_SPEC)
+    assert sum(store.writes) > 0
+
+
+def test_a_long_key_is_matched_without_backtracking_and_counts_as_a_person_key():
+    import time
+
+    started = time.monotonic()
+    for key in ("by_" * 8000 + ".", "mail" * 6000 + "!", "a" * 100_000 + "_by.", "x" * 1_000_000):
+        assert C.is_person_key(key)
+    assert time.monotonic() - started < 1  # PERSON_KEY_RE took 2.1 s on the first one alone
+    assert not C.is_person_key("x" * C.MAX_PERSON_KEY_MATCH_CHARS)
+    assert C.is_person_key("x" * (C.MAX_PERSON_KEY_MATCH_CHARS + 1))
+
+
+def test_up_to_the_cap_the_predicate_is_the_pattern():
+    rnd = random.Random(5)
+    pieces = ["by", "_", "mail", "x", "Name", "-", "phone", "id", "note", ".", "address", "A", "9"]
+    for _ in range(20000):
+        key = "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 40)))[: C.MAX_PERSON_KEY_MATCH_CHARS]
+        assert C.is_person_key(key) == bool(C.PERSON_KEY_RE.match(key)), key
+
+
+def test_a_value_under_a_long_key_is_redacted_and_the_check_accepts_the_result():
+    long_key = "spec_" + "x" * 300
+    value = {"title": "Tint", long_key: "a value", "nested": {long_key: {"deep": 1}}}
+    scrubbed, changed = C.scrub_json(value)
+    assert changed
+    assert scrubbed[long_key] == C.REDACTED and scrubbed["nested"][long_key] is None
+    assert scrubbed["title"] == "Tint"
+    assert C.person_values(scrubbed) == []
+    assert C.person_values(value) == ["$.%s" % long_key, "$.nested.%s" % long_key]
