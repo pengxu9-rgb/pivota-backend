@@ -241,7 +241,7 @@ async def test_the_export_never_lists_the_drop(tmp_path):
         async def fetchval(self, *a): return 1
 
         async def copy_from_query(self, query, output, **kw):
-            output.write(b"m1\n")
+            await output(b"m1\n")
 
     spec = (C.TableSpec("catalog_merchants", "x"),)
     manifest = await C.export_catalog(FakeConn(), CreateOnly(tmp_path), stamp="20261125T0100Z", specs=spec)
@@ -470,7 +470,7 @@ async def test_the_export_query_and_its_count_both_carry_the_where(tmp_path):
 
         async def copy_from_query(self, query, output, **kw):
             seen.append(query)
-            output.write(b"k1\n")
+            await output(b"k1\n")
 
     spec = (next(s for s in C.CATALOG_TABLES if s.name == "aurora_ingredient_research_kb"),)
     await C.export_catalog(FakeConn(), C.LocalDirStore(tmp_path), stamp="20261126T0100Z", specs=spec)
@@ -548,8 +548,10 @@ def test_product_keys_are_kept_only_at_the_product_level_and_option_paths():
     assert C.scrub_json(top_list, COLS.PRODUCT_KEYS)[0] == top_list
 
 
-async def test_a_table_past_the_in_memory_cap_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setattr(C, "MAX_TABLE_COPY_BYTES", 4)
+async def test_one_record_past_the_record_cap_is_refused_and_nothing_is_written(tmp_path, monkeypatch):
+    """S5: the 1 GiB table cap is gone (tables stream); what is bounded is ONE record, the most the
+    splitter ever holds."""
+    monkeypatch.setattr(C, "MAX_RECORD_BYTES", 4)
 
     class FakeConn:
         def transaction(self, **kw):
@@ -567,9 +569,11 @@ async def test_a_table_past_the_in_memory_cap_is_refused(tmp_path, monkeypatch):
         async def fetchval(self, *a): return 1
 
         async def copy_from_query(self, query, output, **kw):
-            output.write(b"m1234567\n")
+            await output(b"m12345")
+            await output(b"67\n")
 
     store = C.LocalDirStore(tmp_path)
-    with pytest.raises(C.CopyRefused, match="in-memory copy cap"):
+    with pytest.raises(C.CopyRefused, match="longer than 4 bytes"):
         await C.export_catalog(FakeConn(), store, stamp="20261126T0100Z", specs=(C.TableSpec("catalog_merchants", "x"),))
     assert store.list("") == []
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []  # no unfinished upload left either
