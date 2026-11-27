@@ -63,6 +63,12 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
         # The consent gate withheld the shipping-address form: the step is there, the form is not (no
         # fields_missing until the consent; services/payment_orchestration/purchase_consent.py).
         body["next_action"] = {"kind": "shipping_address", "consent_required": True, "expires_at": marker.get("expires_at")}
+    choice = detail.get("card_choice_required")
+    if "next_action" not in body and isinstance(choice, Mapping):
+        # The A2A rail waits for the buyer to confirm (or add) the paying card on the AgenPas page before any token
+        # (services/payment_orchestration/a2a_purchase_view.card_choice_waits). A step on OUR page: no url here; the
+        # gateway puts the buyer's AgenPas link in it, as for a consent-gated step.
+        body["next_action"] = {"kind": "card_choice", "expires_at": choice.get("expires_at")}
     if state == "completed" and detail.get("order_reference"):
         body["order_reference"] = detail["order_reference"]
     body["detail"] = dict(detail)
