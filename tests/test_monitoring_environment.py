@@ -123,7 +123,7 @@ def test_usable_email_api_state_does_not_claim_actual_delivery(tmp_path, channel
     state, proc = run_script(tmp_path, "staging", channel_mode=mode,
                              channel_existing=channel_existing, return_process=True)
     assert proc.returncode == 0, proc.stderr
-    assert len(state["alertPolicies"]) == 13
+    assert len(state["alertPolicies"]) == 14
     assert "Channel API state does not prove alert delivery" in proc.stdout
     assert "Confirm a controlled notification" in proc.stdout
     assert "cannot receive" not in proc.stderr
@@ -177,11 +177,13 @@ def test_staging_never_probes_prod_and_scopes_regular_and_reap_policies(tmp_path
     assert not state.get("uptimeCheckConfigs")
     assert state["notificationChannels"][0]["displayName"] == "pivota staging alerts"
     policies = state["alertPolicies"]
-    assert len(policies) == 13  # 8 project policies, 5 Reap policies; no host/TLS, no relgraph success check
+    assert len(policies) == 14  # 8 project policies, 5 Reap, 1 A2A; no host/TLS, no relgraph success check
     assert not any("has not succeeded" in p["displayName"] for p in policies)
     assert all(p["displayName"].startswith("staging:") for p in policies)
     assert not any("prod:" in json.dumps(p) for p in policies)
     assert sum("Reap" in p["displayName"] for p in policies) == 5
+    # Staging gets the A2A held-checkout policy too: the same filter on staging's own worker, paging staging's channel.
+    assert [p["displayName"] for p in policies if "A2A" in p["displayName"]] == ["staging: A2A checkout held for a human"]
     assert all("--project" not in args or args[args.index("--project") + 1] == "pivota-staging"
                for args in state["gcloud"])
 
@@ -193,7 +195,7 @@ def test_production_names_hosts_and_policy_shapes_are_preserved(tmp_path):
         "api.pivota.cc", "gateway.pivota.cc", "mcp.pivota.cc", "commerce.mcp.pivota.cc",
         "ucp.pivota.cc", "acp.pivota.cc",
     }
-    assert len(state["alertPolicies"]) == 16
+    assert len(state["alertPolicies"]) == 17
     assert all(p["displayName"].startswith("prod:") for p in state["alertPolicies"])
     # Prod only: staging's triggers are created paused, and there it would page every morning.
     (success,) = [p for p in state["alertPolicies"]
@@ -236,13 +238,14 @@ def test_invalid_worker_target_fails_before_cloud_reads(tmp_path,worker):
 SCRIPT_METRICS = ",".join([
     "pool_checkout_timeout", "retailer_ingest_drain_held", "retailer_ingest_drain_failed",
     "merchant_purchasability_sweep_ip_throttled", "reap_agentic_poll_report", "reap_agentic_poll_stuck",
-    "reap_agentic_poll_failing", "reap_agentic_poll_human", "reap_agentic_poll_contact",
+    "reap_agentic_poll_failing", "reap_agentic_poll_human", "reap_agentic_poll_contact", "a2a_rail_checkout_held",
 ])
 WAITING_POLICIES = [
     "database pool exhausted", "retailer ingest held for review", "retailer ingest job failed",
     "purchasability sweep IP-throttled", "Reap purchase stuck over 30 minutes",
     "Reap purchase poller failing", "Reap purchase poller went silent",
     "Reap checkout needs human reconciliation", "Reap buyer contact retention blocked",
+    "A2A checkout held for a human",
 ]
 
 
@@ -264,12 +267,12 @@ def test_a_brand_new_project_writes_every_other_policy_and_defers_the_rest(tmp_p
 
 def test_a_metric_that_becomes_visible_within_the_budget_is_waited_for(tmp_path):
     """Rejected once per metric, then accepted: the run waits (the retry budget is shared), writes all
-    sixteen and exits 0."""
+    seventeen and exits 0."""
     state, proc = run_script(tmp_path, "prod", return_process=True, extra_env={
         "MONITORING_UNSEEN_METRICS": SCRIPT_METRICS, "MONITORING_UNSEEN_REJECTS": "1",
         "NEW_METRIC_TRIES": "20", "NEW_METRIC_RETRY_SECONDS": "0"})
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert len(state["alertPolicies"]) == 16 and "NOT CREATED" not in proc.stderr
+    assert len(state["alertPolicies"]) == 17 and "NOT CREATED" not in proc.stderr
     # Every metric this script creates is read by some policy ("went silent" reads the report metric through
     # PromQL), so each was really rejected once and really waited for.
     assert state["rejected"] == {m: 1 for m in SCRIPT_METRICS.split(",")}
