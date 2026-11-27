@@ -918,3 +918,27 @@ async def test_a_hong_kong_purchase_is_taken_with_no_postcode_and_none_is_stored
                                                  idempotency_key="key-2"))
     assert resp.status_code == 202, resp.text
     assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["region"] == "KLN"
+
+
+async def test_with_capture_off_the_door_refuses_an_address_without_what_the_stores_platform_requires(monkeypatch):
+    monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    monkeypatch.setenv("A2A_RAIL_MERCHANT_PLATFORMS", f"{SHOP}:shopify")
+    no_zip = {k: v for k, v in ADDRESS.items() if k != "postalCode"}
+    resp = await _http("POST", BASE, json=_body(address=no_zip))
+    assert resp.status_code == 400 and _error(resp) == "invalid_address", resp.text
+    for value in ADDRESS.values():
+        assert value not in resp.text  # the refusal's code only: the field names go to the log, never a value
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+    # The same address for a merchant with no platform declared opens (the store's checkout is the only judge).
+    monkeypatch.setenv("A2A_RAIL_MERCHANT_PLATFORMS", "other.example:shopify")
+    assert (await _http("POST", BASE, json=_body(address=no_zip, idempotency_key="key-2"))).status_code == 202
+
+
+async def test_with_capture_on_an_address_without_a_platform_field_opens_and_that_field_is_asked_for(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MERCHANT_PLATFORMS", f"{SHOP}:shopify")
+    no_region = {k: v for k, v in ADDRESS.items() if k != "region"}
+    resp = await _http("POST", BASE, json=_body(address=no_region))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert shipping_capture.fields_missing(row["buyer_email"], row["shipping_address"], row["merchant_domain"]) == [
+        "region"]

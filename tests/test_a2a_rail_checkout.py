@@ -691,6 +691,31 @@ async def test_an_incomplete_contact_mints_no_token_at_all():
     assert (await _row(pid))["last_error_code"] == worker.CHECKOUT_CONTACT_INCOMPLETE
 
 
+@pytest.mark.usefixtures("consent_gate_on")
+async def test_an_address_without_what_the_stores_platform_requires_mints_no_token(monkeypatch):
+    # merchant.example declared a Shopify store: a US address needs its state and ZIP there. Without the ZIP the
+    # purchase waits for it (AgenPas asks), and an edited row that loses it fails before anything is sent.
+    monkeypatch.setenv("A2A_RAIL_MERCHANT_PLATFORMS", "merchant.example:shopify")
+    no_zip = {k: v for k, v in ADDRESS.items() if k != "postalCode"}
+    pid = await _open(no_zip)
+    rail = Rail()
+    assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
+    assert rail.sent == [] and (await _row(pid))["state"] == "opened"
+    await database.execute("DELETE FROM a2a_rail_purchases")
+    pid = await _locked()
+    await _set_address(pid, no_zip)
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "failed"
+    assert rail.sent == []
+    assert (await _row(pid))["last_error_code"] == worker.CHECKOUT_CONTACT_INCOMPLETE
+    # The relay is never built without it, and is with it.
+    row = {"id": "ap_0123456789abcdef01234567", "buyer_email": EMAIL, "checkout_url": "https://merchant.example/c",
+           "currency": "USD", "quoted_total_minor": 5000, "merchant_domain": "merchant.example"}
+    assert worker._checkout_setup({**row, "shipping_address": no_zip}) is None
+    assert worker._checkout_setup({**row, "shipping_address": ADDRESS}).shipping["zip_code"] == ADDRESS["postalCode"]
+    assert worker._checkout_setup({**row, "merchant_domain": "other.example", "shipping_address": no_zip}) is not None
+
+
 async def test_a_setup_marker_left_by_an_unseen_answer_is_held_without_a_send():
     pid = await _approving()
     await database.execute("UPDATE a2a_rail_purchases SET pending_write = :w, pending_write_at = CURRENT_TIMESTAMP, "
@@ -3924,6 +3949,20 @@ async def test_with_the_checkout_path_off_an_emailless_purchase_ends_before_any_
     row = await _row(pid)
     assert (row["state"], row["last_error_code"], row["refusal_reason"]) == (
         "expired", worker.SHIPPING_ADDRESS_NOT_COLLECTED, None)
+
+
+@pytest.mark.usefixtures("consent_gate_on")
+def test_the_view_asks_for_the_region_and_postcode_the_stores_platform_requires(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("A2A_RAIL_MERCHANT_PLATFORMS", "merchant.example:shopify")
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
+    bare = {k: v for k, v in ADDRESS.items() if k not in ("region", "postalCode")}
+    row = {"id": "ap_" + "0" * 24, "state": "opened", "buyer_email": EMAIL, "shipping_address": bare,
+           "buyer_action_expires_at": deadline, "last_error_code": worker.SHIPPING_ADDRESS_REQUIRED,
+           "currency": "USD", "our_price_minor": 4650, "merchant_domain": "merchant.example"}
+    assert view.build_view(row)["shipping_address_required"]["fields_missing"] == ["region", "postalCode"]
+    assert "shipping_address_required" not in view.build_view({**row, "merchant_domain": "other.example"})
 
 
 @pytest.mark.usefixtures("consent_gate_on")

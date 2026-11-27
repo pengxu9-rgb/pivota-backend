@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as reap_svc
-from services.payment_orchestration import a2a_markets
+from services.payment_orchestration import a2a_address_requirements, a2a_markets
 
 #: The internal read's dial (routes/agent_internal_commerce_purchases.AGENPAS_INTERNAL_READ_ENABLED_ENV).
 CAPTURE_DIAL_ENV = "AGENPAS_INTERNAL_READ_ENABLED"
@@ -68,9 +68,10 @@ SHIPPING_ADDRESS_EXPIRED = "shipping_address_expired"
 #: tests/test_agenpas_shipping_address.py; not to be relaxed here.
 ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "addressLine2", "city", "region",
                   "postalCode", "country")
-#: The fields every address must have, in every market, in the order `fields_missing` lists them. Neither `region`
-#: nor `postalCode` is required: the payment provider asks for neither, and whether an address needs them is the
-#: store platform's checkout's to say. One given is read (and checked against its market) as before.
+#: The fields every address must have, in every market. `region` and `postalCode` are added where the STORE's
+#: platform requires them in that country (a2a_address_requirements: the payment provider asks for neither, the
+#: store's checkout may); `required_address_fields` gives a merchant's whole list, in `ADDRESS_FIELDS` order.
+#: One given is read (and checked against its market) either way.
 REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "country")
 #: Every field the write reads, in the order `fields_missing` lists them (email first: the card binding
 #: needs it before anything else).
@@ -124,35 +125,40 @@ def _address(value: Any) -> Any:
     return value
 
 
-def required_address_fields(country: Any) -> Tuple[str, ...]:
-    """The fields an address in `country` must have: `REQUIRED_ADDRESS_FIELDS`, the same in every market (no region,
-    no postcode). Kept per country for its callers; a market's own checks are `a2a_markets.address_errors`."""
-    del country
-    return REQUIRED_ADDRESS_FIELDS
+def required_address_fields(country: Any, merchant_domain: Any = None) -> Tuple[str, ...]:
+    """The fields an address in `country` must have for this merchant, in `ADDRESS_FIELDS` order:
+    `REQUIRED_ADDRESS_FIELDS` plus the region and postcode its store's platform requires there
+    (a2a_address_requirements.required_fields). No merchant (None), or one with no declared platform: the base
+    fields only. A market's own format checks are `a2a_markets.address_errors`."""
+    extra = a2a_address_requirements.required_fields(merchant_domain, country)
+    wanted = set(REQUIRED_ADDRESS_FIELDS) | set(extra)
+    return tuple(f for f in ADDRESS_FIELDS if f in wanted)
 
 
-def incomplete_address(value: Any) -> Optional[Dict[str, Any]]:
+def incomplete_address(value: Any, merchant_domain: Any = None) -> Optional[Dict[str, Any]]:
     """The stored address when it is there but lacks a required field, else None. Such an address counts as
     ABSENT (THE waiting rule, `fields_missing`): the gateway's write may replace it, and the worker's park
-    does not take it for a complete contact (db/a2a_rail_ledger: both compare on exactly this value)."""
+    does not take it for a complete contact (db/a2a_rail_ledger: both compare on exactly this value, so both pass
+    the row's own `merchant_domain`)."""
     address = _address(value)
     if not isinstance(address, Mapping) or not address:
         return None
-    if any(not str(address.get(f) or "").strip() for f in required_address_fields(address.get("country"))):
+    required = required_address_fields(address.get("country"), merchant_domain)
+    if any(not str(address.get(f) or "").strip() for f in required):
         return dict(address)
     return None
 
 
-def address_missing(value: Any) -> bool:
+def address_missing(value: Any, merchant_domain: Any = None) -> bool:
     """No stored address, or one that lacks a required field: the write asks for the whole address."""
     address = _address(value)
-    return not (isinstance(address, Mapping) and address) or incomplete_address(address) is not None
+    return not (isinstance(address, Mapping) and address) or incomplete_address(address, merchant_domain) is not None
 
 
 def contact_missing(row: Mapping[str, Any]) -> bool:
     """The row still lacks a part of its contact (`fields_missing`, per field) and it was never purged."""
     return not row.get("contact_purged_at") and bool(
-        fields_missing(row.get("buyer_email"), _address(row.get("shipping_address"))))
+        fields_missing(row.get("buyer_email"), _address(row.get("shipping_address")), row.get("merchant_domain")))
 
 
 def awaits_contact(row: Mapping[str, Any], now: Optional[datetime] = None) -> bool:
@@ -180,11 +186,13 @@ def market_for_currency(currency: Any, markets: Mapping[str, str]) -> Optional[s
     return found[0] if len(found) == 1 else None
 
 
-def fields_missing(buyer_email: Any, shipping_address: Any) -> List[str]:
-    """The fields a stored contact lacks, by name, email first. Never a value."""
+def fields_missing(buyer_email: Any, shipping_address: Any, merchant_domain: Any = None) -> List[str]:
+    """The fields a stored contact lacks, by name, email first, for this merchant (its platform's region and
+    postcode rules included). Never a value."""
     missing = [] if str(buyer_email or "").strip() else ["email"]
     address = shipping_address if isinstance(shipping_address, Mapping) else {}
-    missing.extend(f for f in required_address_fields(address.get("country")) if not str(address.get(f) or "").strip())
+    required = required_address_fields(address.get("country"), merchant_domain)
+    missing.extend(f for f in required if not str(address.get(f) or "").strip())
     return missing
 
 
@@ -229,7 +237,7 @@ _NO_MARKET: Any = object()
 
 
 def read_submission(
-    body: Any, *, email_required: bool, address_required: bool, market: Any = _NO_MARKET,
+    body: Any, *, email_required: bool, address_required: bool, market: Any = _NO_MARKET, merchant_domain: Any = None,
 ) -> Tuple[Optional[str], Optional[Dict[str, str]], Dict[str, str]]:
     """(email or None, address or None, field_errors) for the gateway's flat body. A part may be left out
     when the row already has it (`email_required` / `address_required` False); a part that is sent is read
@@ -237,7 +245,8 @@ def read_submission(
 
     `market` is the purchase's own market (a2a_markets.market_for_currency of its currency): a country other
     than it is `country: unsupported`, so a purchase priced in CAD is never given a US address. The write passes
-    it always; None (no one market for the currency) refuses every country."""
+    it always; None (no one market for the currency) refuses every country. `merchant_domain` is the purchase's:
+    its store's platform adds the region and postcode it requires in that country (`required_address_fields`)."""
     if not isinstance(body, Mapping):
         return None, None, {"body": "invalid"}
     market_given = market is not _NO_MARKET
@@ -270,7 +279,7 @@ def read_submission(
         for key in ("region", "postalCode", "country"):
             if key in values:
                 values[key] = values[key].upper()
-        for name in required_address_fields(values.get("country")):
+        for name in required_address_fields(values.get("country"), merchant_domain):
             if name not in values and name not in errors:
                 errors[name] = "required"
         if "country" in values and (not a2a_markets.market_enabled(values["country"])

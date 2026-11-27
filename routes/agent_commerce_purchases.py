@@ -53,7 +53,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
-from services.payment_orchestration import a2a_markets
+from services.payment_orchestration import a2a_address_requirements, a2a_markets
 from services.payment_orchestration import a2a_purchase_view, agent_run_condition, purchase_consent, purchase_view
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import router as rail_router
@@ -528,6 +528,12 @@ async def _open_a2a_purchase(
             # Outside the US the market's own region and postcode rules apply with capture off too (the US keeps
             # today's capture-off rules exactly).
             stored_address = shipping_capture.door_address(stored_address)
+        # With capture off nobody asks the buyer later: a field the store's platform requires there is required
+        # here (a2a_address_requirements), in every market, the US included. Field names only.
+        lacking = a2a_address_requirements.missing(merchant_host, stored_address)
+        if lacking:
+            raise reap_svc.PurchaseRefused(
+                "invalid_address", "shipping address fields required by the store: " + ",".join(sorted(lacking)))
     else:
         # Capture on: each part is optional; one that is given is read by the same rules (the address also by
         # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.

@@ -141,7 +141,8 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
         # Asked for only while the purchase waits for it: THE shared rule (a2a_shipping_address.awaits_contact),
         # which the consent POST applies too, so the read never offers a step the POST then refuses.
         required: Dict[str, Any] = {
-            "fields_missing": a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))}
+            "fields_missing": a2a_shipping_address.fields_missing(
+                row.get("buyer_email"), row.get("shipping_address"), row.get("merchant_domain"))}
         if expires is not None and row.get("buyer_action_kind") is None:
             required["expires_at"] = row.get("buyer_action_expires_at")
         view["shipping_address_required"] = required
