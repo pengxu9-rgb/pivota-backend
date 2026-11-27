@@ -400,11 +400,72 @@ if has("secrets", "versions", "list"):
     print("1"); sys.exit(0)
 if has("artifacts", "docker", "images", "describe"):
     print({DIGEST!r}); sys.exit(0)
+flags = set(scenario.split("+"))  # the drop tests combine scenarios, e.g. "owner-only+no-sa"
+if has("iam", "service-accounts", "describe") and "no-sa" in flags:
+    sys.exit(1)
+if has("config", "get-value", "account"):
+    if "no-account" in flags:
+        sys.exit(0)  # prints nothing, as gcloud does with no account set
+    print("Operator@Example.com"); sys.exit(0)
+if has("projects", "get-iam-policy"):
+    admin = {{"role": "roles/storage.admin", "members": ["user:operator@example.com"]}}
+    if "owner-only" in flags:
+        admin = None
+    elif "storage-admin-conditional" in flags:
+        admin["condition"] = {{"title": "t", "expression": "request.time < timestamp('2026-01-01T00:00:00Z')"}}
+    elif "storage-admin-other-user" in flags:
+        admin["members"] = ["user:someone-else@example.com"]
+    print(json.dumps({{"bindings": [b for b in ({{"role": "roles/owner", "members": ["user:operator@example.com"]}}, admin) if b]}}))
+    sys.exit(0)
 if has("storage", "buckets", "describe"):
-    print(json.dumps({{"project_number": "999999999999" if scenario == "foreign-bucket" else {PN!r},
-                      "public_access_prevention": "enforced", "uniform_bucket_level_access": True}})); sys.exit(0)
-if has("storage", "buckets", "get-iam-policy"):
-    print(json.dumps({{"bindings": []}})); sys.exit(0)
+    # The key lists of gcloud 581's two shapes. Only --raw (the API's own resource) carries the
+    # project number; the standardized shape has none (the first apply, 2026-11-27).
+    num = "999999999999" if scenario == "foreign-bucket" else {PN!r}
+    if "--raw" in args:
+        print(json.dumps({{"kind": "storage#bucket", "selfLink": "https://www.googleapis.com/storage/v1/b/x", "id": "x",
+                          "name": "x", "projectNumber": num, "metageneration": "3", "location": "US-WEST1",
+                          "storageClass": "STANDARD", "etag": "CAM=", "timeCreated": "2026-11-27T00:00:00.000Z",
+                          "updated": "2026-11-27T00:00:00.000Z", "softDeletePolicy": {{}}, "rpo": "DEFAULT",
+                          "iamConfiguration": {{"bucketPolicyOnly": {{"enabled": True}},
+                                                "uniformBucketLevelAccess": {{"enabled": True}},
+                                                "publicAccessPrevention": "enforced"}},
+                          "locationType": "region", "lifecycle": {{"rule": []}}, "hierarchicalNamespace": {{"enabled": False}}}}))
+    else:
+        print(json.dumps({{"creation_time": "2026-11-27T00:00:00+0000", "default_storage_class": "STANDARD",
+                          "lifecycle_config": {{"rule": []}}, "location": "US-WEST1", "location_type": "region",
+                          "metageneration": 3, "name": "x", "public_access_prevention": "enforced", "rpo": "DEFAULT",
+                          "soft_delete_policy": {{}}, "storage_url": "gs://x/", "uniform_bucket_level_access": True,
+                          "update_time": "2026-11-27T00:00:00+0000"}}))
+    sys.exit(0)
+if has("storage", "buckets") and ("get-iam-policy" in args or "add-iam-policy-binding" in args
+                                   or "remove-iam-policy-binding" in args):
+    # A new bucket's default policy (the project-convenience legacy bindings), kept between calls.
+    import os
+    state = {str(tmp_path / "bucket_policy.json")!r}
+    if os.path.exists(state):
+        pol = json.load(open(state))
+    else:
+        p = "projectOwner:" + project, "projectEditor:" + project, "projectViewer:" + project
+        pol = {{"bindings": [{{"role": "roles/storage.legacyBucketOwner", "members": [p[0], p[1]]}},
+                            {{"role": "roles/storage.legacyBucketReader", "members": [p[2]]}},
+                            {{"role": "roles/storage.legacyObjectOwner", "members": [p[0], p[1]]}},
+                            {{"role": "roles/storage.legacyObjectReader", "members": [p[2]]}}]}}
+    if "get-iam-policy" in args:
+        print(json.dumps(pol)); sys.exit(0)
+    member = next(a.split("=", 1)[1] for a in args if a.startswith("--member="))
+    role = next(a.split("=", 1)[1] for a in args if a.startswith("--role="))
+    if "remove-iam-policy-binding" in args and scenario == "remove-is-noop":
+        sys.exit(0)
+    b = next((b for b in pol["bindings"] if b["role"] == role), None)
+    if "add-iam-policy-binding" in args:
+        if b is None:
+            b = {{"role": role, "members": []}}; pol["bindings"].append(b)
+        if member not in b["members"]:
+            b["members"].append(member)
+    elif b is not None and member in b["members"]:
+        b["members"].remove(member)
+        pol["bindings"] = [x for x in pol["bindings"] if x["members"]]
+    json.dump(pol, open(state, "w")); sys.exit(0)
 if has("run", "services", "describe"):
     svc = args[args.index("describe") + 1]
     if fmt() == "json":
@@ -572,6 +633,89 @@ def test_s2_a_same_named_bucket_of_another_project_is_never_changed(tmp_path, si
     assert res.returncode != 0 and "belongs to project number 999999999999" in res.stderr
     for verb in ("update", "add-iam-policy-binding", "remove-iam-policy-binding"):
         assert not _named(calls, "storage", "buckets", verb), verb
+
+
+# --------------------------------------------------- the drop bucket's first apply (2026-11-27)
+
+def _drop_apply(tmp_path, side, scenario="ok"):
+    fake = _apply_gcloud(tmp_path, scenario)
+    env = {**os.environ, "GCLOUD": str(fake), "APPLY": "1"}
+    res = subprocess.run(["bash", str(SANDBOX / "setup_catalog_drop.sh"), side], env=env,
+                         capture_output=True, text=True, timeout=60)
+    log = tmp_path / "calls.jsonl"
+    calls = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+    pol_file = tmp_path / "bucket_policy.json"
+    return res, calls, (json.loads(pol_file.read_text()) if pol_file.exists() else None)
+
+
+def _changes(calls):
+    return [c for c in calls if any(v in c for v in ("create", "update", "add-iam-policy-binding",
+                                                     "remove-iam-policy-binding"))]
+
+
+@pytest.mark.parametrize("side", ["sandbox", "prod-writer"])
+def test_the_bucket_project_number_is_read_from_the_raw_resource(tmp_path, side):
+    # gcloud's standardized describe has no project number; only --raw has projectNumber.
+    res, calls, _ = _drop_apply(tmp_path, side, "ok+no-sa")
+    assert res.returncode == 0, res.stderr
+    if side == "prod-writer":  # a missing SA is created, after every check
+        assert _named(calls, "iam", "service-accounts", "create")
+    assert f"belongs to pivota-sandbox ({PN})" in res.stdout
+    assert any("--raw" in c for c in _named(calls, "storage", "buckets", "describe"))
+
+
+def test_sandbox_side_adds_the_reader_before_any_legacy_removal_and_reads_back(tmp_path):
+    res, calls, pol = _drop_apply(tmp_path, "sandbox")
+    assert res.returncode == 0, res.stderr
+    edits = [c for c in calls if "add-iam-policy-binding" in c or "remove-iam-policy-binding" in c]
+    assert "add-iam-policy-binding" in edits[0] and "--role=roles/storage.objectViewer" in edits[0]
+    removed = {(next(a for a in c if a.startswith("--role=")), next(a for a in c if a.startswith("--member=")))
+               for c in edits if "remove-iam-policy-binding" in c}
+    assert len(removed) == 6  # owner+editor on two owner roles, viewer on two reader roles
+    assert pol == {"bindings": [{"role": "roles/storage.objectViewer",
+                                 "members": ["serviceAccount:sa-catalog-import@pivota-sandbox.iam.gserviceaccount.com"]}]}
+    assert "read back: no legacy convenience binding, reader present" in res.stdout
+    # the read-back is a second policy read, after the last removal
+    reads = [i for i, c in enumerate(calls) if "get-iam-policy" in c and "buckets" in c]
+    last_remove = max(i for i, c in enumerate(calls) if "remove-iam-policy-binding" in c)
+    assert len(reads) == 2 and reads[1] > last_remove
+
+
+def test_sandbox_side_fails_when_a_legacy_binding_survives_the_removal(tmp_path):
+    res, _, _ = _drop_apply(tmp_path, "sandbox", "remove-is-noop")
+    assert res.returncode != 0 and "legacy bindings remain on gs://" in res.stderr
+
+
+@pytest.mark.parametrize("side", ["sandbox", "prod-writer"])
+@pytest.mark.parametrize("scenario,why", [
+    ("owner-only", "does not hold roles/storage.admin"),
+    ("storage-admin-conditional", "does not hold roles/storage.admin"),
+    ("storage-admin-other-user", "does not hold roles/storage.admin"),
+    ("no-account", "cannot read the operator account"),
+])
+def test_an_operator_without_direct_storage_admin_is_refused_before_any_change(tmp_path, side, scenario, why):
+    # Project Owner alone lost the bucket's IAM mid-run once the legacy bindings were removed.
+    # "no-sa": the prod export SA does not exist yet, so prod-writer would create it if it checked late.
+    res, calls, _ = _drop_apply(tmp_path, side, scenario + "+no-sa")
+    assert res.returncode != 0 and why in res.stderr, res.stderr
+    assert _changes(calls) == []
+
+
+def test_the_operator_check_matches_the_account_case_insensitively(tmp_path):
+    # gcloud may print the account with capitals; IAM members are lower case.
+    res, _, _ = _drop_apply(tmp_path, "sandbox")
+    assert res.returncode == 0 and "operator operator@example.com holds roles/storage.admin" in res.stdout
+
+
+def test_a_rerun_on_a_half_done_bucket_finishes_it(tmp_path):
+    # The first apply's state: reader missing, some legacy bindings already gone.
+    proj = "pivota-sandbox"
+    (tmp_path / "bucket_policy.json").write_text(json.dumps({"bindings": [
+        {"role": "roles/storage.legacyBucketOwner", "members": [f"projectEditor:{proj}"]},
+        {"role": "roles/storage.legacyObjectReader", "members": [f"projectViewer:{proj}"]}]}))
+    res, _, pol = _drop_apply(tmp_path, "sandbox")
+    assert res.returncode == 0, res.stderr
+    assert [b["role"] for b in pol["bindings"]] == ["roles/storage.objectViewer"]
 
 
 @pytest.mark.parametrize("var,host", [

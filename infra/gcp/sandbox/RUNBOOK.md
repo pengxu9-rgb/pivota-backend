@@ -73,7 +73,8 @@ direction.
 
 - This PR merged (scripts and docs only; merging changes nothing in any cloud).
 - The operator account has, at the org: `resourcemanager.projectCreator`; on the billing account:
-  `billing.user`; on `pivota-shared`: `artifactregistry.admin` (to grant registry read).
+  `billing.user`; on `pivota-shared`: `artifactregistry.admin` (to grant registry read). Before
+  step 7 it also needs `roles/storage.admin` on the sandbox project itself (step 7 says why and how).
 - `BILLING_ACCOUNT` = the account listed in `infra/gcp/README.md`.
 - `export GCLOUD=gcloud` (or a pinned SDK path). Every command names `--project` itself; the
   operator's `gcloud config` project is never used.
@@ -215,9 +216,23 @@ certs, DNS authorizations, backend services, NEGs and `sandbox-lb-ip` (names in 
 
 ## Step 7. Catalog drop bucket, sandbox side
 
+**Prerequisite (own go):** the operator account holds `roles/storage.admin` on the sandbox
+project, granted to the account itself (not a group) and without a condition. Project Owner is
+not enough: an Owner reaches a bucket's IAM policy only through the bucket's legacy convenience
+binding (`projectOwner` → `legacyBucketOwner`), and this step removes exactly that binding. On the
+first apply (2026-11-27) the removal took away the operator's `getIamPolicy`/`setIamPolicy`
+mid-run, and the reader grant failed. `setup_catalog_drop.sh` (both sides) now refuses before
+any change unless the grant is there.
+```bash
+gcloud projects add-iam-policy-binding "$SANDBOX_PROJECT" --member="user:<operator account>" --role=roles/storage.admin --condition=None
+```
+
 ```bash
 APPLY=1 infra/gcp/sandbox/setup_catalog_drop.sh sandbox
 ```
+It adds the `sa-catalog-import` reader first, then removes every legacy convenience binding, then
+reads the policy back and fails if a legacy binding remains or the reader is missing. A re-run on a
+half-done bucket finishes it.
 **Check:** `verify_sandbox.sh bucket` will fail on the missing prod writer until step 8; check now:
 `gcloud storage buckets describe gs://$DROP_BUCKET --project "$SANDBOX_PROJECT" --format='value(public_access_prevention,uniform_bucket_level_access)'`
 → `enforced True`, and its IAM policy holds only `sa-catalog-import` as objectViewer.
@@ -228,7 +243,9 @@ APPLY=1 infra/gcp/sandbox/setup_catalog_drop.sh sandbox
 ```bash
 APPLY=1 infra/gcp/sandbox/setup_catalog_drop.sh prod-writer
 ```
-Creates `sa-sandbox-export@pivota-prod` and grants it `objectCreator` on the sandbox bucket. It
+Needs step 7's `roles/storage.admin` prerequisite too (the grant is on the sandbox bucket), and
+checks it, the bucket and its project number before creating anything. Creates
+`sa-sandbox-export@pivota-prod` and grants it `objectCreator` on the sandbox bucket. It
 gets **no** role in pivota-prod here; the export job's own prod-side grants (a catalog-only DB
 read, Q3) come with sandbox-backend's export PR, as their own controller step.
 **Check:** `verify_sandbox.sh bucket` → exactly two bindings.
