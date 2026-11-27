@@ -184,6 +184,9 @@ jobs:
     # #2421 and #2434 were cancelled at 25 with no failures). 30 here plus 10 for
     # `sweep` is the workflow's 40-minute critical path, the same as before and
     # inside deploy-prod's 50-minute poll deadline.
+    # 2026-11-27: four shards had grown to 19-28 min (shard 4 at 27m52s on 213e169d7, and cancelled at
+    # 30 with every test passing on #2956), so a fifth shard keeps each one well under 30 instead of
+    # raising the limit, which would push the critical path past deploy-prod's poll deadline.
     timeout-minutes: 30
     strategy:
       # Every shard runs to its end even when another fails: `sweep` needs all of
@@ -191,9 +194,9 @@ jobs:
       # missing shard.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     env:
-      SWEEP_SHARDS: 4
+      SWEEP_SHARDS: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -384,7 +387,7 @@ jobs:
         if: '!cancelled()'
         env:
           SHARD_RESULT: ${{ needs.sweep-shard.result }}
-          SWEEP_SHARDS: 4
+          SWEEP_SHARDS: 5
         run: |
           python scripts/merge_sweep_shards.py --shards-dir shards \
             --num-shards "${SWEEP_SHARDS}" --needs-result "${SHARD_RESULT}" --out sweep.xml

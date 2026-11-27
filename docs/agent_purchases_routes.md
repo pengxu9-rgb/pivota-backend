@@ -823,6 +823,16 @@ approved or captured, and no order at the merchant), a human ends it as `failed`
 - **Never:** a retry, a setup, a confirm, a cancel, a new token, a refund claim, `completed`, an order id or a
   total, another code, state or rail, or a batch.
 
+**Being told, and how soon.**
+- **The alert:** "prod: A2A checkout held for a human" (infra/gcp/setup_monitoring.sh, log metric
+  `a2a_rail_checkout_held`). It fires on the worker's `a2a_rail_worker: checkout held for a human` line, which the
+  worker writes once, when it holds a checkout (later ticks park the row and write nothing like it). The policy's
+  text is this runbook. Neither the metric nor the policy carries a purchase id: the id is in the log line.
+  `list-held` is the check that the alert works.
+- **The target:** the owner asks the provider for the written statement the same day the alert fires, and the close
+  runs within **one business day** of the provider's reply (and never more than 7 days after it, the evidence rule
+  above).
+
 **What a close causes.**
 - **The agent:** `get_order` shows `failed` / `operator_confirmed_declined`, and `purchase.failed` fires
   ("ended without an order"). The agent may offer to buy again, which is right only because the decline is
