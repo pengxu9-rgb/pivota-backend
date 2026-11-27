@@ -662,3 +662,149 @@ def test_zlib_gzip_framing_reads_back_with_the_standard_library():
     z = zlib.compressobj(6, zlib.DEFLATED, 31)
     data = z.compress(b"abc\n") + z.flush()
     assert gzip.decompress(data) == b"abc\n"
+
+
+# --- review of 5df3af8c7: the email scan is linear, the deadline fires during a scrub, a closed
+# --- session is a named refusal, malformed CSV is a refusal, httpx logs no upload URL ----------
+
+
+def _old_redact_once(text):
+    """The redaction as it was, with the quadratic regex search: the reference for the linear scan."""
+    text = C._EMAIL_CANDIDATE_RE.sub(lambda m: C.REDACTED_TEXT if C._is_email(m) else m.group(0), text)
+    text = C._PHONE_INTL_RE.sub(C.REDACTED_TEXT, text)
+    return C._PHONE_CONTEXT_RE.sub(lambda m: m.group(1) + C.REDACTED_TEXT, text)
+
+
+_EMAIL_PIECES = ["a", "Z", "7", ".", "_", "%", "+", "-", "@", " ", "/", "@2x", ".png", ".com", ".io", "x.",
+                 "bob", "corp", "\n", "é", "tel ", "+44 20 7946 0958"]
+
+
+def _email_corpus(seed=11, n=30000):
+    rnd = random.Random(seed)
+    fixed = ["img@2x.jpg+bob@corp.io", "hero@2x.png.x@c.org", "a@b.com.x@c.org", "a@b.c@d.com",
+             "_480x480@2x.jpg-bob@corp.io", "@@a@b.co", "x" * 70 + "@corp.io", "a@b.co.uk.png@x.io"]
+    return fixed + ["".join(rnd.choice(_EMAIL_PIECES) for _ in range(rnd.randint(0, 24))) for _ in range(n)]
+
+
+def test_the_email_scan_finds_exactly_the_old_matches():
+    for text in _email_corpus():
+        assert [m.span() for m in C._email_candidates(text)] == \
+            [m.span() for m in C._EMAIL_CANDIDATE_RE.finditer(text)], text
+        assert C._redact_once(text) == _old_redact_once(text), text
+
+
+def test_an_email_right_after_an_image_name_is_still_found():
+    # A bare lookbehind on the pattern misses this one: the next match starts mid-run.
+    for text in ("img@2x.jpg+bob@corp.io", "hero@2x.png.bob@corp.io"):
+        assert C.has_email(text)
+        assert "bob@corp.io" not in C.redact_text(text) and C.REDACTED_TEXT in C.redact_text(text)
+
+
+@pytest.mark.parametrize("shape", [
+    "a" * 2_000_000, "a." * 1_000_000, "a" * 2_000_000 + "@", "a@" * 1_000_000, "@" + "a." * 1_000_000,
+    "a@" + "b" * 2_000_000, "a@" + "b." * 1_000_000 + "1", ("img@2x.png+" * 200_000), "+" * 2_000_000,
+])
+def test_the_scan_is_linear_on_adversarial_runs(shape):
+    import time
+
+    started = time.monotonic()
+    C.has_email(shape)
+    C.redact_text(shape)
+    C._text_hits(shape)
+    assert time.monotonic() - started < 5  # the quadratic search took ~22 s at 200k characters
+
+
+async def test_the_deadline_fires_while_a_block_is_being_scrubbed(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    real_scrub = C._TableScrub.scrub
+
+    def slow_scrub(self, text, null_token):
+        time.sleep(1.5)  # a block that takes long to scrub
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+    fired = []
+
+    class Conn(_FakeConn):
+        def terminate(self):
+            fired.append(time.monotonic())
+            super().terminate()
+
+    async def one_block(conn, output):
+        await output(b"m1\n")
+        raise ConnectionError("connection was closed in the middle of operation")
+
+    started = time.monotonic()
+    with pytest.raises(C.CopyRefused, match="passed its 0.2s deadline"):
+        await C.export_catalog(Conn(copy=one_block), C.LocalDirStore(tmp_path), stamp="20261127T0100Z",
+                               specs=_SPEC, deadline_seconds=0.2)
+    assert fired and fired[0] - started < 1.0  # on time, not after the scrub
+    await asyncio.sleep(0)
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+async def test_a_session_the_source_ended_is_a_named_refusal(tmp_path):
+    class InterfaceError(Exception):
+        pass
+
+    class Closed(_FakeConn):
+        async def fetchval(self, *a):
+            raise InterfaceError("cannot call Transaction.__aexit__(): the underlying connection is closed")
+
+        def is_closed(self):
+            return True
+
+    with pytest.raises(C.CopyRefused, match="source ended the export's session "
+                                            r"\(idle_in_transaction_session_timeout or a server-side terminate\)"):
+        await C.export_catalog(Closed(), C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=_SPEC)
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+async def test_an_error_on_an_open_connection_is_not_called_a_closed_session(tmp_path):
+    class Boom(_FakeConn):
+        async def fetchval(self, *a):
+            raise RuntimeError("boom")
+
+        def is_closed(self):
+            return False
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await C.export_catalog(Boom(), C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=_SPEC)
+
+
+async def test_a_refusal_stays_itself_when_the_connection_is_closed(tmp_path):
+    class Closed(_FakeConn):
+        def is_closed(self):
+            return True
+
+    conn = Closed(rows=b"owner@realbrand.example\n")
+    with pytest.raises(C.CopyRefused, match="email-shaped"):
+        await C.export_catalog(conn, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=_SPEC)
+
+
+def test_malformed_csv_is_a_refusal_reported_after_the_sha(tmp_path, monkeypatch):
+    def broken(self, text):
+        raise csv.Error("malformed")
+
+    monkeypatch.setattr(C._TableScrub, "check", broken)
+    data = gzip.compress(b'"m1"\n')
+    store = _local(tmp_path, data)
+    with pytest.raises(C.CopyRefused, match="sha256"):
+        C._check_file(store, _entry(data, 1, sha="0" * 64), None)
+    with pytest.raises(C.CopyRefused, match="table catalog_merchants: the file is not valid CSV"):
+        C._check_file(store, _entry(data, 1), None)
+
+
+def test_the_job_keeps_httpx_from_logging_upload_urls(monkeypatch):
+    import logging
+
+    async def refuse(mode, env):
+        raise C.CopyRefused("stop")
+
+    monkeypatch.setattr(C, "_run", refuse)
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    assert C.main(["export"]) == 2
+    assert logging.getLogger("httpx").level == logging.getLogger("httpcore").level == logging.WARNING

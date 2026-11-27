@@ -744,3 +744,90 @@ async def test_both_reads_of_a_file_name_the_generation_the_import_pinned(db, tm
     await _import(db, pinned)
     assert len(pinned.seen) == 2 * len(SPECS)
     assert all(generation == "gen-" + name for name, generation in pinned.seen)
+
+
+async def test_a_long_run_without_an_at_sign_exports_well_within_the_deadline(db, tmp_path):
+    """The review's probe: one 150k-character title held the event loop for 33.8 s, past a 0.5 s
+    deadline. The email scan is linear now, so a 2M-character text exports in time and exactly."""
+    import time
+
+    await db.execute(
+        "INSERT INTO %s.catalog_products (product_id, merchant_id, title, description) VALUES "
+        "('long-1', 'm1', repeat('a', 150000), repeat('a.', 1000000)), "
+        "('long-2', 'm1', repeat('img@2x.png+', 20000), repeat('b', 2000000) || '@')" % SRC)
+    store = C.LocalDirStore(tmp_path)
+    started = time.monotonic()
+    await C.export_catalog(db, store, stamp="20261127T0100Z", commit="abc123", specs=SPECS, schema=SRC,
+                           deadline_seconds=5)
+    assert time.monotonic() - started < 5
+    await _import(db, store)
+    cols = "product_id, title, description"
+    assert await _rows(db, DST, "catalog_products", [cols], "product_id") == \
+        await _rows(db, SRC, "catalog_products", [cols], "product_id")
+
+
+class _TerminateSpy:
+    """A real connection whose terminate() is timed (asyncpg's Connection has __slots__)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.terminated_at = None
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def terminate(self):
+        import time
+
+        self.terminated_at = time.monotonic()
+        self._conn.terminate()
+
+
+async def test_the_deadline_terminates_on_time_while_a_block_is_being_scrubbed(db, tmp_path, monkeypatch):
+    import time
+
+    real_scrub = C._TableScrub.scrub
+
+    def slow_scrub(self, text, null_token):
+        if self.table == "catalog_products":
+            time.sleep(3)  # a block that takes long to scrub
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+    victim = await _connect()
+    spy = _TerminateSpy(victim)
+    started = time.monotonic()
+    try:
+        with pytest.raises(C.CopyRefused, match="passed its 0.5s deadline; nothing was written"):
+            await C.export_catalog(spy, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS,
+                                   schema=SRC, deadline_seconds=0.5)
+        assert spy.terminated_at is not None and spy.terminated_at - started < 1.5
+        assert victim.is_closed()
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert _files(tmp_path) == []
+
+
+async def test_the_source_killing_an_idle_export_is_a_named_refusal(db, tmp_path, monkeypatch):
+    import asyncio
+
+    real_columns = C._table_columns
+    calls = []
+
+    async def stall_before_the_second_table(conn, schema, table, **kw):
+        calls.append(table)
+        if len(calls) == 2:
+            await asyncio.sleep(2.5)  # idle in the transaction, past its 1s idle_in_transaction timeout
+        return await real_columns(conn, schema, table, **kw)
+
+    monkeypatch.setattr(C, "_table_columns", stall_before_the_second_table)
+    victim = await _connect()
+    try:
+        with pytest.raises(C.CopyRefused, match="source ended the export's session"):
+            await C.export_catalog(victim, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS,
+                                   schema=SRC, idle_timeout="1s")
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert _files(tmp_path) == []

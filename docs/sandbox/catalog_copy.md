@@ -175,7 +175,10 @@ limits, which end with it:
 A client-side deadline (45 min, at most 2 h) **terminates** the connection, which ends the session,
 its transaction and its snapshot on the server at once. A limit reached on the server is a refusal
 naming it. Either way nothing is written: every file is an unfinished upload until the last table
-has passed, and only then are the uploads committed and the manifest written.
+has passed, and only then are the uploads committed and the manifest written. A failure during
+that commit (an upload refused at its final piece, say) can leave some of the stamp's files in
+place without a manifest. The import only reads a stamp that has a manifest, so it never imports
+them; delete them by hand.
 
 What the run line should still weigh:
 

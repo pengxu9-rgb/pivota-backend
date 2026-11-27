@@ -58,7 +58,7 @@ import sys
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("pivota.sandbox_catalog_copy")
 
@@ -353,7 +353,13 @@ REDACTED = "redacted"
 #: An EMAIL is local@domain.tld where the "tld" is not an image/file extension: `hero@2x.png` and
 #: Shopify's `_480x480@2x.jpg` are image names (review V1), and refusing on them would stop every
 #: export with a retina image URL.
-_EMAIL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])")
+_EMAIL_PATTERN = r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])"
+#: The pattern's matches define an email candidate; _email_candidates finds them. Searched as is,
+#: it is quadratic: every position of a long local-part run without an "@" starts a scan of the
+#: rest of the run (a 150k-character title held the event loop for half a minute).
+_EMAIL_CANDIDATE_RE = re.compile(_EMAIL_PATTERN)
+#: The same pattern starting only where a local-part run starts, so each run is scanned once.
+_EMAIL_RUN_START_RE = re.compile(r"(?<![A-Za-z0-9._%+-])" + _EMAIL_PATTERN)
 _NOT_A_TLD = frozenset({"png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff", "ico", "heic",
                         "mp4", "webm", "mov", "pdf", "css", "js"})
 #: A PHONE needs context (review V2: SKUs, GTINs, years, sizes and prices are digit groups too):
@@ -372,8 +378,31 @@ def _is_email(match: "re.Match") -> bool:
     return match.group(2).lower() not in _NOT_A_TLD
 
 
+def _email_candidates(text: str) -> Iterator["re.Match"]:
+    """Exactly the matches of ``_EMAIL_CANDIDATE_RE.finditer(text)``, in linear time.
+
+    A match of the pattern at a position also matches one position earlier while that position is
+    in the local-part run, so the leftmost match at or after ``pos`` starts either at ``pos`` itself
+    or where a run starts. The lookbehind alone is not enough: right after a match that is an image
+    name, as in ``img@2x.jpg+bob@corp.io``, the next match starts mid-run, at ``pos``."""
+    pos = 0
+    while True:
+        match = _EMAIL_CANDIDATE_RE.match(text, pos) or _EMAIL_RUN_START_RE.search(text, pos)
+        if match is None:
+            return
+        yield match
+        pos = match.end()
+
+
 def _redact_once(text: str) -> str:
-    text = _EMAIL_CANDIDATE_RE.sub(lambda m: REDACTED_TEXT if _is_email(m) else m.group(0), text)
+    parts: List[str] = []
+    last = 0
+    for match in _email_candidates(text):
+        if _is_email(match):
+            parts.append(text[last:match.start()])
+            parts.append(REDACTED_TEXT)
+            last = match.end()
+    text = "".join(parts) + text[last:] if parts else text
     text = _PHONE_INTL_RE.sub(REDACTED_TEXT, text)
     return _PHONE_CONTEXT_RE.sub(lambda m: m.group(1) + REDACTED_TEXT, text)
 
@@ -390,7 +419,7 @@ def redact_text(text: str) -> str:
 
 
 def has_email(text: str) -> bool:
-    return any(_is_email(m) for m in _EMAIL_CANDIDATE_RE.finditer(text))
+    return any(_is_email(m) for m in _email_candidates(text))
 
 
 def _text_hits(text: str) -> bool:
@@ -1126,13 +1155,18 @@ class _ExportSink:
         try:
             block = self.split.feed(bytes(chunk))
             if block:
-                text, records = self.scrub.scrub(block.decode("utf-8"), self.null_token)
-                # The export checks its own output before any of it leaves (S3), block by block.
-                self.scrub.check(text)
+                # Off the event loop, so the deadline's timer fires on time however long a block takes.
+                data, records = await asyncio.to_thread(self._process, block)
                 self.records += records
-                await self._out(self.zip.compress(text.encode("utf-8")))
+                await self._out(data)
         except Exception as exc:  # noqa: BLE001 - kept and raised after the COPY (see the class)
             self.error = exc
+
+    def _process(self, block: bytes) -> Tuple[bytes, int]:
+        text, records = self.scrub.scrub(block.decode("utf-8"), self.null_token)
+        # The export checks its own output before any of it leaves (S3), block by block.
+        self.scrub.check(text)
+        return self.zip.compress(text.encode("utf-8")), records
 
     async def _out(self, data: bytes) -> None:
         if data:
@@ -1163,8 +1197,10 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
     """Prod's load (S5): one READ ONLY snapshot, each table streamed (memory stays flat whatever the
     table's size), every statement under statement_timeout and lock_timeout, idle_in_transaction
     capped, and the whole export under a client-side deadline that terminates the connection.
-    Every file is an unfinished upload until the last table has passed; only then are the files
-    committed, and the manifest last."""
+    Every file is an unfinished upload until the last table has passed, so a refusal while reading
+    writes nothing. Only then are the files committed, and the manifest last: a failure during
+    that commit can leave some files under the stamp without a manifest, and the import only reads
+    a stamp that has one (newest_complete_stamp), so those files are never imported."""
     if not _STAMP_RE.match(stamp):
         raise CopyRefused("stamp must look like YYYYmmddTHHMMZ")
     for setting, value in (("statement_timeout", statement_timeout), ("lock_timeout", lock_timeout),
@@ -1194,9 +1230,18 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
         except Exception as exc:
             if expired:
                 raise CopyRefused("the export passed its %gs deadline; nothing was written" % deadline_seconds) from None
+            if isinstance(exc, CopyRefused):
+                raise
             limit = _LIMIT_SQLSTATES.get(getattr(exc, "sqlstate", None) or "")
             if limit:
                 raise CopyRefused("the export hit its %s on the source; nothing was written" % limit) from None
+            is_closed = getattr(conn, "is_closed", None)
+            if is_closed is not None and is_closed():
+                # An idle_in_transaction_session_timeout (25P03) or a server-side terminate closes the
+                # connection between statements: asyncpg then reports the closed connection, with no
+                # SQLSTATE anywhere in the chain.
+                raise CopyRefused("the source ended the export's session (idle_in_transaction_session_timeout "
+                                  "or a server-side terminate); nothing was written") from None
             raise
         finally:
             timer.cancel()
@@ -1412,8 +1457,13 @@ def _check_file(store, entry: Mapping[str, Any], generation: Optional[str]) -> N
             if whole:
                 records += scrub.check(whole.decode("utf-8"))
         split.finish()
-    except (CopyRefused, UnicodeDecodeError) as exc:
-        problem = exc if isinstance(exc, CopyRefused) else CopyRefused("table %s: the file is not UTF-8" % name)
+    except (CopyRefused, UnicodeDecodeError, csv.Error) as exc:
+        if isinstance(exc, CopyRefused):
+            problem = exc
+        elif isinstance(exc, UnicodeDecodeError):
+            problem = CopyRefused("table %s: the file is not UTF-8" % name)
+        else:
+            problem = CopyRefused("table %s: the file is not valid CSV" % name)
         for _ in chunks:  # finish the read so the sha256 is the whole file's (a read error raises here)
             pass
         if not read["whole"]:  # the read itself failed: that is the refusal
@@ -1605,6 +1655,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jobs.sandbox_catalog_copy")
     parser.add_argument("mode", choices=("export", "import"))
     args = parser.parse_args(argv)
+    # httpx logs every request's URL at INFO, and a resumable upload's URL is its session capability.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     try:
         result = asyncio.run(_run(args.mode, os.environ))
     except CopyRefused as exc:
