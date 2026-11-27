@@ -812,16 +812,16 @@ async def test_the_deadline_terminates_on_time_while_a_block_is_being_scrubbed(d
 async def test_the_source_killing_an_idle_export_is_a_named_refusal(db, tmp_path, monkeypatch):
     import asyncio
 
-    real_columns = C._table_columns
+    real_columns = C._source_columns
     calls = []
 
-    async def stall_before_the_second_table(conn, schema, table, **kw):
+    async def stall_before_the_second_table(conn, schema, table):
         calls.append(table)
         if len(calls) == 2:
             await asyncio.sleep(2.5)  # idle in the transaction, past its 1s idle_in_transaction timeout
-        return await real_columns(conn, schema, table, **kw)
+        return await real_columns(conn, schema, table)
 
-    monkeypatch.setattr(C, "_table_columns", stall_before_the_second_table)
+    monkeypatch.setattr(C, "_source_columns", stall_before_the_second_table)
     victim = await _connect()
     try:
         with pytest.raises(C.CopyRefused, match="source ended the export's session"):
@@ -831,3 +831,181 @@ async def test_the_source_killing_an_idle_export_is_a_named_refusal(db, tmp_path
         if not victim.is_closed():
             await victim.close()
     assert _files(tmp_path) == []
+
+
+async def test_nothing_reaches_an_upload_after_the_deadline_on_a_real_connection(db, tmp_path, monkeypatch):
+    """The review's probe: a forced 4 s scrub on a 0.5 s deadline wrote its block into the unfinished
+    upload before the abort. Now the block is dropped when its worker thread returns."""
+    import time
+
+    real_scrub = C._TableScrub.scrub
+
+    def slow_scrub(self, text, null_token):
+        if self.table == "catalog_products":
+            time.sleep(2)
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+    writes = []
+
+    class Store(C.LocalDirStore):
+        def open_writer(self, name):
+            writer = super().open_writer(name)
+            real_write = writer.write
+
+            def write(data):
+                writes.append((time.monotonic(), name))
+                real_write(data)
+
+            writer.write = write
+            return writer
+
+    victim = await _connect()
+    spy = _TerminateSpy(victim)
+    try:
+        with pytest.raises(C.CopyRefused, match="passed its 0.5s deadline; nothing was written"):
+            await C.export_catalog(spy, Store(tmp_path), stamp="20261127T0100Z", specs=SPECS, schema=SRC,
+                                   deadline_seconds=0.5)
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert spy.terminated_at is not None
+    assert [w for w in writes if w[0] >= spy.terminated_at] == []
+    assert not any(name.endswith("/catalog_products.csv.gz") for _, name in writes)
+    assert _files(tmp_path) == []
+
+
+async def test_the_export_needs_select_on_the_catalog_tables_and_nothing_else(db, tmp_path):
+    """The prod export runs as a catalog-only role (infra Q3): SELECT on the catalog tables that
+    exist, USAGE on their schema, a read-only default, nothing else. This export, run as such a
+    role, gives byte-identical files to one run as the owner; and the role reads no other table."""
+    import secrets as _secrets
+    import urllib.parse
+
+    import asyncpg
+
+    role = "sbx_catalog_export_probe_%s" % _secrets.token_hex(4)
+    password = _secrets.token_hex(16)
+    present = [s.name for s in SPECS
+               if await db.fetchval("SELECT to_regclass($1) IS NOT NULL", "%s.%s" % (SRC, s.name))]
+    await db.execute("CREATE ROLE %s LOGIN NOINHERIT PASSWORD '%s'" % (role, password))
+    probe = None
+    try:
+        await db.execute("ALTER ROLE %s SET default_transaction_read_only = on" % role)
+        await db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SRC, role))
+        for name in present:
+            await db.execute("GRANT SELECT ON %s.%s TO %s" % (SRC, name, role))
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (role, password, url.hostname + (":%d" % url.port if url.port else ""))
+        probe = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        assert await probe.fetchval("SHOW default_transaction_read_only") == "on"
+        assert not await probe.fetchval("SELECT has_table_privilege(current_user, $1, 'SELECT')", "%s.orders" % SRC)
+
+        as_role = await C.export_catalog(probe, C.LocalDirStore(tmp_path / "role"), stamp="20261127T0100Z",
+                                         commit="abc123", specs=SPECS, schema=SRC)
+        as_owner = await C.export_catalog(db, C.LocalDirStore(tmp_path / "owner"), stamp="20261127T0100Z",
+                                          commit="abc123", specs=SPECS, schema=SRC)
+        key = [(t["name"], t["rows"], t["sha256"], tuple(t["columns"])) for t in as_role["tables"]]
+        assert key == [(t["name"], t["rows"], t["sha256"], tuple(t["columns"])) for t in as_owner["tables"]]
+        assert as_role["absent_optional_tables"] == as_owner["absent_optional_tables"]
+    finally:
+        if probe is not None:
+            await probe.close()
+        await db.execute("DROP OWNED BY %s" % role)
+        await db.execute("DROP ROLE %s" % role)
+
+
+import contextlib as _contextlib  # noqa: E402
+
+
+@_contextlib.asynccontextmanager
+async def _role_conn(db, grants):
+    """A connection as a fresh LOGIN role holding only USAGE on the source schema plus ``grants``
+    (SQL with {role} for the role's name); the role is dropped on every path."""
+    import secrets as _secrets
+    import urllib.parse
+
+    import asyncpg
+
+    role = "sbx_catalog_export_probe_%s" % _secrets.token_hex(4)
+    password = _secrets.token_hex(16)
+    await db.execute("CREATE ROLE %s LOGIN NOINHERIT PASSWORD '%s'" % (role, password))
+    probe = None
+    try:
+        await db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SRC, role))
+        for grant in grants:
+            await db.execute(grant.format(role=role))
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (role, password, url.hostname + (":%d" % url.port if url.port else ""))
+        probe = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        yield probe
+    finally:
+        if probe is not None:
+            await probe.close()
+        await db.execute("DROP OWNED BY %s" % role)
+        await db.execute("DROP ROLE %s" % role)
+
+
+async def _present(db):
+    return [s.name for s in SPECS if await db.fetchval("SELECT to_regclass($1) IS NOT NULL", "%s.%s" % (SRC, s.name))]
+
+
+async def test_a_catalog_table_the_role_cannot_select_is_refused_even_when_optional(db, tmp_path):
+    """information_schema hides a table the role cannot read; the export decides existence from
+    pg_class, so such a table is a refusal, not an optional table recorded as absent."""
+    import dataclasses
+
+    hidden = "catalog_offers"
+    specs = [dataclasses.replace(s, optional=True) if s.name == hidden else s for s in SPECS]
+    grants = ["GRANT SELECT ON %s.%s TO {role}" % (SRC, n) for n in await _present(db) if n != hidden]
+    async with _role_conn(db, grants) as probe:
+        assert await C._table_columns(probe, SRC, hidden) == []  # what information_schema shows it
+        with pytest.raises(C.CopyRefused, match="cannot read all of table catalog_offers"):
+            await C.export_catalog(probe, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=specs, schema=SRC)
+    assert _files(tmp_path) == []
+
+
+async def test_a_column_level_grant_that_leaves_out_a_column_is_refused(db, tmp_path):
+    """The review's probe: SELECT on catalog_offers' columns except price gave a manifest without
+    price and no refusal (the sandbox would then keep stale prices)."""
+    cols = "offer_id, product_id, merchant_id, currency, stock"
+    grants = ["GRANT SELECT ON %s.%s TO {role}" % (SRC, n) for n in await _present(db) if n != "catalog_offers"]
+    grants.append("GRANT SELECT (%s) ON %s.catalog_offers TO {role}" % (cols, SRC))
+    async with _role_conn(db, grants) as probe:
+        assert "price" not in await C._table_columns(probe, SRC, "catalog_offers")
+        with pytest.raises(C.CopyRefused, match="cannot read all of table catalog_offers"):
+            await C.export_catalog(probe, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS, schema=SRC)
+    assert _files(tmp_path) == []
+
+
+async def test_row_level_security_on_a_copied_table_is_refused(db, tmp_path):
+    """The review's probe: a policy (currency = 'USD') let the export carry 1 of 2 rows, and its
+    count(*) agreed because it ran under the same policy. Refused for any role, owner included."""
+    await db.execute("ALTER TABLE %s.catalog_offers ENABLE ROW LEVEL SECURITY" % SRC)
+    await db.execute("CREATE POLICY usd_only ON %s.catalog_offers FOR SELECT USING (currency = 'USD')" % SRC)
+    grants = ["GRANT SELECT ON %s.%s TO {role}" % (SRC, n) for n in await _present(db)]
+    async with _role_conn(db, grants) as probe:
+        with pytest.raises(C.CopyRefused, match="catalog_offers has row-level security enabled"):
+            await C.export_catalog(probe, C.LocalDirStore(tmp_path / "role"), stamp="20261127T0100Z",
+                                   specs=SPECS, schema=SRC)
+    with pytest.raises(C.CopyRefused, match="catalog_offers has row-level security enabled"):
+        await C.export_catalog(db, C.LocalDirStore(tmp_path / "owner"), stamp="20261127T0100Z",
+                               specs=SPECS, schema=SRC)
+    assert _files(tmp_path) == []
+
+
+async def test_a_view_in_place_of_a_catalog_table_is_refused(db, tmp_path):
+    """A view runs with its owner's rights, not the export role's: never read as a catalog table."""
+    await db.execute("ALTER TABLE %s.external_product_seeds RENAME TO external_product_seeds_base" % SRC)
+    await db.execute("CREATE VIEW %s.external_product_seeds AS SELECT * FROM %s.external_product_seeds_base"
+                     % (SRC, SRC))
+    with pytest.raises(C.CopyRefused, match="source external_product_seeds is not a plain table"):
+        await C.export_catalog(db, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS, schema=SRC)
+    assert _files(tmp_path) == []
+
+
+async def test_a_generated_column_is_still_left_out_of_the_copy(db):
+    """pg_attribute's attgenerated replaces information_schema's is_generated: the same columns."""
+    assert await C._source_columns(db, SRC, "catalog_products") == await C._table_columns(db, SRC, "catalog_products")
+    assert "title_lower" not in await C._source_columns(db, SRC, "catalog_products")
+    assert await C._source_columns(db, SRC, "no_such_table") == []
