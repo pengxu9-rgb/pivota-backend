@@ -304,11 +304,12 @@ def test_a_token_that_does_not_map_cleanly_is_none_never_a_partial_card(token, b
     assert a2a_rail.checkout_card_from_network_token(token, brand=brand, name=name) is None
 
 
-def test_the_checkout_shipping_takes_only_its_own_keys_and_needs_a_us_state():
+def test_the_checkout_shipping_takes_only_its_own_keys_and_needs_no_state_or_zip():
     good = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
             "country": "US", "address1": "1 Main St", "city": "Austin", "state": "TX", "zip_code": "78701"}
     assert a2a_rail.checkout_shipping(good) == good
-    assert a2a_rail.checkout_shipping({k: v for k, v in good.items() if k != "state"}) is None
+    no_state = {k: v for k, v in good.items() if k != "state"}
+    assert a2a_rail.checkout_shipping(no_state) == no_state  # never required: the store platform's to ask for
     assert a2a_rail.checkout_shipping({**{k: v for k, v in good.items() if k != "state"}, "country": "GB"})
     assert a2a_rail.checkout_shipping({**good, "card": {"number": DPAN}}) is None      # no other keys
     assert a2a_rail.checkout_shipping({**good, "address2": f"apt {DPAN}"}) is None   # no card number anywhere
@@ -3783,7 +3784,7 @@ async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
     # The park's "the contact landed meanwhile" check counts an address that is still exactly the incomplete
     # one the worker read as absent (THE waiting rule): the row parks with its deadline, it is not made due at
     # once, and a second park keeps the same deadline.
-    partial = {k: v for k, v in ADDRESS.items() if k != "region"}
+    partial = {k: v for k, v in ADDRESS.items() if k != "city"}
     pid = await _open_without(email=EMAIL, address=partial)
     assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
     row = await _row(pid)
@@ -3798,10 +3799,11 @@ async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
 @pytest.mark.usefixtures("consent_gate_on")
 async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
     assert shipping_capture.fields_missing(None, None) == [
-        "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "country"]  # never a postcode
+        "email", "firstName", "lastName", "phone", "addressLine1", "city", "country"]  # never a region or postcode
     assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "postalCode"}) == []
     assert shipping_capture.fields_missing(None, ADDRESS) == ["email"]
-    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == ["region"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "city"}) == ["city"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == []
     assert shipping_capture.fields_missing(EMAIL, ADDRESS) == []
     # An address alone still waits for the email: the card binding needs it before anything is sent.
     pid = await _open_without(address=ADDRESS)
@@ -4792,15 +4794,12 @@ def test_a_total_outside_usd_is_read_only_by_a_mark_that_names_its_currency(text
     assert worker.checkout_total_minor(text, currency) == minor
 
 
-@pytest.mark.parametrize("country,state_needed", [
-    ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False),
-    ("TW", False), ("GB", False),
-])
-def test_the_checkout_shipping_needs_a_state_only_where_the_market_requires_a_region(country, state_needed):
+@pytest.mark.parametrize("country", ["US", "CA", "AU", "JP", "NZ", "SG", "KR", "TW", "HK", "GB"])
+def test_the_checkout_shipping_needs_no_state_in_any_market(country):
     shipping = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
-                "country": country, "address1": "1 Main St", "city": "Somewhere", "zip_code": "12345"}
-    assert (a2a_rail.checkout_shipping(shipping) is None) is state_needed
-    assert a2a_rail.checkout_shipping({**shipping, "state": "XX"}) is not None
+                "country": country, "address1": "1 Main St", "city": "Somewhere"}
+    assert a2a_rail.checkout_shipping(shipping) == shipping  # the store platform's to ask for
+    assert a2a_rail.checkout_shipping({**shipping, "state": "XX"})["state"] == "XX"
 
 
 def test_a_ceiling_outside_usd_needs_its_own_three_entries_and_is_in_its_minor_units(monkeypatch, jp_on):

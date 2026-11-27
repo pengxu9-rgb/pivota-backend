@@ -68,11 +68,10 @@ SHIPPING_ADDRESS_EXPIRED = "shipping_address_expired"
 #: tests/test_agenpas_shipping_address.py; not to be relaxed here.
 ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "addressLine2", "city", "region",
                   "postalCode", "country")
-#: Every field a market may require, in order: the list for an address whose country is unknown or not one of
-#: a2a_markets.MARKETS. A known market's own list (`required_address_fields`) drops `region` where it has none
-#: or makes it optional. `postalCode` is never required: the payment provider does not ask for it, and whether
-#: an address needs one is the store platform's checkout's to say. One given is read (and checked) as before.
-REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "region", "country")
+#: The fields every address must have, in every market, in the order `fields_missing` lists them. Neither `region`
+#: nor `postalCode` is required: the payment provider asks for neither, and whether an address needs them is the
+#: store platform's checkout's to say. One given is read (and checked against its market) as before.
+REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "country")
 #: Every field the write reads, in the order `fields_missing` lists them (email first: the card binding
 #: needs it before anything else).
 FIELDS = ("email",) + ADDRESS_FIELDS
@@ -126,13 +125,10 @@ def _address(value: Any) -> Any:
 
 
 def required_address_fields(country: Any) -> Tuple[str, ...]:
-    """The fields an address in `country` must have, in `REQUIRED_ADDRESS_FIELDS` order. A country that is not
-    one of a2a_markets.MARKETS (or none at all) gets the whole list. A known market drops `region` where it is not
-    required. `postalCode` is in no list."""
-    code = str(country or "").strip().upper()
-    if code not in a2a_markets.MARKETS or a2a_markets.region_rule(code) == a2a_markets.REGION_REQUIRED:
-        return REQUIRED_ADDRESS_FIELDS
-    return tuple(f for f in REQUIRED_ADDRESS_FIELDS if f != "region")
+    """The fields an address in `country` must have: `REQUIRED_ADDRESS_FIELDS`, the same in every market (no region,
+    no postcode). Kept per country for its callers; a market's own checks are `a2a_markets.address_errors`."""
+    del country
+    return REQUIRED_ADDRESS_FIELDS
 
 
 def incomplete_address(value: Any) -> Optional[Dict[str, Any]]:
