@@ -591,7 +591,12 @@ requires of it:
 - the export runs **in pivota-prod** as `sa-sandbox-export`, with
   `CATALOG_COPY_GCS_URI=gs://$DROP_BUCKET/catalog`. It writes `catalog/<UTC stamp>/...` with
   `_MANIFEST.json` LAST and unique names per run (create-only grant). This is a **PROD** one-off,
-  its own go;
+  its own go; It reads prod as the catalog-only role `sandbox_catalog_export`, never
+  the app's `DATABASE_URL`: per run R3 (`python -m jobs.sandbox_catalog_export_role grant`, as the tables'
+  owner), R4 (the owner's password, LOGIN and a new secret version), R5
+  (`infra/gcp/sandbox/catalog_export_prod.sh <backend image by digest> <secret version number>`) and
+  R6, always (NOLOGIN, end its sessions, `... revoke`, disable the version). See
+  docs/sandbox/catalog_copy.md "Prod run";
 - the import runs **in pivota-sandbox** on `$BE_IMG` as `sa-catalog-import`, with the same
   `CATALOG_COPY_GCS_URI`, the web profile's env (the sandbox guard runs first) and secret
   `DATABASE_URL=DATABASE_URL:latest` (`secrets/catalog-import.list`). It reads only the newest
