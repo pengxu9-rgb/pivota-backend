@@ -418,24 +418,23 @@ if has("projects", "get-iam-policy"):
     print(json.dumps({{"bindings": [b for b in ({{"role": "roles/owner", "members": ["user:operator@example.com"]}}, admin) if b]}}))
     sys.exit(0)
 if has("storage", "buckets", "describe"):
-    # The key lists of gcloud 581's two shapes. Only --raw (the API's own resource) carries the
-    # project number; the standardized shape has none (the first apply, 2026-11-27).
+    # The top-level key lists of gcloud 581's two shapes, as read from the real drop bucket on
+    # 2026-11-27 (names only). Only --raw (the API's own resource) carries the project number.
     num = "999999999999" if scenario == "foreign-bucket" else {PN!r}
     if "--raw" in args:
-        print(json.dumps({{"kind": "storage#bucket", "selfLink": "https://www.googleapis.com/storage/v1/b/x", "id": "x",
-                          "name": "x", "projectNumber": num, "metageneration": "3", "location": "US-WEST1",
-                          "storageClass": "STANDARD", "etag": "CAM=", "timeCreated": "2026-11-27T00:00:00.000Z",
-                          "updated": "2026-11-27T00:00:00.000Z", "softDeletePolicy": {{}}, "rpo": "DEFAULT",
-                          "iamConfiguration": {{"bucketPolicyOnly": {{"enabled": True}},
-                                                "uniformBucketLevelAccess": {{"enabled": True}},
-                                                "publicAccessPrevention": "enforced"}},
-                          "locationType": "region", "lifecycle": {{"rule": []}}, "hierarchicalNamespace": {{"enabled": False}}}}))
+        print(json.dumps({{"etag": "CAM=", "generation": "1", "iamConfiguration": {{"bucketPolicyOnly": {{"enabled": True}},
+                          "uniformBucketLevelAccess": {{"enabled": True}}, "publicAccessPrevention": "enforced"}},
+                          "id": "x", "kind": "storage#bucket", "lifecycle": {{"rule": []}}, "location": "US-WEST1",
+                          "locationType": "region", "metageneration": "3", "name": "x", "projectNumber": num,
+                          "satisfiesPZI": False, "selfLink": "https://www.googleapis.com/storage/v1/b/x",
+                          "softDeletePolicy": {{}}, "storageClass": "STANDARD",
+                          "timeCreated": "2026-11-27T00:00:00.000Z", "updated": "2026-11-27T00:00:00.000Z"}}))
     else:
         print(json.dumps({{"creation_time": "2026-11-27T00:00:00+0000", "default_storage_class": "STANDARD",
-                          "lifecycle_config": {{"rule": []}}, "location": "US-WEST1", "location_type": "region",
-                          "metageneration": 3, "name": "x", "public_access_prevention": "enforced", "rpo": "DEFAULT",
-                          "soft_delete_policy": {{}}, "storage_url": "gs://x/", "uniform_bucket_level_access": True,
-                          "update_time": "2026-11-27T00:00:00+0000"}}))
+                          "generation": 1, "lifecycle_config": {{"rule": []}}, "location": "US-WEST1",
+                          "location_type": "region", "metageneration": 3, "name": "x",
+                          "public_access_prevention": "enforced", "soft_delete_policy": {{}}, "storage_url": "gs://x/",
+                          "uniform_bucket_level_access": True, "update_time": "2026-11-27T00:00:00+0000"}}))
     sys.exit(0)
 if has("storage", "buckets") and ("get-iam-policy" in args or "add-iam-policy-binding" in args
                                    or "remove-iam-policy-binding" in args):
