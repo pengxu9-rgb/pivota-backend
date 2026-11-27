@@ -248,8 +248,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tupl
 
 import db.a2a_rail_ledger as ledger
 import db.partner_agent_merchant_blocks as agent_blocks
+from services.payment_orchestration import a2a_markets
 from services.payment_orchestration import a2a_rail, a2a_shipping_address, agent_run_condition, checkout_amounts, vic_order
 from services.payment_orchestration import router as rail_router
+from utils.money import ZERO_DECIMAL_CURRENCIES
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +335,9 @@ POLL_APPROVAL = 15
 #: (A2A_RAIL_CHECKOUT_STEP_ENABLED) is on too (`token_step_enabled`, a2a_rail rule 6), and purchases park as
 #: `token_step_refused_production`.
 A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
-#: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
-#: at create, and the token step refuses them again).
+#: The rail's measured currency (a2a_rail.TOKEN_CURRENCIES). The token and ceiling steps take the currencies of
+#: the markets switched on (a2a_markets.enabled_currencies, read per call: this set by default); the router
+#: refuses the others at create, and these steps refuse them again.
 TOKEN_CURRENCIES = a2a_rail.TOKEN_CURRENCIES
 
 #: The code an approved purchase ends with while no pay step exists (the order protocol's).
@@ -886,9 +889,15 @@ async def _start_token(s: _Step) -> str:
     if method is None or method.get("status") != "ACTIVE":
         return await _token_failed(s, "quoting", "token_method_unavailable")
     await _record_payment_card(s, method)
-    if str(s.row.get("currency") or "").upper() not in TOKEN_CURRENCIES:
-        # No currency goes with the amount: a non-USD total would be read as USD cents. Refused.
+    if str(s.row.get("currency") or "").upper() not in a2a_markets.enabled_currencies():
+        # No currency goes with the amount: a total in a currency whose market is not switched on (so not
+        # measured) could be read in another currency's units. Refused.
         return await _token_failed(s, "quoting", "token_currency_unsupported")
+    address = a2a_shipping_address._address(s.row.get("shipping_address"))
+    if address and not a2a_markets.address_matches_currency(address, s.row.get("currency")):
+        # The address is not in the market of the purchase's currency (a CAD purchase with a US address): the
+        # store's checkout would be another market's. Nothing is minted.
+        return await _token_failed(s, "quoting", SHIPPING_MARKET_MISMATCH)
     brand = str(method.get("payment_brand") or "").strip().lower()
     payload: Dict[str, Any] = {
         "amount_cents": int(s.row["quoted_total_minor"]),
@@ -993,8 +1002,9 @@ async def _authorizing(s: _Step) -> str:
     if setup is None and a2a_rail.checkout_step_enabled():
         # With the checkout on, the token-receiving steps go only through the relay (in production the
         # transport refuses them otherwise, a2a_rail rule 6). No setup can be built, so none is sent:
-        # the purchase cannot be paid for.
-        return await _token_failed(s, "awaiting_authorization", CHECKOUT_CONTACT_INCOMPLETE)
+        # the purchase cannot be paid for. Another market's address is named as such.
+        code = SHIPPING_MARKET_MISMATCH if _market_mismatch(s.row) else CHECKOUT_CONTACT_INCOMPLETE
+        return await _token_failed(s, "awaiting_authorization", code)
     if variant == _AWAIT:
         # The rail answered `paid` with its await card: poll it (a read), never `paid` again.
         if setup is None:
@@ -1454,6 +1464,9 @@ async def _vic_quote(s: _Step) -> Optional[str]:
     price, and shipping and tax are the only additions it may grow by (shown to them, all in, on the
     rail's page). So does an all-in total over the rail's cap for the currency (`vic_quote_over_limit`)."""
     row = s.row
+    if _market_mismatch(row):
+        # Another market's address for this currency: no quote is asked for, no order goes out.
+        return await _token_failed(s, "quoting", SHIPPING_MARKET_MISMATCH)
     quote = await s.vic.quote_order(vic_order.build_quote_request(row))
     if quote.kind == "refused":
         detail = quote.error_code or quote.http_status or ""
@@ -1882,20 +1895,58 @@ _USD_TOTAL_RE = re.compile(
     r"^(?P<pre>US\$|\$|USD ?)?(?P<units>\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(?P<cents>\d{2}))?(?P<post> ?USD)?\Z")
 
 
+#: The marks that name ONE currency, for the A2A markets other than the US (a2a_markets.MARKETS): its ISO code,
+#: and the symbols no other currency uses. A bare "$" or "¥" is NOT here: "$25.00" in a CAD purchase could be
+#: USD, and "¥" is also the yuan's. A spelling is added here only once a measured `checkout.result` shows it.
+_TOTAL_MARKS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "CAD": (("CA$", "C$", "CAD"), ("CAD",)),
+    "AUD": (("AU$", "A$", "AUD"), ("AUD",)),
+    "NZD": (("NZ$", "NZD"), ("NZD",)),
+    "SGD": (("SG$", "S$", "SGD"), ("SGD",)),
+    "JPY": (("JP¥", "JPY"), ("JPY", "円")),
+}
+
+
+def _total_re(currency: str) -> Optional["re.Pattern[str]"]:
+    marks = _TOTAL_MARKS.get(currency)
+    if marks is None:
+        return None
+    pre = "|".join(re.escape(m) for m in sorted(marks[0], key=len, reverse=True))
+    post = "|".join(re.escape(m) for m in sorted(marks[1], key=len, reverse=True))
+    fraction = "" if currency in ZERO_DECIMAL_CURRENCIES else r"(?:\.(?P<cents>\d{2}))?"
+    units = r"(?P<units>\d{1,3}(?:,\d{3})+|\d{1,9})"
+    return re.compile(rf"^(?:(?P<pre>{pre}) ?)?{units}{fraction}(?: ?(?P<post>{post}))?\Z")
+
+
+_TOTAL_RES = {currency: _total_re(currency) for currency in _TOTAL_MARKS}
+
+
 def checkout_total_minor(value: Any, currency: Any) -> Optional[int]:
     """The checkout's display total (`total`, a string) in minor units, or None when it does not read
-    as an amount in `currency`. Only USD is read (the token step's only currency); a total in any other
-    spelling or currency is None, never a guess."""
-    if str(currency or "").upper() != "USD" or not isinstance(value, str):
+    as an amount in `currency`. A currency mark is required (`_USD_TOTAL_RE` for USD, `_TOTAL_MARKS` for the
+    others); a total in any other spelling or currency is None, never a guess. The yen has no minor
+    unit: "¥" is not read, "JPY 1,500" is 1500, and "JPY 1,500.00" is None."""
+    code = str(currency or "").upper()
+    if not isinstance(value, str):
         return None
-    match = _USD_TOTAL_RE.match(value.strip())
+    pattern = _USD_TOTAL_RE if code == "USD" else _TOTAL_RES.get(code)
+    if pattern is None:
+        return None
+    match = pattern.match(value.strip())
     if match is None or not (match.group("pre") or match.group("post")):
         return None
-    return int(match.group("units").replace(",", "")) * 100 + int(match.group("cents") or 0)
+    units = int(match.group("units").replace(",", ""))
+    if code in ZERO_DECIMAL_CURRENCIES:
+        return units
+    return units * 100 + int(match.group("cents") or 0)
 
 
 #: The approval ceiling's allowances, by env (read live). The checkout path has no quote: the buyer
 #: approves, and the token is minted for, an upper bound on what the merchant's checkout can come to.
+#: PER CURRENCY (`_allowance`): each env takes `CUR:value` entries ("USD:1000,JPY:1500"); a bare value is USD's
+#: (the single value these envs held before other currencies), and the defaults below are USD's only. A
+#: currency other than USD needs its own entry in ALL THREE, or its purchases are refused
+#: (`checkout_ceiling_unconfigured`): no minor unit means the same thing in two currencies.
 A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV = "A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS"
 A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV = "A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR"
 A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV = "A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR"
@@ -1904,10 +1955,21 @@ CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT = 1000
 CHECKOUT_CEILING_MAX_MINOR_DEFAULT = 20000
 #: How today's ceiling is built (stored in `ceiling_source`): items + the two allowances above.
 CEILING_SOURCE_ALLOWANCE_V1 = "allowance_v1"
-#: The currencies a ceiling is computed in: the token step's (only USD is measured).
+#: The rail's measured currency, kept for its readers. A ceiling is computed in the currencies of the markets
+#: switched on (a2a_markets.enabled_currencies, read per call).
 CHECKOUT_CEILING_CURRENCIES = TOKEN_CURRENCIES
 CHECKOUT_PRICE_MISSING = "checkout_price_missing"
 CHECKOUT_CURRENCY_UNSUPPORTED = "checkout_currency_unsupported"
+CHECKOUT_CEILING_UNCONFIGURED = "checkout_ceiling_unconfigured"
+#: The shipping address is not in the market of the purchase's currency (a2a_markets.address_matches_currency).
+SHIPPING_MARKET_MISMATCH = "shipping_market_mismatch"
+
+
+def _market_mismatch(row: Mapping[str, Any]) -> bool:
+    """The row holds an address that is not in the market of its currency (a legacy row, or one written before
+    the pairing was checked). No address yet is not a mismatch: the contact is simply incomplete."""
+    address = a2a_shipping_address._address(row.get("shipping_address"))
+    return bool(address) and not a2a_markets.address_matches_currency(address, row.get("currency"))
 CHECKOUT_CEILING_OVER_CAP = "checkout_ceiling_over_cap"
 CHECKOUT_CEILING_OVER_RAIL_LIMIT = "checkout_ceiling_over_rail_limit"
 CHECKOUT_ORDER_ID_PREFIX = "pvt-"
@@ -1922,18 +1984,54 @@ class CeilingRefused(ValueError):
         self.code, self.refused = code, refused
 
 
-def _env_int(name: str, default: int, *, low: int, high: int) -> int:
-    """An integer allowance from the env, or `default` (logged) when it is not one in [low, high]."""
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default
+_ALLOWANCE_ENTRY_RE = re.compile(r"^([A-Z]{3}):([0-9]{1,12})\Z")
+
+
+def _allowance(name: str, currency: str, usd_default: int, *, low: int, high: int) -> Optional[int]:
+    """The env's value for `currency` (module note above the env names), or None when it has none.
+
+    USD: its `USD:` entry, else a bare value, else `usd_default`; one that is not an integer in [low, high]
+    falls back to `usd_default` (logged), as before. Any other currency: only its own `CUR:` entry, in
+    [low, high]; missing or malformed is None, never a default. A bare value is read only as the first entry;
+    a value with a thousands separator, or any entry that is neither, makes the whole env unusable (logged)."""
+    explicit: Dict[str, str] = {}
+    bare: Optional[str] = None
+    malformed = False
+    for index, part in enumerate((os.getenv(name) or "").split(",")):
+        entry = part.strip().upper().replace(" ", "")
+        if not entry:
+            continue
+        match = _ALLOWANCE_ENTRY_RE.match(entry)
+        if match:
+            if match.group(1) in explicit:
+                # Two entries for one currency: the first is read, and the second is named so it is not missed.
+                logger.warning("a2a_rail_worker: %s names %s twice; the first value is read", name, match.group(1))
+            explicit.setdefault(match.group(1), match.group(2))
+        elif index == 0 and ":" not in entry:
+            bare = entry  # a bare value only ever comes first
+        else:
+            # A thousands separator ("2,000", "USD:1,000") or any other stray entry: the whole value is unusable,
+            # as a non-integer was before (a bare "2" and "000" are never read as two values).
+            malformed = True
+    if malformed:
+        if currency != "USD":
+            logger.warning("a2a_rail_worker: %s is not CUR:value entries; no value for %s", name, currency)
+            return None
+        logger.warning("a2a_rail_worker: %s is not CUR:value entries; using %s", name, usd_default)
+        return usd_default
+    raw = explicit.get(currency, bare if currency == "USD" else None)
+    if raw is None:
+        return usd_default if currency == "USD" else None
     try:
-        value = int(raw)
+        value: Optional[int] = int(raw)
     except ValueError:
         value = None
     if value is None or not low <= value <= high:
-        logger.warning("a2a_rail_worker: %s is not an integer in [%s, %s]; using %s", name, low, high, default)
-        return default
+        if currency != "USD":
+            logger.warning("a2a_rail_worker: %s has no usable value for %s", name, currency)
+            return None
+        logger.warning("a2a_rail_worker: %s is not an integer in [%s, %s]; using %s", name, low, high, usd_default)
+        return usd_default
     return value
 
 
@@ -1941,24 +2039,30 @@ def checkout_ceiling(row: Mapping[str, Any]) -> Tuple[int, str]:
     """THE SEAM: the approval ceiling for a checkout-path purchase, in minor units, and how it was built.
 
     Today (`allowance_v1`): our price x quantity, plus a tax allowance (A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS,
-    default 1500 = 15%, rounded UP to the cent), plus a shipping allowance
-    (A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR, default 1000), at most A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR
-    (default 20000) and within the rail's own cap for the currency. A merchant's own all-in quote (its UCP
+    USD default 1500 = 15%, rounded UP to the minor unit), plus a shipping allowance
+    (A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR, USD default 1000), at most A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR
+    (USD default 20000) and within the rail's own cap for the currency. All three are per currency
+    (`_allowance`); a currency other than USD with any of them unset is refused, `checkout_ceiling_unconfigured`.
+    Amounts are the currency's minor units (yen are whole units). A merchant's own all-in quote (its UCP
     checkout) replaces this function and nothing else. Raises `CeilingRefused`; never guesses a price."""
     currency = str(row.get("currency") or "").upper()
-    if currency not in CHECKOUT_CEILING_CURRENCIES:
+    if currency not in a2a_markets.enabled_currencies():
         raise CeilingRefused(CHECKOUT_CURRENCY_UNSUPPORTED, refused=True)
     price, quantity = row.get("our_price_minor"), row.get("quantity")
     if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
         raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
     if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
         raise CeilingRefused(CHECKOUT_PRICE_MISSING, refused=False)
-    bps = _env_int(A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT, low=0, high=10000)
-    shipping = _env_int(A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT,
-                        low=0, high=100_000)
-    cap = _env_int(A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, CHECKOUT_CEILING_MAX_MINOR_DEFAULT, low=1, high=10_000_000)
+    bps = _allowance(A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS_ENV, currency, CHECKOUT_TAX_ALLOWANCE_BPS_DEFAULT,
+                     low=0, high=10000)
+    shipping = _allowance(A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR_ENV, currency,
+                          CHECKOUT_SHIPPING_ALLOWANCE_MINOR_DEFAULT, low=0, high=100_000)
+    cap = _allowance(A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR_ENV, currency, CHECKOUT_CEILING_MAX_MINOR_DEFAULT,
+                     low=1, high=10_000_000)
+    if bps is None or shipping is None or cap is None:
+        raise CeilingRefused(CHECKOUT_CEILING_UNCONFIGURED, refused=True)
     items = price * quantity
-    tax = -(-items * bps // 10000)  # up to the cent
+    tax = -(-items * bps // 10000)  # up to the minor unit
     ceiling = items + tax + shipping
     if ceiling > cap:
         raise CeilingRefused(CHECKOUT_CEILING_OVER_CAP, refused=True)
@@ -2005,6 +2109,8 @@ def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
     address = row.get("shipping_address")
     if not isinstance(address, Mapping) or not row.get("buyer_email") or not row.get("checkout_url"):
         return None
+    if not a2a_markets.address_matches_currency(address, row.get("currency")):
+        return None  # never relayed with another market's address (the token step refuses it first)
     candidate = {
         "email": row.get("buyer_email"),
         "first_name": address.get("firstName"),
@@ -2025,6 +2131,7 @@ def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
         cardholder_name=f"{shipping['first_name']} {shipping['last_name']}",
         idempotency_key=_checkout_idempotency_key(str(row["id"])),
         ceiling_minor=row.get("quoted_total_minor") if isinstance(row.get("quoted_total_minor"), int) else None,
+        currency=str(row.get("currency") or "").strip().upper(),
     )
 
 
@@ -2136,7 +2243,8 @@ async def _token_approved(s: _Step, *, resolves: Optional[str], relay: Any) -> s
         if not a2a_rail.checkout_step_enabled():
             return await _pay_step_unavailable(s, resolves=resolves)
         # The dial is on but the setup could not be built (checked again here: the contact may have gone).
-        return await _token_failed(s, "awaiting_authorization", CHECKOUT_CONTACT_INCOMPLETE, resolves=resolves)
+        code = SHIPPING_MARKET_MISMATCH if _market_mismatch(s.row) else CHECKOUT_CONTACT_INCOMPLETE
+        return await _token_failed(s, "awaiting_authorization", code, resolves=resolves)
     if relay.refused is not None:
         # This purchase's ACTIVE token, in a shape the checkout card cannot be made from: nothing was sent.
         logger.warning("a2a_rail_worker: approved token not relayable purchase=%s reason=%s", s.id, relay.refused)
@@ -2204,23 +2312,29 @@ async def _cancel_checkout(s: _Step, fail_code: str) -> str:
     return await _checkout_hold(s, CHECKOUT_CANCEL_UNRESOLVED)
 
 
-def setup_answer_refused(setup: Any, ceiling: Any) -> bool:
+def setup_answer_refused(setup: Any, ceiling: Any, currency: Any) -> bool:
     """True when the setup's answer must not be confirmed: ANY of its cards (the confirm card and every
     sibling, e.g. a summary card) shows an amount `confirm_card_refused` cannot verify against `ceiling`,
-    or the relay stripped a credential from it (a value it scrubbed is unknown: the card echoed the token)."""
+    or the relay stripped a credential from it (a value it scrubbed is unknown: the card echoed the token).
+    A purchase in another currency than USD: any card that shows anything money-like is refused
+    (checkout_amounts.confirm_card_refused_outside_usd: no non-USD shape is measured)."""
     if int(getattr(setup, "credential_fields_stripped", 0) or 0) > 0:
         return True
     if getattr(setup, "text_amounts_refused", False):
         # The answer's prose shows an amount we cannot verify (read in the transport; the text never leaves it).
         return True
     cards = list(getattr(setup, "cards", None) or [])
+    if str(currency or "").upper() != "USD":
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+            return True  # no positive ceiling refuses, as in USD
+        return not cards or any(checkout_amounts.confirm_card_refused_outside_usd(card.data) for card in cards)
     return not cards or any(confirm_card_refused(card.data, ceiling) for card in cards)
 
 
 async def _checkout_confirm(s: _Step, setup: Any) -> str:
     """Submit the merchant's checkout, IN THE SETUP'S OWN STEP, after checking THIS step's setup answer (every
     card in it). A MONEY WRITE: recorded first, never resent on an answer from the provider."""
-    if setup_answer_refused(setup, s.row.get("quoted_total_minor")):
+    if setup_answer_refused(setup, s.row.get("quoted_total_minor"), s.row.get("currency")):
         # A card of the setup's answer we cannot verify against the ceiling (money-like and not exactly a named
         # shape within it: services/payment_orchestration/checkout_amounts; a card too large to read; a value
         # the relay scrubbed): never confirmed. Cancelled instead; nothing has been submitted yet.
@@ -2826,6 +2940,12 @@ async def _quoting(s: _Step) -> str:
     if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
         if not token_step_enabled():
             return await _parked(s, _token_step_off_reason())
+        if str(row.get("currency") or "").upper() not in a2a_markets.enabled_currencies():
+            return await _start_token(s)  # refused there by name (`token_currency_unsupported`), nothing minted
+        address = a2a_shipping_address._address(row.get("shipping_address"))
+        if address and not a2a_markets.address_matches_currency(address, row.get("currency")):
+            # Another market's address for this currency: named as such, never minted (`_start_token` too).
+            return await _token_failed(s, "quoting", SHIPPING_MARKET_MISMATCH)
         if a2a_rail.checkout_step_enabled() and _checkout_setup(row) is None:
             # The token would be relayed into a checkout that cannot be filled: no token is minted.
             return await _token_failed(s, "quoting", CHECKOUT_CONTACT_INCOMPLETE)

@@ -434,7 +434,9 @@ async def test_a_refused_order_fails_the_purchase_with_the_write_resolved(a2a, f
 @pytest.mark.parametrize("columns,code", [
     ({"currency": "SGD"}, "vic_currency_unsupported"),
     ({"buyer_email": None}, "vic_contact_missing"),
-], ids=["not_usd", "no_contact"])
+    ({"shipping_address": {**ADDRESS, "country": "CA", "region": "ON", "postalCode": "K1A 0B1"}},
+     "shipping_market_mismatch"),  # a USD order with a Canadian address: never quoted, never sent
+], ids=["not_usd", "no_contact", "address_not_the_markets"])
 async def test_an_order_the_step_cannot_send_is_never_sent(a2a, fake, columns, code):
     pid = await _quoting(**columns)
     assert await _step(a2a, fake, pid) == "failed"

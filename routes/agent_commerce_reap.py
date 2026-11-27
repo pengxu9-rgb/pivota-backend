@@ -110,6 +110,7 @@ import db.reap_continuation as continuation
 from db.reap_agentic_ledger import require_consent_version as consent_shape
 import db.tierb_cart_link_eligibility as tierb_eligibility
 import db.merchant_purchasability as purchasability
+from services import market_registry
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 import services.merchant_item_resolver as merchant_item
@@ -692,16 +693,13 @@ _MERCHANT_ROW = ledger.ELIGIBILITY_MERCHANT_ROW
 #: are denominated in USD will refuse here. That refusal is CORRECT — an SGD storefront quoted in
 #: USD is exactly the divergence this check exists for — but it will look like a bug, so the
 #: runbook names it under "Before arming".
-_MARKET_CURRENCY: Dict[str, str] = {
-    "US": "USD",
-    "CA": "CAD",
-    "GB": "GBP",
-    "AU": "AUD",
-    "SG": "SGD",
-    "HK": "HKD",
-    "JP": "JPY",
-    "NZ": "NZD",
-}
+#:
+#: THE CURRENCIES ARE THE MARKET REGISTRY'S (services/market_registry.py, ADR-026): this lists the markets, and
+#: the registry says each one's currency, so the two cannot drift. The list is also what the merchant directory
+#: advertises as agentic markets (services/agent_merchant_directory.rail_posture), so a market is added here only
+#: when this rail may sell in it.
+_PRICED_MARKETS = ("US", "CA", "GB", "AU", "SG", "HK", "JP", "NZ")
+_MARKET_CURRENCY: Dict[str, str] = {market: market_registry.currency_for(market) for market in _PRICED_MARKETS}
 
 #: THE STORED DOMAIN IS CANONICALISED IN THE SQL, not trusted to be canonical.
 #:
