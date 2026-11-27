@@ -444,16 +444,29 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
 
 # ── a purchase in another currency than USD (no measured shape yet) ─────────────────────────────────────
 
+#: The Han currency words. PREFIXED ones (港元, 港幣, 台幣, 新台幣, ...), 幣 / 币 alone and the Cantonese 蚊 are money
+#: wherever they stand; BARE 円 / 圓 / 圆 / 元 may also begin a place name (元町, 元朗, 円山町), so a spaced one is read
+#: as money only when no Han character follows it.
+_HAN_PREFIXED_CURRENCY = r"(?:港|台|臺|新台|新臺)(?:円|圓|圆|元|幣|币)|幣|币|蚊"
+_HAN_BARE_CURRENCY = r"(?:円|圓|圆|元)"
 #: A number followed by a currency word written in letters, not a symbol: "1,500円", "15,000원", "1万円", "1만원",
-#: "100元", "100港元", "100港幣", "330台幣", "330新台幣". Glued to the number (only digits and grouping commas
+#: "100元", "100港元", "100港幣", "330台幣", "330新台幣", "100蚊". Glued to the number (only digits and grouping commas
 #: between), whatever follows: "1500円送料".
-_HAN_CURRENCY_WORD = r"(?:港|台|臺|新台|新臺)?(?:円|圓|圆|元|幣|币)"
-_LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_CURRENCY_WORD + r"|원|엔)")
-#: The same with a space before the word ("1500 円", "15000 원"), unless the word runs on into a place name of its
-#: own script ("1-2 円山町", "1-2 元町", "1 원효로": 円 / 元 then a Han character, 원 then a Hangul syllable).
+_LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(
+    r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_PREFIXED_CURRENCY + "|" + _HAN_BARE_CURRENCY + r"|원|엔)")
+#: The same with a space before the word ("1500 円", "15000 원", "100 港元整"), unless a BARE word runs on into a place
+#: name of its own script ("1-2 円山町", "1-2 元町", "2 元朗", "1 원효로": 円 / 元 then a Han character, 원 then a Hangul
+#: syllable). A prefixed word is money whatever follows it ("100 港幣整", "100 台幣元").
 _SPACED_LETTER_CURRENCY_RE = re.compile(
-    r"\d[\d,]*\s+(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_CURRENCY_WORD
+    r"\d[\d,]*\s+(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_PREFIXED_CURRENCY + "|" + _HAN_BARE_CURRENCY
     + r"(?![\u3400-\u9fff\uf900-\ufaff])|(?:원|엔)(?![\uac00-\ud7a3]))")
+#: A prefixed Han currency word BEFORE a number: "港幣 100", "新台幣330", "港元$100".
+_HAN_CURRENCY_BEFORE_DIGIT_RE = re.compile(r"(?:港|台|臺|新台|新臺)(?:円|圓|圆|元|幣|币)[^\d\n]{0,3}\d")
+#: The codes of the rail's markets (and NTD, Taiwan's common spelling) in ANY case, as a whole word next to a number:
+#: "100 hkd", "NTD 330", "330 ntd". Only these: every ISO code in any case would read "2 all" or "3 top" as money.
+_MARKET_CODE_ANY_CASE_NEXT_TO_DIGIT_RE = re.compile(
+    r"(?<![A-Za-z])(?:usd|cad|aud|nzd|sgd|jpy|krw|twd|ntd|hkd)\s*\d|\d\s*(?:usd|cad|aud|nzd|sgd|jpy|krw|twd|ntd|hkd)(?![A-Za-z])",
+    re.IGNORECASE)
 #: A number, then up to two words, then a currency word in Latin letters: "1500 yen", "15000 won", "15 Canadian
 #: dollars", "20 NZ dollars". Whole words only ("15 entries" is not "en").
 _LATIN_CURRENCY_WORD_AFTER_DIGIT_RE = re.compile(
@@ -464,6 +477,7 @@ _LATIN_CURRENCY_WORD_AFTER_DIGIT_RE = re.compile(
 _TOTAL_WORDS_ANY = (
     "合計", "合计", "總計", "总计", "総額", "总额", "總額", "会計", "會計", "金額", "金额", "価格", "价格", "價格", "料金",
     "代金", "小計", "小计", "支払", "支付", "付款", "应付", "應付", "총액", "합계", "금액", "결제", "가격", "소계",
+    "總數", "总数", "收費", "收费", "運費", "运费",
 )
 _TOTAL_WORD_BEFORE_DIGIT_RE = re.compile(
     r"(?:(?<![A-Za-z])(?:total|subtotal|amount|price|due|balance|sum|cost|charge|charged|pay|paid|payable|owe|owed|fee|"
@@ -476,9 +490,10 @@ def text_amount_shaped(text: Any) -> bool:
     currency or spelling. There is no measured non-USD confirm card or prose yet, so no amount in it can be
     verified against the ceiling: the caller refuses on any. That is a currency mark or ISO code next to a
     number, a two- or three-decimal or decimal-comma number, a plural currency word, a non-ASCII digit
-    (`_money_pattern`, `_prose_money`); a number followed by 円 / 원 / 元 (glued, or spaced unless the word is a
-    place name's), or by yen / won / yuan / dollars, up to two words later; or a total word, English or CJK,
-    shortly before a number. Not an address, a postcode, a quantity or a date ("3丁目1-2", "〒150-0043",
+    (`_money_pattern`, `_prose_money`); a number followed by 円 / 원 / 元 / 港幣 / 台幣 / 蚊 (glued, or spaced unless a
+    bare 円 / 元 / 원 begins a place name), or by yen / won / yuan / dollars, up to two words later; 港幣 / 新台幣 before
+    a number; a market's code in any case ("100 hkd", "NTD 330"); or a total word, English or CJK, shortly before
+    a number. Not an address, a postcode, a quantity or a date ("3丁目1-2", "〒150-0043",
     "Qty 2", "2026-11-27"). Pure; never raises."""
     if not isinstance(text, str) or not text:
         return False
@@ -486,7 +501,8 @@ def text_amount_shaped(text: Any) -> bool:
         normal = normalise(text)
         return bool(_money_pattern(normal) or _prose_money(normal) or _LETTER_CURRENCY_AFTER_DIGIT_RE.search(normal)
                     or _SPACED_LETTER_CURRENCY_RE.search(normal) or _LATIN_CURRENCY_WORD_AFTER_DIGIT_RE.search(normal)
-                    or _TOTAL_WORD_BEFORE_DIGIT_RE.search(normal))
+                    or _TOTAL_WORD_BEFORE_DIGIT_RE.search(normal) or _HAN_CURRENCY_BEFORE_DIGIT_RE.search(normal)
+                    or _MARKET_CODE_ANY_CASE_NEXT_TO_DIGIT_RE.search(normal))
     except Exception:  # noqa: BLE001 - unreadable text is refused
         return True
 

@@ -347,8 +347,9 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   `region` and a ZIP, 12345 or 12345-6789, in `postalCode`, each when given; required where the store's
   platform requires them, "Store platform requirements" below) (`invalid_address`). Capture off (any one of them
   off, e.g. this read dial on before the checkout dial): both stay required and every answer is as before,
-  except that an address lacking a field the store's platform requires is refused `invalid_address` (nobody
-  will ask the buyer for it later). A request the router hands to Reap is parsed by
+  except that an address lacking a field the store's platform requires, or with a region or postcode that is
+  not its market's (a Canadian province on a US address), is refused `invalid_address` (nobody will ask the
+  buyer later). The worker checks both again before it builds the relay, whatever path stored the address. A request the router hands to Reap is parsed by
   Reap's own model, which still requires both.
 - **Turn capture on, in this order**: the read dial, the checkout step and the token step (each per its own
   runbook), then the consent gate and its configuration (the section above), and
@@ -615,7 +616,8 @@ door, the address write, the router, the worker's token and ceiling steps and th
   any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
   in any currency or script, is refused before anything is submitted (`confirm_card_refused_outside_usd`,
   `text_amount_shaped`): a currency symbol or code next to a number ("$15.00", "JPY 1500"); a number followed
-  by 円 / 원 / 元 / 幣 ("1,500円", "1500 円", "100港幣", "330 新台幣") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
+  by 円 / 원 / 元 / 幣 / 蚊 ("1,500円", "1500 円", "100港幣", "100 港元整", "330 新台幣"); 港幣 or 新台幣 before a
+  number ("港幣 100"); a market's code in any case ("100 hkd", "NTD 330") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
   or CJK, before a number ("合計 1500", "お会計は1500です", "Order value 1500"), on a card also as a key
   ({"合計": "1500"}). Addresses, postcodes, quantities and dates are not amounts ("1-2 円山町", "〒150-0043",
   "Qty 2"). No positive ceiling refuses too. A card that shows no amount (the measured card) proceeds on the

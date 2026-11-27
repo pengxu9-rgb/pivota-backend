@@ -5089,6 +5089,27 @@ def test_outside_usd_prose_with_any_amount_is_refused(text, currency, ceiling, r
     assert a2a_rail._text_parts_refused(_text_only(text), None, ceiling, currency) is refused
 
 
+@pytest.mark.parametrize("text,shaped", [
+    # F1: a prefixed Han currency word is money whatever follows it; a bare 元 may begin a place name.
+    ("100 港元整", True), ("100 港幣整", True), ("100 台幣元", True), ("100港幣", True), ("2 元朗", False),
+    ("1-2 元町", False), ("1500 円", True),
+    # F2: a currency word before the number, NTD, a market's code in any case, 蚊, and more total words.
+    ("港幣 100", True), ("新台幣 330", True), ("新台幣330元", True), ("NTD 330", True), ("330 NTD", True),
+    ("100 hkd", True), ("twd330", True), ("100蚊", True), ("總數 100", True), ("收費 50", True), ("運費 30", True),
+    ("add 2 all", False), ("3 top picks", False), ("Ship to 3 台中市", False), ("香港 2 號", False),
+])
+def test_outside_usd_the_hong_kong_and_taiwan_amount_shapes(text, shaped):
+    assert amounts.text_amount_shaped(text) is shaped
+
+
+def test_the_relay_is_never_built_with_a_region_or_postcode_that_is_not_its_markets():
+    row = {"id": "ap_0123456789abcdef01234567", "buyer_email": EMAIL, "checkout_url": "https://merchant.example/c",
+           "currency": "USD", "quoted_total_minor": 5000, "merchant_domain": "merchant.example"}
+    for over in ({"region": "ON"}, {"postalCode": "K1A 0B1"}, {"region": "ON", "postalCode": "K1A 0B1"}):
+        assert worker._checkout_setup({**row, "shipping_address": {**ADDRESS, **over}}) is None, over
+    assert worker._checkout_setup({**row, "shipping_address": {**ADDRESS, "region": "tx"}}) is not None
+
+
 @pytest.mark.parametrize("text,currency", [("CA$12.00 USD", "CAD"), ("CA$12.00 USD", "USD"), ("$12.00 CAD", "USD"),
                                            ("JPY 1,500 USD", "JPY")])
 def test_a_total_with_two_currencies_reads_as_neither(text, currency):

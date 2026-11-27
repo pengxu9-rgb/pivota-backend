@@ -524,10 +524,9 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
-        if market_country != "US":
-            # Outside the US the market's own region and postcode rules apply with capture off too (the US keeps
-            # today's capture-off rules exactly).
-            stored_address = shipping_capture.door_address(stored_address)
+        # The market's own checks on a region and postcode GIVEN apply with capture off too, in every market: a
+        # Canadian province or postcode on a US address is refused here, before the buyer approves.
+        stored_address = shipping_capture.door_address(stored_address)
         # With capture off nobody asks the buyer later: a field the store's platform requires there is required
         # here (a2a_address_requirements), in every market, the US included. Field names only.
         lacking = a2a_address_requirements.missing(merchant_host, stored_address)
@@ -535,8 +534,8 @@ async def _open_a2a_purchase(
             raise reap_svc.PurchaseRefused(
                 "invalid_address", "shipping address fields required by the store: " + ",".join(sorted(lacking)))
     else:
-        # Capture on: each part is optional; one that is given is read by the same rules (the address also by
-        # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.
+        # Capture on: each part is optional; one that is given is read by the same rules (its market's checks on a
+        # region and postcode given). What is missing, the store's platform included, AgenPas asks the buyer for.
         stored_email = shipping_capture.door_email(buyer_email) if buyer_email else None
         stored_address = shipping_capture.door_address(shipping_address) if shipping_address else None
         if stored_email is not None and stored_address is not None:
