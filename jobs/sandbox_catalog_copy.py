@@ -1655,9 +1655,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jobs.sandbox_catalog_copy")
     parser.add_argument("mode", choices=("export", "import"))
     args = parser.parse_args(argv)
-    # httpx logs every request's URL at INFO, and a resumable upload's URL is its session capability.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
     try:
         result = asyncio.run(_run(args.mode, os.environ))
     except CopyRefused as exc:
@@ -1667,5 +1664,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+def _quiet_http_logs() -> None:
+    """httpx logs every request's URL at INFO, and a resumable upload's URL is its session
+    capability. Only the job's own process sets this: the levels are process-wide, so main() leaves
+    them alone and an importer (the tests, jobs.sandbox_schema_apply) keeps its own."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+if __name__ == "__main__":  # pragma: no cover - run as `python -m jobs.sandbox_catalog_copy` (tested in a subprocess)
+    _quiet_http_logs()
     sys.exit(main())

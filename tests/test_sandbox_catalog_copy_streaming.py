@@ -797,14 +797,42 @@ def test_malformed_csv_is_a_refusal_reported_after_the_sha(tmp_path, monkeypatch
         C._check_file(store, _entry(data, 1), None)
 
 
-def test_the_job_keeps_httpx_from_logging_upload_urls(monkeypatch):
+def test_the_job_process_keeps_httpx_from_logging_upload_urls():
+    """The real entry point (python -m) quiets httpx and httpcore before it runs."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(C.__file__).resolve().parents[1]
+    probe = ("import logging, runpy, sys\n"
+             "sys.argv = ['jobs.sandbox_catalog_copy', 'export']\n"
+             "try:\n"
+             "    runpy.run_module('jobs.sandbox_catalog_copy', run_name='__main__', alter_sys=True)\n"
+             "except SystemExit as exc:\n"
+             "    print('exit', exc.code)\n"
+             "print('levels', logging.getLogger('httpx').level, logging.getLogger('httpcore').level)\n")
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "PYTHONPATH", "TMPDIR")}
+    env["PIVOTA_ENV"] = "test"  # the export refuses at once: no database, no store, no network
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), env.get("PYTHONPATH", "")) if p)
+    out = subprocess.run([sys.executable, "-c", probe], cwd=root, env=env, capture_output=True, text=True,
+                         timeout=60)
+    assert "exit 2" in out.stdout, out.stderr
+    assert "levels 30 30" in out.stdout, out.stdout + out.stderr
+    assert "runs only where PIVOTA_ENV resolves to production" in out.stderr
+
+
+def test_main_leaves_the_process_wide_log_levels_alone(monkeypatch):
+    """A test (or jobs.sandbox_schema_apply) calling main() must not silence httpx for the rest of
+    the process: other tests read httpx's and httpcore's records."""
     import logging
 
     async def refuse(mode, env):
         raise C.CopyRefused("stop")
 
     monkeypatch.setattr(C, "_run", refuse)
-    for name in ("httpx", "httpcore"):
-        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    before = {n: (logging.getLogger(n).level, logging.getLogger(n).isEnabledFor(logging.INFO))
+              for n in ("httpx", "httpcore", "httpcore.http11")}
     assert C.main(["export"]) == 2
-    assert logging.getLogger("httpx").level == logging.getLogger("httpcore").level == logging.WARNING
+    assert {n: (logging.getLogger(n).level, logging.getLogger(n).isEnabledFor(logging.INFO))
+            for n in before} == before
