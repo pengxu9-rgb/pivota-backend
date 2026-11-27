@@ -248,7 +248,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tupl
 
 import db.a2a_rail_ledger as ledger
 import db.partner_agent_merchant_blocks as agent_blocks
-from services.payment_orchestration import a2a_markets
+from services.payment_orchestration import a2a_address_requirements, a2a_markets
 from services.payment_orchestration import a2a_rail, a2a_shipping_address, agent_run_condition, checkout_amounts, vic_order
 from services.payment_orchestration import router as rail_router
 from utils.money import ZERO_DECIMAL_CURRENCIES
@@ -643,7 +643,8 @@ async def _await_contact(s: _Step) -> str:
         return await _settled(s, moved, "expired")
     parked = await ledger.park_for_shipping_address_as_holder(
         s.id, s.worker, expires_at=deadline, next_poll_at=_later(POLL_SHIPPING_ADDRESS),
-        incomplete_address=a2a_shipping_address.incomplete_address(s.row.get("shipping_address")))
+        incomplete_address=a2a_shipping_address.incomplete_address(
+            s.row.get("shipping_address"), s.row.get("merchant_domain")))
     return SHIPPING_ADDRESS_REQUIRED if parked is not None else "lost"
 
 
@@ -2114,6 +2115,8 @@ def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
         return None
     if not a2a_markets.address_matches_currency(address, row.get("currency")):
         return None  # never relayed with another market's address (the token step refuses it first)
+    if a2a_address_requirements.missing(row.get("merchant_domain"), address):
+        return None  # never relayed without a field the store's platform requires there: it would fail at the store
     candidate = {
         "email": row.get("buyer_email"),
         "first_name": address.get("firstName"),

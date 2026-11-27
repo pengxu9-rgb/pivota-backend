@@ -448,11 +448,12 @@ async def submit_shipping_address_for_gateway(
         body = None
     # THE waiting rule's "missing" (a2a_shipping_address.awaits_contact): an address that lacks a required field
     # is asked for whole, and the ledger replaces exactly that stored value (a compare-and-swap on it).
-    replaces = shipping_capture.incomplete_address(row.get("shipping_address"))
+    merchant = row.get("merchant_domain")
+    replaces = shipping_capture.incomplete_address(row.get("shipping_address"), merchant)
     email, address, field_errors = shipping_capture.read_submission(
         body, email_required=not row.get("buyer_email"),
-        address_required=shipping_capture.address_missing(row.get("shipping_address")),
-        market=a2a_markets.market_for_currency(row.get("currency")))
+        address_required=shipping_capture.address_missing(row.get("shipping_address"), merchant),
+        market=a2a_markets.market_for_currency(row.get("currency")), merchant_domain=merchant)
     if field_errors:
         # The app's "already normalised" error shape (`status` + `error`), which ErrorHandlerMiddleware passes
         # through with its status: a 422 stays a 422 (a FastAPI-default 422 would be re-nested as a 400).
