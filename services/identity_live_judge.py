@@ -366,7 +366,9 @@ class ReplayAgent:
 
 # --- the text contract for a model agent -----------------------------------------------------
 
-PROMPT_VERSION = "p2"  # p2: the sceptic checks a list of differences one by one (p1 said "look for any")
+# Per role, so a record says which text that role was given. sceptic p2 checks a list of
+# differences one by one (p1 said "look for any reason"); the matcher text is unchanged since p1.
+PROMPT_VERSIONS = {"matcher": "p1", "sceptic": "p2"}
 
 _ROLE_TEXT = {
     "matcher": "Decide whether the two listings are the same buyable item: same brand, same product "

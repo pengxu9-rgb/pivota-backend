@@ -478,7 +478,10 @@ def test_the_sceptic_prompt_names_each_difference_to_check():
     assert "checked all five" not in lj.role_instructions("matcher")
 
 
-def test_every_record_names_the_prompt_version():
-    agent = jg.GeminiAgent("sceptic", "gemini-4-hydrogen", post=FakePost(payload(json.dumps(answer()))))
-    agent(view())
-    assert agent.records[0]["prompt"] == lj.PROMPT_VERSION == "p2"
+def test_every_record_names_its_own_role_prompt_version():
+    post = FakePost(payload(json.dumps(answer())))
+    m = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=post)
+    s = jg.GeminiAgent("sceptic", "gemini-4-hydrogen", post=post)
+    m(view()), s(view())
+    assert m.records[0]["prompt"] == "p1" and s.records[0]["prompt"] == "p2"
+    assert set(lj.PROMPT_VERSIONS) == set(lj.ROLES)
