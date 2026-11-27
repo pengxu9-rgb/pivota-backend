@@ -445,12 +445,15 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
 # ── a purchase in another currency than USD (no measured shape yet) ─────────────────────────────────────
 
 #: A number followed by a currency word written in letters, not a symbol: "1,500円", "15,000원", "1万円", "1만원",
-#: "100元". Glued to the number (only digits and grouping commas between), whatever follows: "1500円送料".
-_LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:円|圓|圆|元|원|엔)")
+#: "100元", "100港元", "100港幣", "330台幣", "330新台幣". Glued to the number (only digits and grouping commas
+#: between), whatever follows: "1500円送料".
+_HAN_CURRENCY_WORD = r"(?:港|台|臺|新台|新臺)?(?:円|圓|圆|元|幣|币)"
+_LETTER_CURRENCY_AFTER_DIGIT_RE = re.compile(r"\d[\d,]*(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_CURRENCY_WORD + r"|원|엔)")
 #: The same with a space before the word ("1500 円", "15000 원"), unless the word runs on into a place name of its
 #: own script ("1-2 円山町", "1-2 元町", "1 원효로": 円 / 元 then a Han character, 원 then a Hangul syllable).
 _SPACED_LETTER_CURRENCY_RE = re.compile(
-    r"\d[\d,]*\s+(?:[万萬億亿千百만억천]\s?)?(?:(?:円|圓|圆|元)(?![\u3400-\u9fff\uf900-\ufaff])|(?:원|엔)(?![\uac00-\ud7a3]))")
+    r"\d[\d,]*\s+(?:[万萬億亿千百만억천]\s?)?(?:" + _HAN_CURRENCY_WORD
+    + r"(?![\u3400-\u9fff\uf900-\ufaff])|(?:원|엔)(?![\uac00-\ud7a3]))")
 #: A number, then up to two words, then a currency word in Latin letters: "1500 yen", "15000 won", "15 Canadian
 #: dollars", "20 NZ dollars". Whole words only ("15 entries" is not "en").
 _LATIN_CURRENCY_WORD_AFTER_DIGIT_RE = re.compile(

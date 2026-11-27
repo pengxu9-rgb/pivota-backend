@@ -303,16 +303,23 @@ async def test_a_full_contact_at_create_is_stored_as_before_and_asks_for_nothing
 
 @pytest.mark.parametrize("address", [
     {k: v for k, v in ADDRESS.items() if k != "region"},
-    {k: v for k, v in ADDRESS.items() if k != "postalCode"},
     {**ADDRESS, "region": "PR"},           # a territory
-    {**ADDRESS, "postalCode": "7879"},
-], ids=["no_region", "no_postal_code", "territory", "bad_zip"])
-async def test_a_given_us_address_needs_a_real_state_and_a_zip(address, monkeypatch):
+    {**ADDRESS, "postalCode": "7879"},     # a zip given is checked
+], ids=["no_region", "territory", "bad_zip"])
+async def test_a_given_us_address_needs_a_real_state_and_a_well_formed_zip_if_any(address, monkeypatch):
     resp = await _http("POST", BASE, json=_body(address=address))
     assert resp.status_code == 400 and "invalid_address" in resp.text
     for value in ADDRESS.values():
         assert value not in resp.text
     assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+
+
+async def test_a_us_address_with_no_zip_is_taken_the_store_platform_asks_for_one_if_it_needs_it():
+    no_zip = {k: v for k, v in ADDRESS.items() if k != "postalCode"}
+    resp = await _http("POST", BASE, json=_body(address=no_zip))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert row["shipping_address"] == no_zip
 
 
 @pytest.mark.parametrize("missing", ["email", "address", "both"])
@@ -890,3 +897,24 @@ async def test_while_korea_is_off_a_won_purchase_is_not_taken_by_the_a2a_rail(mo
     assert resp.json().get("handled_by") == "reap", resp.text
     assert stubs.catalog_currency == []
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []
+
+
+HK_ADDRESS = {"firstName": "Pat", "lastName": "Example", "phone": "+85221234567", "addressLine1": "1 Example Road",
+              "city": "Kowloon", "country": "HK"}
+
+
+async def test_a_hong_kong_purchase_is_taken_with_no_postcode_and_none_is_stored(monkeypatch, stubs):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,HK")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:HK")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,HKD:50000")
+    monkeypatch.setitem(FACTS, "currency", "HKD")
+    monkeypatch.setitem(FACTS, "market_country", "HK")
+    resp = await _http("POST", BASE, json=_body(address=HK_ADDRESS, expected_currency="HKD"))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert (row["currency"], row["shipping_address"]["country"]) == ("HKD", "HK")
+    assert "postalCode" not in row["shipping_address"] and "region" not in row["shipping_address"]
+    # The same address with a region is refused at the door: Hong Kong has no ISO 3166-2 subdivision.
+    resp = await _http("POST", BASE, json=_body(address={**HK_ADDRESS, "region": "KLN"}, expected_currency="HKD",
+                                                 idempotency_key="key-2"))
+    assert resp.status_code == 400 and _error(resp) == "invalid_address", resp.text

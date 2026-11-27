@@ -70,9 +70,9 @@ ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "addressLine
                   "postalCode", "country")
 #: Every field a market may require, in order: the list for an address whose country is unknown or not one of
 #: a2a_markets.MARKETS. A known market's own list (`required_address_fields`) drops `region` where it has none
-#: or makes it optional.
-REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode",
-                           "country")
+#: or makes it optional. `postalCode` is never required: the payment provider does not ask for it, and whether
+#: an address needs one is the store platform's checkout's to say. One given is read (and checked) as before.
+REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "region", "country")
 #: Every field the write reads, in the order `fields_missing` lists them (email first: the card binding
 #: needs it before anything else).
 FIELDS = ("email",) + ADDRESS_FIELDS
@@ -127,7 +127,8 @@ def _address(value: Any) -> Any:
 
 def required_address_fields(country: Any) -> Tuple[str, ...]:
     """The fields an address in `country` must have, in `REQUIRED_ADDRESS_FIELDS` order. A country that is not
-    one of a2a_markets.MARKETS (or none at all) gets the whole list."""
+    one of a2a_markets.MARKETS (or none at all) gets the whole list. A known market drops `region` where it is not
+    required. `postalCode` is in no list."""
     code = str(country or "").strip().upper()
     if code not in a2a_markets.MARKETS or a2a_markets.region_rule(code) == a2a_markets.REGION_REQUIRED:
         return REQUIRED_ADDRESS_FIELDS

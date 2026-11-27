@@ -1,7 +1,7 @@
 """services/payment_orchestration/a2a_markets.py: which markets the A2A rail takes, and each one's address rules.
 
 Pinned here: unset means the US only (the rail as before); the env is the whole list, and a code outside the table
-turns nothing on; every market's currency is the market registry's; Hong Kong is not in the table; KR and TW are
+turns nothing on; every market's currency is the market registry's; a postcode is never required; KR and TW are
 priced in their own currency without joining the Reap lane's market map; each market's
 region and postcode rules, as the door and the address write read them; and the router takes a currency only
 while its market is on.
@@ -33,6 +33,7 @@ VALID = {
     "JP": {"region": "13", "postalCode": "100-0001"},
     "KR": {"region": "11", "postalCode": "04524"},
     "TW": {"region": "TPE", "postalCode": "100"},
+    "HK": {},  # no region, no postcode
 }
 
 
@@ -50,7 +51,7 @@ def _no_markets_env(monkeypatch):
 
 @pytest.mark.parametrize("raw,expected", [
     (None, {"US"}), ("", {"US"}), ("   ", {"US"}), ("US", {"US"}), ("us, jp", {"US", "JP"}), ("CA", {"CA"}),
-    ("CA,XX,HK,GB", {"CA"}), ("XX", set()), ("U S", set()),
+    ("CA,XX,GB", {"CA"}), ("XX", set()), ("U S", set()), ("US,HK", {"US", "HK"}),
 ])
 def test_unset_is_the_us_only_and_the_env_is_the_whole_list(monkeypatch, raw, expected):
     if raw is not None:
@@ -58,12 +59,11 @@ def test_unset_is_the_us_only_and_the_env_is_the_whole_list(monkeypatch, raw, ex
     assert markets.enabled_markets() == frozenset(expected)
 
 
-def test_every_market_is_the_registrys_with_its_currency_and_hong_kong_is_not_in_the_table():
-    assert set(markets.MARKETS) == {"US", "CA", "AU", "NZ", "SG", "JP", "KR", "TW"}
+def test_every_market_is_the_registrys_with_its_currency():
+    assert set(markets.MARKETS) == {"US", "CA", "AU", "NZ", "SG", "JP", "KR", "TW", "HK"}
     for market in markets.MARKETS:
         assert markets.currency_for(market) == market_registry.currency_for(market), market
-    for market in ("HK", "GB"):
-        assert markets.currency_for(market) is None, market
+    assert markets.currency_for("GB") is None and markets.currency_for("HK") == "HKD"
     assert market_registry.market("TW")["status"] == "off"  # listed for its currency, served nowhere
 
 
@@ -81,8 +81,8 @@ def test_the_reap_lanes_markets_are_unchanged_and_only_the_a2a_rail_prices_korea
 
 def test_the_enabled_currencies_follow_the_markets(monkeypatch):
     assert markets.enabled_currencies() == frozenset({"USD"})
-    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA,AU,NZ,SG,JP,KR,TW")
-    assert markets.enabled_currencies() == frozenset({"USD", "CAD", "AUD", "NZD", "SGD", "JPY", "KRW", "TWD"})
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,CA,AU,NZ,SG,JP,KR,TW,HK")
+    assert markets.enabled_currencies() == frozenset({"USD", "CAD", "AUD", "NZD", "SGD", "JPY", "KRW", "TWD", "HKD"})
 
 
 @pytest.mark.parametrize("country", sorted(VALID))
@@ -105,7 +105,7 @@ def test_a_valid_address_passes_its_markets_rules(country):
     ("JP", {"region": "48"}, {"region": "invalid"}),
     ("JP", {"region": None}, {"region": "required"}),
     ("JP", {"postalCode": "1000001"}, {}),
-    ("JP", {"postalCode": None}, {"postalCode": "required"}),
+    ("JP", {"postalCode": None}, {}),  # a postcode is never required, in any market
     ("KR", {"region": None}, {}),
     ("KR", {"region": "51"}, {}),
     ("KR", {"region": "99"}, {"region": "invalid"}),
@@ -113,7 +113,12 @@ def test_a_valid_address_passes_its_markets_rules(country):
     ("TW", {"postalCode": "10048"}, {}),
     ("TW", {"postalCode": "1004"}, {"postalCode": "invalid"}),
     ("TW", {"region": "TPQ"}, {"region": "invalid"}),
-    ("TW", {"postalCode": None}, {"postalCode": "required"}),
+    ("TW", {"postalCode": None}, {}),
+    ("US", {"postalCode": None}, {}),
+    ("SG", {"postalCode": "not-a-code"}, {"postalCode": "invalid"}),  # one given is still checked
+    ("HK", {"region": "KLN"}, {"region": "invalid"}),  # no ISO 3166-2 subdivision: refused, as in SG
+    ("HK", {"postalCode": "000000"}, {}),  # none exists: one given is the buyer's, unchecked
+    ("HK", {"postalCode": "anything"}, {}),
 ])
 def test_each_markets_region_and_postcode_rules(country, over, errors):
     assert dict(markets.address_errors(_address(country, **over))) == errors
@@ -121,13 +126,14 @@ def test_each_markets_region_and_postcode_rules(country, over, errors):
 
 @pytest.mark.parametrize("country,region_listed", [
     ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False), ("TW", False),
-    ("HK", True), (None, True),
+    ("HK", False), ("GB", True), (None, True),
 ])
 def test_fields_missing_asks_for_a_region_only_where_the_market_requires_one(country, region_listed):
     address = {"country": country} if country else {}
     missing = shipping.fields_missing(EMAIL, address)
     assert ("region" in missing) is region_listed
-    assert "postalCode" in missing and (country is not None or "country" in missing)
+    assert "postalCode" not in missing  # never asked for: the store platform's to require
+    assert country is not None or "country" in missing
     complete = _address(country) if country in VALID else None
     if complete is not None:
         assert shipping.fields_missing(EMAIL, {k: v for k, v in complete.items() if k != "region"}) == (
@@ -239,3 +245,30 @@ def test_a_canadian_purchase_shown_in_dollars_never_takes_the_rail(monkeypatch):
     assert _choice(market_country="CA", currency="USD").dropped == {"a2a": "currency_market_mismatch"}
     assert _choice(market_country="CA", currency="USD", preferred="a2a").refusal == "currency_market_mismatch"
     assert _choice(market_country="CA", currency="CAD").rail == "a2a"
+
+
+def test_no_market_asks_for_a_postcode_and_the_relay_sends_no_zip_code_without_one(monkeypatch):
+    from services.payment_orchestration import a2a_rail
+
+    for country in (*markets.MARKETS, "GB", "", None):
+        assert "postalCode" not in shipping.required_address_fields(country), country
+    assert "region" in shipping.required_address_fields("GB")  # not in the table: the whole list, region included
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,JP")
+    for country in ("US", "JP"):
+        email, address, errors = _submit(country, postalCode=None)
+        assert errors == {} and "postalCode" not in address, country
+    monkeypatch.setenv(markets.MARKETS_ENV, "US,HK")
+    email, address, errors = _submit("HK")
+    assert errors == {} and email == EMAIL and "postalCode" not in address and address["country"] == "HK"
+    assert shipping.fields_missing(EMAIL, address) == [] and shipping.incomplete_address(address) is None
+    assert _submit("HK", region="HK")[2] == {"region": "invalid"}
+    assert shipping.door_address(_address("HK"))["country"] == "HK"
+    hk = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+85221234567", "country": "HK",
+          "address1": "1 Example Road", "city": "Kowloon"}
+    assert a2a_rail.checkout_shipping(hk) == hk  # no zip_code, nothing invented for it
+    assert a2a_rail.checkout_shipping({**hk, "zip_code": "000000"})["zip_code"] == "000000"  # the buyer's, as given
+    us = {**hk, "country": "US", "state": "TX"}
+    assert a2a_rail.checkout_shipping(us) == us  # no zip_code in any market unless one was given
+    assert a2a_rail.checkout_shipping({**us, "zip_code": "78701"})["zip_code"] == "78701"
+    assert a2a_rail.checkout_shipping({k: v for k, v in us.items() if k != "state"}) is None  # the US state stays
+    assert a2a_rail.checkout_shipping({k: v for k, v in hk.items() if k != "country"}) is None
