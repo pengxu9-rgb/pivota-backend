@@ -942,3 +942,15 @@ async def test_with_capture_on_an_address_without_a_platform_field_opens_and_tha
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert shipping_capture.fields_missing(row["buyer_email"], row["shipping_address"], row["merchant_domain"]) == [
         "region"]
+
+
+async def test_with_capture_off_a_us_address_with_another_markets_region_or_postcode_is_refused(monkeypatch):
+    monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    for i, over in enumerate(({"region": "ON"}, {"postalCode": "K1A 0B1"}, {"region": "ON", "postalCode": "K1A 0B1"})):
+        resp = await _http("POST", BASE, json=_body(address={**ADDRESS, **over}, idempotency_key=f"k-{i}"))
+        assert resp.status_code == 400 and _error(resp) == "invalid_address", (over, resp.text)
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+    # Read as the door reads it with capture on: the state upper-cased.
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, "region": "tx"}, idempotency_key="k-ok"))
+    assert resp.status_code == 202, resp.text
+    assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["region"] == "TX"

@@ -2150,6 +2150,9 @@ def _checkout_setup(row: Mapping[str, Any]) -> Optional[a2a_rail.CheckoutSetup]:
         return None  # never relayed with another market's address (the token step refuses it first)
     if a2a_address_requirements.missing(row.get("merchant_domain"), address):
         return None  # never relayed without a field the store's platform requires there: it would fail at the store
+    if a2a_markets.address_errors({**address, "country": str(address.get("country") or "").upper(),
+                                   "region": str(address.get("region") or "").upper()}):
+        return None  # a region or postcode given that is not its market's (whatever path stored it) is never relayed
     candidate = {
         "email": row.get("buyer_email"),
         "first_name": address.get("firstName"),
