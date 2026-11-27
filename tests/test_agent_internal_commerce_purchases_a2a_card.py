@@ -35,13 +35,22 @@ async def _with_card(state: str, *, method: str = "pm_visa", card_method: str = 
 
 async def test_an_a2a_body_names_the_paying_card_once_its_token_is_minted(monkeypatch):
     monkeypatch.setenv(internal_routes.AGENPAS_PAYMENT_CARD_ENABLED_ENV, "1")
+    # The ids are random hex, so the card's digits can turn up in them by chance; this one always carries them, so
+    # the leak check below must hold however the ids come out.
+    monkeypatch.setattr(a2a_ledger, "new_purchase_id", lambda: f"{a2a_ledger.ID_PREFIX}04444ab00000000000000000")
     rail_id = await _with_card("awaiting_authorization")
+    assert "4444" in rail_id
     internal = await _get(f"{INTERNAL}/{rail_id}", headers=_headers())
     assert internal.status_code == 200, internal.text
     body = internal.json()
     assert body["payment_card"] == {"network": "visa", "last4": "4444"}
     public = await _public(f"{PUBLIC}/{rail_id}")
-    assert "payment_card" not in public.json() and "4444" not in public.text
+    assert "payment_card" not in public.json()
+    # The leak check reads the public body with its random ids taken out (the rail purchase's and its parent's).
+    text = public.text
+    for random_id in {rail_id, public.json()["purchase_id"]}:
+        text = text.replace(random_id, "<id>")
+    assert "4444" not in text
     assert {k: v for k, v in body.items() if k != "payment_card"} == public.json()
 
 
