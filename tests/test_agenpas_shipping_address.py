@@ -942,6 +942,16 @@ async def test_with_capture_on_an_address_without_a_platform_field_opens_and_tha
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert shipping_capture.fields_missing(row["buyer_email"], row["shipping_address"], row["merchant_domain"]) == [
         "region"]
+    # The buyer's write is read for the same store: a form still without the state is refused by name, and the
+    # stored address is replaced by one that has it.
+    pid = row["id"]
+    await _consent(pid)
+    form = {k: v for k, v in _form().items() if k != "region"}
+    resp = await _submit(pid, form)
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["field_errors"] == {"region": "required"}
+    assert (await _submit(pid, _form())).status_code == 200
+    assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"]["region"] == ADDRESS["region"]
 
 
 async def test_with_capture_off_a_us_address_with_another_markets_region_or_postcode_is_refused(monkeypatch):

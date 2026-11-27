@@ -700,7 +700,10 @@ async def test_an_address_without_what_the_stores_platform_requires_mints_no_tok
     pid = await _open(no_zip)
     rail = Rail()
     assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
-    assert rail.sent == [] and (await _row(pid))["state"] == "opened"
+    parked = await _row(pid)
+    assert rail.sent == [] and parked["state"] == "opened"
+    # Parked for the ZIP: the stored address counts as absent, so the wait (code and deadline) stays armed.
+    assert parked["last_error_code"] == worker.SHIPPING_ADDRESS_REQUIRED and parked["buyer_action_expires_at"]
     await database.execute("DELETE FROM a2a_rail_purchases")
     pid = await _locked()
     await _set_address(pid, no_zip)
