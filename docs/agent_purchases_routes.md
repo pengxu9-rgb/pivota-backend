@@ -57,6 +57,9 @@ decided before any database read.
   nowhere to send the buyer: poll again. With the AgenPas consent gate on (below) and no consent yet
   for that step, it is `{"kind", "expires_at", "consent_required": true}` with NO `url` (and no
   `type`): the buyer must accept Pivota's terms on the AgenPas page first.
+  On the A2A rail, while the worker waits for the buyer to confirm the paying card (the card choice, below), it is
+  `{"kind": "card_choice", "expires_at"}` with no `url`: a step on Pivota's own AgenPas page (the gateway puts the
+  buyer's AgenPas link in it). `detail.card_choice_required = {"expires_at"}` says the same.
 - `order_reference`: present on `completed`; the merchant order reference from the rail.
 - `detail`: exactly what `GET /agent/v2/commerce/reap/purchases/{rp_id}` returns.
 - 503 `state_unmapped`: the rail reported a state this service has no unified word for. Do not
@@ -449,11 +452,16 @@ The dial off: the worker mints on the card the purchase names, exactly as before
 was waiting. **Turn on** on `web` first, then the worker; **off** on the worker first, then `web` (a worker that
 waits while `web` shows no choice leaves purchases waiting until the deadline).
 
-**How the buyer gets there.** While a purchase waits, an agent sees only `locking` (no `next_action`, no hosted
-URL): nothing in the agent's own surfaces sends the buyer anywhere. The buyer is asked on the AgenPas page the
-agent's link already opened (the gateway's `card_choice` screen, its own `AGENPAS_CARD_PICKER_ENABLED`, which ships
-separately). So **the worker's dial must not go on before that gateway screen is live, and only while every A2A
-purchase's buyer is on the AgenPas page**: any other purchase would wait out the 30 minutes and expire, unminted.
+**How the buyer gets there.** While a purchase waits (parked `card_choice_required`, nothing confirmed or asked for,
+no token, the deadline ahead, the dial and the consent gate on: `a2a_purchase_view.card_choice_waits`), the agent's
+view is `locking` with `next_action = {"kind": "card_choice", "expires_at"}` (no URL, no `type`) and
+`detail.card_choice_required = {"expires_at"}`: the step is on the AgenPas page, and the gateway puts the buyer's
+AgenPas link in that `next_action` (as for a consent-gated step), so a returning buyer with a saved card, who had no
+earlier step to open the page from, is sent there too (staging run-through 11-27: without it, nothing told the agent to
+hand the link over). The buyer is asked on the gateway's `card_choice` screen (its own `AGENPAS_CARD_PICKER_ENABLED`).
+Once confirmed (or a new card asked for) the step is gone: the token's approval page or the card page is the next
+one. **The worker's dial still must not go on before that gateway screen and the gateway's `card_choice` link are
+live**: a purchase whose buyer cannot reach the page waits out the 30 minutes and expires, unminted.
 
 Same router as the read: its dial, its key (`AGENPAS_INTERNAL_READ_KEY`) and its (agent id, purchase id) scoping,
 like the shipping-address write.
