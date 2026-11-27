@@ -1,7 +1,7 @@
 # Sandbox catalog copy (design step 6)
 
 Code: `jobs/sandbox_catalog_copy.py`. Tests: `tests/test_sandbox_catalog_copy.py`,
-`tests/test_sandbox_catalog_copy_postgres.py`.
+`tests/test_sandbox_catalog_copy_streaming.py`, `tests/test_sandbox_catalog_copy_postgres.py`.
 
 ```
 prod (pivota-prod)                       GCS                                sandbox (pivota-sandbox)
@@ -15,7 +15,8 @@ python -m jobs.sandbox_catalog_copy      gs://pivota-sandbox-catalog-drop/  pyth
 * Export refuses unless `PIVOTA_ENV` resolves to production; import refuses unless it is `sandbox`
   and `config.sandbox_guard` passes. Exit code 2 on a refusal, 0 on success, one `DONE {...}` line.
 * The export's service account needs `roles/storage.objectCreator` on the bucket only; it writes
-  with `ifGenerationMatch=0` and never reads back. The import's needs `objectViewer`.
+  resumable uploads created with `ifGenerationMatch=0` and never reads back. The import's needs
+  `objectViewer` (it reads each object's generation, then its bytes).
 * The manifest is written last. The import takes the newest stamp that has one.
 * Prices keep their values. The gateway marks sandbox answers `sandbox: true` and treats copied
   prices as fresh (decision 4).
@@ -147,8 +148,51 @@ in a table that references a copied one (for example a test order on a merchant)
 prod keeps that merchant; if prod removes the merchant, the FK's own `ON DELETE` rule applies.
 
 The importer does not trust the export: it re-checks the manifest against the same column rules,
-verifies sha256 and row count per file before touching the database, and re-applies the
-placeholder and `realtime_enabled=false` itself.
+verifies sha256, gzip framing, row count and the scrub per file in one streamed read before touching
+the database, and re-applies the placeholder and `realtime_enabled=false` itself. The load then
+streams the same object generation into COPY and checks its sha256 again at the end; a mismatch
+raises inside the COPY and rolls the import back.
+
+## Prod load and memory (S5)
+
+Nothing holds a table in memory, on either side. COPY's output is cut into whole CSV records
+(`RecordSplitter`), scrubbed and checked, gzipped and sent as a GCS resumable upload in 8 MiB
+pieces. The import reads 1 MiB at a time and inflates at most 1 MiB per step, so a small file that
+inflates hugely is still processed in bounded pieces. One record is the largest unit either side
+holds; a record over 256 MiB (`MAX_RECORD_BYTES`) is refused.
+
+On prod the export runs in one `REPEATABLE READ, READ ONLY` transaction with these `SET LOCAL`
+limits, which end with it:
+
+| Setting | Default | Why |
+|---|---|---|
+| `statement_timeout` | 20min | bounds each table's COPY (and its count) |
+| `lock_timeout` | 5s | never queue behind a migration's `ACCESS EXCLUSIVE` request, which would stall every query queued behind it |
+| `idle_in_transaction_session_timeout` | 2min | a stalled job gives its snapshot back |
+| `client_connection_check_interval` (PG 14+) | 5s | a terminated session stops even inside a scan that sends nothing |
+| `application_name` | `sandbox_catalog_export` | visible in `pg_stat_activity` |
+
+A client-side deadline (45 min, at most 2 h) **terminates** the connection, which ends the session,
+its transaction and its snapshot on the server at once. A limit reached on the server is a refusal
+naming it. Either way nothing is written: every file is an unfinished upload until the last table
+has passed, and only then are the uploads committed and the manifest written. A failure during
+that commit (an upload refused at its final piece, say) can leave some of the stamp's files in
+place without a manifest. The import only reads a stamp that has a manifest, so it never imports
+them; delete them by hand.
+
+What the run line should still weigh:
+
+* The snapshot holds `ACCESS SHARE` on every table it has read until it commits. A migration that
+  needs `ACCESS EXCLUSIVE` on one of them waits until the export ends (up to the deadline), and
+  queries queued behind that migration wait too. Run the export outside a deploy window.
+* A long snapshot holds back vacuum's horizon for its duration.
+* `DATABASE_URL` can name a read replica instead of the primary; nothing in the code changes. On a
+  hot standby a long query can be cancelled by a recovery conflict (`max_standby_streaming_delay`),
+  which shows up as a refusal or an error and writes nothing; rerun it.
+* A refusal inside a table (a scrub finding) lets that table's COPY run to its end with the rest of
+  its output dropped unread. asyncpg 0.31 stalls a connection whose COPY sink raises mid-stream, so
+  the sink keeps the refusal and the export raises it after the COPY. `statement_timeout` and the
+  deadline bound that COPY.
 
 ## Known limits
 
@@ -157,8 +201,6 @@ placeholder and `realtime_enabled=false` itself.
 * A first prod export may refuse on a column the classification does not list (prod drift), on a
   risky name, or on a person key holding an object; that is the rule working. Classify, drop or
   scrub it in its own reviewed change.
-* Nothing streams yet (S5): each table is held in memory, about 5-8x its size, and a table whose
-  COPY output passes 1 GiB is refused (MAX_TABLE_COPY_BYTES) rather than running the job out of memory.
 * Phones are recognised only with context: an international number written with "+", or a number
   right after a phone word (tel, phone, call, mobile, fax, whatsapp, contact, and the Korean, Japanese
   and Chinese words). A bare digit group (a SKU, GTIN, year, size or price) is never redacted, so a

@@ -561,3 +561,273 @@ async def test_an_email_used_as_a_json_key_does_not_leave_prod(db, tmp_path):
     await _export(db, store)
     blob = b"".join(gzip.decompress(store.get(n)) for n in store.list("") if n.endswith(".gz"))
     assert b"jane.doe@person.example" not in blob
+
+
+# --- S5: streaming, prod's limits and the deadline ------------------------------------------------
+
+
+def _files(tmp_path):
+    return [p for p in tmp_path.rglob("*") if p.is_file()]
+
+
+def _with_where(name, where):
+    import dataclasses
+
+    return [dataclasses.replace(s, where=where) if s.name == name else s for s in SPECS]
+
+
+async def _big_products(conn, n=4000, width=2000):
+    """~8 MB of products whose text holds newlines, quotes and commas, so records span COPY chunks."""
+    await conn.execute(
+        "INSERT INTO %s.catalog_products (product_id, merchant_id, title, description, attrs) "
+        "SELECT 'big-' || i, 'm1', 'Tint ' || i, repeat(E'line, \"q\"\\n', %d), "
+        "jsonb_build_object('k', i, 'blob', repeat('x', 200)) FROM generate_series(1, %d) i"
+        % (SRC, width // 10, n))
+
+
+async def test_a_table_bigger_than_one_copy_chunk_streams_and_round_trips_exactly(db, tmp_path, monkeypatch):
+    await _big_products(db)
+    calls = []
+    real = C._ExportSink.__call__
+
+    async def counting(self, chunk):
+        calls.append(len(chunk))
+        return await real(self, chunk)
+
+    monkeypatch.setattr(C._ExportSink, "__call__", counting)
+    monkeypatch.setattr(C, "READ_CHUNK_BYTES", 4096)  # the import reads the file in small pieces too
+    monkeypatch.setattr(C, "INFLATE_STEP_BYTES", 1 << 16)
+    store = C.LocalDirStore(tmp_path)
+    manifest = await _export(db, store)
+    assert len(calls) > 20 and max(calls) < 1 << 20  # asyncpg hands COPY over in pieces
+    assert next(t for t in manifest["tables"] if t["name"] == "catalog_products")["rows"] == 4002
+    await _import(db, store)
+    cols = "product_id, merchant_id, title, description, tags, attrs, updated_at, title_lower"
+    assert await _rows(db, DST, "catalog_products", [cols], "product_id") == \
+        await _rows(db, SRC, "catalog_products", [cols], "product_id")
+
+
+async def test_a_refusal_late_in_a_big_table_does_not_stall_the_connection(db, tmp_path):
+    """asyncpg 0.31 stalls a connection whose COPY sink raises mid-stream; the sink keeps the refusal
+    instead, and the export raises it after the COPY. The connection is fine afterwards."""
+    await _big_products(db)
+    await db.execute("ALTER TABLE %s.catalog_products DROP CONSTRAINT catalog_products_merchant_id_fkey" % SRC)
+    await db.execute("UPDATE %s.catalog_products SET merchant_id = 'mailto:owner@realbrand.example' "
+                     "WHERE product_id = 'big-3990'" % SRC)
+    import asyncio
+
+    store = C.LocalDirStore(tmp_path)
+    with pytest.raises(C.CopyRefused, match="catalog_products column merchant_id holds an email-shaped value"):
+        await asyncio.wait_for(_export(db, store), timeout=60)
+    assert await db.fetchval("SELECT 1") == 1
+    assert not db.is_in_transaction()
+    assert _files(tmp_path) == []
+
+
+async def test_the_limits_are_local_to_the_export_transaction(db, tmp_path):
+    names = ("statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
+             "client_connection_check_interval")
+    before = [await db.fetchval("SHOW %s" % n) for n in names]
+    await _export(db, C.LocalDirStore(tmp_path))
+    assert [await db.fetchval("SHOW %s" % n) for n in names] == before
+    assert await db.fetchval("SHOW application_name") != "sandbox_catalog_export"
+
+
+async def test_the_export_does_not_queue_behind_a_migrations_lock(db, tmp_path):
+    other = await _connect()
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute("LOCK TABLE %s.catalog_offers IN ACCESS EXCLUSIVE MODE" % SRC)
+        with pytest.raises(C.CopyRefused, match="hit its lock_timeout on the source; nothing was written"):
+            await C.export_catalog(db, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS,
+                                   schema=SRC, lock_timeout="200ms")
+        await tx.rollback()
+    finally:
+        await other.close()
+    assert _files(tmp_path) == []
+    assert await db.fetchval("SELECT 1") == 1
+
+
+async def test_a_statement_past_its_timeout_is_refused(db, tmp_path):
+    specs = _with_where("catalog_offers", "(SELECT true FROM pg_sleep(2))")
+    with pytest.raises(C.CopyRefused, match="hit its statement_timeout on the source"):
+        await C.export_catalog(db, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=specs,
+                               schema=SRC, statement_timeout="200ms")
+    assert _files(tmp_path) == []
+    assert await db.fetchval("SELECT 1") == 1
+
+
+async def test_the_deadline_ends_the_session_on_the_server(db, tmp_path):
+    import asyncio
+    import time
+
+    victim = await _connect()
+    pid = victim.get_server_pid()
+    specs = _with_where("catalog_offers", "(SELECT true FROM pg_sleep(30))")
+    started = time.monotonic()
+    try:
+        with pytest.raises(C.CopyRefused, match="passed its 0.5s deadline; nothing was written"):
+            await C.export_catalog(victim, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=specs,
+                                   schema=SRC, deadline_seconds=0.5)
+        assert time.monotonic() - started < 10
+        assert victim.is_closed()
+        # client_connection_check_interval (5s) makes the server notice the closed socket mid-statement.
+        for _ in range(150):
+            if not await db.fetchval("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid):
+                break
+            await asyncio.sleep(0.1)
+        assert await db.fetchval("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid) == 0
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert _files(tmp_path) == []
+
+
+async def test_a_file_changed_between_the_check_and_the_load_rolls_the_import_back(db, tmp_path):
+    store = C.LocalDirStore(tmp_path)
+    await _export(db, store)
+    await _import(db, store)
+    before = await _rows(db, DST, "catalog_offers", ["*"], "offer_id")
+    await db.execute("UPDATE %s.catalog_offers SET price = 99 WHERE offer_id = 'o-p1'" % SRC)
+    await _export(db, store, stamp="20261126T0100Z")
+
+    class Swapped(C.LocalDirStore):
+        """The load (second read) of catalog_offers gets other bytes than the check (first read)."""
+        reads = {}
+
+        def open_reader(self, name, generation):
+            self.reads[name] = self.reads.get(name, 0) + 1
+            if name.endswith("catalog_offers.csv.gz") and self.reads[name] == 2:
+                yield gzip.compress(b'"o-p1","p1","m1","1.0000","USD","5"\n"o-p2","p2","m2","0.0100","KRW",\n')
+                return
+            yield from super().open_reader(name, generation)
+
+    with pytest.raises(C.CopyRefused, match="catalog_offers: the file changed between the check and the load"):
+        await _import(db, Swapped(tmp_path))
+    assert await _rows(db, DST, "catalog_offers", ["*"], "offer_id") == before
+    assert await db.fetchval("SELECT 1") == 1 and not db.is_in_transaction()
+
+
+async def test_the_import_refuses_a_cut_off_file_whose_manifest_matches_it(db, tmp_path):
+    import hashlib
+
+    store = C.LocalDirStore(tmp_path)
+    await _export(db, store)
+    name = "20261125T0100Z/catalog_offers.csv.gz"
+    cut = store.get(name)[:-6]
+    (tmp_path / name).write_bytes(cut)
+    path = tmp_path / "20261125T0100Z" / C.MANIFEST_NAME
+    manifest = json.loads(path.read_text())
+    next(t for t in manifest["tables"] if t["name"] == "catalog_offers")["sha256"] = hashlib.sha256(cut).hexdigest()
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(C.CopyRefused, match="catalog_offers: the file's gzip stream is cut off"):
+        await _import(db, store)
+    assert await db.fetchval("SELECT count(*) FROM %s.catalog_offers" % DST) == 0
+
+
+async def test_both_reads_of_a_file_name_the_generation_the_import_pinned(db, tmp_path):
+    store = C.LocalDirStore(tmp_path)
+    await _export(db, store)
+
+    class Pinned(C.LocalDirStore):
+        seen = []
+
+        def generation(self, name):
+            return "gen-" + name
+
+        def open_reader(self, name, generation):
+            self.seen.append((name, generation))
+            yield from super().open_reader(name, generation)
+
+    pinned = Pinned(tmp_path)
+    await _import(db, pinned)
+    assert len(pinned.seen) == 2 * len(SPECS)
+    assert all(generation == "gen-" + name for name, generation in pinned.seen)
+
+
+async def test_a_long_run_without_an_at_sign_exports_well_within_the_deadline(db, tmp_path):
+    """The review's probe: one 150k-character title held the event loop for 33.8 s, past a 0.5 s
+    deadline. The email scan is linear now, so a 2M-character text exports in time and exactly."""
+    import time
+
+    await db.execute(
+        "INSERT INTO %s.catalog_products (product_id, merchant_id, title, description) VALUES "
+        "('long-1', 'm1', repeat('a', 150000), repeat('a.', 1000000)), "
+        "('long-2', 'm1', repeat('img@2x.png+', 20000), repeat('b', 2000000) || '@')" % SRC)
+    store = C.LocalDirStore(tmp_path)
+    started = time.monotonic()
+    await C.export_catalog(db, store, stamp="20261127T0100Z", commit="abc123", specs=SPECS, schema=SRC,
+                           deadline_seconds=5)
+    assert time.monotonic() - started < 5
+    await _import(db, store)
+    cols = "product_id, title, description"
+    assert await _rows(db, DST, "catalog_products", [cols], "product_id") == \
+        await _rows(db, SRC, "catalog_products", [cols], "product_id")
+
+
+class _TerminateSpy:
+    """A real connection whose terminate() is timed (asyncpg's Connection has __slots__)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.terminated_at = None
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def terminate(self):
+        import time
+
+        self.terminated_at = time.monotonic()
+        self._conn.terminate()
+
+
+async def test_the_deadline_terminates_on_time_while_a_block_is_being_scrubbed(db, tmp_path, monkeypatch):
+    import time
+
+    real_scrub = C._TableScrub.scrub
+
+    def slow_scrub(self, text, null_token):
+        if self.table == "catalog_products":
+            time.sleep(3)  # a block that takes long to scrub
+        return real_scrub(self, text, null_token)
+
+    monkeypatch.setattr(C._TableScrub, "scrub", slow_scrub)
+    victim = await _connect()
+    spy = _TerminateSpy(victim)
+    started = time.monotonic()
+    try:
+        with pytest.raises(C.CopyRefused, match="passed its 0.5s deadline; nothing was written"):
+            await C.export_catalog(spy, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS,
+                                   schema=SRC, deadline_seconds=0.5)
+        assert spy.terminated_at is not None and spy.terminated_at - started < 1.5
+        assert victim.is_closed()
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert _files(tmp_path) == []
+
+
+async def test_the_source_killing_an_idle_export_is_a_named_refusal(db, tmp_path, monkeypatch):
+    import asyncio
+
+    real_columns = C._table_columns
+    calls = []
+
+    async def stall_before_the_second_table(conn, schema, table, **kw):
+        calls.append(table)
+        if len(calls) == 2:
+            await asyncio.sleep(2.5)  # idle in the transaction, past its 1s idle_in_transaction timeout
+        return await real_columns(conn, schema, table, **kw)
+
+    monkeypatch.setattr(C, "_table_columns", stall_before_the_second_table)
+    victim = await _connect()
+    try:
+        with pytest.raises(C.CopyRefused, match="source ended the export's session"):
+            await C.export_catalog(victim, C.LocalDirStore(tmp_path), stamp="20261127T0100Z", specs=SPECS,
+                                   schema=SRC, idle_timeout="1s")
+    finally:
+        if not victim.is_closed():
+            await victim.close()
+    assert _files(tmp_path) == []

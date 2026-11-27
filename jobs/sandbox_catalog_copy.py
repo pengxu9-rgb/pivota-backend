@@ -13,9 +13,12 @@ snapshot and the job is incapable of writing to prod's database. Per table it re
 column list and types, removes the columns the spec drops, REFUSES if any remaining column is not
 classified in jobs/sandbox_catalog_columns.py (S3: fail closed) or its name looks like personal data
 or a secret (see RISKY_COLUMN_TOKENS) and the spec has not allowed it, then runs
-``COPY (SELECT ...) TO STDOUT (FORMAT csv)``, scrubs every JSON and text column in Python
-(scrub_csv: person keys, email/phone-shaped values), checks its own output (assert_scrubbed) and
-only then writes ``<prefix>/<stamp>/<table>.csv.gz``.
+``COPY (SELECT ...) TO STDOUT (FORMAT csv)`` and streams it (S5): whole records are scrubbed in
+Python (every JSON and text column: person keys, email/phone-shaped values), checked again (the
+export checks its own output), gzipped and sent as an unfinished upload of
+``<prefix>/<stamp>/<table>.csv.gz``. No table is held in memory. statement_timeout, lock_timeout and
+idle_in_transaction_session_timeout are SET LOCAL, and a client-side deadline terminates the session.
+Only when every table has passed are the uploads committed.
 ``<prefix>/<stamp>/_MANIFEST.json`` (columns, row counts, sha256 per file, the commit) is written
 LAST, so a stamp without a manifest is an unfinished export and is never imported. Objects are
 created with ifGenerationMatch=0: an export never overwrites anything.
@@ -23,7 +26,9 @@ created with ifGenerationMatch=0: an export never overwrites anything.
 IMPORT (sandbox). Refuses unless PIVOTA_ENV=sandbox and config.sandbox_guard passes (which also
 refuses a DATABASE_URL naming a prod host, project or IP). Picks the newest stamp that has a
 manifest, re-applies the export's column rules to the manifest (it does not trust the export),
-checks every file's sha256 and row count and every JSON value against the scrub, then in ONE transaction: stages each table, deletes the
+checks every file's sha256 and row count and every value against the scrub in one streamed read,
+then in ONE transaction: stages each table (streamed again from the same object generation, its
+sha256 re-checked), deletes the
 sandbox rows the new copy no longer has (children first), upserts the rest (parents first), bumps
 serial sequences, and checks each table's row count equals the manifest's. Any mismatch rolls the
 whole import back and the previous copy stays.
@@ -42,7 +47,6 @@ import argparse
 import asyncio
 import csv
 import datetime as _dt
-import gzip
 import hashlib
 import io
 import json
@@ -51,9 +55,10 @@ import os
 import re
 import secrets
 import sys
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("pivota.sandbox_catalog_copy")
 
@@ -61,10 +66,24 @@ logger = logging.getLogger("pivota.sandbox_catalog_copy")
 #: export predates the scrub, so the importer refuses it.
 FORMAT_VERSION = 2
 MANIFEST_NAME = "_MANIFEST.json"
-#: Nothing streams yet (S5 is open): a table's COPY output, its scrubbed copy and its gzip are all held
-#: in memory, about 5-8x the table. A table whose COPY output passes this cap is refused, so a large
-#: table fails loudly instead of the job running out of memory (review V6).
-MAX_TABLE_COPY_BYTES = 1 << 30
+#: Streaming (S5): no table is ever held in memory. The export and the import hold at most one CSV
+#: record (refused past MAX_RECORD_BYTES), one inflate step, one read chunk and one upload chunk.
+MAX_RECORD_BYTES = 256 << 20
+INFLATE_STEP_BYTES = 1 << 20
+READ_CHUNK_BYTES = 1 << 20
+#: A multiple of GCS's 256 KiB resumable-upload quantum.
+UPLOAD_CHUNK_BYTES = 8 << 20
+#: Prod's load (S5). Each limit is a SET LOCAL in the export's own transaction, so it ends with it.
+#: lock_timeout keeps the export from queueing behind a migration's lock (and everything behind
+#: it); idle_in_transaction ends a stalled job's snapshot; the deadline terminates the session.
+EXPORT_STATEMENT_TIMEOUT = "20min"
+EXPORT_LOCK_TIMEOUT = "5s"
+EXPORT_IDLE_IN_TRANSACTION_TIMEOUT = "2min"
+EXPORT_DEADLINE_SECONDS = 45 * 60
+#: PostgreSQL 14+: while a statement runs, the server checks this often that the client is still
+#: there, so a session the deadline terminated stops even inside a long scan that sends nothing.
+EXPORT_CLIENT_CHECK_INTERVAL = "5s"
+MAX_EXPORT_DEADLINE_SECONDS = 2 * 60 * 60
 _STAMP_RE = re.compile(r"^\d{8}T\d{4}Z$")
 
 
@@ -334,7 +353,13 @@ REDACTED = "redacted"
 #: An EMAIL is local@domain.tld where the "tld" is not an image/file extension: `hero@2x.png` and
 #: Shopify's `_480x480@2x.jpg` are image names (review V1), and refusing on them would stop every
 #: export with a retina image URL.
-_EMAIL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])")
+_EMAIL_PATTERN = r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+)([A-Za-z]{2,63})(?![A-Za-z0-9-])"
+#: The pattern's matches define an email candidate; _email_candidates finds them. Searched as is,
+#: it is quadratic: every position of a long local-part run without an "@" starts a scan of the
+#: rest of the run (a 150k-character title held the event loop for half a minute).
+_EMAIL_CANDIDATE_RE = re.compile(_EMAIL_PATTERN)
+#: The same pattern starting only where a local-part run starts, so each run is scanned once.
+_EMAIL_RUN_START_RE = re.compile(r"(?<![A-Za-z0-9._%+-])" + _EMAIL_PATTERN)
 _NOT_A_TLD = frozenset({"png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff", "ico", "heic",
                         "mp4", "webm", "mov", "pdf", "css", "js"})
 #: A PHONE needs context (review V2: SKUs, GTINs, years, sizes and prices are digit groups too):
@@ -353,8 +378,31 @@ def _is_email(match: "re.Match") -> bool:
     return match.group(2).lower() not in _NOT_A_TLD
 
 
+def _email_candidates(text: str) -> Iterator["re.Match"]:
+    """Exactly the matches of ``_EMAIL_CANDIDATE_RE.finditer(text)``, in linear time.
+
+    A match of the pattern at a position also matches one position earlier while that position is
+    in the local-part run, so the leftmost match at or after ``pos`` starts either at ``pos`` itself
+    or where a run starts. The lookbehind alone is not enough: right after a match that is an image
+    name, as in ``img@2x.jpg+bob@corp.io``, the next match starts mid-run, at ``pos``."""
+    pos = 0
+    while True:
+        match = _EMAIL_CANDIDATE_RE.match(text, pos) or _EMAIL_RUN_START_RE.search(text, pos)
+        if match is None:
+            return
+        yield match
+        pos = match.end()
+
+
 def _redact_once(text: str) -> str:
-    text = _EMAIL_CANDIDATE_RE.sub(lambda m: REDACTED_TEXT if _is_email(m) else m.group(0), text)
+    parts: List[str] = []
+    last = 0
+    for match in _email_candidates(text):
+        if _is_email(match):
+            parts.append(text[last:match.start()])
+            parts.append(REDACTED_TEXT)
+            last = match.end()
+    text = "".join(parts) + text[last:] if parts else text
     text = _PHONE_INTL_RE.sub(REDACTED_TEXT, text)
     return _PHONE_CONTEXT_RE.sub(lambda m: m.group(1) + REDACTED_TEXT, text)
 
@@ -371,7 +419,7 @@ def redact_text(text: str) -> str:
 
 
 def has_email(text: str) -> bool:
-    return any(_is_email(m) for m in _EMAIL_CANDIDATE_RE.finditer(text))
+    return any(_is_email(m) for m in _email_candidates(text))
 
 
 def _text_hits(text: str) -> bool:
@@ -504,71 +552,168 @@ def _csv_field(value: Optional[str]) -> str:
     return "" if value is None else '"%s"' % value.replace('"', '""')
 
 
-def scrub_csv(table: str, raw: bytes, null_token: str, columns: Sequence[str]) -> bytes:
-    """Re-write a ``COPY ... (FORMAT csv, NULL null_token)`` result with every JSON and text column
-    scrubbed. Output: standard CSV (NULL = an empty unquoted field, every other value quoted), which
-    ``COPY FROM (FORMAT csv)`` reads back exactly."""
-    from jobs.sandbox_catalog_columns import JSON as _JSON, TEXT as _TEXT, column_class, json_keep_keys
+class _TableScrub:
+    """One table's scrub (S3), applied to a block of whole CSV records at a time, so neither the export
+    nor the import ever holds a table in memory (S5). scrub_csv and assert_scrubbed are the whole-file
+    forms of the same two passes."""
 
-    classes = [column_class(table, c) for c in columns]
-    keeps = [json_keep_keys(table, c) for c in columns]
-    out = io.StringIO()
-    csv.field_size_limit(sys.maxsize)
-    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
-        if len(row) != len(columns):
-            raise CopyRefused("table %s: a CSV record has %d fields, expected %d" % (table, len(row), len(columns)))
-        cells: List[Optional[str]] = [None if v == null_token else v for v in row]
-        for i, cell in enumerate(cells):
-            if cell is None:
-                continue
-            if classes[i] == _JSON:
-                try:
-                    value = _loads(cell)
-                except ValueError:
-                    raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
-                new, changed = scrub_json(value, keeps[i])
-                if changed:  # a repeated key counts as a change (_scrub), so it is always rewritten
-                    cells[i] = _dumps(new)
-            elif classes[i] == _TEXT:
-                cells[i] = redact_text(cell)
-        out.write(",".join(_csv_field(c) for c in cells) + "\n")
-    return out.getvalue().encode("utf-8")
+    def __init__(self, table: str, columns: Sequence[str]):
+        from jobs.sandbox_catalog_columns import column_class, json_keep_keys
+
+        csv.field_size_limit(sys.maxsize)  # a product payload can exceed csv's 128 KiB default
+        self.table = table
+        self.columns = list(columns)
+        self.classes = [column_class(table, c) for c in self.columns]
+        self.keeps = [json_keep_keys(table, c) for c in self.columns]
+
+    def _rows(self, text: str):
+        for row in csv.reader(io.StringIO(text, newline="")):
+            if len(row) != len(self.columns):
+                raise CopyRefused("table %s: a CSV record has %d fields, expected %d"
+                                  % (self.table, len(row), len(self.columns)))
+            yield row
+
+    def scrub(self, text: str, null_token: str) -> Tuple[str, int]:
+        """Re-write ``COPY ... (FORMAT csv, NULL null_token)`` records with every JSON and text column
+        scrubbed: standard CSV (NULL = an empty unquoted field, every other value quoted), which
+        ``COPY FROM (FORMAT csv)`` reads back exactly. Returns the text and its record count."""
+        from jobs.sandbox_catalog_columns import JSON as _JSON, TEXT as _TEXT
+
+        out: List[str] = []
+        for row in self._rows(text):
+            cells: List[Optional[str]] = [None if v == null_token else v for v in row]
+            for i, cell in enumerate(cells):
+                if cell is None:
+                    continue
+                if self.classes[i] == _JSON:
+                    try:
+                        value = _loads(cell)
+                    except ValueError:
+                        raise CopyRefused("table %s column %s holds a value that is not JSON"
+                                          % (self.table, self.columns[i])) from None
+                    new, changed = scrub_json(value, self.keeps[i])
+                    if changed:  # a repeated key counts as a change (_scrub), so it is always rewritten
+                        cells[i] = _dumps(new)
+                elif self.classes[i] == _TEXT:
+                    cells[i] = redact_text(cell)
+            out.append(",".join(_csv_field(c) for c in cells) + "\n")
+        return "".join(out), len(out)
+
+    def check(self, text: str) -> int:
+        """Refuse when the records still name a person: a person key holding a value or an
+        email/phone-shaped string in a JSON column, an email/phone in a text column, or an email in ANY
+        other column. A REPLACED column holds the spec's own placeholder and is skipped. Names the
+        table, the column and the JSON path, never the value. Returns the record count."""
+        from jobs.sandbox_catalog_columns import JSON as _JSON, REPLACED as _REPLACED, TEXT as _TEXT
+
+        records = 0
+        for row in self._rows(text):
+            records += 1
+            for i, cell in enumerate(row):
+                if cell == "" or self.classes[i] == _REPLACED:
+                    continue
+                if self.classes[i] == _JSON:
+                    try:
+                        value = _loads(cell)
+                    except ValueError:
+                        raise CopyRefused("table %s column %s holds a value that is not JSON"
+                                          % (self.table, self.columns[i])) from None
+                    if _has_duplicates(value):
+                        raise CopyRefused("table %s column %s holds a JSON object with a repeated key"
+                                          % (self.table, self.columns[i]))
+                    hits = person_values(value, self.keeps[i])
+                    if hits:
+                        raise CopyRefused("table %s column %s: a person key or contact detail survived the "
+                                          "scrub at %s" % (self.table, self.columns[i], hits[0]))
+                elif self.classes[i] == _TEXT and _text_hits(cell):
+                    raise CopyRefused("table %s column %s: an email- or phone-shaped value survived the scrub"
+                                      % (self.table, self.columns[i]))
+                elif has_email(cell):
+                    raise CopyRefused("table %s column %s holds an email-shaped value"
+                                      % (self.table, self.columns[i]))
+        return records
+
+
+def scrub_csv(table: str, raw: bytes, null_token: str, columns: Sequence[str]) -> bytes:
+    """The whole-file form of _TableScrub.scrub."""
+    return _TableScrub(table, columns).scrub(raw.decode("utf-8"), null_token)[0].encode("utf-8")
 
 
 def assert_scrubbed(table: str, raw: bytes, columns: Sequence[str]) -> int:
-    """Refuse when the CSV ``raw`` still names a person: a person key holding a value or an
-    email/phone-shaped string in a JSON column, an email/phone in a text column, or an email in ANY
-    other column. A REPLACED column holds the spec's own placeholder and is skipped. Names the table,
-    the column and the JSON path, never the value. Returns the email-shaped values found (0, or it
+    """The whole-file form of _TableScrub.check. Returns the email-shaped values found (0, or it
     raised): the manifest's email_like_values."""
-    from jobs.sandbox_catalog_columns import JSON as _JSON, REPLACED as _REPLACED, TEXT as _TEXT
-    from jobs.sandbox_catalog_columns import column_class, json_keep_keys
-
-    classes = [column_class(table, c) for c in columns]
-    keeps = [json_keep_keys(table, c) for c in columns]
-    csv.field_size_limit(sys.maxsize)
-    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
-        for i, cell in enumerate(row[: len(columns)]):
-            if cell == "" or classes[i] == _REPLACED:
-                continue
-            if classes[i] == _JSON:
-                try:
-                    value = _loads(cell)
-                except ValueError:
-                    raise CopyRefused("table %s column %s holds a value that is not JSON" % (table, columns[i])) from None
-                if _has_duplicates(value):
-                    raise CopyRefused("table %s column %s holds a JSON object with a repeated key"
-                                      % (table, columns[i]))
-                hits = person_values(value, keeps[i])
-                if hits:
-                    raise CopyRefused("table %s column %s: a person key or contact detail survived the "
-                                      "scrub at %s" % (table, columns[i], hits[0]))
-            elif classes[i] == _TEXT and _text_hits(cell):
-                raise CopyRefused("table %s column %s: an email- or phone-shaped value survived the scrub"
-                                  % (table, columns[i]))
-            elif has_email(cell):
-                raise CopyRefused("table %s column %s holds an email-shaped value" % (table, columns[i]))
+    _TableScrub(table, columns).check(raw.decode("utf-8"))
     return 0
+
+
+class RecordSplitter:
+    """Cuts a CSV byte stream (PostgreSQL's COPY csv output) into blocks of whole records (S5).
+
+    A record ends at a newline outside quotes. Inside a quoted field PostgreSQL writes a quote as two
+    quotes, so the parity of the quotes seen so far says whether a newline is inside a field. Newline
+    and quote are ASCII and never occur inside a UTF-8 multi-byte character, so a cut never splits one.
+    Holds at most one unfinished record, and refuses one longer than ``max_record`` bytes."""
+
+    def __init__(self, table: str, max_record: Optional[int] = None):
+        self.table = table
+        self.max_record = MAX_RECORD_BYTES if max_record is None else max_record
+        self._tail = bytearray()
+        self._odd = False  # the quote parity of _tail
+
+    def _bounded(self) -> None:
+        if len(self._tail) > self.max_record:
+            raise CopyRefused("table %s: a CSV record is longer than %d bytes" % (self.table, self.max_record))
+
+    def feed(self, data: bytes) -> bytes:
+        """Every whole record completed by ``data`` (b"" while none is), in order."""
+        odd, start, cut = self._odd, 0, -1
+        while True:
+            nl = data.find(b"\n", start)
+            if nl < 0:
+                break
+            if data.count(b'"', start, nl) & 1:
+                odd = not odd
+            if not odd:
+                cut = nl
+            start = nl + 1
+        if data.count(b'"', start) & 1:
+            odd = not odd
+        self._odd = odd
+        if cut < 0:
+            self._tail += data
+            self._bounded()
+            return b""
+        block = bytes(self._tail) + data[: cut + 1] if self._tail else bytes(data[: cut + 1])
+        self._tail = bytearray(data[cut + 1:])
+        self._bounded()
+        return block
+
+    def finish(self) -> None:
+        """COPY ends every record with a newline: anything left over is a cut-off stream."""
+        if self._tail:
+            raise CopyRefused("table %s: the CSV stream ends inside a record" % self.table)
+
+
+def _inflated(chunks: Iterable[bytes], table: str) -> Iterable[bytes]:
+    """gunzip a stream of gzip chunks, at most INFLATE_STEP_BYTES out per step, so a small file that
+    inflates hugely is still processed in bounded pieces. One gzip member, nothing after it."""
+    d = zlib.decompressobj(31)
+    for chunk in chunks:
+        data = chunk
+        while data and not d.eof:
+            try:
+                out = d.decompress(data, INFLATE_STEP_BYTES)
+            except zlib.error:
+                raise CopyRefused("table %s: the file is not valid gzip" % table) from None
+            if out:
+                yield out
+            # Output zlib still holds when this chunk is used up comes out with the next chunk's
+            # first call; the stream always ends with its 8-byte trailer, so none is left behind.
+            data = d.unconsumed_tail
+        if d.eof and (d.unused_data or data):
+            raise CopyRefused("table %s: the file carries data after its gzip stream" % table)
+    if not d.eof:
+        raise CopyRefused("table %s: the file's gzip stream is cut off" % table)
 
 
 def json_columns_of(spec: TableSpec, columns: Sequence[str]) -> List[str]:
@@ -651,30 +796,165 @@ def _spec_by_name(specs: Iterable[TableSpec]) -> Dict[str, TableSpec]:
 # ---------------------------------------------------------------------------------------------
 
 
+class _LocalWriter:
+    """A file written under ``<root>/.uploading/`` and linked into place on commit. Like a GCS resumable
+    upload: nothing exists under its name until commit, and commit never overwrites."""
+
+    def __init__(self, store: "LocalDirStore", name: str):
+        import tempfile
+
+        self.final = store.root / name
+        parts = store.root / LocalDirStore.UPLOADING
+        parts.mkdir(parents=True, exist_ok=True)
+        fd, part = tempfile.mkstemp(dir=parts)
+        self.part = Path(part)
+        self.handle = os.fdopen(fd, "wb")
+        self.name = name
+
+    def write(self, data: bytes) -> None:
+        self.handle.write(data)
+
+    def flush(self) -> None:
+        self.handle.flush()
+
+    def commit(self) -> None:
+        self.handle.close()
+        self.final.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(self.part, self.final)  # fails if the name exists, as ifGenerationMatch=0 on GCS
+        except FileExistsError:
+            raise CopyRefused("object already exists; an export never overwrites (%s)" % self.name) from None
+        finally:
+            self.part.unlink(missing_ok=True)
+
+    def abort(self) -> None:
+        if not self.handle.closed:
+            self.handle.close()
+        self.part.unlink(missing_ok=True)
+
+
 class LocalDirStore:
     """A directory standing in for a bucket prefix. Same no-overwrite rule as the GCS writer."""
+
+    UPLOADING = ".uploading"
 
     def __init__(self, root: Path):
         self.root = Path(root)
 
+    def open_writer(self, name: str) -> _LocalWriter:
+        return _LocalWriter(self, name)
+
     def put(self, name: str, data: bytes) -> None:
-        path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(path, "xb") as handle:  # x: never overwrite, as ifGenerationMatch=0 on GCS
-                handle.write(data)
-        except FileExistsError:
-            raise CopyRefused("object already exists; an export never overwrites (%s)" % name) from None
+        _put(self, name, data)
 
     def get(self, name: str) -> bytes:
         return (self.root / name).read_bytes()
+
+    def generation(self, name: str) -> Optional[str]:
+        """A directory has no generations; the import's second sha256 check covers a changed file."""
+        return None
+
+    def open_reader(self, name: str, generation: Optional[str]) -> Iterable[bytes]:
+        with open(self.root / name, "rb") as handle:
+            while True:
+                chunk = handle.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                yield chunk
 
     def list(self, prefix: str = "") -> List[str]:
         base = self.root
         if not base.exists():
             return []
         names = [str(p.relative_to(base)) for p in base.rglob("*") if p.is_file()]
-        return sorted(n for n in names if n.startswith(prefix))
+        return sorted(n for n in names if n.startswith(prefix) and not n.startswith(self.UPLOADING + "/"))
+
+
+def _put(store, name: str, data: bytes) -> None:
+    writer = store.open_writer(name)
+    try:
+        writer.write(data)
+        writer.commit()
+    except BaseException:
+        writer.abort()
+        raise
+
+
+class _GcsUpload:  # pragma: no cover - exercised only on Cloud Run (unit-tested with a fake httpx)
+    """A GCS resumable upload created with ifGenerationMatch=0. The object exists only once commit()
+    sends the last piece, so an export that refuses part-way creates nothing for that file. Holds at
+    most UPLOAD_CHUNK_BYTES; flush() sends every whole 256 KiB piece and keeps less than one.
+    The session URL is a capability: it is never logged or put in a refusal."""
+
+    QUANTUM = 256 << 10
+
+    def __init__(self, store: "GcsStore", name: str):
+        self.store, self.name = store, name
+        self.buffer = bytearray()
+        self.offset = 0
+        response = store._call(
+            "post", "create %s" % name,
+            "https://storage.googleapis.com/upload/storage/v1/b/%s/o" % store.bucket,
+            params={"uploadType": "resumable", "name": store._name(name), "ifGenerationMatch": "0"},
+            content=b"",
+            headers={"Authorization": "Bearer " + store._token(),
+                     "X-Upload-Content-Type": "application/octet-stream"},
+            timeout=60,
+        )
+        if response.status_code == 412:
+            raise CopyRefused("object already exists; an export never overwrites (%s)" % name)
+        store._ok(response, "create %s" % name)
+        self.session = response.headers.get("location") or ""
+        if not self.session.startswith("https://storage.googleapis.com/"):
+            raise CopyRefused("GCS gave no upload session for %s" % name)
+
+    def _send(self, piece: bytes, total: Optional[int]) -> None:
+        what = "upload %s" % self.name
+        if piece:
+            span = "bytes %d-%d/%s" % (self.offset, self.offset + len(piece) - 1, "*" if total is None else total)
+        else:
+            span = "bytes */%d" % total
+        response = self.store._call("put", what, self.session, content=piece,
+                                    headers={"Content-Range": span}, timeout=300)
+        if total is None:
+            # GCS answers 308 with the persisted range; anything short of all we sent is a refusal.
+            expected = "bytes=0-%d" % (self.offset + len(piece) - 1)
+            if response.status_code != 308 or response.headers.get("range") != expected:
+                raise CopyRefused("GCS answered HTTP %d for %s" % (response.status_code, what))
+        else:
+            if response.status_code == 412:
+                raise CopyRefused("object already exists; an export never overwrites (%s)" % self.name)
+            if response.status_code not in (200, 201):
+                raise CopyRefused("GCS answered HTTP %d for %s" % (response.status_code, what))
+        self.offset += len(piece)
+
+    def _send_whole_pieces(self, keep_below: int) -> None:
+        while len(self.buffer) >= keep_below:
+            size = (len(self.buffer) // self.QUANTUM) * self.QUANTUM
+            size = min(size, UPLOAD_CHUNK_BYTES)
+            if size == 0:
+                return
+            self._send(bytes(self.buffer[:size]), None)
+            del self.buffer[:size]
+
+    def write(self, data: bytes) -> None:
+        self.buffer += data
+        self._send_whole_pieces(UPLOAD_CHUNK_BYTES)
+
+    def flush(self) -> None:
+        self._send_whole_pieces(self.QUANTUM)
+
+    def commit(self) -> None:
+        self._send(bytes(self.buffer), self.offset + len(self.buffer))
+        self.buffer = bytearray()
+
+    def abort(self) -> None:
+        import httpx
+
+        try:
+            httpx.delete(self.session, timeout=10)  # GCS answers 499: the session is cancelled
+        except httpx.HTTPError:
+            pass  # an unfinished session creates nothing and expires on its own
 
 
 class GcsStore:  # pragma: no cover - exercised only on Cloud Run
@@ -723,32 +1003,53 @@ class GcsStore:  # pragma: no cover - exercised only on Cloud Run
         self._ok(response, "the metadata token")
         return response.json()["access_token"]
 
-    def put(self, name: str, data: bytes) -> None:
-        response = self._call(
-            "post", "create %s" % name,
-            "https://storage.googleapis.com/upload/storage/v1/b/%s/o" % self.bucket,
-            params={"uploadType": "media", "name": self._name(name), "ifGenerationMatch": "0"},
-            content=data,
-            headers={"Authorization": "Bearer " + self._token(), "Content-Type": "application/octet-stream"},
-            timeout=300,
-        )
-        if response.status_code == 412:
-            raise CopyRefused("object already exists; an export never overwrites (%s)" % name)
-        self._ok(response, "create %s" % name)
+    def open_writer(self, name: str) -> _GcsUpload:
+        return _GcsUpload(self, name)
 
-    def get(self, name: str) -> bytes:
+    def put(self, name: str, data: bytes) -> None:
+        _put(self, name, data)
+
+    def _object_url(self, name: str) -> str:
         import urllib.parse
 
+        return "https://storage.googleapis.com/storage/v1/b/%s/o/%s" % (
+            self.bucket, urllib.parse.quote(self._name(name), safe=""))
+
+    def get(self, name: str) -> bytes:
         response = self._call(
-            "get", "read %s" % name,
-            "https://storage.googleapis.com/storage/v1/b/%s/o/%s"
-            % (self.bucket, urllib.parse.quote(self._name(name), safe="")),
+            "get", "read %s" % name, self._object_url(name),
             params={"alt": "media"},
             headers={"Authorization": "Bearer " + self._token()},
             timeout=300,
         )
         self._ok(response, "read %s" % name)
         return response.content
+
+    def generation(self, name: str) -> str:
+        """The object's generation, so the import's load reads the very bytes its check read."""
+        response = self._call(
+            "get", "stat %s" % name, self._object_url(name),
+            params={"fields": "generation"},
+            headers={"Authorization": "Bearer " + self._token()},
+            timeout=60,
+        )
+        self._ok(response, "stat %s" % name)
+        return str(response.json()["generation"])
+
+    def open_reader(self, name: str, generation: Optional[str]) -> Iterable[bytes]:
+        import httpx
+
+        params = {"alt": "media"}
+        if generation is not None:
+            params["generation"] = generation
+        try:
+            with httpx.stream("GET", self._object_url(name), params=params,
+                              headers={"Authorization": "Bearer " + self._token()}, timeout=300) as response:
+                self._ok(response, "read %s" % name)
+                for chunk in response.iter_bytes(READ_CHUNK_BYTES):
+                    yield chunk
+        except httpx.HTTPError as exc:
+            raise CopyRefused("GCS unreachable for read %s (%s)" % (name, type(exc).__name__)) from None
 
     def list(self, prefix: str = "") -> List[str]:
         names: List[str] = []
@@ -818,18 +1119,6 @@ async def _table_column_types(conn, schema: str, table: str) -> Dict[str, str]:
     return out
 
 
-def _count_csv_records(raw: bytes) -> int:
-    csv.field_size_limit(sys.maxsize)  # a product payload can exceed csv's 128 KiB default
-    return sum(1 for _ in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")))
-
-
-def _gzip(raw: bytes) -> bytes:
-    out = io.BytesIO()
-    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as handle:
-        handle.write(raw)
-    return out.getvalue()
-
-
 # ---------------------------------------------------------------------------------------------
 # Export (prod)
 # ---------------------------------------------------------------------------------------------
@@ -840,59 +1129,130 @@ def utc_stamp(now: Optional[_dt.datetime] = None) -> str:
     return now.astimezone(_dt.timezone.utc).strftime("%Y%m%dT%H%MZ")
 
 
+class _ExportSink:
+    """One table's COPY output, streamed (S5): whole records -> the scrub -> its own check -> gzip ->
+    the store's writer. Holds one unfinished record, the gzip window and one upload chunk at most.
+
+    It never raises inside the COPY. asyncpg 0.31 leaves the connection's reading paused when a sink
+    raises while the server is still sending, and the transaction's ROLLBACK then waits forever. So a
+    refusal is kept, the rest of the table's output is dropped unread, and the export raises it as
+    soon as the COPY returns. statement_timeout and the deadline bound that COPY."""
+
+    def __init__(self, table: str, columns: Sequence[str], null_token: str, writer):
+        self.scrub = _TableScrub(table, columns)
+        self.split = RecordSplitter(table)
+        self.null_token = null_token
+        self.zip = zlib.compressobj(6, zlib.DEFLATED, 31)  # gzip framing, mtime 0
+        self.writer = writer
+        self.sha = hashlib.sha256()
+        self.size = 0
+        self.records = 0
+        self.error: Optional[Exception] = None
+
+    async def __call__(self, chunk: bytes) -> None:
+        if self.error is not None:
+            return
+        try:
+            block = self.split.feed(bytes(chunk))
+            if block:
+                # Off the event loop, so the deadline's timer fires on time however long a block takes.
+                data, records = await asyncio.to_thread(self._process, block)
+                self.records += records
+                await self._out(data)
+        except Exception as exc:  # noqa: BLE001 - kept and raised after the COPY (see the class)
+            self.error = exc
+
+    def _process(self, block: bytes) -> Tuple[bytes, int]:
+        text, records = self.scrub.scrub(block.decode("utf-8"), self.null_token)
+        # The export checks its own output before any of it leaves (S3), block by block.
+        self.scrub.check(text)
+        return self.zip.compress(text.encode("utf-8")), records
+
+    async def _out(self, data: bytes) -> None:
+        if data:
+            self.sha.update(data)
+            self.size += len(data)
+            await asyncio.to_thread(self.writer.write, data)
+
+    async def finish(self) -> None:
+        if self.error is not None:
+            raise self.error
+        self.split.finish()
+        await self._out(self.zip.flush())
+        await asyncio.to_thread(self.writer.flush)
+
+
+#: The server-side limits, by the SQLSTATE PostgreSQL raises when one ends a statement or a session.
+_LIMIT_SQLSTATES = {"57014": "statement_timeout", "55P03": "lock_timeout",
+                    "25P03": "idle_in_transaction_session_timeout"}
+_PG_INTERVAL_RE = re.compile(r"^[1-9][0-9]{0,6}(ms|s|min)$")
+
+
 async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = None,
                          specs: Sequence[TableSpec] = CATALOG_TABLES, schema: str = "public",
-                         statement_timeout: str = "15min") -> Dict[str, Any]:
+                         statement_timeout: str = EXPORT_STATEMENT_TIMEOUT,
+                         lock_timeout: str = EXPORT_LOCK_TIMEOUT,
+                         idle_timeout: str = EXPORT_IDLE_IN_TRANSACTION_TIMEOUT,
+                         deadline_seconds: float = EXPORT_DEADLINE_SECONDS) -> Dict[str, Any]:
+    """Prod's load (S5): one READ ONLY snapshot, each table streamed (memory stays flat whatever the
+    table's size), every statement under statement_timeout and lock_timeout, idle_in_transaction
+    capped, and the whole export under a client-side deadline that terminates the connection.
+    Every file is an unfinished upload until the last table has passed, so a refusal while reading
+    writes nothing. Only then are the files committed, and the manifest last: a failure during
+    that commit can leave some files under the stamp without a manifest, and the import only reads
+    a stamp that has one (newest_complete_stamp), so those files are never imported."""
     if not _STAMP_RE.match(stamp):
         raise CopyRefused("stamp must look like YYYYmmddTHHMMZ")
+    for setting, value in (("statement_timeout", statement_timeout), ("lock_timeout", lock_timeout),
+                           ("idle_in_transaction_session_timeout", idle_timeout)):
+        if not _PG_INTERVAL_RE.match(value):
+            raise CopyRefused("%s must look like 30s, 500ms or 20min" % setting)
+    if not 0 < deadline_seconds <= MAX_EXPORT_DEADLINE_SECONDS:
+        raise CopyRefused("the export deadline must be between 0 and %d seconds" % MAX_EXPORT_DEADLINE_SECONDS)
     _assert_no_never_copy((s.name for s in specs), "the export's table list")
-    tables: List[Dict[str, Any]] = []
-    absent: List[str] = []
-    files: List[Tuple[str, bytes]] = []
-    async with conn.transaction(isolation="repeatable_read", readonly=True):
-        await conn.execute("SET LOCAL statement_timeout = '%s'" % statement_timeout.replace("'", ""))
-        for spec in specs:
-            existing = await _table_columns(conn, schema, spec.name)
-            if not existing:
-                if spec.optional:
-                    absent.append(spec.name)
-                    continue
-                raise CopyRefused("table %s does not exist in the source" % spec.name)
-            plan = plan_columns(spec, existing, await _table_column_types(conn, schema, spec.name))
-            where = " WHERE %s" % spec.where if spec.where else ""
-            query = "SELECT %s FROM %s.%s%s" % (", ".join(e for _, e in plan), _q(schema), _q(spec.name), where)
-            null_token = "__sandbox_copy_null_%s__" % secrets.token_hex(16)
-            buf = io.BytesIO()
-            await conn.copy_from_query(query, output=buf, format="csv", null=null_token)
-            if buf.tell() > MAX_TABLE_COPY_BYTES:
-                raise CopyRefused("table %s: %d bytes exceeds the in-memory copy cap (streaming is S5)"
-                                  % (spec.name, buf.tell()))
-            planned = [c for c, _ in plan]
-            # The scrub (S3): every JSON and text column, here, before anything is uploaded; then the
-            # export checks its own output and refuses if anything is left.
-            raw = scrub_csv(spec.name, buf.getvalue(), null_token, planned)
-            email_like = assert_scrubbed(spec.name, raw, planned)
-            rows = await conn.fetchval("SELECT count(*) FROM %s.%s%s" % (_q(schema), _q(spec.name), where))
-            if _count_csv_records(raw) != rows:
-                raise CopyRefused("table %s: CSV record count differs from the snapshot's" % spec.name)
-            json_cols = json_columns_of(spec, planned)
-            data = _gzip(raw)
-            fname = "%s/%s.csv.gz" % (stamp, spec.name)
-            files.append((fname, data))
-            tables.append({
-                "name": spec.name,
-                "columns": planned,
-                "json_columns": json_cols,
-                "rows": int(rows),
-                "file": fname,
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                # A gate now (SF3), not a review signal: after the scrub the copy holds no
-                # email-shaped value anywhere, and the importer refuses a manifest saying otherwise.
-                "email_like_values": email_like,
-            })
-    for fname, data in files:
-        store.put(fname, data)
+    writers: List[Any] = []
+    # The deadline TERMINATES the connection: the server ends the session, its transaction and its
+    # snapshot at once, whatever the client is waiting on (a cancelled COPY can stall asyncpg; see
+    # _ExportSink). The caller's connection is unusable afterwards; the job exits on the refusal.
+    expired: List[bool] = []
+
+    def _expire() -> None:
+        expired.append(True)
+        conn.terminate()
+
+    timer = asyncio.get_running_loop().call_later(deadline_seconds, _expire)
+    try:
+        try:
+            tables, absent = await _export_tables(
+                conn, store, stamp, specs, schema, writers,
+                (("statement_timeout", statement_timeout), ("lock_timeout", lock_timeout),
+                 ("idle_in_transaction_session_timeout", idle_timeout)))
+        except Exception as exc:
+            if expired:
+                raise CopyRefused("the export passed its %gs deadline; nothing was written" % deadline_seconds) from None
+            if isinstance(exc, CopyRefused):
+                raise
+            limit = _LIMIT_SQLSTATES.get(getattr(exc, "sqlstate", None) or "")
+            if limit:
+                raise CopyRefused("the export hit its %s on the source; nothing was written" % limit) from None
+            is_closed = getattr(conn, "is_closed", None)
+            if is_closed is not None and is_closed():
+                # An idle_in_transaction_session_timeout (25P03) or a server-side terminate closes the
+                # connection between statements: asyncpg then reports the closed connection, with no
+                # SQLSTATE anywhere in the chain.
+                raise CopyRefused("the source ended the export's session (idle_in_transaction_session_timeout "
+                                  "or a server-side terminate); nothing was written") from None
+            raise
+        finally:
+            timer.cancel()
+        if expired:
+            raise CopyRefused("the export passed its %gs deadline; nothing was written" % deadline_seconds)
+        while writers:
+            writers[0].commit()
+            writers.pop(0)
+    finally:
+        for writer in writers:
+            writer.abort()
     manifest = {
         "format_version": FORMAT_VERSION,
         "stamp": stamp,
@@ -903,6 +1263,54 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
     }
     store.put("%s/%s" % (stamp, MANIFEST_NAME), json.dumps(manifest, indent=1, sort_keys=True).encode())
     return manifest
+
+
+async def _export_tables(conn, store, stamp: str, specs: Sequence[TableSpec], schema: str,
+                         writers: List[Any], limits) -> Tuple[List[Dict[str, Any]], List[str]]:
+    tables: List[Dict[str, Any]] = []
+    absent: List[str] = []
+    async with conn.transaction(isolation="repeatable_read", readonly=True):
+        version = getattr(conn, "get_server_version", None)
+        extra: Tuple[Tuple[str, str], ...] = (("application_name", "sandbox_catalog_export"),)
+        if version is not None and version().major >= 14:
+            extra += (("client_connection_check_interval", EXPORT_CLIENT_CHECK_INTERVAL),)
+        for setting, value in limits + extra:
+            # set_config(..., true) is SET LOCAL: it ends with this transaction.
+            await conn.execute("SELECT pg_catalog.set_config($1, $2, true)", setting, value)
+        for spec in specs:
+            existing = await _table_columns(conn, schema, spec.name)
+            if not existing:
+                if spec.optional:
+                    absent.append(spec.name)
+                    continue
+                raise CopyRefused("table %s does not exist in the source" % spec.name)
+            plan = plan_columns(spec, existing, await _table_column_types(conn, schema, spec.name))
+            where = " WHERE %s" % spec.where if spec.where else ""
+            query = "SELECT %s FROM %s.%s%s" % (", ".join(e for _, e in plan), _q(schema), _q(spec.name), where)
+            planned = [c for c, _ in plan]
+            fname = "%s/%s.csv.gz" % (stamp, spec.name)
+            writer = await asyncio.to_thread(store.open_writer, fname)
+            writers.append(writer)
+            # The scrub (S3) runs in the sink, on every JSON and text column, before anything is sent.
+            sink = _ExportSink(spec.name, planned, "__sandbox_copy_null_%s__" % secrets.token_hex(16), writer)
+            await conn.copy_from_query(query, output=sink, format="csv", null=sink.null_token)
+            await sink.finish()
+            rows = await conn.fetchval("SELECT count(*) FROM %s.%s%s" % (_q(schema), _q(spec.name), where))
+            if sink.records != rows:
+                raise CopyRefused("table %s: CSV record count differs from the snapshot's" % spec.name)
+            tables.append({
+                "name": spec.name,
+                "columns": planned,
+                "json_columns": json_columns_of(spec, planned),
+                "rows": int(rows),
+                "file": fname,
+                "bytes": sink.size,
+                "sha256": sink.sha.hexdigest(),
+                # A gate now (SF3), not a review signal: after the scrub the copy holds no
+                # email-shaped value anywhere, and the importer refuses a manifest saying otherwise.
+                "email_like_values": 0,
+            })
+    return tables, absent
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1024,6 +1432,72 @@ async def _bump_sequences(conn, schema: str, table: str) -> None:
             )
 
 
+def _check_file(store, entry: Mapping[str, Any], generation: Optional[str]) -> None:
+    """Pass 1 of the import, before the database is touched: the file's sha256, its gzip framing, its
+    record count and the scrub, all in one streamed read. A sha256 mismatch is reported first."""
+    name = entry["name"]
+    sha = hashlib.sha256()
+    problem: Optional[CopyRefused] = None
+    records = 0
+
+    read = {"whole": False}
+
+    def hashed():
+        for chunk in store.open_reader(entry["file"], generation):
+            sha.update(chunk)
+            yield chunk
+        read["whole"] = True
+
+    split = RecordSplitter(name)
+    scrub = _TableScrub(name, entry["columns"])
+    chunks = hashed()
+    try:
+        for block in _inflated(chunks, name):
+            whole = split.feed(block)
+            if whole:
+                records += scrub.check(whole.decode("utf-8"))
+        split.finish()
+    except (CopyRefused, UnicodeDecodeError, csv.Error) as exc:
+        if isinstance(exc, CopyRefused):
+            problem = exc
+        elif isinstance(exc, UnicodeDecodeError):
+            problem = CopyRefused("table %s: the file is not UTF-8" % name)
+        else:
+            problem = CopyRefused("table %s: the file is not valid CSV" % name)
+        for _ in chunks:  # finish the read so the sha256 is the whole file's (a read error raises here)
+            pass
+        if not read["whole"]:  # the read itself failed: that is the refusal
+            raise problem
+    if sha.hexdigest() != entry.get("sha256"):
+        raise CopyRefused("table %s: file sha256 does not match the manifest" % name)
+    if problem is not None:
+        raise problem
+    if records != entry.get("rows"):
+        raise CopyRefused("table %s: file row count does not match the manifest" % name)
+
+
+async def _load_stream(store, entry: Mapping[str, Any], generation: Optional[str]):
+    """Pass 2, inside the import's transaction: the same object generation, inflated straight into
+    COPY. Its sha256 is checked again at the end; a mismatch raises inside the COPY, so the
+    transaction rolls back."""
+    sha = hashlib.sha256()
+
+    def hashed():
+        for chunk in store.open_reader(entry["file"], generation):
+            sha.update(chunk)
+            yield chunk
+
+    inflated = iter(_inflated(hashed(), entry["name"]))
+    done = object()
+    while True:
+        block = await asyncio.to_thread(next, inflated, done)
+        if block is done:
+            break
+        yield block
+    if sha.hexdigest() != entry.get("sha256"):
+        raise CopyRefused("table %s: the file changed between the check and the load" % entry["name"])
+
+
 async def import_catalog(conn, store, *, stamp: Optional[str] = None,
                          specs: Sequence[TableSpec] = CATALOG_TABLES, schema: str = "public") -> Dict[str, Any]:
     stamp = stamp or newest_complete_stamp(store)
@@ -1034,21 +1508,16 @@ async def import_catalog(conn, store, *, stamp: Optional[str] = None,
         raise CopyRefused("manifest stamp does not match its folder")
     validate_manifest(manifest, specs)
 
-    # Download and verify everything before touching the database.
-    payloads: Dict[str, bytes] = {}
+    # Check every file before touching the database, one streamed read each (S5): sha256, gzip, row
+    # count and the scrub (the importer does not trust the export's). The load then reads the same
+    # object generation again and re-checks its sha256, so nothing is held in memory between the two.
+    generations: Dict[str, Optional[str]] = {}
     entries = {e["name"]: e for e in manifest["tables"]}
     for name, entry in entries.items():
         if entry.get("file") != "%s/%s.csv.gz" % (stamp, name):
             raise CopyRefused("manifest table %s points outside its stamp" % name)
-        data = store.get(entry["file"])
-        if hashlib.sha256(data).hexdigest() != entry.get("sha256"):
-            raise CopyRefused("table %s: file sha256 does not match the manifest" % name)
-        raw = gzip.decompress(data)
-        if _count_csv_records(raw) != entry.get("rows"):
-            raise CopyRefused("table %s: file row count does not match the manifest" % name)
-        # The importer does not trust the export's scrub either.
-        assert_scrubbed(name, raw, entry["columns"])
-        payloads[name] = raw
+        generations[name] = await asyncio.to_thread(store.generation, entry["file"])
+        await asyncio.to_thread(_check_file, store, entry, generations[name])
 
     order = await _fk_order(conn, schema, list(entries))
     report: Dict[str, Any] = {"stamp": stamp, "commit": manifest.get("commit"), "tables": {}}
@@ -1067,7 +1536,8 @@ async def import_catalog(conn, store, *, stamp: Optional[str] = None,
                 "CREATE TEMP TABLE %s ON COMMIT DROP AS SELECT %s FROM %s.%s WITH NO DATA"
                 % (_q(stage), ", ".join(_q(c) for c in columns), _q(schema), _q(name))
             )
-            await conn.copy_to_table(stage, source=io.BytesIO(payloads[name]), columns=columns, format="csv")
+            await conn.copy_to_table(stage, source=_load_stream(store, entries[name], generations[name]),
+                                     columns=columns, format="csv")
             # Re-apply the spec's replacements HERE too: a placeholder the export was meant to
             # write (contact_email) or a safety override (realtime_enabled=false) holds even if
             # the export did not apply it.
@@ -1194,5 +1664,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+def _quiet_http_logs() -> None:
+    """httpx logs every request's URL at INFO, and a resumable upload's URL is its session
+    capability. Only the job's own process sets this: the levels are process-wide, so main() leaves
+    them alone and an importer (the tests, jobs.sandbox_schema_apply) keeps its own."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+if __name__ == "__main__":  # pragma: no cover - run as `python -m jobs.sandbox_catalog_copy` (tested in a subprocess)
+    _quiet_http_logs()
     sys.exit(main())
