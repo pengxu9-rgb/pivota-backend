@@ -302,11 +302,10 @@ async def test_a_full_contact_at_create_is_stored_as_before_and_asks_for_nothing
 
 
 @pytest.mark.parametrize("address", [
-    {k: v for k, v in ADDRESS.items() if k != "region"},
-    {**ADDRESS, "region": "PR"},           # a territory
+    {**ADDRESS, "region": "PR"},           # a territory: a state given is checked
     {**ADDRESS, "postalCode": "7879"},     # a zip given is checked
-], ids=["no_region", "territory", "bad_zip"])
-async def test_a_given_us_address_needs_a_real_state_and_a_well_formed_zip_if_any(address, monkeypatch):
+], ids=["territory", "bad_zip"])
+async def test_a_given_us_state_and_zip_are_checked_when_given(address, monkeypatch):
     resp = await _http("POST", BASE, json=_body(address=address))
     assert resp.status_code == 400 and "invalid_address" in resp.text
     for value in ADDRESS.values():
@@ -314,8 +313,8 @@ async def test_a_given_us_address_needs_a_real_state_and_a_well_formed_zip_if_an
     assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
 
 
-async def test_a_us_address_with_no_zip_is_taken_the_store_platform_asks_for_one_if_it_needs_it():
-    no_zip = {k: v for k, v in ADDRESS.items() if k != "postalCode"}
+async def test_a_us_address_with_no_state_or_zip_is_taken_the_store_platform_asks_if_it_needs_them():
+    no_zip = {k: v for k, v in ADDRESS.items() if k not in ("postalCode", "region")}
     resp = await _http("POST", BASE, json=_body(address=no_zip))
     assert resp.status_code == 202, resp.text
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
@@ -914,7 +913,8 @@ async def test_a_hong_kong_purchase_is_taken_with_no_postcode_and_none_is_stored
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert (row["currency"], row["shipping_address"]["country"]) == ("HKD", "HK")
     assert "postalCode" not in row["shipping_address"] and "region" not in row["shipping_address"]
-    # The same address with a region is refused at the door: Hong Kong has no ISO 3166-2 subdivision.
+    # A region given in Hong Kong (no ISO 3166-2 subdivision) is the buyer's: stored as written, unchecked.
     resp = await _http("POST", BASE, json=_body(address={**HK_ADDRESS, "region": "KLN"}, expected_currency="HKD",
                                                  idempotency_key="key-2"))
-    assert resp.status_code == 400 and _error(resp) == "invalid_address", resp.text
+    assert resp.status_code == 202, resp.text
+    assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["region"] == "KLN"

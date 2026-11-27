@@ -347,7 +347,8 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   `POST /agent/v2/commerce/purchases` on the A2A rail accept a body without `buyer.email` and/or
   `buyer.shipping_address`, and only then does the view ask for it. One that is given is read by the Reap
   rules, plus its market's region and postcode rules ("A2A markets" below; for the US, a real state or DC in
-  `region` and a ZIP, 12345 or 12345-6789, in `postalCode`) (`invalid_address`). Capture off (any one of them off, e.g. this read dial on before the checkout dial):
+  `region` and a ZIP, 12345 or 12345-6789, in `postalCode`, each when given: neither is required)
+  (`invalid_address`). Capture off (any one of them off, e.g. this read dial on before the checkout dial):
   both stay required and every answer is exactly as before. A request the router hands to Reap is parsed by
   Reap's own model, which still requires both.
 - **Turn capture on, in this order**: the read dial, the checkout step and the token step (each per its own
@@ -399,8 +400,8 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
 - **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
   has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
   NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
-  `country`), never a stored value. `region` is listed only where the address's market requires one; with
-  no country yet, every field is listed. The same names sit in `detail.shipping_address_required`.
+  `country`), never a stored value. `region` and `postalCode` are never listed: no market requires them (the
+  store platform's checkout asks if it needs them); with no country yet, every other field is listed. The same names sit in `detail.shipping_address_required`.
 - **Body.** Flat JSON: `email, firstName, lastName, phone, addressLine1, addressLine2, city, region,
   postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
   in `fields_missing`); a part that is sent is read whole. The country must be a market switched on for the
@@ -606,11 +607,12 @@ door, the address write, the router, the worker's token and ceiling steps and th
   (`config/market_registry.json`). The rail prices a cart link through the Reap lane's loader with its own
   market's currency, so KR and TW are priced without joining the Reap lane's market map (which is also the
   merchant directory's list of Reap's agentic markets: Reap is not advertised there).
-- **Addresses.** `region` is the ISO 3166-2 subdivision code without the country prefix. It is required in
-  the US, CA, AU and JP (and sent as `state`), optional in NZ, KR and TW, and refused in SG and HK. A
-  postcode is never asked for, in any market: the payment provider does not require one, and whether an address
-  needs one is the store platform's checkout's to say. One the buyer gives is checked against its market's
-  format (Hong Kong has none: sent unchecked) and sent as `zip_code`; with none, no `zip_code` is sent. Outside
+- **Addresses.** Neither a region nor a postcode is ever asked for, in any market: the payment provider requires
+  neither, and which fields an address needs is the store platform's checkout's to say. A region the buyer gives
+  is the ISO 3166-2 subdivision code without the country prefix, checked against its market's list and sent as
+  `state` (SG and HK have no subdivisions: sent unchecked). A postcode the buyer gives is checked against its
+  market's format (Hong Kong has none: sent unchecked) and sent as `zip_code`. With none, no `state` / `zip_code`
+  is sent. Outside
   the US these rules apply with shipping-address capture off too. They are our pre-check, so a malformed value
   is caught before the buyer is asked to approve; the sandbox checkout below is where they meet the store's form.
 - **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
@@ -639,9 +641,9 @@ door, the address write, the router, the worker's token and ceiling steps and th
 **Before a market goes on**, in the sandbox, for that currency:
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor
    units (the yen and won cases decide between ×1 and ×100).
-2. One checkout end to end: the address fills the store's form (the region as `state`), and the
+2. One checkout end to end: the address fills the store's form (a region given as `state`), and the
    `checkout.result` total reads (`checkout_total_minor`) or is held. It also shows what the store's form
-   does with an address that has no postcode (no `zip_code` sent) and, for Hong Kong, whether it wants a district
+   does with an address that has no region or postcode (no `state` / `zip_code` sent) and, for Hong Kong, whether it wants a district
    or area that the table does not ask for.
 3. The ceiling's three entries set for its currency, and `A2A_RAIL_MAX_TOTAL_MINOR` too.
 4. The merchant's own facts for that market, as for the US: its `A2A_RAIL_MERCHANTS` entry, a fresh

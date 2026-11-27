@@ -90,7 +90,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 from urllib.parse import urlparse
 
 from config.platform import is_production as _platform_is_production
-from services.payment_orchestration import a2a_markets, checkout_amounts
+from services.payment_orchestration import checkout_amounts
 
 logger = logging.getLogger(__name__)
 
@@ -709,8 +709,8 @@ def parse_response(body: Any, *, card_code: Callable[[Any], bool] = has_card_cod
 CHECKOUT_CARD_BRANDS: FrozenSet[str] = frozenset({"visa", "mastercard"})
 #: The shipping fields the checkout skill takes (measured 2026-11-17). This is the REQUEST's field list, not an
 #: address rule: which fields an address needs is the merchant platform's checkout's, which the skill fills.
-#: `state` is sent for every market whose region is required (a2a_markets.state_required). `zip_code` is sent when
-#: the buyer gave a postcode and is never required: the provider does not ask for it; a store platform may.
+#: `state` and `zip_code` are sent when the buyer gave a region / postcode and are never required: the provider does
+#: not ask for them; a store platform may.
 CHECKOUT_SHIPPING_REQUIRED: Tuple[str, ...] = (
     "email", "first_name", "last_name", "phone", "country", "address1", "city",
 )
@@ -787,7 +787,7 @@ def _clean_field(value: Any) -> Optional[str]:
 
 def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
     """The checkout skill's `shipping`, validated, or None. Only the skill's own keys; every required
-    one present (`zip_code` is not one); `state` where the market requires a region; no value that carries a card number (an address is never a way
+    one present (`state` and `zip_code` are not); no value that carries a card number (an address is never a way
     to send card data). Never raises, never logs (the values are the buyer's PII)."""
     if not isinstance(value, Mapping):
         return None
@@ -803,8 +803,6 @@ def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
             return None
         out[key] = text
     if any(key not in out for key in CHECKOUT_SHIPPING_REQUIRED) or not _COUNTRY_RE.match(out["country"]):
-        return None
-    if a2a_markets.state_required(out["country"]) and "state" not in out:
         return None
     return out
 
