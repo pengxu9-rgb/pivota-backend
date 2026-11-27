@@ -21,8 +21,9 @@ ADC when VERTEX_AI_ENABLED=true, else the AI Studio endpoint with GEMINI_API_KEY
     candidate that finished with STOP, and was not blocked; anything else is no answer;
   * parses the non-thought text with parse_agent_answer (the whole reply must be one JSON object).
 A 429, a 5xx or a timeout is retried twice with a pause; any other failure is an agent error.
-Every call is recorded (pair id, role, model, answer, finish reason, token counts) so the run can
-be replayed by ReplayAgent and scored again without new calls.
+Every call is recorded, a failed one too (pair id, role, model, answer, finish reason, token
+counts, attempts, and the error with its HTTP status), so a run's error rate is read from its
+record and the run can be replayed by ReplayAgent and scored again without new calls.
 """
 
 from __future__ import annotations
@@ -166,6 +167,25 @@ def read_response(payload: Any, model: str) -> tuple:
     return "".join(texts), finish, None
 
 
+def failure_text(exc: BaseException) -> str:
+    """The error class and, for an HTTP error, its status; never the response body."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return f"{type(exc).__name__} {status}" if isinstance(status, int) else type(exc).__name__
+
+
+def error_summary(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Calls, errors and attempts of a run, read from its record."""
+    calls = len(records)
+    errors = [r for r in records if r.get("error")]
+    by_error: Dict[str, int] = {}
+    for r in errors:
+        by_error[str(r["error"])] = by_error.get(str(r["error"]), 0) + 1
+    return {"calls": calls, "errors": len(errors),
+            "error_rate": round(len(errors) / calls, 4) if calls else 0.0,
+            "attempts": sum(int(r.get("attempts") or 0) for r in records),
+            "by_error": dict(sorted(by_error.items()))}
+
+
 class GeminiAgent:
     """One role on one model. Call it with a pair view; it returns the parsed answer, None when the
     reply is not one JSON object, or raises (the judge then does not show the pair)."""
@@ -184,16 +204,18 @@ class GeminiAgent:
         self.records: List[Dict[str, Any]] = []
 
     def _record(self, view: Mapping[str, Any], answer: Any, finish: Any, usage: Dict[str, int],
-                error: Optional[str]) -> None:
+                error: Optional[str], attempts: int) -> None:
         row = {"pair_id": view.get("pair_id"), "role": self.role, "model": self.model,
-               "thinking": self.thinking, "answer": answer, "finish_reason": finish, "usage": usage}
+               "thinking": self.thinking, "answer": answer, "finish_reason": finish, "usage": usage,
+               "attempts": attempts}
         if error:
             row["error"] = error
         with self._lock:
             self.records.append(row)
 
-    def _call(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    def _call(self, request: Dict[str, Any], attempts: List[int]) -> Dict[str, Any]:
         for pause in (*RETRY_PAUSES_S, None):
+            attempts[0] += 1
             try:
                 return self._post(self.model, request)
             except TransportError:
@@ -205,14 +227,20 @@ class GeminiAgent:
     def __call__(self, view: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         if not shopify_pair(view):
             raise SourceNotAllowed("a listing is not from a source whose terms allow a model vendor")
-        payload = self._call(build_request(self.role, view, self.thinking))
+        attempts = [0]
+        try:
+            payload = self._call(build_request(self.role, view, self.thinking), attempts)
+        except Exception as exc:  # recorded, then the judge turns it into not_shown
+            self._record(view, None, None, {}, failure_text(exc), attempts[0])
+            raise
         text, finish, problem = read_response(payload, self.model)
         usage = _usage(payload) if isinstance(payload, Mapping) else {}
         if problem:
-            self._record(view, None, finish, usage, problem)
+            self._record(view, None, finish, usage, problem, attempts[0])
             raise lj.AnswerError(problem)
         answer = lj.parse_agent_answer(text)
-        self._record(view, answer, finish, usage, None if answer is not None else "not one JSON object")
+        self._record(view, answer, finish, usage, None if answer is not None else "not one JSON object",
+                     attempts[0])
         return answer
 
 

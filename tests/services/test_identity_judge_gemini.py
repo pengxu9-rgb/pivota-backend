@@ -339,3 +339,65 @@ def test_vertex_post_marks_a_timeout_retryable_and_a_400_not(monkeypatch):
     _patch_transport(monkeypatch, (400, {"error": "bad"}))
     with pytest.raises(httpx.HTTPStatusError):
         jg.vertex_post("gemini-4-carbon", {})
+
+
+# --- every call is recorded, a failed one too ----------------------------------------------------
+
+def test_a_failed_call_is_recorded_with_its_status_and_attempts():
+    import httpx
+
+    def denied(model, request):
+        resp = httpx.Response(403, json={"error": {"message": "secret-free body"}},
+                              request=httpx.Request("POST", "https://gen.example/x"))
+        resp.raise_for_status()
+    agent = jg.GeminiAgent("sceptic", "gemini-4-carbon", post=denied, sleep=lambda s: None)
+    r = lj.judge(view(), lambda v: answer(), agent)
+    assert r["reasons"] == ["sceptic:error:HTTPStatusError"]
+    (rec,) = agent.records
+    assert rec["error"] == "HTTPStatusError 403" and rec["attempts"] == 1 and rec["answer"] is None
+    assert "secret-free body" not in json.dumps(rec)  # the response body is never recorded
+
+
+def test_exhausted_retries_are_recorded_with_every_attempt():
+    def busy(model, request):
+        raise jg.TransportError("http 429")
+    agent = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=busy, sleep=lambda s: None)
+    lj.judge(view(), agent, lambda v: answer())
+    (rec,) = agent.records
+    assert rec["error"] == "TransportError" and rec["attempts"] == 1 + len(jg.RETRY_PAUSES_S)
+
+
+def test_a_good_call_records_its_attempts():
+    seq = [jg.TransportError("timeout")]
+    def once_then_ok(model, request):
+        if seq:
+            raise seq.pop()
+        return payload(json.dumps(answer()))(model, request)
+    agent = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=once_then_ok, sleep=lambda s: None)
+    agent(view())
+    assert agent.records[0]["attempts"] == 2 and "error" not in agent.records[0]
+
+
+def test_error_summary_reads_the_rate_from_the_record():
+    recs = [{"attempts": 1}, {"attempts": 3, "error": "TransportError"},
+            {"attempts": 1, "error": "HTTPStatusError 403"}, {"attempts": 1, "error": "HTTPStatusError 403"}]
+    assert jg.error_summary(recs) == {"calls": 4, "errors": 3, "error_rate": 0.75, "attempts": 6,
+                                      "by_error": {"HTTPStatusError 403": 2, "TransportError": 1}}
+    assert jg.error_summary([])["error_rate"] == 0.0
+
+
+def test_runner_reports_errors_from_the_record(tmp_path, capsys):
+    import httpx
+
+    def split(model, request):
+        if model == "gemini-4-carbon":
+            raise httpx.HTTPStatusError("denied", request=httpx.Request("POST", "https://g.example"),
+                                        response=httpx.Response(403))
+        return payload(json.dumps(answer()))(model, request)
+    rec = tmp_path / "r.jsonl"
+    cli.main(["run", "--truth", str(_truth(tmp_path)), "--matcher", "gemini", "--sceptic", "gemini",
+              "--record", str(rec), "--out", str(tmp_path / "v.jsonl")], post=split)
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["calls"] == {"calls": 2, "errors": 1, "error_rate": 0.5, "attempts": 2,
+                                "by_error": {"HTTPStatusError 403": 1}}
+    assert len(ts.read_jsonl(str(rec))) == 2  # the failed call is in the record

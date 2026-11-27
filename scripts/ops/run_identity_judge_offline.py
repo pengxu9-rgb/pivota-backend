@@ -134,7 +134,8 @@ def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
             ts.write_jsonl(args.record, records)
             from services import identity_judge_gemini as jg
 
-            out = {"recorded": len(records), "usage": jg.usage_totals(records)}
+            out = {"recorded": len(records), "usage": jg.usage_totals(records),
+                   "calls": jg.error_summary(records)}
         verdicts = {str(x["pair_id"]): x["verdict"] for x in results}
         scored = ts.score(pairs, verdicts)
         _print({"judge_offline": "run", "judge": lj.JUDGE_VERSION, "matcher": args.matcher,
