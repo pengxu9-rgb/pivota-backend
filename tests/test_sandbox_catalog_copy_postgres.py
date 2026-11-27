@@ -873,3 +873,80 @@ async def test_nothing_reaches_an_upload_after_the_deadline_on_a_real_connection
     assert [w for w in writes if w[0] >= spy.terminated_at] == []
     assert not any(name.endswith("/catalog_products.csv.gz") for _, name in writes)
     assert _files(tmp_path) == []
+
+
+async def test_the_export_needs_select_on_the_catalog_tables_and_nothing_else(db, tmp_path):
+    """The prod export runs as a catalog-only role (infra Q3): SELECT on the catalog tables that
+    exist, USAGE on their schema, a read-only default, nothing else. This export, run as such a
+    role, gives byte-identical files to one run as the owner; and the role reads no other table."""
+    import secrets as _secrets
+    import urllib.parse
+
+    import asyncpg
+
+    role = "sbx_catalog_export_probe_%s" % _secrets.token_hex(4)
+    password = _secrets.token_hex(16)
+    present = [s.name for s in SPECS
+               if await db.fetchval("SELECT to_regclass($1) IS NOT NULL", "%s.%s" % (SRC, s.name))]
+    await db.execute("CREATE ROLE %s LOGIN NOINHERIT PASSWORD '%s'" % (role, password))
+    probe = None
+    try:
+        await db.execute("ALTER ROLE %s SET default_transaction_read_only = on" % role)
+        await db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SRC, role))
+        for name in present:
+            await db.execute("GRANT SELECT ON %s.%s TO %s" % (SRC, name, role))
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (role, password, url.hostname + (":%d" % url.port if url.port else ""))
+        probe = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        assert await probe.fetchval("SHOW default_transaction_read_only") == "on"
+        assert not await probe.fetchval("SELECT has_table_privilege(current_user, $1, 'SELECT')", "%s.orders" % SRC)
+
+        as_role = await C.export_catalog(probe, C.LocalDirStore(tmp_path / "role"), stamp="20261127T0100Z",
+                                         commit="abc123", specs=SPECS, schema=SRC)
+        as_owner = await C.export_catalog(db, C.LocalDirStore(tmp_path / "owner"), stamp="20261127T0100Z",
+                                          commit="abc123", specs=SPECS, schema=SRC)
+        key = [(t["name"], t["rows"], t["sha256"], tuple(t["columns"])) for t in as_role["tables"]]
+        assert key == [(t["name"], t["rows"], t["sha256"], tuple(t["columns"])) for t in as_owner["tables"]]
+        assert as_role["absent_optional_tables"] == as_owner["absent_optional_tables"]
+    finally:
+        if probe is not None:
+            await probe.close()
+        await db.execute("DROP OWNED BY %s" % role)
+        await db.execute("DROP ROLE %s" % role)
+
+
+async def test_without_select_an_optional_catalog_table_is_silently_recorded_absent(db, tmp_path):
+    """Why the per-run grant must cover EVERY catalog table that exists (the role design's check 9):
+    information_schema hides a table the role cannot read, so the export records an optional one
+    as absent and carries on."""
+    import dataclasses
+    import secrets as _secrets
+    import urllib.parse
+
+    import asyncpg
+
+    hidden = "catalog_offers"
+    specs = [dataclasses.replace(s, optional=True) if s.name == hidden else s for s in SPECS]
+    role = "sbx_catalog_export_probe_%s" % _secrets.token_hex(4)
+    password = _secrets.token_hex(16)
+    await db.execute("CREATE ROLE %s LOGIN NOINHERIT PASSWORD '%s'" % (role, password))
+    probe = None
+    try:
+        await db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SRC, role))
+        for spec in specs:
+            if spec.name != hidden and await db.fetchval("SELECT to_regclass($1) IS NOT NULL",
+                                                         "%s.%s" % (SRC, spec.name)):
+                await db.execute("GRANT SELECT ON %s.%s TO %s" % (SRC, spec.name, role))
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (role, password, url.hostname + (":%d" % url.port if url.port else ""))
+        probe = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        manifest = await C.export_catalog(probe, C.LocalDirStore(tmp_path), stamp="20261127T0100Z",
+                                          commit="abc123", specs=specs, schema=SRC)
+        assert hidden in manifest["absent_optional_tables"]
+        assert hidden not in [t["name"] for t in manifest["tables"]]
+        assert await db.fetchval("SELECT count(*) FROM %s.%s" % (SRC, hidden)) > 0  # it exists, with rows
+    finally:
+        if probe is not None:
+            await probe.close()
+        await db.execute("DROP OWNED BY %s" % role)
+        await db.execute("DROP ROLE %s" % role)
