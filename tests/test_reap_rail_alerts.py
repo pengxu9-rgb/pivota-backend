@@ -1110,7 +1110,8 @@ def test_the_script_wires_the_first_run_safely(source):
                       "prod: retailer ingest job failed", "prod: purchasability sweep IP-throttled",
                       STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
                       "prod: Reap checkout needs human reconciliation",
-                      "prod: Reap buyer contact retention blocked"]
+                      "prod: Reap buyer contact retention blocked",
+                      "prod: A2A checkout held for a human"]
     # ONE deliberate exception (2026-11-02): "relgraph-sync has not succeeded in a day" is the LAST write,
     # after every waiting-path policy, because its hour() is unproven by a create and a refusal aborts
     # the run at check(); last, it cannot leave anything else unwritten. A deferral is not an abort, so
@@ -1203,7 +1204,7 @@ def test_no_plain_upsert_reads_a_log_metric(source):
     body = _uncommented(source)
     calls = re.findall(r'^(upsert|upsert_on_new_metric) "([^"]+)" "\$\((?:policy|promql_policy) (.*?)\)"$',
                        body, re.S | re.M)
-    assert len(calls) == 16, [n for _, n, _ in calls]
+    assert len(calls) == 17, [n for _, n, _ in calls]
     first_policy = min(body.index('\nupsert "'), body.index('\nupsert_on_new_metric "'))
     readers = 0
     for writer, name, args in calls:
@@ -1217,7 +1218,7 @@ def test_no_plain_upsert_reads_a_log_metric(source):
             created = [m.start() for m in re.finditer(
                 rf'(?:^upsert_log_metric {metric} |^METRIC={metric}$)', body, re.M)]
             assert created and created[0] < first_policy, f"{metric} is not created before the policies"
-    assert readers == 9
+    assert readers == 10
 
 
 def test_the_nine_existing_policies_render_exactly_as_before_this_change():

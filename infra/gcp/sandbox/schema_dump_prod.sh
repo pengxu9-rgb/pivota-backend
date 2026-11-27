@@ -18,7 +18,12 @@ SECRET=SANDBOX_SCHEMA_DUMP_DATABASE_URL
 DUMP_IMG="${1:-}"
 [[ "$DUMP_IMG" =~ ^us-west1-docker\.pkg\.dev/pivota-shared/pivota/sandbox-schema-dump@sha256:[0-9a-f]{64}$ ]] \
   || { echo "usage: $0 us-west1-docker.pkg.dev/pivota-shared/pivota/sandbox-schema-dump@sha256:<digest>" >&2; exit 2; }
-say "schema dump in $PROD -> gs://$DROP_BUCKET/schema"; mode_banner
+say "schema dump in $PROD -> gs://$DROP_BUCKET/schema"
+if [ "$APPLY" = 1 ]; then   # every call below goes to pivota-prod, not the sandbox project
+  echo "APPLY=1: changes WILL be made in project $PROD"
+else
+  echo "dry run (APPLY=0): nothing will be changed in $PROD; mutating commands are printed only"
+fi
 
 remove_grant(){
   run "$GCLOUD" secrets remove-iam-policy-binding "$SECRET" --project "$PROD" \
@@ -26,7 +31,10 @@ remove_grant(){
 }
 on_exit(){
   local rc=$?
-  trap - EXIT INT TERM
+  # IGNORE further signals while cleaning up (a second ^C or TERM must not skip the removal), and
+  # the gcloud children inherit the ignore. `trap -` would restore the default, which kills.
+  trap - EXIT
+  trap '' INT TERM
   if ! remove_grant; then
     printf '\n!!! FAILED: could not remove %s access to %s in %s. The grant is STILL ON a prod secret.\n' \
       "$PROD_EXPORT_SA" "$SECRET" "$PROD" >&2

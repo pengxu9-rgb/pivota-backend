@@ -303,6 +303,7 @@ def _executed_mutations(log: Path) -> list[list[str]]:
         ["setup_catalog_drop.sh", "sandbox"],
         ["setup_catalog_drop.sh", "prod-writer"],
         ["deploy_sandbox.sh", "sandbox-r1"],
+        ["catalog_export_prod.sh", "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "d" * 64, "7"],
     ],
 )
 def test_dry_run_executes_no_mutating_cloud_call(tmp_path, argv):
@@ -326,6 +327,7 @@ DRY_RUN_ARGVS = [
     ["bootstrap_sandbox.sh", "secrets"], ["bootstrap_sandbox.sh", "iam"], ["setup_sandbox_lb.sh"],
     ["setup_catalog_drop.sh", "sandbox"], ["setup_catalog_drop.sh", "prod-writer"], ["deploy_sandbox.sh", "sandbox-r1"],
     ["schema_dump_prod.sh", "us-west1-docker.pkg.dev/pivota-shared/pivota/sandbox-schema-dump@sha256:" + "b" * 64],
+    ["catalog_export_prod.sh", "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "d" * 64, "7"],
 ]
 
 
@@ -2226,3 +2228,197 @@ def test_a_symlinked_local_config_is_judged_by_its_target(tmp_path, target_mode,
     assert (res.returncode == 0) is ok, res.stderr
     if not ok:
         assert "writable by group or others" in res.stderr
+
+
+
+# ------------------------------------------------------------------- the catalog export (role design R5)
+EXPORT_IMG = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "e" * 64
+
+
+def _export_run(tmp_path, fail_on=(), apply=True, img=EXPORT_IMG, version="7", executions=""):
+    log = tmp_path / "calls.jsonl"
+    fake = tmp_path / "gcloud"
+    fake.write_text(f"""#!{sys.executable}
+import json, sys
+a = sys.argv[1:]
+open({str(log)!r}, "a").write(json.dumps(a) + "\\n")
+if "executions" in a and "list" in a:
+    print({executions!r})
+sys.exit(1 if any(f in a for f in {list(fail_on)!r}) else 0)
+""")
+    fake.chmod(0o755)
+    env = {**os.environ, "GCLOUD": str(fake)}
+    env.pop("APPLY", None)
+    if apply:
+        env["APPLY"] = "1"
+    res = subprocess.run(["bash", str(SANDBOX / "catalog_export_prod.sh"), img, version], env=env,
+                         capture_output=True, text=True, timeout=60)
+    calls = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+    return res, calls
+
+
+def _export_verbs(calls):
+    out = []
+    for c in calls:
+        if "executions" in c and "list" in c: out.append("list")
+        elif "executions" in c and "cancel" in c: out.append("cancel")
+        elif "add-iam-policy-binding" in c: out.append("grant")
+        elif "remove-iam-policy-binding" in c: out.append("ungrant")
+        elif "deploy" in c: out.append("deploy")
+        elif "execute" in c: out.append("execute")
+        elif "delete" in c: out.append("delete-job")
+    return out
+
+
+@pytest.mark.parametrize("fail_on,want,rc", [
+    ((), ["grant", "deploy", "execute", "ungrant", "delete-job"], 0),
+    (("execute",), ["grant", "deploy", "execute", "list", "ungrant", "delete-job"], 1),
+    (("deploy",), ["grant", "deploy", "ungrant", "delete-job"], 1),
+    (("add-iam-policy-binding",), ["grant", "ungrant"], 1),
+])
+def test_export_grant_is_removed_and_the_job_deleted_on_every_path(tmp_path, fail_on, want, rc):
+    res, calls = _export_run(tmp_path, fail_on=fail_on)
+    assert _export_verbs(calls) == want, (calls, res.stderr)
+    assert res.returncode == rc, res.stdout + res.stderr
+    for c in calls:
+        assert "--project" in c and c[c.index("--project") + 1] == "pivota-prod", c
+
+
+def test_export_job_is_exactly_the_reviewed_run(tmp_path):
+    res, calls = _export_run(tmp_path)
+    assert res.returncode == 0, res.stdout + res.stderr
+    grant, deploy, execute, ungrant, delete = calls
+    member = "--member=serviceAccount:sa-sandbox-export@pivota-prod.iam.gserviceaccount.com"
+    for c in (grant, ungrant):
+        assert c[:3] in (["secrets", "add-iam-policy-binding", "CATALOG_EXPORT_DATABASE_URL"],
+                         ["secrets", "remove-iam-policy-binding", "CATALOG_EXPORT_DATABASE_URL"])
+        assert member in c and "--role=roles/secretmanager.secretAccessor" in c
+    assert deploy[:4] == ["run", "jobs", "deploy", "sandbox-catalog-export"]
+    arg = lambda c, k: c[c.index(k) + 1]
+    assert arg(deploy, "--image") == EXPORT_IMG
+    assert arg(deploy, "--service-account") == "sa-sandbox-export@pivota-prod.iam.gserviceaccount.com"
+    assert arg(deploy, "--set-secrets") == "DATABASE_URL=CATALOG_EXPORT_DATABASE_URL:7"  # the number, never latest
+    assert arg(deploy, "--set-env-vars") == "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://pivota-sandbox-catalog-drop/catalog"
+    assert arg(deploy, "--command") == "python" and "--args=-m,jobs.sandbox_catalog_copy,export" in deploy
+    assert arg(deploy, "--max-retries") == "0" and arg(deploy, "--task-timeout") == "3600s"
+    assert arg(deploy, "--vpc-egress") == "all-traffic"
+    assert execute[:4] == ["run", "jobs", "execute", "sandbox-catalog-export"] and "--wait" in execute
+    assert delete[:4] == ["run", "jobs", "delete", "sandbox-catalog-export"]
+
+
+@pytest.mark.parametrize("fail_on,needle", [
+    (("remove-iam-policy-binding",), "STILL ON a prod secret"),
+    (("delete",), "could not delete job sandbox-catalog-export"),
+])
+def test_export_a_failed_cleanup_after_a_good_run_exits_3_loudly(tmp_path, fail_on, needle):
+    res, calls = _export_run(tmp_path, fail_on=fail_on)
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert needle in res.stderr
+    assert _export_verbs(calls)[-2:] == ["ungrant", "delete-job"]  # both cleanups are tried either way
+
+
+def test_export_a_failed_run_keeps_its_own_code_when_a_cleanup_also_fails(tmp_path):
+    res, _ = _export_run(tmp_path, fail_on=("execute", "remove-iam-policy-binding"))
+    assert res.returncode == 1 and "STILL ON a prod secret" in res.stderr
+
+
+def test_export_dry_run_prints_the_same_order_and_runs_nothing(tmp_path):
+    res, calls = _export_run(tmp_path, apply=False)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0 and calls == []
+    order = [out.index(s) for s in ("secrets add-iam-policy-binding", "run jobs deploy sandbox-catalog-export",
+                                     "run jobs execute sandbox-catalog-export", "secrets remove-iam-policy-binding",
+                                     "run jobs delete sandbox-catalog-export")]
+    assert order == sorted(order)
+
+
+@pytest.mark.parametrize("img,version", [
+    ("us-west1-docker.pkg.dev/pivota-shared/pivota/backend:latest", "7"),
+    ("us-west1-docker.pkg.dev/pivota-shared/pivota/gateway@sha256:" + "e" * 64, "7"),
+    ("", "7"),
+    (EXPORT_IMG, "latest"), (EXPORT_IMG, "0"), (EXPORT_IMG, ""), (EXPORT_IMG, "7;x"), (EXPORT_IMG, "1234567"),
+])
+def test_export_wants_an_image_by_digest_and_a_version_number(tmp_path, img, version):
+    res, calls = _export_run(tmp_path, img=img, version=version)
+    assert res.returncode == 2 and calls == [], res.stdout + res.stderr
+
+
+
+def test_export_a_failed_execute_cancels_this_jobs_executions_before_the_delete(tmp_path):
+    res, calls = _export_run(tmp_path, fail_on=("execute",), executions="sandbox-catalog-export-abc12")
+    assert res.returncode == 1
+    assert _export_verbs(calls) == ["grant", "deploy", "execute", "list", "cancel", "ungrant", "delete-job"]
+    cancel = [c for c in calls if "cancel" in c][0]
+    assert cancel[:5] == ["run", "jobs", "executions", "cancel", "sandbox-catalog-export-abc12"]
+    listing = [c for c in calls if "list" in c][0]
+    assert "--job" in listing and listing[listing.index("--job") + 1] == "sandbox-catalog-export"
+
+
+def test_export_a_good_run_cancels_nothing(tmp_path):
+    res, calls = _export_run(tmp_path, executions="sandbox-catalog-export-abc12")
+    assert res.returncode == 0 and "list" not in _export_verbs(calls) and "cancel" not in _export_verbs(calls)
+
+
+def _interrupt_twice(tmp_path, script, args):
+    """^C as a terminal sends it: to the whole process group. Once during the run (the execute), and
+    again while the cleanup removes the grant. The second must not stop the cleanup."""
+    import signal
+    import time
+
+    log = tmp_path / "calls.jsonl"
+    fake = tmp_path / "gcloud"
+    fake.write_text(f"""#!{sys.executable}
+import json, sys, time
+a = sys.argv[1:]
+def note(x):
+    open({str(log)!r}, "a").write(json.dumps(x) + "\\n")
+if "execute" in a:
+    note(["started"] + a); time.sleep(30)
+if "remove-iam-policy-binding" in a:
+    note(["removing"]); time.sleep(2)
+if "executions" in a and "list" in a:
+    print("sandbox-catalog-export-abc12")
+note(a)
+""")
+    fake.chmod(0o755)
+    env = {**os.environ, "GCLOUD": str(fake), "APPLY": "1"}
+    proc = subprocess.Popen(["bash", str(SANDBOX / script), *args], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+    def wait_for(word):
+        for _ in range(200):
+            if log.exists() and word in log.read_text():
+                return
+            time.sleep(0.05)
+        raise AssertionError("never saw %s" % word)
+
+    wait_for('"started"')
+    os.killpg(proc.pid, signal.SIGTERM)
+    wait_for('"removing"')
+    os.killpg(proc.pid, signal.SIGTERM)  # the second one, mid-cleanup
+    out, err = proc.communicate(timeout=60)
+    calls = [json.loads(l) for l in log.read_text().splitlines()]
+    return proc.returncode, calls, err
+
+
+def test_export_a_second_interrupt_during_cleanup_does_not_skip_it(tmp_path):
+    rc, calls, err = _interrupt_twice(tmp_path, "catalog_export_prod.sh", [EXPORT_IMG, "7"])
+    assert rc == 130, err
+    done = [c for c in calls if c and c[0] not in ("started", "removing")]
+    assert _export_verbs(done)[-4:] == ["list", "cancel", "ungrant", "delete-job"], done
+    assert "STILL ON" not in err
+
+
+def test_dump_a_second_interrupt_during_cleanup_does_not_skip_it(tmp_path):
+    rc, calls, err = _interrupt_twice(tmp_path, "schema_dump_prod.sh", [DUMP_IMG])
+    assert rc == 130, err
+    assert any("remove-iam-policy-binding" in c for c in calls), calls
+
+
+def test_the_prod_scripts_say_prod_in_their_banner(tmp_path):
+    for script, args in (("catalog_export_prod.sh", [EXPORT_IMG, "7"]), ("schema_dump_prod.sh", [DUMP_IMG])):
+        env = {**os.environ, "GCLOUD": str(_fake_gcloud(tmp_path)), "APPLY": "1"}
+        res = subprocess.run(["bash", str(SANDBOX / script), *args], env=env, capture_output=True, text=True,
+                             timeout=60)
+        assert "changes WILL be made in project pivota-prod" in res.stdout, (script, res.stdout)
+        assert "in project pivota-sandbox" not in res.stdout
