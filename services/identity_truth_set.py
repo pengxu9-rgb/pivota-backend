@@ -409,11 +409,26 @@ def _inside_repo(path: str, root: Optional[str] = None) -> bool:
     return os.path.commonpath([root, target]) == root
 
 
+def _inside_any_checkout(path: str) -> bool:
+    """True when a directory above the path holds a .git entry: another checkout or worktree of
+    this repository (or any repository), where a careless `git add` would publish the file."""
+    d = os.path.dirname(os.path.realpath(os.path.abspath(path)))
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
 def write_jsonl(path: str, rows: Iterable[Mapping[str, Any]], *, repo_root: Optional[str] = None) -> int:
-    """Write rows as JSON lines. Refuses any path inside this public repository: the set holds
-    real store and product names."""
+    """Write rows as JSON lines. Refuses any path inside this public repository, or inside any git
+    checkout (another worktree of it included): the set holds real store and product names."""
     if _inside_repo(path, repo_root):
         raise TruthSetError(f"refused: {path} is inside the public repository; write the truth set elsewhere")
+    if _inside_any_checkout(path):
+        raise TruthSetError(f"refused: {path} is inside a git checkout; write the truth set elsewhere")
     n = 0
     with open(path, "w", encoding="utf-8") as fh:
         for r in rows:
@@ -429,6 +444,8 @@ def to_row(p: TruthPair) -> Dict[str, Any]:
 def from_row(r: Mapping[str, Any]) -> TruthPair:
     if r.get("schema") != SCHEMA_VERSION:
         raise TruthSetError(f"schema {r.get('schema')!r} is not {SCHEMA_VERSION}")
+    if not isinstance(r.get("a"), Mapping) or not isinstance(r.get("b"), Mapping):
+        raise TruthSetError(f"pair {r.get('pair_id')}: a side is not an object")
     return TruthPair(**{k: r[k] for k in ("pair_id", "a", "b", "label", "grade", "basis", "grain",
                                           "source", "note", "schema")})
 

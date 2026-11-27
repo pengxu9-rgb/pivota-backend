@@ -346,6 +346,15 @@ _PERSON_KEY_ALTERNATION = "|".join((
     r"reasons?", r"rationales?", r"raw_?payload", r"headers", r"webhook_?url", r"webhook_?secret",
 ))
 PERSON_KEY_RE = re.compile(r"(?:%s)\Z" % _PERSON_KEY_ALTERNATION, re.IGNORECASE)
+#: PERSON_KEY_RE backtracks quadratically on a long key ("by_" * 8000 + "." took 2 s). No catalog
+#: attribute is named with more than this many characters, so a longer key is treated as a person
+#: key (its value is redacted: fail closed), and the pattern only ever sees short keys.
+MAX_PERSON_KEY_MATCH_CHARS = 256
+
+
+def is_person_key(key: str) -> bool:
+    """The scrub's and the check's one predicate for a person key (see PERSON_KEY_RE)."""
+    return len(key) > MAX_PERSON_KEY_MATCH_CHARS or PERSON_KEY_RE.match(key) is not None
 REDACTED = "redacted"
 #: Email- and phone-shaped substrings, redacted in every text and JSON string value (SF3: a person's
 #: address under a catalog-named key such as note2). The email check is a GATE on every column: after
@@ -498,7 +507,7 @@ def _scrub(value: Any, keep: set, scope: bool) -> Tuple[Any, bool]:
         for key, inner in value.items():
             new_key = _key_out(key, set(out))
             changed = changed or new_key != key
-            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
+            if is_person_key(str(key)) and not (scope and str(key) in keep):
                 new = inner if inner is None or inner == REDACTED else (REDACTED if isinstance(inner, str) else None)
                 changed = changed or new is not inner
                 out[new_key] = new
@@ -529,7 +538,7 @@ def _person_values(value: Any, keep: set, scope: bool, path: str) -> List[str]:
             here = "%s.%s" % (path, key)
             if _text_hits(str(key)):
                 found.append("%s.<key>" % path)
-            if PERSON_KEY_RE.match(str(key)) and not (scope and str(key) in keep):
+            if is_person_key(str(key)) and not (scope and str(key) in keep):
                 if inner is not None and inner != REDACTED:
                     found.append(here)
             else:
@@ -1119,6 +1128,42 @@ async def _table_column_types(conn, schema: str, table: str) -> Dict[str, str]:
     return out
 
 
+async def _source_columns(conn, schema: str, table: str) -> List[str]:
+    """The export's view of one source table, from pg_class and pg_attribute (which every role
+    reads), never from information_schema, which hides what the role cannot read: [] when the
+    table does not exist, else its copyable (non-generated) columns in order.
+
+    Refuses, optional table or not, when the export would carry less than the table holds without
+    noticing: the table exists but the export's role has no table-level SELECT on it (a missing
+    grant, or a column-level grant that leaves columns out; information_schema would show such a
+    table as absent, or without those columns); row-level security is enabled on it (a policy would
+    filter the rows, and the export's own count(*) runs under the same policy, so the counts would
+    still agree); or it is not a plain table (a view runs with its owner's rights, not the role's)."""
+    row = await conn.fetchrow(
+        """
+        SELECT c.relkind::text AS relkind, c.relrowsecurity, has_table_privilege(c.oid, 'SELECT') AS can_select,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a
+                      WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+                      ORDER BY a.attnum) AS columns
+          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2
+        """,
+        schema, table,
+    )
+    if row is None:
+        return []
+    if row["relkind"] not in ("r", "p"):
+        raise CopyRefused("source %s is not a plain table (relkind %s); a view runs with its owner's rights"
+                          % (table, row["relkind"]))
+    if not row["can_select"]:
+        raise CopyRefused("the export's role cannot read all of table %s (no table-level SELECT); "
+                          "it would be copied short or skipped" % table)
+    if row["relrowsecurity"]:
+        raise CopyRefused("table %s has row-level security enabled; a policy could filter the rows the "
+                          "export copies" % table)
+    return list(row["columns"])
+
+
 # ---------------------------------------------------------------------------------------------
 # Export (prod)
 # ---------------------------------------------------------------------------------------------
@@ -1136,9 +1181,13 @@ class _ExportSink:
     It never raises inside the COPY. asyncpg 0.31 leaves the connection's reading paused when a sink
     raises while the server is still sending, and the transaction's ROLLBACK then waits forever. So a
     refusal is kept, the rest of the table's output is dropped unread, and the export raises it as
-    soon as the COPY returns. statement_timeout and the deadline bound that COPY."""
+    soon as the COPY returns. statement_timeout and the deadline bound that COPY.
 
-    def __init__(self, table: str, columns: Sequence[str], null_token: str, writer):
+    Once the export's deadline has fired (``expired`` non-empty) it writes nothing more: a block
+    whose scrub was still running in its worker thread is dropped when the thread returns."""
+
+    def __init__(self, table: str, columns: Sequence[str], null_token: str, writer,
+                 expired: Sequence[bool] = ()):
         self.scrub = _TableScrub(table, columns)
         self.split = RecordSplitter(table)
         self.null_token = null_token
@@ -1148,15 +1197,18 @@ class _ExportSink:
         self.size = 0
         self.records = 0
         self.error: Optional[Exception] = None
+        self.expired = expired
 
     async def __call__(self, chunk: bytes) -> None:
-        if self.error is not None:
+        if self.error is not None or self.expired:
             return
         try:
             block = self.split.feed(bytes(chunk))
             if block:
                 # Off the event loop, so the deadline's timer fires on time however long a block takes.
                 data, records = await asyncio.to_thread(self._process, block)
+                if self.expired:  # the deadline fired while this block was being scrubbed
+                    return
                 self.records += records
                 await self._out(data)
         except Exception as exc:  # noqa: BLE001 - kept and raised after the COPY (see the class)
@@ -1177,6 +1229,8 @@ class _ExportSink:
     async def finish(self) -> None:
         if self.error is not None:
             raise self.error
+        if self.expired:
+            return
         self.split.finish()
         await self._out(self.zip.flush())
         await asyncio.to_thread(self.writer.flush)
@@ -1200,7 +1254,13 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
     Every file is an unfinished upload until the last table has passed, so a refusal while reading
     writes nothing. Only then are the files committed, and the manifest last: a failure during
     that commit can leave some files under the stamp without a manifest, and the import only reads
-    a stamp that has one (newest_complete_stamp), so those files are never imported."""
+    a stamp that has one (newest_complete_stamp), so those files are never imported.
+
+    What the deadline bounds: the SOURCE. When it fires the connection is terminated, so prod's
+    session, snapshot and locks end on time. It does not bound when this function returns: a worker
+    thread cannot be interrupted, so the function returns once the block being scrubbed finishes (one
+    COPY chunk's records, at most one MAX_RECORD_BYTES record), writing nothing more after the
+    deadline, and then refuses."""
     if not _STAMP_RE.match(stamp):
         raise CopyRefused("stamp must look like YYYYmmddTHHMMZ")
     for setting, value in (("statement_timeout", statement_timeout), ("lock_timeout", lock_timeout),
@@ -1226,7 +1286,7 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
             tables, absent = await _export_tables(
                 conn, store, stamp, specs, schema, writers,
                 (("statement_timeout", statement_timeout), ("lock_timeout", lock_timeout),
-                 ("idle_in_transaction_session_timeout", idle_timeout)))
+                 ("idle_in_transaction_session_timeout", idle_timeout)), expired)
         except Exception as exc:
             if expired:
                 raise CopyRefused("the export passed its %gs deadline; nothing was written" % deadline_seconds) from None
@@ -1266,7 +1326,8 @@ async def export_catalog(conn, store, *, stamp: str, commit: Optional[str] = Non
 
 
 async def _export_tables(conn, store, stamp: str, specs: Sequence[TableSpec], schema: str,
-                         writers: List[Any], limits) -> Tuple[List[Dict[str, Any]], List[str]]:
+                         writers: List[Any], limits,
+                         expired: Sequence[bool] = ()) -> Tuple[List[Dict[str, Any]], List[str]]:
     tables: List[Dict[str, Any]] = []
     absent: List[str] = []
     async with conn.transaction(isolation="repeatable_read", readonly=True):
@@ -1278,7 +1339,7 @@ async def _export_tables(conn, store, stamp: str, specs: Sequence[TableSpec], sc
             # set_config(..., true) is SET LOCAL: it ends with this transaction.
             await conn.execute("SELECT pg_catalog.set_config($1, $2, true)", setting, value)
         for spec in specs:
-            existing = await _table_columns(conn, schema, spec.name)
+            existing = await _source_columns(conn, schema, spec.name)
             if not existing:
                 if spec.optional:
                     absent.append(spec.name)
@@ -1292,7 +1353,8 @@ async def _export_tables(conn, store, stamp: str, specs: Sequence[TableSpec], sc
             writer = await asyncio.to_thread(store.open_writer, fname)
             writers.append(writer)
             # The scrub (S3) runs in the sink, on every JSON and text column, before anything is sent.
-            sink = _ExportSink(spec.name, planned, "__sandbox_copy_null_%s__" % secrets.token_hex(16), writer)
+            sink = _ExportSink(spec.name, planned, "__sandbox_copy_null_%s__" % secrets.token_hex(16), writer,
+                               expired)
             await conn.copy_from_query(query, output=sink, format="csv", null=sink.null_token)
             await sink.finish()
             rows = await conn.fetchval("SELECT count(*) FROM %s.%s%s" % (_q(schema), _q(spec.name), where))

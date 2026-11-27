@@ -45,7 +45,8 @@ uploaded (`scrub_csv`):
 * at any depth, a key that names a person, a secret, a request or free text (`*by` / `*_by_*` such as
   reviewed_by, createdBy, signed_by_name; `*mail*`, `*address*`, `*phone*`, mobile*; token, secret,
   api_key, session/request/trace id; user, customer_*, employee_*, reviewer*, contact*, name, handle;
-  notes, comments, reason, rationale; card fields, raw_payload, headers, webhook_url, ...) has a
+  notes, comments, reason, rationale; card fields, raw_payload, headers, webhook_url, ...; and any
+  key longer than 256 characters, which no catalog attribute is) has a
   string value replaced by `"redacted"` (a string: the gateway serves a `product_evidence` claim
   only when `reviewed_by` is a non-empty string) and ANY other value, objects and arrays included,
   by null. A JSON column of product data keeps `name` and `handle` at the product level, in the
@@ -173,7 +174,9 @@ limits, which end with it:
 | `application_name` | `sandbox_catalog_export` | visible in `pg_stat_activity` |
 
 A client-side deadline (45 min, at most 2 h) **terminates** the connection, which ends the session,
-its transaction and its snapshot on the server at once. A limit reached on the server is a refusal
+its transaction and its snapshot on the server at once. The deadline bounds the source, not the
+job: a block already being scrubbed in its worker thread runs to its end (one COPY chunk's records,
+at most one 256 MiB record), is dropped unwritten, and then the job refuses. A limit reached on the server is a refusal
 naming it. Either way nothing is written: every file is an unfinished upload until the last table
 has passed, and only then are the uploads committed and the manifest written. A failure during
 that commit (an upload refused at its final piece, say) can leave some of the stamp's files in
