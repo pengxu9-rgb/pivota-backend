@@ -663,7 +663,11 @@ jobs:
           # tests.services: 6,246 executed on 2026-10-20 at 80e833683 against the 5,879 floor (cap 6,467), 221
           # under its cap. Re-floated ahead of the trip, with the global re-float above, at the same ~97%:
           # 6,060, ~186 of deletion headroom, cap 6,666.
-          SUBTREES = {'tests.services': 6060, 'readiness.tests': 120}
+          # tests.services: 6,703 executed on 2026-11-27 at 321a999c9 (#2951) against the 6,060 floor (cap 6,666),
+          # 37 OVER -- tripped on the push run with every test PASSING, so the deploy gate refused 321a999c9.
+          # Re-floated within the printed window (6,094..6,703) at the same ~97%: 6,500, ~203 of deletion
+          # headroom, cap 7,150.
+          SUBTREES = {'tests.services': 6500, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
