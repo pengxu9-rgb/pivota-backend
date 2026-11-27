@@ -344,6 +344,16 @@ upsert_log_metric reap_agentic_poll_contact \
   "Reap precheckout purchases held after buyer contact retention elapsed" \
   "$REAP_POLL_CONTACT_FILTER"
 
+# The A2A rail's worker holds a checkout for a human when money MAY have moved
+# (services/payment_orchestration/a2a_rail_worker: _hold_before_paying and _checkout_hold). It writes
+# `a2a_rail_worker: checkout held for a human purchase=<id> code=<code>` ONCE, when the hold is written;
+# every later tick parks the row unread and writes nothing like it. So one line = one new hold.
+# The purchase id stays in the log line only; neither the metric nor the policy carries it.
+A2A_CHECKOUT_HELD_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"a2a_rail_worker: checkout held for a human "'
+upsert_log_metric a2a_rail_checkout_held \
+  "A2A rail checkouts held for a human (one line per new hold; money may have moved)" \
+  "$A2A_CHECKOUT_HELD_FILTER"
+
 echo "== alert policies"
 # Two replies used to be read as good news, and both now ABORT where the run previously went on:
 #   * an ERROR DOCUMENT from the list. `d.get("alertPolicies", [])` over {"error": ...} is an empty
@@ -823,6 +833,12 @@ upsert_on_new_metric "prod: Reap buyer contact retention blocked" "$(policy \
   "prod: Reap buyer contact retention blocked" \
   "The poller counted contact_retention_blocked >= 1: a resolving, needs_enrollment or quoting purchase whose buyer contact the retention cap (REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS) erased. The purchase and its payment evidence remain, and it makes no new quote or checkout. Usually the buyer has not come back yet. Its owner view says contact_reentry_required=true, and only the buyer's own agent can restore contact: POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume with the identical original request, which needs the create gate on. If nobody resumes within REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS (default 86400, 24 h), measured from contact_purged_at (when the contact was erased), the poller ends a row with no dispatch evidence as contact_reentry_lapsed (needs_enrollment to expired, resolving or quoting to failed) and it leaves this count. A row whose checkout dispatch is unresolved (dispatch_started, or legacy unknown) cannot be resumed; in quoting it is also counted as checkout needs human, so work it there. Do not copy old PII, edit the row, blindly retry or create a replacement. Runbook: docs/runbooks/reap_agentic_purchase.md, Contact-paused purchases." \
   'metric.type="logging.googleapis.com/user/reap_agentic_poll_contact" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+upsert_on_new_metric "prod: A2A checkout held for a human" "$(policy \
+  "prod: A2A checkout held for a human" \
+  "An A2A rail checkout was held for a human: the worker logged 'a2a_rail_worker: checkout held for a human' (the purchase and its hold code are in that log line). Money MAY have moved, so the worker never retries, confirms again, cancels or fails it, and the buyer's AgenPaz page says it is checking with the store until a human ends it. 1) List the held checkouts: python -m jobs.a2a_rail_operator list-held, a read-only production one-off through the one-off gate. 2) Code checkout_payment_reached_declined (the provider answered payment-reached, success false, no order id): the same day, the owner asks the provider for a written statement for THIS checkout. It must name our checkout task id or our external order reference, and say that the payment was declined, that no authorization was approved or captured, and that no order exists at the merchant. It must be dated at least 1 hour after the hold. Close it within one business day of the provider's reply, and never more than 7 days after it: python -m jobs.a2a_rail_operator close-declined, preview first, then --apply with the fence the preview printed, each a production one-off with the owner's go for that purchase (the go names the purchase, the statement's reference and whether --lookup runs). A2A_RAIL_OPERATOR_CLOSE_DECLINED_ENABLED is set only in that one-off's env, never on a service. Never re-run an apply: if its result is unclear, read the row with a preview instead. 3) Any other hold code (checkout_payment_reached_unconfirmed, a setup or confirm whose answer was never seen, and the rest): do not close, fail or retry it. It needs the provider's evidence and a bound lookup (close-declined --legacy-unconfirmed), or it stays held; resolve-held refuses every payment-reached hold. 4) A late order or a reversed authorization after a close: write an incident note, and the owner contacts the merchant and the provider; nothing is written to the ledger by hand. Runbook: docs/agent_purchases_routes.md, Held A2A checkouts (operator path) and A provider-confirmed decline (close-declined)." \
+  'metric.type="logging.googleapis.com/user/a2a_rail_checkout_held" AND resource.type="cloud_run_revision"' \
   ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
 
 # LAST, after every other policy and retirement, on purpose: hour() in a PromQL ALERT condition was

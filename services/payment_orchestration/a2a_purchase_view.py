@@ -91,6 +91,24 @@ def merchant_order_url_is_allowed(url: Any, merchant_domain: str) -> bool:
     return bool(domain) and (host == domain or host.endswith("." + domain))
 
 
+def card_choice_waits(row: Mapping[str, Any], now: datetime) -> bool:
+    """The purchase waits for the buyer's card choice right now: parked by the worker (`card_choice_required`) in
+    `quoting`, nothing confirmed or asked for yet, no token, the wait's deadline ahead, and the choice running (its dial
+    and the consent gate, ledger.card_picker_active). A new-card request clears the park code itself (the worker
+    then leaves for the card page, which is its own step). A row read without migration 300's columns offers no step
+    (the page could not show the choice either); 301's missing column reads as "not asked". Pure but for the dials."""
+    expires = _aware(row.get("buyer_action_expires_at"))
+    return (
+        str(row.get("state") or "") == "quoting"
+        and row.get("last_error_code") == ledger.CARD_CHOICE_REQUIRED
+        and "card_confirmed_at" in row and row.get("card_confirmed_at") is None
+        and row.get("card_new_requested_at") is None
+        and not row.get("payment_token_id")
+        and expires is not None and expires > now
+        and ledger.card_picker_active()
+    )
+
+
 def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """The `detail` body for one owner-scoped row. Pure."""
     now = now or datetime.now(timezone.utc)
@@ -127,6 +145,11 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
         if expires is not None and row.get("buyer_action_kind") is None:
             required["expires_at"] = row.get("buyer_action_expires_at")
         view["shipping_address_required"] = required
+    if card_choice_waits(row, now):
+        # The worker waits for the buyer to confirm (or add) the paying card on the AgenPas page before any token (the card
+        # choice, migration 300): the buyer has a step, on our own page, with the wait's deadline. No URL here: the
+        # gateway puts the buyer's AgenPas link in `next_action` (purchase_view.unified_body builds kind `card_choice`).
+        view["card_choice_required"] = {"expires_at": row.get("buyer_action_expires_at")}
     if state == "completed" and row.get("merchant_order_id"):
         view["order_reference"] = row["merchant_order_id"]
         if merchant_order_url_is_allowed(row.get("merchant_order_status_url"), str(row.get("merchant_domain") or "")):

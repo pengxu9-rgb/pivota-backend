@@ -12,9 +12,10 @@ Each candidate pair is judged in three stages:
                 No agent overrides a veto.
   3. Two agents a matcher and a sceptic each answer {same, fields, cites}. A deterministic verifier
                 drops an answer that cites a field its input does not have, and an agent cannot
-                CREATE agreement on brand or size where the normaliser cannot read it on both
-                sides (ADR-032: model-filled fields may veto, never agree): such an "agree" is read
-                as "unknown". Then:
+                CREATE agreement the normaliser cannot read on both sides (ADR-032: model-filled
+                fields may veto, never agree): brand, size and shade need equal readings, line
+                needs title cores sharing half their words, form needs equal conflict tokens.
+                Such an "agree" is read as "unknown". Then:
                   both say same, every field checks on both, the price band checked -> confirmed
                   both say same, a field unknown or the price unchecked, none differ -> likely
                   anything else (disagree, a field differs, an answer missing or dropped) -> not_shown
@@ -23,12 +24,13 @@ Agents are plain callables (view -> answer dict or None), so the same pipeline r
   * rules_matcher / rules_sceptic: deterministic stand-ins built on the normaliser. They make no
     model call and are NOT the live agents; they measure the deterministic layer and exercise the
     pipeline end to end.
-  * ReplayAgent: answers recorded elsewhere (a model run, once the models and the vendor terms for
-    each source are settled), read from a JSON-lines file keyed by pair id and role.
-build_agent_prompt / parse_agent_answer are the text contract a model agent would use.
+  * ReplayAgent: answers recorded elsewhere (a model run), read from a JSON-lines file keyed by
+    pair id and role.
+  * services/identity_judge_gemini.GeminiAgent: a Gemini model in either role (offline runs only).
+build_agent_prompt / parse_agent_answer are the text contract a model agent uses.
 
-Pure: no database, store, platform or model call. services/identity_truth_set.score grades the
-verdicts.
+This module is pure: no database, store, platform or model call. services/identity_truth_set.score
+grades the verdicts.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Opti
 
 from services.product_match_normalizer import canonical_brand, size_key, title_core
 
-JUDGE_VERSION = "lj.v1"
+JUDGE_VERSION = "lj.v2"
 ROLES = ("matcher", "sceptic")
 FIELDS = ("brand", "line", "size", "shade", "form")
 FIELD_VALUES = ("agree", "differ", "unknown", "not_applicable")
@@ -64,18 +66,29 @@ def _text(side: Mapping[str, Any]) -> str:
 
 def _price(v: Any) -> Optional[float]:
     """A positive finite number, else None. A string is read only when it is a plain number:
-    "$20" or "20 USD" is None (never guessed), and so are NaN, infinity and a bool."""
+    "$20", "20 USD" or one in non-ASCII digits is None (never guessed), and so are NaN, infinity
+    and a bool."""
     if isinstance(v, bool) or v is None:
         return None
     if isinstance(v, str):
         v = v.strip()
-        if not re.fullmatch(r"\d+(?:\.\d+)?", v):
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", v):  # ASCII digits only: "\d" takes "١٢"
             return None
     try:
         p = float(v)
     except (TypeError, ValueError):
         return None
     return p if math.isfinite(p) and p > 0 else None
+
+
+NOT_A_CURRENCY = frozenset({"XXX", "XTS"})  # ISO 4217 "no currency" and "testing" codes
+
+
+def _currency(v: Any) -> str:
+    """A three-letter ISO 4217-shaped code, upper-cased, else "" (unknown). "US$", "usd " -> "" and
+    "USD"; a currency is never guessed from a symbol."""
+    c = str(v or "").strip().upper()
+    return c if re.fullmatch(r"[A-Z]{3}", c) and c not in NOT_A_CURRENCY else ""
 
 
 @dataclass(frozen=True)
@@ -96,7 +109,7 @@ def normalise(side: Mapping[str, Any]) -> Read:
         brand=canonical_brand(side.get("brand")) or "",
         core=tc.core, tokens=tc.tokens, conflicts=tc.conflicts, shade=tc.shade_tokens,
         size=size_key(tc.size), price=_price(side.get("price")),
-        currency=str(side.get("currency") or "").strip().upper(),
+        currency=_currency(side.get("currency")),
     )
 
 
@@ -182,8 +195,14 @@ def _ground(fields: Dict[str, str], a: Read, b: Read) -> Dict[str, str]:
     """An agent may not create agreement the normaliser cannot read on both sides: brand and size
     agree only when both are read and equal; shade agrees only when the two shade readings are
     equal, and is not_applicable only when neither side names one (a shade on one side only is
-    unknown)."""
+    unknown). Line agrees only when the title cores share at least half their words, and form only
+    when the two conflict-token readings are equal: below that the text does not show it, so the
+    agent's "agree" is read as "unknown" (likely at best, never confirmed on the agent's word)."""
     out = dict(fields)
+    if out["line"] == "agree" and _overlap(a, b) < LINE_OVERLAP_MIN:
+        out["line"] = "unknown"
+    if out["form"] == "agree" and a.conflicts != b.conflicts:
+        out["form"] = "unknown"
     if out["brand"] == "agree" and not (a.brand and b.brand and a.brand == b.brand):
         out["brand"] = "unknown"
     if out["size"] == "agree" and not (a.size is not None and a.size == b.size):
@@ -337,11 +356,10 @@ _ROLE_TEXT = {
 }
 
 
-def build_agent_prompt(role: str, view: Mapping[str, Any]) -> str:
-    """The prompt for one agent on one pair. Only the view's own fields are shown."""
+def role_instructions(role: str) -> str:
+    """What one agent is told, without the listings: its role and the answer format."""
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}")
-    sides = {s: {k: v for k, v in (view.get(s) or {}).items() if k in CITABLE} for s in ("a", "b")}
     return (
         f"{_ROLE_TEXT[role]}\n"
         "Use only the fields given. Answer with one JSON object and nothing else:\n"
@@ -349,8 +367,21 @@ def build_agent_prompt(role: str, view: Mapping[str, Any]) -> str:
         '"cites": ["a.title", "b.title", ...]}\n'
         'V is "agree", "differ", "unknown" (a side does not say) or "not_applicable" (shade or form '
         "only). cites lists every field you relied on, as a.<field> or b.<field>.\n"
-        f"Listing a: {json.dumps(sides['a'], ensure_ascii=False, sort_keys=True)}\n"
-        f"Listing b: {json.dumps(sides['b'], ensure_ascii=False, sort_keys=True)}\n"
+    )
+
+
+def agent_sides(view: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The two listings as an agent sees them: only the citable fields."""
+    return {s: {k: v for k, v in (view.get(s) or {}).items() if k in CITABLE} for s in ("a", "b")}
+
+
+def build_agent_prompt(role: str, view: Mapping[str, Any]) -> str:
+    """The prompt for one agent on one pair, as one text. Only the view's own fields are shown."""
+    sides = agent_sides(view)
+    return (
+        role_instructions(role)
+        + f"Listing a: {json.dumps(sides['a'], ensure_ascii=False, sort_keys=True)}\n"
+        + f"Listing b: {json.dumps(sides['b'], ensure_ascii=False, sort_keys=True)}\n"
     )
 
 
@@ -361,18 +392,27 @@ def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     return dict(pairs)
 
 
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
 def parse_agent_answer(text: Any) -> Optional[Dict[str, Any]]:
-    """The JSON object that starts at the reply's first "{", decoded by the JSON parser itself (so
-    a brace inside a string is text, never structure), or None. No later object is tried: if the
-    first one is broken, a nested object inside it must not be mistaken for the answer. A
-    duplicate key anywhere refuses the reply. Validation is validate_answer's job."""
+    """The reply as ONE JSON object, or None. The whole reply (whitespace trimmed, or the inside of
+    one ```json fence that is the whole reply) must be that object: text before or after it, a
+    second object, or an example object inside prose is refused, so no object is picked out of a
+    longer reply. Decoded by the JSON parser itself, so a brace inside a string is text, never
+    structure. A duplicate key anywhere refuses the reply. Validation is validate_answer's job."""
     if not isinstance(text, str):
         return None
-    start = text.find("{")
-    if start == -1:
+    body = text.strip()
+    fenced = _FENCE.fullmatch(body)
+    if fenced:
+        body = fenced.group(1)
+    if not body.startswith("{"):
         return None
     try:
-        obj, _end = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys).raw_decode(text, start)
+        obj, end = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys).raw_decode(body)
     except ValueError:  # json.JSONDecodeError is a ValueError, and so is a duplicate key
+        return None
+    if body[end:].strip():
         return None
     return obj if isinstance(obj, dict) else None
