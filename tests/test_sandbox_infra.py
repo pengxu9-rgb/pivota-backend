@@ -2092,13 +2092,15 @@ def test_a_symlinked_local_config_is_judged_by_its_target(tmp_path, target_mode,
 EXPORT_IMG = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "e" * 64
 
 
-def _export_run(tmp_path, fail_on=(), apply=True, img=EXPORT_IMG, version="7"):
+def _export_run(tmp_path, fail_on=(), apply=True, img=EXPORT_IMG, version="7", executions=""):
     log = tmp_path / "calls.jsonl"
     fake = tmp_path / "gcloud"
     fake.write_text(f"""#!{sys.executable}
 import json, sys
 a = sys.argv[1:]
 open({str(log)!r}, "a").write(json.dumps(a) + "\\n")
+if "executions" in a and "list" in a:
+    print({executions!r})
 sys.exit(1 if any(f in a for f in {list(fail_on)!r}) else 0)
 """)
     fake.chmod(0o755)
@@ -2115,7 +2117,9 @@ sys.exit(1 if any(f in a for f in {list(fail_on)!r}) else 0)
 def _export_verbs(calls):
     out = []
     for c in calls:
-        if "add-iam-policy-binding" in c: out.append("grant")
+        if "executions" in c and "list" in c: out.append("list")
+        elif "executions" in c and "cancel" in c: out.append("cancel")
+        elif "add-iam-policy-binding" in c: out.append("grant")
         elif "remove-iam-policy-binding" in c: out.append("ungrant")
         elif "deploy" in c: out.append("deploy")
         elif "execute" in c: out.append("execute")
@@ -2125,7 +2129,7 @@ def _export_verbs(calls):
 
 @pytest.mark.parametrize("fail_on,want,rc", [
     ((), ["grant", "deploy", "execute", "ungrant", "delete-job"], 0),
-    (("execute",), ["grant", "deploy", "execute", "ungrant", "delete-job"], 1),
+    (("execute",), ["grant", "deploy", "execute", "list", "ungrant", "delete-job"], 1),
     (("deploy",), ["grant", "deploy", "ungrant", "delete-job"], 1),
     (("add-iam-policy-binding",), ["grant", "ungrant"], 1),
 ])
@@ -2194,3 +2198,84 @@ def test_export_dry_run_prints_the_same_order_and_runs_nothing(tmp_path):
 def test_export_wants_an_image_by_digest_and_a_version_number(tmp_path, img, version):
     res, calls = _export_run(tmp_path, img=img, version=version)
     assert res.returncode == 2 and calls == [], res.stdout + res.stderr
+
+
+
+def test_export_a_failed_execute_cancels_this_jobs_executions_before_the_delete(tmp_path):
+    res, calls = _export_run(tmp_path, fail_on=("execute",), executions="sandbox-catalog-export-abc12")
+    assert res.returncode == 1
+    assert _export_verbs(calls) == ["grant", "deploy", "execute", "list", "cancel", "ungrant", "delete-job"]
+    cancel = [c for c in calls if "cancel" in c][0]
+    assert cancel[:5] == ["run", "jobs", "executions", "cancel", "sandbox-catalog-export-abc12"]
+    listing = [c for c in calls if "list" in c][0]
+    assert "--job" in listing and listing[listing.index("--job") + 1] == "sandbox-catalog-export"
+
+
+def test_export_a_good_run_cancels_nothing(tmp_path):
+    res, calls = _export_run(tmp_path, executions="sandbox-catalog-export-abc12")
+    assert res.returncode == 0 and "list" not in _export_verbs(calls) and "cancel" not in _export_verbs(calls)
+
+
+def _interrupt_twice(tmp_path, script, args):
+    """^C as a terminal sends it: to the whole process group. Once during the run (the execute), and
+    again while the cleanup removes the grant. The second must not stop the cleanup."""
+    import signal
+    import time
+
+    log = tmp_path / "calls.jsonl"
+    fake = tmp_path / "gcloud"
+    fake.write_text(f"""#!{sys.executable}
+import json, sys, time
+a = sys.argv[1:]
+def note(x):
+    open({str(log)!r}, "a").write(json.dumps(x) + "\\n")
+if "execute" in a:
+    note(["started"] + a); time.sleep(30)
+if "remove-iam-policy-binding" in a:
+    note(["removing"]); time.sleep(2)
+if "executions" in a and "list" in a:
+    print("sandbox-catalog-export-abc12")
+note(a)
+""")
+    fake.chmod(0o755)
+    env = {**os.environ, "GCLOUD": str(fake), "APPLY": "1"}
+    proc = subprocess.Popen(["bash", str(SANDBOX / script), *args], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+    def wait_for(word):
+        for _ in range(200):
+            if log.exists() and word in log.read_text():
+                return
+            time.sleep(0.05)
+        raise AssertionError("never saw %s" % word)
+
+    wait_for('"started"')
+    os.killpg(proc.pid, signal.SIGTERM)
+    wait_for('"removing"')
+    os.killpg(proc.pid, signal.SIGTERM)  # the second one, mid-cleanup
+    out, err = proc.communicate(timeout=60)
+    calls = [json.loads(l) for l in log.read_text().splitlines()]
+    return proc.returncode, calls, err
+
+
+def test_export_a_second_interrupt_during_cleanup_does_not_skip_it(tmp_path):
+    rc, calls, err = _interrupt_twice(tmp_path, "catalog_export_prod.sh", [EXPORT_IMG, "7"])
+    assert rc == 130, err
+    done = [c for c in calls if c and c[0] not in ("started", "removing")]
+    assert _export_verbs(done)[-4:] == ["list", "cancel", "ungrant", "delete-job"], done
+    assert "STILL ON" not in err
+
+
+def test_dump_a_second_interrupt_during_cleanup_does_not_skip_it(tmp_path):
+    rc, calls, err = _interrupt_twice(tmp_path, "schema_dump_prod.sh", [DUMP_IMG])
+    assert rc == 130, err
+    assert any("remove-iam-policy-binding" in c for c in calls), calls
+
+
+def test_the_prod_scripts_say_prod_in_their_banner(tmp_path):
+    for script, args in (("catalog_export_prod.sh", [EXPORT_IMG, "7"]), ("schema_dump_prod.sh", [DUMP_IMG])):
+        env = {**os.environ, "GCLOUD": str(_fake_gcloud(tmp_path)), "APPLY": "1"}
+        res = subprocess.run(["bash", str(SANDBOX / script), *args], env=env, capture_output=True, text=True,
+                             timeout=60)
+        assert "changes WILL be made in project pivota-prod" in res.stdout, (script, res.stdout)
+        assert "in project pivota-sandbox" not in res.stdout

@@ -77,7 +77,7 @@ async def test_grant_then_revoke_gives_exactly_the_catalog_tables_and_then_nothi
     out = capsys.readouterr().out
     assert "PRESENT catalog_tables=2 of=3" in out and "GRANT_DONE" in out
     assert "READ_4 security_definer_executable" in out and "CHECK_8B SKIPPED" in out
-    await R.revoke(conn, role=role, schema=SCHEMA)
+    await R.revoke(conn, TABLES, role=role, schema=SCHEMA)
     assert await _readable(conn, role) == []
     assert "REVOKE_DONE" in capsys.readouterr().out
 
@@ -194,7 +194,7 @@ async def test_revoke_with_login_still_on_is_a_stop_but_the_revoke_stays(env):
     await _grant(conn, role)
     await conn.execute("ALTER ROLE %s LOGIN" % role)
     with pytest.raises(R.Stop, match="login"):
-        await R.revoke(conn, role=role, schema=SCHEMA)
+        await R.revoke(conn, TABLES, role=role, schema=SCHEMA)
     assert await _readable(conn, role) == []
 
 
@@ -211,7 +211,7 @@ async def test_revoke_leaves_another_grantors_grant_and_says_so(env):
     finally:
         await conn.execute("RESET ROLE")
     with pytest.raises(R.Stop, match="readable"):
-        await R.revoke(conn, role=role, schema=SCHEMA)
+        await R.revoke(conn, TABLES, role=role, schema=SCHEMA)
     assert await _readable(conn, role) == ["xrole_src.cat_a"]
 
 
@@ -229,7 +229,7 @@ async def test_revoke_with_a_session_still_open_is_a_stop(env):
     try:
         await conn.execute("ALTER ROLE %s NOLOGIN PASSWORD NULL" % role)  # NOLOGIN does not end it
         with pytest.raises(R.Stop, match="sessions"):
-            await R.revoke(conn, role=role, schema=SCHEMA)
+            await R.revoke(conn, TABLES, role=role, schema=SCHEMA)
     finally:
         await session.close()
 
@@ -272,3 +272,90 @@ async def test_a_grant_that_did_not_take_is_refused(env):
     with pytest.raises(R.Stop, match="CHECK_9"):
         await R.grant(DropOneGrant(conn), TABLES, role=role, schema=SCHEMA, require_pg17=False)
     assert await _readable(conn, role) == []  # rolled back: cat_a's grant is gone too
+
+
+async def test_a_non_superuser_owner_grants_and_revokes_beside_a_table_it_does_not_own(env, capsys):
+    """The review's probe: the R3/R6 one-offs run as the app role, which is not a superuser. With a
+    table in the schema that role cannot touch, `REVOKE ... ON ALL TABLES IN SCHEMA` fails outright and
+    rolls every revoke back; revoking the catalog tables by name works, and the re-read still runs."""
+    import urllib.parse
+
+    import asyncpg
+
+    conn, role, _ = env
+    owner = role + "_owner"
+    password = secrets.token_hex(16)
+    await conn.execute("CREATE ROLE %s LOGIN NOSUPERUSER PASSWORD '%s'" % (owner, password))
+    as_owner = None
+    try:
+        await conn.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SCHEMA, owner))
+        for t in ("cat_a", "cat_b"):
+            await conn.execute("ALTER TABLE %s.%s OWNER TO %s" % (SCHEMA, t, owner))
+        # not_catalog stays the superuser's: the owner holds no privilege at all on it
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (owner, password, url.hostname + (":%d" % url.port if url.port else ""))
+        as_owner = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        assert not await as_owner.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+
+        await R.grant(as_owner, TABLES, role=role, schema=SCHEMA, require_pg17=False)
+        assert await _readable(conn, role) == ["xrole_src.cat_a", "xrole_src.cat_b"]
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):  # the old, schema-wide form
+            await as_owner.execute("REVOKE SELECT ON ALL TABLES IN SCHEMA %s FROM %s" % (SCHEMA, role))
+        await R.revoke(as_owner, TABLES, role=role, schema=SCHEMA)
+        assert await _readable(conn, role) == []
+        assert "REVOKED tables=2 of=2" in capsys.readouterr().out
+    finally:
+        if as_owner is not None:
+            await as_owner.close()
+        await conn.execute("REASSIGN OWNED BY %s TO CURRENT_USER" % owner)
+        await conn.execute("DROP OWNED BY %s" % owner)
+        await conn.execute("DROP ROLE %s" % owner)
+
+
+async def test_a_catalog_table_the_revoker_cannot_touch_is_a_stop_and_the_rest_are_revoked(env, capsys):
+    """One table's REVOKE failing (here: owned by a role the revoker has no privilege on) does not undo
+    the others, and the run stops."""
+    import urllib.parse
+
+    import asyncpg
+
+    conn, role, other = env
+    owner = role + "_owner"
+    password = secrets.token_hex(16)
+    await conn.execute("CREATE ROLE %s LOGIN NOSUPERUSER PASSWORD '%s'" % (owner, password))
+    as_owner = None
+    try:
+        await conn.execute("GRANT USAGE ON SCHEMA %s TO %s" % (SCHEMA, owner))
+        await conn.execute("ALTER TABLE %s.cat_a OWNER TO %s" % (SCHEMA, owner))
+        # cat_a is the revoker's own: a superuser's GRANT on it is recorded as the owner's, so it is revoked
+        await conn.execute("GRANT SELECT ON %s.cat_a TO %s" % (SCHEMA, role))
+        # cat_b stays the superuser's: the revoker holds no privilege on it, so its REVOKE fails
+        await conn.execute("GRANT SELECT ON %s.cat_b TO %s" % (SCHEMA, role))
+        url = urllib.parse.urlsplit(DATABASE_URL)
+        netloc = "%s:%s@%s" % (owner, password, url.hostname + (":%d" % url.port if url.port else ""))
+        as_owner = await asyncpg.connect(urllib.parse.urlunsplit(url._replace(netloc=netloc)))
+        with pytest.raises(R.Stop, match="revoke cat_b"):
+            await R.revoke(as_owner, TABLES, role=role, schema=SCHEMA)
+        out = capsys.readouterr().out
+        assert "REVOKE_FAILED cat_b InsufficientPrivilegeError" in out and "REREAD readable" in out
+        assert "xrole_src.cat_a" not in await _readable(conn, role)
+    finally:
+        if as_owner is not None:
+            await as_owner.close()
+        await conn.execute("REASSIGN OWNED BY %s TO CURRENT_USER" % owner)
+        await conn.execute("DROP OWNED BY %s" % owner)
+        await conn.execute("DROP ROLE %s" % owner)
+
+
+def test_main_reports_a_database_error_as_exit_3_with_its_sqlstate_only(monkeypatch, capsys):
+    import asyncpg
+
+    async def denied(mode, dsn):
+        raise asyncpg.InsufficientPrivilegeError("permission denied for table secret_name on host-x")
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setattr(R, "_run", denied)
+    assert R.main(["revoke"]) == 3
+    out = capsys.readouterr().out
+    assert "STOP InsufficientPrivilegeError sqlstate=42501" in out
+    assert "secret_name" not in out and "host-x" not in out

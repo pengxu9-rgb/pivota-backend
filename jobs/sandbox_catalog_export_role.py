@@ -13,11 +13,14 @@ its GRANT is real and the later REVOKE removes it), then SELECT on each present 
 checks 1 to 10. ANY failed check rolls the whole transaction back, so the role is left with nothing,
 and the exit code is 3. Checks 4 and 5b are printed for a person to read; they do not fail.
 
-revoke: REVOKE SELECT ON ALL TABLES IN SCHEMA <schema>, committed, then the hard re-read: nothing
-readable (table- or column-level, any schema), no session, LOGIN off. Any failure is exit 3 (the
-REVOKE stays committed): the next run is blocked until it is explained.
+revoke: REVOKE SELECT on each present catalog table BY NAME (never `ON ALL TABLES IN SCHEMA`, which
+fails outright when the owner has no privilege on some other table there), each in its own savepoint,
+committed; then, whatever happened, the hard re-read: nothing readable (table- or column-level, any
+schema), no session, LOGIN off. Any failure is exit 3 (what was revoked stays revoked): the next run is
+blocked until it is explained.
 
-Prints names and counts only, never a value. Exit 0 = done, 3 = STOP (read the lines), 2 = bad usage.
+Prints names, counts and SQLSTATEs only, never a value or an error's text. Exit 0 = done, 3 = STOP (read
+the lines, a database error included), 2 = bad usage.
 """
 
 from __future__ import annotations
@@ -170,16 +173,33 @@ async def _checks(conn, role: str, schema: str, names: Sequence[str], present: S
         "WHERE c.relrowsecurity OR c.relforcerowsecurity", list(present), schema)
 
 
-async def revoke(conn, *, role: str = ROLE, schema: str = SCHEMA) -> None:
+async def revoke(conn, tables: Sequence[str], *, role: str = ROLE, schema: str = SCHEMA) -> None:
+    """REVOKE by NAME, one catalog table at a time (the list the grant used): `REVOKE ... ON ALL TABLES
+    IN SCHEMA` fails outright, rolling back every revoke, when the owner has no privilege at all on
+    any one other table in the schema. A table that cannot be revoked is recorded and the rest still
+    go; the hard re-read below runs whatever happened."""
+    import asyncpg
+
     if not await conn.fetchval("SELECT count(*) FROM pg_roles WHERE rolname = $1", role):
         raise Stop("role %s does not exist" % role)
+    failed: List[str] = []
     async with conn.transaction():
         await conn.execute("SET LOCAL statement_timeout = '30s'")
         await conn.execute("SET LOCAL lock_timeout = '2s'")
-        await conn.execute('REVOKE SELECT ON ALL TABLES IN SCHEMA "%s" FROM "%s"' % (
-            schema.replace('"', '""'), role.replace('"', '""')))
-    _say("REVOKED schema=%s" % schema)
-    failed: List[str] = []
+        present = [r[0] for r in await conn.fetch(
+            "SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(format('%I.%I', $2::text, t)) IS NOT NULL",
+            list(tables), schema)]
+        revoked = 0
+        for name in present:
+            try:
+                async with conn.transaction():  # a savepoint: one failure does not undo the others
+                    await conn.execute('REVOKE SELECT ON "%s"."%s" FROM "%s"' % (
+                        schema.replace('"', '""'), name.replace('"', '""'), role.replace('"', '""')))
+                revoked += 1
+            except asyncpg.PostgresError as exc:
+                _say("REVOKE_FAILED %s %s" % (name, type(exc).__name__))
+                failed.append("revoke %s" % name)
+    _say("REVOKED tables=%d of=%d" % (revoked, len(present)))
     if await _rows(conn, "REREAD readable", _readable_sql(), role):
         failed.append("readable")  # a grant from another grantor survives this REVOKE
     if await _rows(conn, "REREAD sessions", "SELECT pid::text FROM pg_stat_activity WHERE usename = $1", role):
@@ -204,7 +224,7 @@ async def _run(mode: str, dsn: str) -> None:
         if mode == "grant":
             await grant(conn, [s.name for s in CATALOG_TABLES])
         else:
-            await revoke(conn)
+            await revoke(conn, [s.name for s in CATALOG_TABLES])
     finally:
         await conn.close()
 
@@ -222,6 +242,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Stop as exc:
         _say("STOP %s (%s)" % (exc, "rolled back: the role holds nothing new" if args.mode == "grant"
                                else "the REVOKE is committed; the next run is blocked"))
+        return 3
+    except Exception as exc:  # noqa: BLE001 - a database or connection error is a STOP too, never a traceback
+        # the type and SQLSTATE only: a connection error's text can name the host
+        _say("STOP %s sqlstate=%s (%s)" % (type(exc).__name__, getattr(exc, "sqlstate", None) or "-",
+                                           "rolled back: the role holds nothing new" if args.mode == "grant"
+                                           else "read the role's grants by hand before any next run"))
         return 3
     return 0
 
