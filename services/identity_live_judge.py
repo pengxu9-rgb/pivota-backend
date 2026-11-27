@@ -244,9 +244,23 @@ def combine(answers: Mapping[str, Optional[Dict[str, Any]]], a: Read, b: Read) -
     return "confirmed", []
 
 
+AGENTS_ONLY = "agents_only"
+
+
 def judge(view: Mapping[str, Any], matcher: Agent, sceptic: Agent) -> Dict[str, Any]:
     """One pair: {pair_id, verdict, reasons, judge}. Vetoed pairs never reach the agents.
     A view that is not {pair_id, a: {...}, b: {...}} is refused (ValueError), not judged."""
+    return _judge(view, matcher, sceptic, apply_vetoes=True)
+
+
+def judge_agents_only(view: Mapping[str, Any], matcher: Agent, sceptic: Agent) -> Dict[str, Any]:
+    """EVALUATION ONLY, never a live verdict: the vetoes are skipped, so the agents (with the
+    verifier and the grounding, which stay on) are measured on the pairs the rules would have
+    ended. The result carries mode "agents_only" and the vetoes it skipped."""
+    return _judge(view, matcher, sceptic, apply_vetoes=False)
+
+
+def _judge(view: Mapping[str, Any], matcher: Agent, sceptic: Agent, *, apply_vetoes: bool) -> Dict[str, Any]:
     if not isinstance(view, Mapping):
         raise ValueError("a pair view is not an object")
     for s in ("a", "b"):
@@ -255,8 +269,10 @@ def judge(view: Mapping[str, Any], matcher: Agent, sceptic: Agent) -> Dict[str, 
     a, b = normalise(view["a"]), normalise(view["b"])
     out: Dict[str, Any] = {"pair_id": view.get("pair_id"), "judge": JUDGE_VERSION}
     v = vetoes(a, b)
-    if v:
+    if v and apply_vetoes:
         return {**out, "verdict": "not_shown", "reasons": [f"veto:{r}" for r in v]}
+    if not apply_vetoes:
+        out = {**out, "mode": AGENTS_ONLY, "vetoes_skipped": v}
     answers: Dict[str, Optional[Dict[str, Any]]] = {}
     dropped: Dict[str, str] = {}
     for role, agent in (("matcher", matcher), ("sceptic", sceptic)):
@@ -274,8 +290,10 @@ def judge(view: Mapping[str, Any], matcher: Agent, sceptic: Agent) -> Dict[str, 
     return {**out, "verdict": verdict, "reasons": reasons}
 
 
-def judge_all(views: Iterable[Mapping[str, Any]], matcher: Agent, sceptic: Agent) -> List[Dict[str, Any]]:
-    return [judge(v, matcher, sceptic) for v in views]
+def judge_all(views: Iterable[Mapping[str, Any]], matcher: Agent, sceptic: Agent, *,
+              agents_only: bool = False) -> List[Dict[str, Any]]:
+    one = judge_agents_only if agents_only else judge
+    return [one(v, matcher, sceptic) for v in views]
 
 
 def reason_counts(results: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
