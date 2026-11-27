@@ -366,11 +366,26 @@ class ReplayAgent:
 
 # --- the text contract for a model agent -----------------------------------------------------
 
+PROMPT_VERSION = "p2"  # p2: the sceptic checks a list of differences one by one (p1 said "look for any")
+
 _ROLE_TEXT = {
     "matcher": "Decide whether the two listings are the same buyable item: same brand, same product "
                "line and formula, same size and same shade.",
-    "sceptic": "Look for any reason the two listings are NOT the same buyable item: another size, "
-               "shade, formula, edition, a refill, mini, set or tester. Say same only if you find none.",
+    "sceptic": (
+        "You are the sceptic. Your job is to find a reason the two listings are NOT the same buyable "
+        "item. Check each of these in turn, comparing the two titles and variant titles word by word:\n"
+        "1. Concentration or format: eau de parfum, eau de toilette, cologne, extrait, parfum, body mist "
+        "or spray; cream, gel, lotion, balm, oil, serum, stick, powder, cushion, liquid.\n"
+        "2. Size or count: ml, g, oz or fl oz, a pack of N, set, duo, kit, mini, travel size, sample, "
+        "tester, refill.\n"
+        "3. Shade, colour, scent or variant name.\n"
+        "4. Edition or version: limited, anniversary, holiday, gift, new formula, intense, plus, v2 or v3, "
+        "an SPF number or PA rating.\n"
+        "5. Product line: a different product of the same brand, even with similar words.\n"
+        "If any of these differs, or one listing names one and the other does not, answer same: false and "
+        "mark that field differ. A field one listing does not state is unknown, never agree. Answer same: "
+        "true only when you checked all five and found no difference."
+    ),
 }
 
 

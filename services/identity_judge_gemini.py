@@ -206,7 +206,8 @@ class GeminiAgent:
     def _record(self, view: Mapping[str, Any], answer: Any, finish: Any, usage: Dict[str, int],
                 error: Optional[str], attempts: int) -> None:
         row = {"pair_id": view.get("pair_id"), "role": self.role, "model": self.model,
-               "thinking": self.thinking, "answer": answer, "finish_reason": finish, "usage": usage,
+               "thinking": self.thinking, "prompt": lj.PROMPT_VERSION, "answer": answer,
+               "finish_reason": finish, "usage": usage,
                "attempts": attempts}
         if error:
             row["error"] = error

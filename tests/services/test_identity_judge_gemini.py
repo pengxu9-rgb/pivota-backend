@@ -466,3 +466,19 @@ def test_agents_only_holds_on_the_single_worker_path_too(tmp_path, capsys):
     (row,) = ts.read_jsonl(str(out))
     assert row["mode"] == "agents_only" and row["vetoes_skipped"] == ["conflict:mini"]
     assert lj.judge_all([view()], lambda v: answer(), lambda v: answer(), agents_only=True)[0]["mode"] == "agents_only"
+
+
+# --- prompt p2: the sceptic checks a list of differences -------------------------------------
+
+def test_the_sceptic_prompt_names_each_difference_to_check():
+    text = lj.role_instructions("sceptic")
+    for word in ("eau de parfum", "eau de toilette", "cologne", "refill", "mini", "tester", "set",
+                 "shade", "limited", "SPF", "fl oz", "unknown, never agree", "checked all five"):
+        assert word in text
+    assert "checked all five" not in lj.role_instructions("matcher")
+
+
+def test_every_record_names_the_prompt_version():
+    agent = jg.GeminiAgent("sceptic", "gemini-4-hydrogen", post=FakePost(payload(json.dumps(answer()))))
+    agent(view())
+    assert agent.records[0]["prompt"] == lj.PROMPT_VERSION == "p2"
