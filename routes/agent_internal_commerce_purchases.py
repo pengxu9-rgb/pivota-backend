@@ -100,16 +100,22 @@ THE CARD CHOICE (AGENPAS_CARD_PICKER_ENABLED, default off, read per request, and
 db/a2a_rail_ledger has the design). On,
 an A2A-rail purchase whose order is locked waits, before any token is asked for, for the buyer to confirm a card; while
 it waits, a GET body carries a top-level
-`card_choice = {confirmed, expires_at, cards: [{handle, network, last4, added_at, selected}]}`: the buyer's ACTIVE cards
+`card_choice = {confirmed, new_card, expires_at, cards: [{handle, network, last4, added_at, selected}]}` (`new_card`: the
+buyer asked to add a new card and the worker is about to open the card page): the buyer's ACTIVE cards
 as the worker last read them from the rail (newest first; `selected` is the card the purchase will be paid with unless
 the buyer picks another). `handle` names a card for THIS purchase only (an HMAC under this router's key, never the
 rail's card id). No field
 otherwise (another rail, no card list recorded, past the token or the deadline) or when the read fails (never a 503).
 Never in the public route or the webhooks.
 
-`POST /agent/internal/commerce/purchases/{purchase_id}/card-choice`: the buyer's confirmation, from the page's Approve.
+`POST /agent/internal/commerce/purchases/{purchase_id}/card-choice`: the buyer's confirmation, from the page's Approve, or
+their "Add a new card" (migration 301).
 SAME router as the read (its dial, key and scoping, like the shipping-address write).
-  BODY   exactly `{"handle": "<24 hex>"}`, at most 256 bytes (else 400 {"error": "invalid_card_choice"}).
+  BODY   exactly `{"handle": "<24 hex>"}`, or exactly `{"new_card": true}`, at most 256 bytes (else 400
+         {"error": "invalid_card_choice"}). `new_card` records the request (db/a2a_rail_ledger.request_new_card, the same
+         conditions as the confirmation): the worker leaves the wait for the rail's card page, binds the new card, takes
+         it as the confirmed card and locks the order again. A repeat is the same answer; a saved card after it, or a
+         new card after a saved one was confirmed, is 409 card_choice_closed.
   CONSENT checked before the body is read: no consent row for (a2a, rail purchase, approval, its epoch) is 409
          {"error": "consent_required"} (the page offers the terms first); a failed consent read is a 503.
   WRITE  a compare-and-swap (db/a2a_rail_ledger.confirm_card_choice) on exactly the cards it read just before (a
@@ -222,6 +228,7 @@ def _card_choice_view(purchase_id: str, choice: Dict[str, Any]) -> Dict[str, Any
     expires_at = choice.get("expires_at")
     return {
         "confirmed": bool(choice.get("confirmed")),
+        "new_card": bool(choice.get("new_card")),
         "expires_at": expires_at.isoformat() if isinstance(expires_at, datetime) else None,
         "cards": [
             {"handle": a2a_ledger.card_handle(purchase_id, o["id"], _handle_key()), "network": o.get("network"),
@@ -497,6 +504,28 @@ async def _confirmed_with(rail_id: str, agent_id: str, owner: str, handle: str) 
                 and a2a_ledger.card_handle(rail_id, method_id, _handle_key()) == handle)
 
 
+async def _record_new_card(rail_id: str, agent_id: str, owner: str) -> Optional[str]:
+    """Record that the buyer asked for a new card. None when it is recorded (now, or by an identical earlier call); else
+    the refusal."""
+    choice = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
+    if choice is None:
+        # Nothing to choose any more: an earlier identical request (the worker already left for the card page) is fine.
+        row = await a2a_ledger.get_purchase_for_owner(rail_id, agent_id, owner)
+        asked = (row is not None and row.get("card_new_requested_at") is not None and row.get("card_confirmed_at") is None
+                 and row.get("state") in ("quoting", "needs_payment_method"))
+        return None if asked else "card_choice_closed"
+    if choice["confirmed"]:
+        return "card_choice_closed"
+    if choice["new_card"]:
+        return None
+    if await a2a_ledger.request_new_card(rail_id, agent_id, owner) is not None:
+        return None
+    current = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
+    if current is not None and current["new_card"]:
+        return None
+    return "card_choice_stale" if current is not None and not current["confirmed"] else "card_choice_closed"
+
+
 async def _record_card_choice(rail_id: str, agent_id: str, owner: str, handle: str) -> Optional[str]:
     """Record the buyer's card. None when it is recorded (now, or by an identical earlier call); else the refusal."""
     choice = await a2a_ledger.get_card_choice_for_owner(rail_id, agent_id, owner)
@@ -507,8 +536,8 @@ async def _record_card_choice(rail_id: str, agent_id: str, owner: str, handle: s
     method_id = next((o["id"] for o in choice["options"] if a2a_ledger.card_handle(rail_id, o["id"], key) == handle), None)
     if method_id is None:
         return "card_choice_stale"
-    if choice["confirmed"]:
-        return None if method_id == choice["selected"] else "card_choice_closed"
+    if choice["confirmed"] or choice["new_card"]:
+        return None if choice["confirmed"] and method_id == choice["selected"] else "card_choice_closed"
     written = await a2a_ledger.confirm_card_choice(
         rail_id, agent_id, owner, method_id=method_id, options_text=choice["options_text"])
     if written is not None or await _confirmed_with(rail_id, agent_id, owner, handle):
@@ -555,6 +584,7 @@ async def confirm_card_choice_for_gateway(
         return _card_choice_refusal("consent_required")
     raw = await request.body()
     handle = None
+    new_card = False
     if len(raw) <= _CARD_CHOICE_BODY_MAX_BYTES:
         try:
             body = json.loads(raw)
@@ -562,10 +592,15 @@ async def confirm_card_choice_for_gateway(
             body = None
         if isinstance(body, dict) and set(body) == {"handle"} and a2a_ledger.is_card_handle(body["handle"]):
             handle = body["handle"]
-    if handle is None:
+        elif isinstance(body, dict) and set(body) == {"new_card"} and body["new_card"] is True:
+            new_card = True
+    if handle is None and not new_card:
         return JSONResponse(status_code=400, content={"error": "invalid_card_choice"})
     try:
-        refused = await _record_card_choice(rail_id, agent_id, owner, handle)
+        if new_card:
+            refused = await _record_new_card(rail_id, agent_id, owner)
+        else:
+            refused = await _record_card_choice(rail_id, agent_id, owner, handle)
         if refused is not None:
             return _card_choice_refusal(refused)
     except Exception as exc:  # noqa: BLE001

@@ -723,11 +723,14 @@ _HOLDER_FENCED = {
     "_RECORD_PAYMENT_CARD_SQL",
     # The card-choice park (migration 300): the held `quoting` row, no token, no pending write.
     "_PARK_FOR_CARD_CHOICE_SQL", "_END_CARD_CHOICE_WAIT_SQL",
+    # The new card from the card choice (migration 301): the held binding row, its own card, once.
+    "_CONFIRM_NEW_CARD_SQL",
 }
 _REVIEWED_UNFENCED = {
     "_OPERATOR_FAIL_HELD_CHECKOUT_SQL": "paying only, never a closed row",
     "_SUBMIT_SHIPPING_ADDRESS_SQL": "opened only",
     "_CONFIRM_CARD_CHOICE_SQL": "quoting only, unheld, no token, no pending write, unconfirmed, the cards as read",
+    "_REQUEST_NEW_CARD_SQL": "quoting only, unheld, no token, no pending write, unconfirmed, a card list offered",
     "_CLAIM_SQL": "claimed_by IS NULL and a non-terminal state",
     "_REQUEUE_STALE_SQL": "claimed_by IS NOT NULL (a close NULLs it)",
     "_EXPIRE_SQL": "pre-paying states only",
