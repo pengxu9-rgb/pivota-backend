@@ -53,6 +53,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
+from services.payment_orchestration import a2a_markets
 from services.payment_orchestration import a2a_purchase_view, agent_run_condition, purchase_consent, purchase_view
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import router as rail_router
@@ -476,11 +477,12 @@ async def create_purchase(
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
             logger.warning("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
             raise reap_svc.PurchaseRefused("not_available_on_this_rail")
-        if market_country not in shipping_capture.PILOT_COUNTRIES:
-            # THE A2A PILOT IS THE US, in code (not only by the router's merchant list): any other market, from
-            # the address or the currency, is refused by name on this rail.
+        if not a2a_markets.market_enabled(market_country):
+            # THE A2A RAIL'S MARKETS ARE SWITCHED ON ONE BY ONE, in code (not only by the router's merchant list):
+            # a market not on (`A2A_RAIL_MARKETS`, the US only by default), from the address or the currency, is
+            # refused by name on this rail.
             raise reap_svc.PurchaseRefused(
-                shipping_capture.SHIPPING_COUNTRY_UNSUPPORTED, "the A2A rail ships to the US only")
+                shipping_capture.SHIPPING_COUNTRY_UNSUPPORTED, "the A2A rail does not ship to this market")
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,
@@ -515,6 +517,10 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
+        if market_country != "US":
+            # Outside the US the market's own region and postcode rules apply with capture off too (the US keeps
+            # today's capture-off rules exactly).
+            stored_address = shipping_capture.door_address(stored_address)
     else:
         # Capture on: each part is optional; one that is given is read by the same rules (the address also by
         # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.

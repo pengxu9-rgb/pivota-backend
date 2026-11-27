@@ -221,13 +221,13 @@ REGISTRY_TABLE = REPO / "config" / "market_registry.json"
 
 #: The size of the baseline per kind. ONLY EVER LOWER THESE. When a default is removed, delete
 #: its entry from the baseline file and lower the number here in the same change.
-BASELINE_COUNTS = {"a": 184, "b": 89, "c": 4}
+BASELINE_COUNTS = {"a": 184, "b": 89, "c": 3}
 
 #: Entries that were already in the code when the ratchet landed carry `"origin": "2026-11-12"`
 #: and need no reason. Every entry added later must say why (`reason`) or name the entry it
 #: replaces (`moved`). This is how many grandfathered entries are left. ONLY EVER LOWER THIS.
 GRANDFATHER_ORIGIN = "2026-11-12"
-GRANDFATHERED_COUNT = 277
+GRANDFATHERED_COUNT = 276
 #: The fingerprints of those 278, frozen. An entry may say `origin` only if its fingerprint is in
 #: this file, and the file is pinned by its sha256, so nobody can grandfather a new default by
 #: typing `origin` on it. NEVER EDIT THE FILE OR THIS DIGEST: a removed default simply stops

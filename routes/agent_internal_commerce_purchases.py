@@ -160,6 +160,7 @@ import db.reap_agentic_ledger as reap_ledger
 import services.payment_orchestration.purchase_product_image as product_image
 import db.reap_continuation as continuation
 from routes import agent_commerce_purchases as public
+from services.payment_orchestration import a2a_markets
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import purchase_consent
 from services.payment_orchestration.rails import RAIL_ID_PREFIX
@@ -457,7 +458,8 @@ async def submit_shipping_address_for_gateway(
     replaces = shipping_capture.incomplete_address(row.get("shipping_address"))
     email, address, field_errors = shipping_capture.read_submission(
         body, email_required=not row.get("buyer_email"),
-        address_required=shipping_capture.address_missing(row.get("shipping_address")))
+        address_required=shipping_capture.address_missing(row.get("shipping_address")),
+        market=a2a_markets.market_for_currency(row.get("currency")))
     if field_errors:
         # The app's "already normalised" error shape (`status` + `error`), which ErrorHandlerMiddleware passes
         # through with its status: a 422 stays a 422 (a FastAPI-default 422 would be re-nested as a 400).
