@@ -20,8 +20,8 @@ from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import answer_for_a_create_whose_quote_holds_its_order, validate_order_create_governance
 from routes.agent_api import agent_search_products as agent_v1_search_products
-from routes.agent_api import agent_track_order as agent_v1_track_order
-from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
+from routes.fulfillment_api import fulfillment_tracking_answer
+from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context, log_agent_request
 from routes.agent_forwarded_owner import (
     PARTNER_AGENT_ID_METADATA_KEY,
     PARTNER_IDENTITY_METADATA_KEY,
@@ -1414,15 +1414,26 @@ async def list_merchant_capabilities_v2(
 @router.get("/orders/{order_id}/tracking")
 async def track_order_v2(
     order_id: str,
-    # Adoption only, no `via` access: agent_v1_track_order re-checks the owner on its own.
     context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    # THE SAME OWNER RULE AS GET /orders/{id} (routes.agent_forwarded_owner.order_access_allowed): the order's own
+    # agent and, with PARTNER_IDENTITY_FORWARDING_ENABLED on, the service that vouched for the partner that owns it
+    # when it reads WITHOUT the partner's assertion (the gateway's kernel order read). A strict owner check here
+    # answered 403 on a partner-owned order, which the gateway turns into "that quote is no longer available"
+    # (review 11-11 P2-A, audit 11-22 F5). An order with no owner is nobody's.
+    if not str(order.get("agent_id") or "") or not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
-    tracking_response = await agent_v1_track_order(order_id=order_id, context=context)
+    if not context.can_access_merchant(order["merchant_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized for this order")
+    try:
+        tracking_response = fulfillment_tracking_answer(order_id, order)
+    except Exception as error:  # noqa: BLE001 - the fulfillment route's answer for a tracking error, unchanged
+        logger.error(f"Fulfillment tracking error: {error}")
+        await log_agent_request(context=context, status_code=500, order_id=order_id, error_message=str(error))
+        raise HTTPException(status_code=500, detail="Failed to get tracking information")
     amounts = _order_amounts_from_row(order)
     return {
         "status": "success",
@@ -1455,7 +1466,7 @@ async def _require_checkout_cancel_upstream() -> None:
 async def cancel_order_v2(
     order_id: str,
     _enabled: None = Depends(_require_checkout_cancel_upstream),
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("cancel_order", resource=("path", "order_id"))),
 ):
     """Cancel an unpaid order and close its hosted payment page at the PSP (FIX_PLAN C-11).
 
@@ -1465,11 +1476,16 @@ async def cancel_order_v2(
       409 PAYMENT_PROCESSING: a payment is settling at the PSP; not canceled
       503 CANCEL_NOT_CONFIRMED: the PSP surface could not be closed; not canceled; retry
       404 Order not found: unknown, or another agent's (never 403: the id is not confirmed to a non-owner)
+
+    WHO MAY CANCEL: the shared owner rule (routes.agent_forwarded_owner.order_access_allowed), as GET /orders/{id}.
+    With PARTNER_IDENTITY_FORWARDING_ENABLED on, a request-bound `cancel_order` assertion makes the partner the
+    caller (adopted), and the vouching gateway without one is served on the partner-owned order it created.
+    `checkout_cancel.agent_id` records the caller that cancelled.
     """
     from services.checkout_cancel_upstream import cancel_order_upstream
 
     order = await get_order(order_id)
-    if not order or str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order or not str(order.get("agent_id") or "") or not order_access_allowed(order, context):
         raise HTTPException(status_code=404, detail="Order not found")
 
     result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
