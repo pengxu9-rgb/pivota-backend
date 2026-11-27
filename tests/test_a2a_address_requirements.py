@@ -74,7 +74,10 @@ def test_a_merchant_with_no_platform_requires_nothing_more_and_is_logged_once(ca
         assert req.required_fields("other.example", "US") == frozenset()
         assert req.required_fields("other.example", "US") == frozenset()
     assert len([r for r in caplog.records if "no platform declared" in r.getMessage()]) == 1
-    assert req.required_fields(None, "US") == frozenset()  # no merchant at all: nothing, nothing logged
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=req.__name__):
+        assert req.required_fields(None, "US") == frozenset()  # no merchant at all: nothing, nothing logged
+    assert caplog.records == []
     assert req.required_fields(SHOP, "GB") == frozenset()  # a country the table does not list
 
 
