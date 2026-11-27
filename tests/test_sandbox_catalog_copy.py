@@ -238,6 +238,10 @@ async def test_the_export_never_lists_the_drop(tmp_path):
             return [{"column_name": "merchant_id", "type_name": "varchar", "type_kind": "b",
                      "base_name": None, "elem_name": None, "base_elem_name": None}]
 
+        async def fetchrow(self, *a):  # _source_columns: a plain table the role reads whole
+            return {"relkind": "r", "relrowsecurity": False, "can_select": True,
+                    "columns": [c["column_name"] for c in await self.fetch()]}
+
         async def fetchval(self, *a): return 1
 
         async def copy_from_query(self, query, output, **kw):
@@ -464,6 +468,10 @@ async def test_the_export_query_and_its_count_both_carry_the_where(tmp_path):
             return [{"column_name": "kb_key", "type_name": "text", "type_kind": "b",
                      "base_name": None, "elem_name": None, "base_elem_name": None}]
 
+        async def fetchrow(self, *a):  # _source_columns: a plain table the role reads whole
+            return {"relkind": "r", "relrowsecurity": False, "can_select": True,
+                    "columns": [c["column_name"] for c in await self.fetch()]}
+
         async def fetchval(self, query, *a):
             seen.append(query)
             return 1
@@ -565,6 +573,10 @@ async def test_one_record_past_the_record_cap_is_refused_and_nothing_is_written(
         async def fetch(self, *a):
             return [{"column_name": "merchant_id", "type_name": "varchar", "type_kind": "b",
                      "base_name": None, "elem_name": None, "base_elem_name": None}]
+
+        async def fetchrow(self, *a):  # _source_columns: a plain table the role reads whole
+            return {"relkind": "r", "relrowsecurity": False, "can_select": True,
+                    "columns": [c["column_name"] for c in await self.fetch()]}
 
         async def fetchval(self, *a): return 1
 
