@@ -1128,6 +1128,42 @@ async def _table_column_types(conn, schema: str, table: str) -> Dict[str, str]:
     return out
 
 
+async def _source_columns(conn, schema: str, table: str) -> List[str]:
+    """The export's view of one source table, from pg_class and pg_attribute (which every role
+    reads), never from information_schema, which hides what the role cannot read: [] when the
+    table does not exist, else its copyable (non-generated) columns in order.
+
+    Refuses, optional table or not, when the export would carry less than the table holds without
+    noticing: the table exists but the export's role has no table-level SELECT on it (a missing
+    grant, or a column-level grant that leaves columns out; information_schema would show such a
+    table as absent, or without those columns); row-level security is enabled on it (a policy would
+    filter the rows, and the export's own count(*) runs under the same policy, so the counts would
+    still agree); or it is not a plain table (a view runs with its owner's rights, not the role's)."""
+    row = await conn.fetchrow(
+        """
+        SELECT c.relkind::text AS relkind, c.relrowsecurity, has_table_privilege(c.oid, 'SELECT') AS can_select,
+               ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a
+                      WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+                      ORDER BY a.attnum) AS columns
+          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2
+        """,
+        schema, table,
+    )
+    if row is None:
+        return []
+    if row["relkind"] not in ("r", "p"):
+        raise CopyRefused("source %s is not a plain table (relkind %s); a view runs with its owner's rights"
+                          % (table, row["relkind"]))
+    if not row["can_select"]:
+        raise CopyRefused("the export's role cannot read all of table %s (no table-level SELECT); "
+                          "it would be copied short or skipped" % table)
+    if row["relrowsecurity"]:
+        raise CopyRefused("table %s has row-level security enabled; a policy could filter the rows the "
+                          "export copies" % table)
+    return list(row["columns"])
+
+
 # ---------------------------------------------------------------------------------------------
 # Export (prod)
 # ---------------------------------------------------------------------------------------------
@@ -1303,7 +1339,7 @@ async def _export_tables(conn, store, stamp: str, specs: Sequence[TableSpec], sc
             # set_config(..., true) is SET LOCAL: it ends with this transaction.
             await conn.execute("SELECT pg_catalog.set_config($1, $2, true)", setting, value)
         for spec in specs:
-            existing = await _table_columns(conn, schema, spec.name)
+            existing = await _source_columns(conn, schema, spec.name)
             if not existing:
                 if spec.optional:
                     absent.append(spec.name)

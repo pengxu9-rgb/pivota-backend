@@ -218,6 +218,10 @@ class _FakeConn:
         return [{"column_name": "merchant_id", "type_name": "varchar", "type_kind": "b",
                  "base_name": None, "elem_name": None, "base_elem_name": None}]
 
+    async def fetchrow(self, *a):  # _source_columns: a plain table the role reads whole
+        return {"relkind": "r", "relrowsecurity": False, "can_select": True,
+                "columns": [c["column_name"] for c in await self.fetch()]}
+
     async def fetchval(self, *a):
         return self.rows.count(b"\n")
 
