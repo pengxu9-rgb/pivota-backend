@@ -7,15 +7,16 @@ Each candidate pair is judged in three stages:
                 strength, format words: CONFLICT_LEXICON).
   2. Veto       deterministic rules end the pair on a STATED conflict: two different brands, both
                 sizes known and unequal, both shades named and unequal, a conflict token on one
-                side only, or a price outside the 0.6-1.67 band (the owner's 16 October rule).
+                side only, or a price outside the 0.6-1.67 band (the owner's 16 October rule;
+                checked only on two valid prices in one stated currency, never converted).
                 No agent overrides a veto.
   3. Two agents a matcher and a sceptic each answer {same, fields, cites}. A deterministic verifier
                 drops an answer that cites a field its input does not have, and an agent cannot
                 CREATE agreement on brand or size where the normaliser cannot read it on both
                 sides (ADR-032: model-filled fields may veto, never agree): such an "agree" is read
                 as "unknown". Then:
-                  both say same, every field checks on both  -> confirmed
-                  both say same, a field unknown, none differ -> likely
+                  both say same, every field checks on both, the price band checked -> confirmed
+                  both say same, a field unknown or the price unchecked, none differ -> likely
                   anything else (disagree, a field differs, an answer missing or dropped) -> not_shown
 
 Agents are plain callables (view -> answer dict or None), so the same pipeline runs with:
@@ -33,6 +34,7 @@ verdicts.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -61,11 +63,19 @@ def _text(side: Mapping[str, Any]) -> str:
 
 
 def _price(v: Any) -> Optional[float]:
+    """A positive finite number, else None. A string is read only when it is a plain number:
+    "$20" or "20 USD" is None (never guessed), and so are NaN, infinity and a bool."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if not re.fullmatch(r"\d+(?:\.\d+)?", v):
+            return None
     try:
         p = float(v)
     except (TypeError, ValueError):
         return None
-    return p if p > 0 else None
+    return p if math.isfinite(p) and p > 0 else None
 
 
 @dataclass(frozen=True)
@@ -86,7 +96,7 @@ def normalise(side: Mapping[str, Any]) -> Read:
         brand=canonical_brand(side.get("brand")) or "",
         core=tc.core, tokens=tc.tokens, conflicts=tc.conflicts, shade=tc.shade_tokens,
         size=size_key(tc.size), price=_price(side.get("price")),
-        currency=str(side.get("currency") or "").upper(),
+        currency=str(side.get("currency") or "").strip().upper(),
     )
 
 
@@ -97,6 +107,12 @@ def _overlap(a: Read, b: Read) -> float:
 
 
 # --- 2. veto ---------------------------------------------------------------------------------
+
+def price_checkable(a: Read, b: Read) -> bool:
+    """The band check runs only on two valid prices in one stated currency. Prices are never
+    converted and a currency is never assumed; an unchecked price caps the verdict at likely."""
+    return bool(a.price and b.price and a.currency and a.currency == b.currency)
+
 
 def vetoes(a: Read, b: Read) -> List[str]:
     """The stated conflicts that end a pair. One-sided or missing information is not a veto (it
@@ -109,7 +125,7 @@ def vetoes(a: Read, b: Read) -> List[str]:
         out.append("size")
     if a.shade and b.shade and a.shade != b.shade:
         out.append("shade")
-    if a.price and b.price and a.currency and a.currency == b.currency:
+    if price_checkable(a, b):
         lo, hi = PRICE_BAND
         if not lo <= a.price / b.price <= hi:
             out.append("price_band")
@@ -127,12 +143,18 @@ def validate_answer(answer: Any, view: Mapping[str, Any]) -> Dict[str, Any]:
     that is present and non-empty in that side of the view; a "same" answer must cite each side."""
     if not isinstance(answer, Mapping):
         raise AnswerError("not an object")
+    extra = sorted(set(answer) - {"same", "fields", "cites"})
+    if extra:
+        raise AnswerError(f"unknown keys {extra}")
     same = answer.get("same")
     if not isinstance(same, bool):
         raise AnswerError("same is not a boolean")
     fields_in = answer.get("fields")
     if not isinstance(fields_in, Mapping):
         raise AnswerError("fields is not an object")
+    extra = sorted(set(fields_in) - set(FIELDS))
+    if extra:
+        raise AnswerError(f"unknown fields {extra}")
     fields: Dict[str, str] = {}
     for f in FIELDS:
         v = fields_in.get(f, "unknown")
@@ -157,12 +179,19 @@ def validate_answer(answer: Any, view: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _ground(fields: Dict[str, str], a: Read, b: Read) -> Dict[str, str]:
-    """An agent may not create agreement the normaliser cannot read on both sides."""
+    """An agent may not create agreement the normaliser cannot read on both sides: brand and size
+    agree only when both are read and equal; shade agrees only when the two shade readings are
+    equal, and is not_applicable only when neither side names one (a shade on one side only is
+    unknown)."""
     out = dict(fields)
     if out["brand"] == "agree" and not (a.brand and b.brand and a.brand == b.brand):
         out["brand"] = "unknown"
     if out["size"] == "agree" and not (a.size is not None and a.size == b.size):
         out["size"] = "unknown"
+    if out["shade"] == "agree" and a.shade != b.shade:
+        out["shade"] = "unknown"
+    if out["shade"] == "not_applicable" and (a.shade or b.shade):
+        out["shade"] = "unknown"
     return out
 
 
@@ -189,14 +218,22 @@ def combine(answers: Mapping[str, Optional[Dict[str, Any]]], a: Read, b: Read) -
     if reasons:
         return "not_shown", reasons
     unknown = sorted({f for role in ROLES for f in FIELDS if not _checks(f, grounded[role][f])})
+    if not price_checkable(a, b):
+        unknown = sorted(unknown + ["price"])
     if unknown:
         return "likely", [f"unknown:{f}" for f in unknown]
     return "confirmed", []
 
 
 def judge(view: Mapping[str, Any], matcher: Agent, sceptic: Agent) -> Dict[str, Any]:
-    """One pair: {pair_id, verdict, reasons, judge}. Vetoed pairs never reach the agents."""
-    a, b = normalise(view.get("a") or {}), normalise(view.get("b") or {})
+    """One pair: {pair_id, verdict, reasons, judge}. Vetoed pairs never reach the agents.
+    A view that is not {pair_id, a: {...}, b: {...}} is refused (ValueError), not judged."""
+    if not isinstance(view, Mapping):
+        raise ValueError("a pair view is not an object")
+    for s in ("a", "b"):
+        if not isinstance(view.get(s), Mapping):
+            raise ValueError(f"pair {view.get('pair_id')}: side {s} is not an object")
+    a, b = normalise(view["a"]), normalise(view["b"])
     out: Dict[str, Any] = {"pair_id": view.get("pair_id"), "judge": JUDGE_VERSION}
     v = vetoes(a, b)
     if v:
@@ -272,7 +309,7 @@ def rules_sceptic(view: Mapping[str, Any]) -> Dict[str, Any]:
 
 class ReplayAgent:
     """Answers recorded elsewhere: JSON lines {pair_id, role, answer}. A pair with no line for this
-    role gets None (as a timed-out agent does)."""
+    role gets None (as a timed-out agent does); two lines for one pair and role are refused."""
 
     def __init__(self, role: str, rows: Iterable[Mapping[str, Any]]):
         if role not in ROLES:
@@ -281,7 +318,10 @@ class ReplayAgent:
         self.answers: Dict[str, Any] = {}
         for r in rows:
             if r.get("role") == role and r.get("pair_id"):
-                self.answers[str(r["pair_id"])] = r.get("answer")
+                pid = str(r["pair_id"])
+                if pid in self.answers:
+                    raise ValueError(f"two {role} answers for pair {pid}")
+                self.answers[pid] = r.get("answer")
 
     def __call__(self, view: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
         return self.answers.get(str(view.get("pair_id")))
@@ -314,23 +354,25 @@ def build_agent_prompt(role: str, view: Mapping[str, Any]) -> str:
     )
 
 
+def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
 def parse_agent_answer(text: Any) -> Optional[Dict[str, Any]]:
-    """The first JSON object in a model's reply, or None. Validation is validate_answer's job."""
+    """The JSON object that starts at the reply's first "{", decoded by the JSON parser itself (so
+    a brace inside a string is text, never structure), or None. No later object is tried: if the
+    first one is broken, a nested object inside it must not be mistaken for the answer. A
+    duplicate key anywhere refuses the reply. Validation is validate_answer's job."""
     if not isinstance(text, str):
         return None
     start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                    except json.JSONDecodeError:
-                        break
-                    return obj if isinstance(obj, dict) else None
-        start = text.find("{", start + 1)
-    return None
+    if start == -1:
+        return None
+    try:
+        obj, _end = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys).raw_decode(text, start)
+    except ValueError:  # json.JSONDecodeError is a ValueError, and so is a duplicate key
+        return None
+    return obj if isinstance(obj, dict) else None

@@ -31,8 +31,8 @@ def const(ans):
     return lambda v: ans
 
 
-SAME_A = side("Glow Serum 30ml")
-SAME_B = side("Glow Serum 30 ml", host="store-b.example")
+SAME_A = side("Glow Serum 30ml", price=20, currency="USD")
+SAME_B = side("Glow Serum 30 ml", host="store-b.example", price=22, currency="USD")
 
 
 # --- vetoes ----------------------------------------------------------------------------------
@@ -68,11 +68,38 @@ def test_missing_information_is_not_a_veto():
     assert lj.vetoes(lj.normalise(a), lj.normalise(b)) == []
 
 
-def test_the_price_band_edges_are_inside():
-    for pb in (12.0, 33.4):  # 20/12 = 1.667 and 20/33.4 = 0.599: just inside / just outside
-        a = side("Glow Serum 30ml", price=20, currency="USD")
-        b = side("Glow Serum 30ml", host="store-b.example", price=pb, currency="USD")
-        assert ("price_band" in lj.vetoes(lj.normalise(a), lj.normalise(b))) is (pb == 33.4)
+@pytest.mark.parametrize("pa,vetoed", [(0.6, False), (1.67, False), (0.599, True), (1.671, True)])
+def test_the_price_band_edges_are_inside(pa, vetoed):
+    a = side("Glow Serum 30ml", price=pa, currency="USD")
+    b = side("Glow Serum 30ml", host="store-b.example", price=1, currency="USD")
+    assert ("price_band" in lj.vetoes(lj.normalise(a), lj.normalise(b))) is vetoed
+
+
+@pytest.mark.parametrize("pa,ca,pb,cb", [
+    (20, "USD", 200, "EUR"),      # two currencies: never converted
+    (20, None, 200, None),        # no currency on either side: never assumed
+    (20, "USD", None, "USD"),     # one price missing
+    ("$20", "USD", 21, "USD"),    # not a plain number: never guessed
+    (float("nan"), "USD", 21, "USD"),
+    ("nan", "USD", 21, "USD"),
+    (float("inf"), "USD", 21, "USD"),
+    ("1e1", "USD", 21, "USD"),    # exponent spelling is not a plain number
+    (-20, "USD", 21, "USD"),
+    (True, "USD", 21, "USD"),
+])
+def test_an_unchecked_price_caps_at_likely(pa, ca, pb, cb):
+    a = side("Glow Serum 30ml", price=pa, currency=ca)
+    b = side("Glow Serum 30ml", host="store-b.example", price=pb, currency=cb)
+    r = lj.judge(view(a, b), const(answer()), const(answer()))
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:price"]
+
+
+def test_currency_is_compared_stripped_and_case_folded():
+    a = side("Glow Serum 30ml", price=20, currency=" usd")
+    b = side("Glow Serum 30ml", host="store-b.example", price=200, currency="USD ")
+    assert lj.judge(view(a, b), const(answer()), const(answer()))["reasons"] == ["veto:price_band"]
+    b = side("Glow Serum 30ml", host="store-b.example", price=" 21 ", currency="USD")
+    assert lj.judge(view(a, b), const(answer()), const(answer()))["verdict"] == "confirmed"
 
 
 # --- combining the two agents ----------------------------------------------------------------
@@ -112,6 +139,9 @@ def test_a_missing_or_failing_agent_is_not_shown():
     (answer(cites=["a.title", "c.title"]), "is not a.<field>"),
     (answer(cites=["a.gtin", "b.title"]), "is not a.<field>"),   # the barcode is never citable
     (answer(cites=["a.title"]), "cite both"),
+    (answer(cites=["", "a.title", "b.title"]), "is not a.<field>"),
+    ({**answer(), "note": "x"}, "unknown keys"),
+    ({**answer(), "fields": {**answer()["fields"], "colour": "agree"}}, "unknown fields"),
     ({**answer(), "same": "yes"}, "not a boolean"),
     (answer(size="maybe"), "has value"),
     (answer(line="not_applicable"), "cannot be not_applicable"),
@@ -122,13 +152,35 @@ def test_an_answer_that_breaks_the_contract_is_dropped(bad, why):
     assert len(r["reasons"]) == 1 and r["reasons"][0].startswith("sceptic:dropped:") and why in r["reasons"][0]
 
 
+USD = {"price": 20, "currency": "USD"}
+
+
 def test_an_agent_cannot_create_size_or_brand_agreement_it_cannot_read():
-    a, b = side("Glow Serum"), side("Glow Serum", host="store-b.example")  # no size on either side
+    a, b = side("Glow Serum", **USD), side("Glow Serum", host="store-b.example", **USD)  # no size either side
     r = lj.judge(view(a, b), const(answer()), const(answer()))
     assert r["verdict"] == "likely" and r["reasons"] == ["unknown:size"]
-    a, b = side("Glow Serum 30ml", brand=""), side("Glow Serum 30ml", host="store-b.example")
-    r = lj.judge(view(a, b), const(answer(cites=["a.title", "b.title"])), const(answer()))
+    a, b = side("Glow Serum 30ml", brand="", **USD), side("Glow Serum 30ml", host="store-b.example", **USD)
+    r = lj.judge(view(a, b), const(answer()), const(answer()))
     assert r["verdict"] == "likely" and r["reasons"] == ["unknown:brand"]
+    a, b = side("Glow Serum 30ml", brand="", **USD), side("Glow Serum 30ml", brand="", host="store-b.example", **USD)
+    r = lj.judge(view(a, b), const(answer()), const(answer()))
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:brand"]
+
+
+@pytest.mark.parametrize("shade_answer", ["agree", "not_applicable"])
+def test_a_shade_on_one_side_only_caps_at_likely(shade_answer):
+    a = side("Lip Tint 4g - Rose", **USD)
+    b = side("Lip Tint 4g", host="store-b.example", **USD)
+    r = lj.judge(view(a, b), const(answer(shade=shade_answer)), const(answer(shade=shade_answer)))
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:shade"]
+
+
+def test_shade_agrees_only_on_equal_readings_and_is_not_applicable_only_on_none():
+    a = side("Lip Tint 4g - Rose", **USD)
+    b = side("Lip Tint 4g - Rose", host="store-b.example", **USD)
+    assert lj.judge(view(a, b), const(answer(shade="agree")), const(answer(shade="agree")))["verdict"] == "confirmed"
+    r = lj.judge(view(a, b), const(answer(shade="not_applicable")), const(answer(shade="agree")))
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:shade"]
 
 
 def test_a_different_answer_needs_no_cites():
@@ -141,12 +193,12 @@ def test_a_different_answer_needs_no_cites():
 def test_rules_agents_confirm_only_what_they_can_read():
     r = lj.judge(view(SAME_A, SAME_B), lj.rules_matcher, lj.rules_sceptic)
     assert r["verdict"] == "confirmed"
-    reordered = side("Serum Glow 30ml", host="store-b.example")
+    reordered = side("Serum Glow 30ml", host="store-b.example", **USD)
     r = lj.judge(view(SAME_A, reordered), lj.rules_matcher, lj.rules_sceptic)
     assert r["verdict"] == "not_shown" and r["reasons"] == ["sceptic:different", "sceptic:differ:line"]
-    r = lj.judge(view(side("Glow Serum"), side("Glow Serum", host="store-b.example")),
+    r = lj.judge(view(side("Glow Serum", **USD), side("Glow Serum", host="store-b.example", **USD)),
                  lj.rules_matcher, lj.rules_sceptic)
-    assert r["verdict"] == "likely"
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:size"]
 
 
 def test_variant_title_is_read():
@@ -163,6 +215,14 @@ def test_replay_agent_reads_its_role_only():
     assert m({"pair_id": "p2"}) is None
     with pytest.raises(ValueError):
         lj.ReplayAgent("judge", rows)
+    with pytest.raises(ValueError, match="two matcher answers"):
+        lj.ReplayAgent("matcher", rows + [{"pair_id": "p1", "role": "matcher", "answer": answer(same=False)}])
+
+
+def test_a_view_that_is_not_two_objects_is_refused():
+    for bad in ("x", {"pair_id": "p", "a": "a title", "b": SAME_B}, {"pair_id": "p", "a": SAME_A}):
+        with pytest.raises(ValueError):
+            lj.judge(bad, const(answer()), const(answer()))
 
 
 # --- the model text contract -----------------------------------------------------------------
@@ -175,12 +235,26 @@ def test_prompt_shows_only_citable_fields():
         lj.build_agent_prompt("judge", v)
 
 
-def test_parse_agent_answer_takes_the_first_object():
+def test_parse_agent_answer_takes_the_object_at_the_first_brace():
     obj = answer()
     assert lj.parse_agent_answer(f"Here you go:\n```json\n{json.dumps(obj)}\n```") == obj
-    assert lj.parse_agent_answer("{not json} then " + json.dumps(obj)) == obj
+    assert lj.parse_agent_answer("{not json} then " + json.dumps(obj)) is None  # no later object is tried
     assert lj.parse_agent_answer("no object") is None
     assert lj.parse_agent_answer(None) is None
+
+
+def test_parse_agent_answer_cannot_flip_false_to_true():
+    inner = json.dumps(answer(same=True))
+    # A brace inside a string is text: the outer false answer is read, never the inner true one.
+    text = '{"same": false, "note": "x}", "ex": ' + inner + "}"
+    assert lj.parse_agent_answer(text)["same"] is False
+    # A broken outer object is refused whole; its nested true object is not taken instead.
+    assert lj.parse_agent_answer('{"same": false, "ex": ' + inner + ", broken}") is None
+
+
+def test_parse_agent_answer_refuses_duplicate_keys():
+    assert lj.parse_agent_answer('{"same": false, "same": true, "fields": {}, "cites": []}') is None
+    assert lj.parse_agent_answer('{"same": true, "fields": {"size": "differ", "size": "agree"}, "cites": []}') is None
 
 
 def test_reason_counts_cut_dropped_free_text():
@@ -244,3 +318,21 @@ def test_cli_prompts_and_refusals(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["judge_offline"] == "refused"
     assert not os.path.exists(inside)
     assert cli.main(["run", "--truth", str(truth), "--matcher", "gpt", "--out", str(tmp_path / "v")]) == 2
+
+
+def test_cli_refuses_a_side_that_is_not_an_object(tmp_path, capsys):
+    truth = _truth(tmp_path)
+    rows = ts.read_jsonl(str(truth))
+    rows[0]["a"] = "a title"
+    ts.write_jsonl(str(truth), rows, repo_root=REPO)
+    assert cli.main(["run", "--truth", str(truth), "--out", str(tmp_path / "v.jsonl")]) == 2
+    assert "not an object" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_outputs_are_refused_inside_any_git_checkout(tmp_path):
+    other = tmp_path / "other-checkout"
+    (other / "sub").mkdir(parents=True)
+    (other / ".git").write_text("gitdir: elsewhere\n")  # a worktree's .git is a file
+    with pytest.raises(ts.TruthSetError, match="inside a git checkout"):
+        ts.write_jsonl(str(other / "sub" / "v.jsonl"), [{"x": 1}], repo_root=REPO)
+    assert not (other / "sub" / "v.jsonl").exists()
