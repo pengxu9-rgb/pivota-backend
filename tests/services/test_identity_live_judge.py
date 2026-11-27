@@ -235,12 +235,27 @@ def test_prompt_shows_only_citable_fields():
         lj.build_agent_prompt("judge", v)
 
 
-def test_parse_agent_answer_takes_the_object_at_the_first_brace():
+def test_parse_agent_answer_takes_only_a_reply_that_is_one_object():
     obj = answer()
-    assert lj.parse_agent_answer(f"Here you go:\n```json\n{json.dumps(obj)}\n```") == obj
+    assert lj.parse_agent_answer(json.dumps(obj)) == obj
+    assert lj.parse_agent_answer(f"  \n{json.dumps(obj)}\n ") == obj
+    assert lj.parse_agent_answer(f"```json\n{json.dumps(obj)}\n```") == obj  # one fence that is the whole reply
+    assert lj.parse_agent_answer(f"```\n{json.dumps(obj)}\n```") == obj
     assert lj.parse_agent_answer("{not json} then " + json.dumps(obj)) is None  # no later object is tried
     assert lj.parse_agent_answer("no object") is None
     assert lj.parse_agent_answer(None) is None
+
+
+@pytest.mark.parametrize("text", [
+    "Here you go:\n" + json.dumps(answer()),                       # prose before
+    json.dumps(answer()) + "\nHope that helps.",                     # prose after
+    'For example {"same": true} is a shape; my answer: ' + json.dumps(answer(same=False)),
+    json.dumps(answer(same=True)) + json.dumps(answer(same=False)),  # two objects
+    "Here you go:\n```json\n" + json.dumps(answer()) + "\n```",     # a fence inside prose
+    "[" + json.dumps(answer()) + "]",                               # an array, not an object
+])
+def test_parse_agent_answer_refuses_anything_around_the_object(text):
+    assert lj.parse_agent_answer(text) is None
 
 
 def test_parse_agent_answer_cannot_flip_false_to_true():
@@ -336,3 +351,51 @@ def test_outputs_are_refused_inside_any_git_checkout(tmp_path):
     with pytest.raises(ts.TruthSetError, match="inside a git checkout"):
         ts.write_jsonl(str(other / "sub" / "v.jsonl"), [{"x": 1}], repo_root=REPO)
     assert not (other / "sub" / "v.jsonl").exists()
+
+
+# --- lj.v2: ASCII prices, currency codes, line and form grounding ------------------------------
+
+@pytest.mark.parametrize("raw,read", [
+    ("12", 12.0), ("12.50", 12.5), ("١٢", None), ("１２", None), ("12٠", None),
+])
+def test_a_price_string_is_read_only_in_ascii_digits(raw, read):
+    assert lj._price(raw) == read
+
+
+@pytest.mark.parametrize("raw,read", [
+    ("USD", "USD"), (" usd ", "USD"), ("US$", ""), ("$", ""), ("USDT", ""), ("XXX", ""), ("XTS", ""),
+    ("U5D", ""), ("USĐ", ""), (None, ""), (840, ""),
+])
+def test_a_currency_is_a_three_letter_code_or_unknown(raw, read):
+    assert lj._currency(raw) == read
+
+
+def test_a_currency_that_is_not_a_code_leaves_the_price_unchecked():
+    a = side("Glow Serum 30ml", price=20, currency="US$")
+    b = side("Glow Serum 30ml", host="store-b.example", price=200, currency="US$")
+    r = lj.judge(view(a, b), const(answer()), const(answer()))
+    assert r["verdict"] == "likely" and "unknown:price" in r["reasons"]  # no band check, no veto
+
+
+def test_an_agent_cannot_make_lines_agree_that_share_few_words():
+    a = side("Glow Serum 30ml", price=20, currency="USD")
+    b = side("Night Repair Balm Concentrate 30ml", host="store-b.example", price=21, currency="USD")
+    assert lj._overlap(lj.normalise(a), lj.normalise(b)) < lj.LINE_OVERLAP_MIN
+    r = lj.judge(view(a, b), const(answer()), const(answer()))
+    assert r["verdict"] == "likely" and r["reasons"] == ["unknown:line"]
+
+
+def test_line_agreement_at_the_overlap_floor_stands():
+    r = lj.judge(view(SAME_A, SAME_B), const(answer()), const(answer()))
+    assert r["verdict"] == "confirmed"
+
+
+def test_an_agent_cannot_make_forms_agree_the_tokens_do_not_show():
+    a, b = lj.normalise(side("Glow Serum 30ml")), lj.normalise(side("Glow Serum Refill 30ml"))
+    assert a.conflicts != b.conflicts
+    assert lj._ground(answer()["fields"], a, b)["form"] == "unknown"
+    assert lj._ground(answer()["fields"], a, a)["form"] == "agree"
+
+
+def test_the_judge_version_names_the_grounding_change():
+    assert lj.JUDGE_VERSION == "lj.v2"
