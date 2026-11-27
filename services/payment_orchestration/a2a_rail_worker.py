@@ -1906,6 +1906,7 @@ _TOTAL_MARKS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
     "JPY": (("JP¥", "JPY"), ("JPY", "円")),
     "KRW": (("₩", "KRW"), ("KRW", "원")),
     "TWD": (("NT$", "TWD"), ("TWD",)),
+    "HKD": (("HK$", "HKD"), ("HKD",)),
 }
 
 

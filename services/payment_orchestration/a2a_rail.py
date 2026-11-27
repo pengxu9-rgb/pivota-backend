@@ -707,12 +707,14 @@ def parse_response(body: Any, *, card_code: Callable[[Any], bool] = has_card_cod
 
 #: The card brands the checkout skill takes (`card.brand`).
 CHECKOUT_CARD_BRANDS: FrozenSet[str] = frozenset({"visa", "mastercard"})
-#: The shipping fields the checkout skill takes (measured 2026-11-17). `state` is required for the US, and for
-#: every market whose region is required (a2a_markets.state_required).
+#: The shipping fields the checkout skill takes (measured 2026-11-17). This is the REQUEST's field list, not an
+#: address rule: which fields an address needs is the merchant platform's checkout's, which the skill fills.
+#: `state` is sent for every market whose region is required (a2a_markets.state_required). `zip_code` is sent when
+#: the buyer gave a postcode and is never required: the provider does not ask for it; a store platform may.
 CHECKOUT_SHIPPING_REQUIRED: Tuple[str, ...] = (
-    "email", "first_name", "last_name", "phone", "country", "address1", "city", "zip_code",
+    "email", "first_name", "last_name", "phone", "country", "address1", "city",
 )
-CHECKOUT_SHIPPING_OPTIONAL: Tuple[str, ...] = ("address2", "state")
+CHECKOUT_SHIPPING_OPTIONAL: Tuple[str, ...] = ("address2", "state", "zip_code")
 _CHECKOUT_SHIPPING_MAX = 256
 _TOKEN_NUMBER_RE = re.compile(r"^[0-9]{13,19}\Z")
 _TOKEN_EXPIRY_RE = re.compile(r"^(0[1-9]|1[0-2])([0-9]{2})\Z")
@@ -785,7 +787,7 @@ def _clean_field(value: Any) -> Optional[str]:
 
 def checkout_shipping(value: Any) -> Optional[Dict[str, str]]:
     """The checkout skill's `shipping`, validated, or None. Only the skill's own keys; every required
-    one present; `state` where the market requires a region; no value that carries a card number (an address is never a way
+    one present (`zip_code` is not one); `state` where the market requires a region; no value that carries a card number (an address is never a way
     to send card data). Never raises, never logs (the values are the buyer's PII)."""
     if not isinstance(value, Mapping):
         return None

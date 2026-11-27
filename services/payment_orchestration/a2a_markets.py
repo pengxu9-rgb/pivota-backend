@@ -23,16 +23,19 @@ THE ADDRESS RULES. Each market says:
   - `region`: "required", "optional" or "none". The provider's checkout fills the store's form with it as
     `state`; it is the ISO 3166-2 subdivision code without the country prefix ("ON", "NSW", "13").
   - `regions`: the codes accepted when a region is given (None for a market with no region).
-  - `postal`: the postcode's pattern. Every market here has one, because the provider's checkout requires
-    `zip_code` (a2a_rail.CHECKOUT_SHIPPING_REQUIRED).
+  - `postal`: the pattern a postcode is checked against WHEN ONE IS GIVEN, or None for a market whose addresses
+    have no postcode (Hong Kong: one given there is sent as written, unchecked). A postcode is never ASKED FOR:
+    the payment provider does not require one, and whether an address needs one is the store platform's
+    checkout's to say, which the provider's agent fills. With none, `zip_code` is not sent
+    (a2a_rail.checkout_shipping).
+  These rules are OUR pre-check, so a malformed value is caught before the buyer is asked to approve. Each
+  market's sandbox checkout (docs/agent_purchases_routes.md) is where they are compared with the store's form.
 
 PRICING. The rail prices a cart link through the Reap lane's loader, passing its own market's currency
 (`currency_for`, routes/agent_commerce_reap._cart_market_currency). So KR and TW are priced here without being in
 the Reap lane's map, which is also the merchant directory's list of Reap's agentic markets.
 
 NOT HERE, ON PURPOSE:
-  - Hong Kong. Its addresses have no postcode and the provider's checkout requires `zip_code`. It is added
-    once the provider says what to send.
   - FX. No amount is ever converted: a purchase is priced, capped, minted and checked in its market's currency.
 """
 
@@ -77,8 +80,9 @@ TW_REGIONS = frozenset({"CHA", "CYI", "CYQ", "HSQ", "HSZ", "HUA", "ILA", "KEE", 
 REGION_REQUIRED, REGION_OPTIONAL, REGION_NONE = "required", "optional", "none"
 
 
-def _market(region: str, regions: Optional[FrozenSet[str]], postal: str) -> Mapping[str, Any]:
-    return MappingProxyType({"region": region, "regions": regions, "postal": re.compile(postal)})
+def _market(region: str, regions: Optional[FrozenSet[str]], postal: Optional[str]) -> Mapping[str, Any]:
+    return MappingProxyType({"region": region, "regions": regions,
+                             "postal": re.compile(postal) if postal is not None else None})
 
 
 #: Every market the A2A rail can be switched on for. Adding one here turns nothing on (`A2A_RAIL_MARKETS` does).
@@ -91,6 +95,9 @@ MARKETS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
     "JP": _market(REGION_REQUIRED, JP_REGIONS, r"^[0-9]{3}-?[0-9]{4}\Z"),
     "KR": _market(REGION_OPTIONAL, KR_REGIONS, r"^[0-9]{5}\Z"),
     "TW": _market(REGION_OPTIONAL, TW_REGIONS, r"^[0-9]{3}(?:[0-9]{2,3})?\Z"),
+    #: No postcode and no ISO 3166-2 subdivision: neither is asked for. Whether a store's form wants a district
+    #: or area is the platform's, checked in Hong Kong's sandbox checkout.
+    "HK": _market(REGION_NONE, None, None),
 })
 
 
@@ -100,7 +107,7 @@ _WARNED: set = set()
 
 def enabled_markets() -> FrozenSet[str]:
     """The markets switched on (`A2A_RAIL_MARKETS`), each one in `MARKETS`. Unset or blank: the US only. A code
-    outside `MARKETS` ("USA", "HK") turns nothing on and is logged as a WARNING, once per value per process."""
+    outside `MARKETS` ("USA", "GB") turns nothing on and is logged as a WARNING, once per value per process."""
     raw = os.getenv(MARKETS_ENV)
     if raw is None or not raw.strip():
         return frozenset(DEFAULT_MARKETS)
@@ -160,8 +167,8 @@ def state_required(market: Any) -> bool:
 
 
 def address_errors(address: Mapping[str, Any]) -> Mapping[str, str]:
-    """The market's rules on a cleaned address (`region` and `country` upper-cased), by field: `required` or
-    `invalid`. A country not in `MARKETS` returns nothing here; whether it is ON is the caller's check."""
+    """The market's rules on a cleaned address (`region` and `country` upper-cased), by field: `required` (a
+    region only) or `invalid`. A country not in `MARKETS` returns nothing here; whether it is ON is the caller's check."""
     entry = MARKETS.get(str(address.get("country") or "").upper())
     if entry is None:
         return {}
@@ -172,8 +179,8 @@ def address_errors(address: Mapping[str, Any]) -> Mapping[str, str]:
     elif region and (entry["regions"] is None or region not in entry["regions"]):
         errors["region"] = "invalid"
     postal = str(address.get("postalCode") or "").upper()
-    if not postal:
-        errors["postalCode"] = "required"
-    elif not entry["postal"].match(postal):
+    # Never required (the store platform's to ask for); checked only when given, and not at all in a market
+    # that has no postcode (one given there is the buyer's, sent unchecked).
+    if postal and entry["postal"] is not None and not entry["postal"].match(postal):
         errors["postalCode"] = "invalid"
     return errors

@@ -582,14 +582,17 @@ door, the address write, the router, the worker's token and ceiling steps and th
   (`currency_market_mismatch` otherwise: a Canadian address shown in USD never takes it). The address write
   refuses a country other than the market of the purchase's currency (`country: unsupported`), and the worker
   refuses one before anything is minted (`shipping_market_mismatch`) and never builds the relay with one.
-- **The table:** US, CA, AU, NZ, SG, JP, KR, TW. Each market's currency is the market registry's
+- **The table:** US, CA, AU, NZ, SG, JP, KR, TW, HK. Each market's currency is the market registry's
   (`config/market_registry.json`). The rail prices a cart link through the Reap lane's loader with its own
   market's currency, so KR and TW are priced without joining the Reap lane's market map (which is also the
-  merchant directory's list of Reap's agentic markets: Reap is not advertised there). Not in it: Hong Kong, whose
-  addresses have no postcode while the provider's checkout requires `zip_code`.
+  merchant directory's list of Reap's agentic markets: Reap is not advertised there).
 - **Addresses.** `region` is the ISO 3166-2 subdivision code without the country prefix. It is required in
-  the US, CA, AU and JP (and sent as `state`), optional in NZ, KR and TW, and refused in SG. Every market
-  needs a postcode in its own format. Outside the US these rules apply with shipping-address capture off too.
+  the US, CA, AU and JP (and sent as `state`), optional in NZ, KR and TW, and refused in SG and HK. A
+  postcode is never asked for, in any market: the payment provider does not require one, and whether an address
+  needs one is the store platform's checkout's to say. One the buyer gives is checked against its market's
+  format (Hong Kong has none: sent unchecked) and sent as `zip_code`; with none, no `zip_code` is sent. Outside
+  the US these rules apply with shipping-address capture off too. They are our pre-check, so a malformed value
+  is caught before the buyer is asked to approve; the sandbox checkout below is where they meet the store's form.
 - **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
   minor units (yen and won are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
   already (`USD:3000,CAD:4000`). The ceiling's three envs (`A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS`,
@@ -601,13 +604,13 @@ door, the address write, the router, the worker's token and ceiling steps and th
 - **The final total.** The worker completes a checkout only on a total it can read in the purchase's currency
   (`a2a_rail_worker.checkout_total_minor`). Outside USD it reads only marks that name one currency: the ISO
   code ("CAD 25.00", "25.00 CAD") and symbols no other currency uses (CA$, C$, A$, AU$, NZ$, SG$, S$, NT$,
-  JP¥, ₩, 円, 원). A bare "$" or "¥" is not read. Any other spelling is held for a human
+  HK$, JP¥, ₩, 円, 원). A bare "$" or "¥" is not read. Any other spelling is held for a human
   (`checkout_total_*`), never guessed.
 - **The confirm card and the setup prose.** USD purchases are read exactly as before (`checkout_amounts`). In
   any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
   in any currency or script, is refused before anything is submitted (`confirm_card_refused_outside_usd`,
   `text_amount_shaped`): a currency symbol or code next to a number ("$15.00", "JPY 1500"); a number followed
-  by 円 / 원 / 元 ("1,500円", "1500 円") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
+  by 円 / 원 / 元 / 幣 ("1,500円", "1500 円", "100港幣", "330 新台幣") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
   or CJK, before a number ("合計 1500", "お会計は1500です", "Order value 1500"), on a card also as a key
   ({"合計": "1500"}). Addresses, postcodes, quantities and dates are not amounts ("1-2 円山町", "〒150-0043",
   "Qty 2"). No positive ceiling refuses too. A card that shows no amount (the measured card) proceeds on the
@@ -617,7 +620,9 @@ door, the address write, the router, the worker's token and ceiling steps and th
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor
    units (the yen and won cases decide between ×1 and ×100).
 2. One checkout end to end: the address fills the store's form (the region as `state`), and the
-   `checkout.result` total reads (`checkout_total_minor`) or is held.
+   `checkout.result` total reads (`checkout_total_minor`) or is held. It also shows what the store's form
+   does with an address that has no postcode (no `zip_code` sent) and, for Hong Kong, whether it wants a district
+   or area that the table does not ask for.
 3. The ceiling's three entries set for its currency, and `A2A_RAIL_MAX_TOTAL_MINOR` too.
 4. The merchant's own facts for that market, as for the US: its `A2A_RAIL_MERCHANTS` entry, a fresh
    purchasability fact and the daily cart-link (Tier B) verdict for the market.
