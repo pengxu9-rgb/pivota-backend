@@ -49,8 +49,8 @@
 # timeout = 12:00. Every neighbour on the crawl address, each as its LONGEST window (task timeout x
 # (max-retries + 1)), and the prod one-off house windows, are clear of 11:47-12:00:
 #   * merchant-purchasability-sweep   hourly :07, done by :27; it holds the Shopify edge pacer;
-#   * reap-cart-proof-enrichment      06:41, task-timeout 10800s -> 09:41; pacer holder;
-#   * reap-cart-proof-mirror          13:13, task-timeout 15000s -> 17:23; pacer holder. THIS is why
+#   * the Reap proof enrichment job  06:41, task-timeout 10800s -> 09:41; pacer holder;
+#   * the Reap proof mirror job      13:13, task-timeout 15000s -> 17:23; pacer holder. THIS is why
 #                                     the slot is not 15:47: that window overlaps the mirror's;
 #   * external-seed-destination-sweep 02:20, tierb-cart-link-eligibility 03:30,
 #     catalog-destination-sweep 04:10: all done by 06:10;
