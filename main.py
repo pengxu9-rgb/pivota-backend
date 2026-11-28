@@ -148,6 +148,7 @@ from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.agent_commerce_purchases import router as agent_commerce_purchases_router
 from routes.agent_storefront_handoffs import router as agent_storefront_handoffs_router
+from routes.agent_internal_merchant_facts import router as agent_internal_merchant_facts_router
 from routes.agent_storefront_referrals import router as agent_storefront_referrals_router
 from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
@@ -1215,6 +1216,11 @@ app.include_router(agent_commerce_purchases_router)
 # and read by the gateway for the partner it vouches for. Dark (404) unless
 # UCP_STOREFRONT_HANDOFF_RECORD_ENABLED, read per request.
 app.include_router(agent_storefront_handoffs_router)
+# POST /internal/agent/merchant-facts/door-read: the gateway's request-time read of a seller's UCP door,
+# re-parsed here and kept as its own fact (migration 302; the run condition does not read it). Service
+# callers only. Answers {"written": false, "reason": "disabled"} unless MERCHANT_FACT_REQUEST_WRITE=on,
+# read per request.
+app.include_router(agent_internal_merchant_facts_router)
 # POST /agent/v2/storefront-cart-referrals: one referral (a click row and its tracking members) for a
 # store cart the gateway's checkout door builds. Dark (the unknown-path 404) unless
 # UCP_STOREFRONT_CART_REFERRAL_ENABLED, read per request.
