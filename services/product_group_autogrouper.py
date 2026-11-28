@@ -20,6 +20,13 @@ Background — why this matters:
     deduping. That's exactly what this service produces.
 
 What this service does NOT do:
+  - Move a listing out of a group it is already in (ADR-032 M11 item 3).
+    A listing with no membership, or already in this cluster's group,
+    joins it; a listing in ANY other group (curated, engine-moved, a
+    variant promoter's, or the singleton of its own earlier content_key)
+    is left there and reported as kept. The membership upsert enforces
+    it in SQL (`DO UPDATE ... WHERE` the group is the same), so a row
+    claimed between the read and the write is not taken either.
   - Touch catalog_products. Identity stays where it is; only the
     grouping layer changes.
   - Touch seed_data / product_payload. Same reason.
@@ -74,6 +81,8 @@ class ClusterRow:
     source_product_id: str
     pdp_lifecycle_stage: Optional[str]
     pivota_signature_minted_at: Optional[Any]
+    # The listing's product_group_members row at read time (None: no membership).
+    current_group_id: Optional[str] = None
 
 
 @dataclass
@@ -85,6 +94,9 @@ class ClusterOutcome:
     members_upserted: int = 0
     primary_flag_writes: int = 0
     dry_run: bool = True
+    # Listings left in the other group they are already in (M11 item 3), never moved.
+    members_kept_in_other_group: int = 0
+    kept_product_keys: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +104,9 @@ class AutogroupReport:
     clusters_considered: int = 0
     clusters_grouped: int = 0
     members_upserted_total: int = 0
+    # Clusters with fewer than two listings free to join: nothing written for them.
+    clusters_left_alone: int = 0
+    members_kept_total: int = 0
     per_cluster: List[ClusterOutcome] = field(default_factory=list)
 
 
@@ -349,8 +364,13 @@ def _build_cluster_query(*, content_key: Optional[str], merchant_id: Optional[st
           cp.platform,
           cp.source_product_id,
           cp.pdp_lifecycle_stage,
-          cp.pivota_signature_minted_at
+          cp.pivota_signature_minted_at,
+          m.product_group_id AS current_group_id
         FROM catalog_products cp
+        LEFT JOIN product_group_members m
+          ON m.merchant_id = cp.merchant_id
+         AND m.platform = cp.platform
+         AND m.platform_product_id = cp.source_product_id
         WHERE {where_sql}
         ORDER BY cp.content_key, cp.product_key
     """
@@ -373,6 +393,7 @@ async def _fetch_clusters(*, content_key: Optional[str], merchant_id: Optional[s
             source_product_id=d["source_product_id"],
             pdp_lifecycle_stage=d.get("pdp_lifecycle_stage"),
             pivota_signature_minted_at=d.get("pivota_signature_minted_at"),
+            current_group_id=d.get("current_group_id"),
         ))
     return clusters
 
@@ -391,10 +412,14 @@ _UPSERT_MEMBER_SQL = """
     )
     ON CONFLICT (merchant_id, platform, platform_product_id)
     DO UPDATE SET
-      product_group_id = EXCLUDED.product_group_id,
-      is_primary = EXCLUDED.is_primary,
+      is_primary = product_group_members.is_primary OR EXCLUDED.is_primary,
       updated_at = NOW()
+    WHERE product_group_members.product_group_id = EXCLUDED.product_group_id
 """
+# M11 item 3: the WHERE never moves a listing from another group. The upsert only RAISES a primary
+# flag; lowering the others is `_CLEAR_OTHER_PRIMARIES_SQL`'s, which runs only when the new primary
+# is in the group. So when the chosen primary was claimed by another group after the read, nothing
+# is demoted and the group keeps the primary it had.
 
 
 _CLEAR_OTHER_PRIMARIES_SQL = """
@@ -406,7 +431,24 @@ _CLEAR_OTHER_PRIMARIES_SQL = """
                AND platform = :primary_platform
                AND platform_product_id = :primary_platform_product_id)
       AND is_primary = TRUE
+      AND EXISTS (
+        SELECT 1 FROM product_group_members p
+        WHERE p.product_group_id = :product_group_id
+          AND p.merchant_id = :primary_merchant_id
+          AND p.platform = :primary_platform
+          AND p.platform_product_id = :primary_platform_product_id
+      )
 """
+# The EXISTS: see the note under _UPSERT_MEMBER_SQL. The new primary in the group is flagged by the upsert just run.
+
+
+def _partition(content_key: str, rows: List[ClusterRow]) -> Tuple[str, List[ClusterRow], List[ClusterRow]]:
+    """(group id, rows free to join it, rows kept in another group). Free: no membership, or
+    already a member of this cluster's group."""
+    group_id = derive_product_group_id(content_key)
+    joinable = [r for r in rows if r.current_group_id in (None, group_id)]
+    kept = [r for r in rows if r.current_group_id not in (None, group_id)]
+    return group_id, joinable, kept
 
 
 async def _apply_cluster(*, content_key: str, rows: List[ClusterRow]) -> ClusterOutcome:
@@ -417,12 +459,12 @@ async def _apply_cluster(*, content_key: str, rows: List[ClusterRow]) -> Cluster
     Wrapped in a transaction so partial application can't leave a
     cluster with zero or multiple primaries simultaneously visible to
     readers."""
-    primary = pick_primary(rows)
-    group_id = derive_product_group_id(content_key)
+    group_id, joinable, kept = _partition(content_key, rows)
+    primary = pick_primary(joinable)
 
     members_upserted = 0
     async with database.transaction():
-        for r in rows:
+        for r in joinable:
             is_primary = (
                 r.merchant_id == primary.merchant_id
                 and r.platform == primary.platform
@@ -455,24 +497,29 @@ async def _apply_cluster(*, content_key: str, rows: List[ClusterRow]) -> Cluster
     return ClusterOutcome(
         content_key=content_key,
         product_group_id=group_id,
-        member_count=len(rows),
+        member_count=len(joinable),
         primary_product_key=primary.product_key,
         members_upserted=members_upserted,
         primary_flag_writes=1,
         dry_run=False,
+        members_kept_in_other_group=len(kept),
+        kept_product_keys=[r.product_key for r in kept],
     )
 
 
 def _dry_run_outcome(content_key: str, rows: List[ClusterRow]) -> ClusterOutcome:
-    primary = pick_primary(rows)
+    group_id, joinable, kept = _partition(content_key, rows)
+    primary = pick_primary(joinable)
     return ClusterOutcome(
         content_key=content_key,
-        product_group_id=derive_product_group_id(content_key),
-        member_count=len(rows),
+        product_group_id=group_id,
+        member_count=len(joinable),
         primary_product_key=primary.product_key,
         members_upserted=0,
         primary_flag_writes=0,
         dry_run=True,
+        members_kept_in_other_group=len(kept),
+        kept_product_keys=[r.product_key for r in kept],
     )
 
 
@@ -509,6 +556,13 @@ async def autogroup_clusters(
         # Defensive: if the eligible CTE missed a singleton (shouldn't),
         # skip it.
         if len(rows) < 2:
+            continue
+        _, joinable, kept = _partition(ck, rows)
+        report.members_kept_total += len(kept)
+        if len(joinable) < 2:
+            # M11 item 3: fewer than two listings free to join -- no multi-member group to write,
+            # and the others stay in the groups they are in.
+            report.clusters_left_alone += 1
             continue
         if apply:
             outcome = await _apply_cluster(content_key=ck, rows=rows)

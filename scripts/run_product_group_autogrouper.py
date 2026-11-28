@@ -67,6 +67,8 @@ async def _drive(args: argparse.Namespace) -> dict:
             "clusters_considered": report.clusters_considered,
             "clusters_grouped": report.clusters_grouped,
             "members_upserted_total": report.members_upserted_total,
+            "clusters_left_alone": report.clusters_left_alone,
+            "members_kept_total": report.members_kept_total,
         },
         "per_cluster": [asdict(o) for o in report.per_cluster],
     }
