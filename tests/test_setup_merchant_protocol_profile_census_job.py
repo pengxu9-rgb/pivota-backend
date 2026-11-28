@@ -32,9 +32,10 @@ GATE = "MERCHANT_PROTOCOL_PROFILE_SWEEP_ENABLED"
 TAG = "0123456789abcdef0123456789abcdef01234567"
 
 # One invocation per line, fields separated by \x1f. State: {"job": null | {"gate": "true"|"false"},
-# "trigger": null | "ENABLED" | "PAUSED"}. FAIL_AT=N fails the Nth MUTATING call (and only it);
-# FAIL_KEYS="run jobs update;scheduler jobs resume" fails every call with one of those first three
-# words; READ_FAIL=1 fails the --format reads. A failed call changes nothing.
+# "trigger": null | "ENABLED" | "PAUSED"}. FAIL_AT="N[,M...]" fails those MUTATING calls (counted from
+# 1); FAIL_KEYS="run jobs update;scheduler jobs resume" fails every call with one of those first three
+# words; NOOP_KEYS (same form) answers 0 and changes NOTHING (a call that silently did not apply);
+# READ_FAIL=1 fails the --format reads. A failed call changes nothing.
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env python3
@@ -66,9 +67,11 @@ FAKE_GCLOUD = textwrap.dedent(
         state["_mutations"] = n
         save()
         fail_keys = [k for k in os.environ.get("FAIL_KEYS", "").split(";") if k]
-        if str(n) == os.environ.get("FAIL_AT") or key in fail_keys:
+        if str(n) in os.environ.get("FAIL_AT", "").split(",") or key in fail_keys:
             sys.stderr.write("fake: %s failed\\n" % key)
             sys.exit(1)
+        if key in [k for k in os.environ.get("NOOP_KEYS", "").split(";") if k]:
+            sys.exit(0)
     if key == "iam service-accounts describe":
         sys.exit(0 if os.environ.get("SA_EXISTS", "1") == "1" else 1)
     if key == "artifacts docker images":
@@ -296,7 +299,10 @@ _MODES = [(), ("--enable",)]
 @pytest.mark.parametrize("fail", [{}] + [{"FAIL_AT": str(n)} for n in range(1, 8)] + [
     {"FAIL_KEYS": k} for k in ("run jobs create", "run jobs update", "scheduler jobs create",
                                "scheduler jobs update", "scheduler jobs pause", "scheduler jobs resume",
-                               "run jobs update;scheduler jobs pause")] + [{"READ_FAIL": "1"}],
+                               "run jobs update;scheduler jobs pause")] + [
+    {"NOOP_KEYS": k} for k in ("run jobs update", "scheduler jobs pause", "scheduler jobs resume",
+                               "run jobs update;scheduler jobs pause", "run jobs create;scheduler jobs resume")] + [
+    {"READ_FAIL": "1"}],
     ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()) or "ok")
 def test_the_two_switches_never_disagree_silently(tmp_path, initial, mode, fail):
     """Whatever step fails, the run ends with gate and trigger agreeing, or exits non-zero printing
@@ -318,6 +324,38 @@ def test_a_failed_resume_puts_the_gate_back(tmp_path):
     assert proc.returncode == 1
     assert _pair(state) == ("false", "PAUSED")
     assert "putting the gate back to false" in proc.stderr and "MISMATCH" not in proc.stderr
+
+
+def _mutations(calls: List[List[str]]) -> List[List[str]]:
+    return [c for c in calls if c[:2] in (["run", "jobs"], ["scheduler", "jobs"])
+            and c[2] in ("create", "update", "pause", "resume")]
+
+
+def test_the_revert_of_a_failed_resume_is_the_very_next_write(tmp_path):
+    """The exit check would also go dark, but the revert must not lean on it: right after the failed
+    resume, the job's gate goes back to false, before anything else is written."""
+    _proc, calls, _state = _run(tmp_path, "prod", TAG, "--enable", env={"FAIL_KEYS": "scheduler jobs resume"})
+    writes = _mutations(calls)
+    i = max(n for n, c in enumerate(writes) if c[:3] == ["scheduler", "jobs", "resume"])
+    assert writes[i + 1][:4] == ["run", "jobs", "update", JOB], writes
+    assert _flag(writes[i + 1], "--update-env-vars") == f"{GATE}=false"
+
+
+def test_an_arming_run_whose_revert_also_fails_goes_dark_at_exit(tmp_path):
+    """Resume fails (write 4) and the revert fails too (write 5): the exit check pauses the trigger and
+    puts the gate to false itself, so the run ends dark without a MISMATCH, still exiting 1."""
+    proc, calls, state = _run(tmp_path, "prod", TAG, "--enable", env={"FAIL_AT": "4,5"})
+    assert [c[:3] for c in _mutations(calls)][3:5] == [["scheduler", "jobs", "resume"], ["run", "jobs", "update"]]
+    assert proc.returncode == 1
+    assert _pair(state) == ("false", "PAUSED") and "MISMATCH" not in proc.stderr
+
+
+def test_arming_an_existing_dark_lane_writes_the_gate_before_any_resume(tmp_path):
+    proc, calls, state = _run(tmp_path, "prod", TAG, "--enable", state=INITIAL["dark"])
+    assert proc.returncode == 0, proc.stderr
+    writes = [c[:3] for c in _mutations(calls)]
+    assert writes.index(["run", "jobs", "update"]) < writes.index(["scheduler", "jobs", "resume"]), writes
+    assert _pair(state) == ("true", "ENABLED")
 
 
 def test_a_failed_pause_while_disarming_changes_nothing_else(tmp_path):
