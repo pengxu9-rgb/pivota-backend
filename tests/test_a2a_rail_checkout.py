@@ -304,15 +304,18 @@ def test_a_token_that_does_not_map_cleanly_is_none_never_a_partial_card(token, b
     assert a2a_rail.checkout_card_from_network_token(token, brand=brand, name=name) is None
 
 
-def test_the_checkout_shipping_takes_only_its_own_keys_and_needs_a_us_state():
+def test_the_checkout_shipping_takes_only_its_own_keys_and_needs_no_state_or_zip():
     good = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
             "country": "US", "address1": "1 Main St", "city": "Austin", "state": "TX", "zip_code": "78701"}
     assert a2a_rail.checkout_shipping(good) == good
-    assert a2a_rail.checkout_shipping({k: v for k, v in good.items() if k != "state"}) is None
+    no_state = {k: v for k, v in good.items() if k != "state"}
+    assert a2a_rail.checkout_shipping(no_state) == no_state  # never required: the store platform's to ask for
     assert a2a_rail.checkout_shipping({**{k: v for k, v in good.items() if k != "state"}, "country": "GB"})
     assert a2a_rail.checkout_shipping({**good, "card": {"number": DPAN}}) is None      # no other keys
     assert a2a_rail.checkout_shipping({**good, "address2": f"apt {DPAN}"}) is None   # no card number anywhere
-    assert a2a_rail.checkout_shipping({**good, "zip_code": ""}) is None
+    assert a2a_rail.checkout_shipping({**good, "zip_code": ""}) is None  # a zip_code given must be a value
+    no_zip = {k: v for k, v in good.items() if k != "zip_code"}
+    assert a2a_rail.checkout_shipping(no_zip) == no_zip  # never required: the store platform's to ask for
     assert a2a_rail.checkout_shipping({**good, "country": "usa"}) is None
 
 
@@ -674,14 +677,14 @@ async def _set_address(pid, address):
 @pytest.mark.usefixtures("consent_gate_on")
 async def test_an_incomplete_contact_mints_no_token_at_all():
     # Incomplete from the start: parked in `opened`, NOTHING sent (AgenPas asks the buyer for the address).
-    pid = await _open({k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    pid = await _open({k: v for k, v in ADDRESS.items() if k != "city"})
     rail = Rail()
     assert await _step(rail, pid) == worker.SHIPPING_ADDRESS_REQUIRED
     assert rail.sent == [] and (await _row(pid))["state"] == "opened"
     # Incomplete only after the card step (an edited row): still never minted, and failed as before.
     await database.execute("DELETE FROM a2a_rail_purchases")
     pid = await _locked()
-    await _set_address(pid, {k: v for k, v in ADDRESS.items() if k != "postalCode"})
+    await _set_address(pid, {k: v for k, v in ADDRESS.items() if k != "city"})
     rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
     assert await _step(rail, pid) == "failed"
     assert rail.sent == []
@@ -3781,7 +3784,7 @@ async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
     # The park's "the contact landed meanwhile" check counts an address that is still exactly the incomplete
     # one the worker read as absent (THE waiting rule): the row parks with its deadline, it is not made due at
     # once, and a second park keeps the same deadline.
-    partial = {k: v for k, v in ADDRESS.items() if k != "region"}
+    partial = {k: v for k, v in ADDRESS.items() if k != "city"}
     pid = await _open_without(email=EMAIL, address=partial)
     assert await _step(Rail(), pid) == worker.SHIPPING_ADDRESS_REQUIRED
     row = await _row(pid)
@@ -3796,9 +3799,11 @@ async def test_an_incomplete_address_parks_like_a_missing_one_and_never_loops():
 @pytest.mark.usefixtures("consent_gate_on")
 async def test_the_email_is_asked_for_first_and_each_missing_part_is_named():
     assert shipping_capture.fields_missing(None, None) == [
-        "email", "firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode", "country"]
+        "email", "firstName", "lastName", "phone", "addressLine1", "city", "country"]  # never a region or postcode
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "postalCode"}) == []
     assert shipping_capture.fields_missing(None, ADDRESS) == ["email"]
-    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == ["region"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "city"}) == ["city"]
+    assert shipping_capture.fields_missing(EMAIL, {k: v for k, v in ADDRESS.items() if k != "region"}) == []
     assert shipping_capture.fields_missing(EMAIL, ADDRESS) == []
     # An address alone still waits for the email: the card binding needs it before anything is sent.
     pid = await _open_without(address=ADDRESS)
@@ -3927,16 +3932,21 @@ def test_the_view_names_the_missing_fields_and_never_a_stored_value():
 
     deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
     partial = {**ADDRESS}
-    partial.pop("postalCode")
+    partial.pop("city")
     row = {"id": "ap_" + "0" * 24, "state": "opened", "buyer_email": EMAIL, "shipping_address": partial,
            "buyer_action_expires_at": deadline, "last_error_code": worker.SHIPPING_ADDRESS_REQUIRED,
            "currency": "USD", "our_price_minor": 4650, "merchant_domain": "merchant.example"}
     detail = view.build_view(row)
-    assert detail["shipping_address_required"] == {"fields_missing": ["postalCode"], "expires_at": deadline}
+    assert detail["shipping_address_required"] == {"fields_missing": ["city"], "country": "US", "expires_at": deadline}
     parent = {"id": "pp_" + "0" * 24, "rail": "a2a", "executor": "rail_managed", "rail_purchase_id": row["id"]}
     body = unified_view.unified_body(parent, detail)
     assert body["state"] == "routing"
-    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["postalCode"], "expires_at": deadline}
+    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["city"], "country": "US",
+                                   "expires_at": deadline}
+    # The country is the purchase's own market (G2: the form offers exactly it); none when no one market has the currency.
+    for currency, country in (("HKD", "HK"), ("KRW", "KR"), ("TWD", "TW"), ("JPY", "JP")):
+        assert view.build_view({**row, "currency": currency})["shipping_address_required"]["country"] == country
+    assert "country" not in view.build_view({**row, "currency": "EUR"})["shipping_address_required"]
     assert "url" not in body["next_action"] and "prefill" not in body["next_action"]
     text = json.dumps(body, default=str)
     for value in (EMAIL, *partial.values()):
@@ -4777,24 +4787,24 @@ def jp_on(monkeypatch):
 @pytest.mark.parametrize("text,currency,minor", [
     ("CA$25.00", "CAD", 2500), ("C$ 25.00", "CAD", 2500), ("CAD 25.00", "CAD", 2500), ("25.00 CAD", "CAD", 2500),
     ("$25.00", "CAD", None), ("A$12.30", "AUD", 1230), ("AU$1,234.56", "AUD", 123456), ("A$12.30", "CAD", None),
-    ("NZ$9.90", "NZD", 990), ("S$9.90", "SGD", 990), ("SG$9.90", "SGD", 990), ("NT$330", "TWD", None),
+    ("NZ$9.90", "NZD", 990), ("S$9.90", "SGD", 990), ("SG$9.90", "SGD", 990), ("NT$330", "TWD", 33000),
+    ("NT$330.50", "TWD", 33050), ("$330", "TWD", None), ("NT$330", "USD", None),
     ("JPY 1,500", "JPY", 1500), ("1,500円", "JPY", 1500), ("JP¥1500", "JPY", 1500), ("¥1,500", "JPY", None),
-    ("JPY 1,500.00", "JPY", None), ("₩15,000", "KRW", None), ("HK$10.00", "HKD", None), ("25.00", "CAD", None), ("CA$25.00", "USD", None),
+    ("JPY 1,500.00", "JPY", None), ("₩15,000", "KRW", 15000), ("15,000원", "KRW", 15000), ("KRW 15000", "KRW", 15000),
+    ("₩15,000.00", "KRW", None), ("HK$10.00", "HKD", 1000), ("HKD 1,234.50", "HKD", 123450), ("$10.00", "HKD", None),
+    ("HK$10.00", "USD", None), ("HK$10.00", "TWD", None), ("25.00", "CAD", None), ("CA$25.00", "USD", None),
     ("€23,00", "EUR", None),
 ])
 def test_a_total_outside_usd_is_read_only_by_a_mark_that_names_its_currency(text, currency, minor):
     assert worker.checkout_total_minor(text, currency) == minor
 
 
-@pytest.mark.parametrize("country,state_needed", [
-    ("US", True), ("CA", True), ("AU", True), ("JP", True), ("NZ", False), ("SG", False), ("KR", False),
-    ("GB", False),
-])
-def test_the_checkout_shipping_needs_a_state_only_where_the_market_requires_a_region(country, state_needed):
+@pytest.mark.parametrize("country", ["US", "CA", "AU", "JP", "NZ", "SG", "KR", "TW", "HK", "GB"])
+def test_the_checkout_shipping_needs_no_state_in_any_market(country):
     shipping = {"email": EMAIL, "first_name": "Pat", "last_name": "Example", "phone": "+15125550100",
-                "country": country, "address1": "1 Main St", "city": "Somewhere", "zip_code": "12345"}
-    assert (a2a_rail.checkout_shipping(shipping) is None) is state_needed
-    assert a2a_rail.checkout_shipping({**shipping, "state": "XX"}) is not None
+                "country": country, "address1": "1 Main St", "city": "Somewhere"}
+    assert a2a_rail.checkout_shipping(shipping) == shipping  # the store platform's to ask for
+    assert a2a_rail.checkout_shipping({**shipping, "state": "XX"})["state"] == "XX"
 
 
 def test_a_ceiling_outside_usd_needs_its_own_three_entries_and_is_in_its_minor_units(monkeypatch, jp_on):
@@ -4972,6 +4982,24 @@ def test_the_relay_is_never_built_with_another_markets_address(ca_on):
     assert worker._checkout_setup({**row, "currency": "USD", "shipping_address": ADDRESS}).currency == "USD"
 
 
+def test_a_relay_is_built_without_a_zip_code_when_the_buyer_gave_no_postcode(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,HK")
+    hk = {"firstName": "Pat", "lastName": "Example", "phone": "+85221234567", "addressLine1": "1 Example Road",
+          "city": "Kowloon", "country": "HK"}
+    row = {"id": "ap_0123456789abcdef01234567", "buyer_email": EMAIL, "checkout_url": "https://merchant.example/c",
+           "currency": "HKD", "quoted_total_minor": 10000, "shipping_address": hk}
+    setup = worker._checkout_setup(row)
+    assert setup is not None and setup.currency == "HKD"
+    assert setup.shipping["country"] == "HK" and "zip_code" not in setup.shipping and "state" not in setup.shipping
+    assert worker._checkout_setup({**row, "currency": "USD"}) is None  # an HK address in USD: another market's
+    us_without_zip = {**ADDRESS}
+    us_without_zip.pop("postalCode")
+    us_setup = worker._checkout_setup({**row, "currency": "USD", "shipping_address": us_without_zip})
+    assert us_setup is not None and "zip_code" not in us_setup.shipping and us_setup.shipping["state"] == "TX"
+    assert worker._checkout_setup({**row, "currency": "USD", "shipping_address": ADDRESS}).shipping["zip_code"] == (
+        "78701")  # one given is sent
+
+
 def _setup_with(*datas):
     from types import SimpleNamespace
 
@@ -4993,6 +5021,11 @@ MEASURED_CARD = {"merchant": "merchant.example", "cardLast4": "3478", "cardBrand
     ({"note": "1500円"}, "JPY", 1500, True),          # no grouping comma: only the letter-currency rule sees it
     ({"note": "15000원"}, "KRW", 15000, True),
     ({"items": ["1万円"]}, "JPY", 10000, True),
+    ({"note": "HK$100"}, "HKD", 10000, True),
+    ({"note": "100港幣"}, "HKD", 10000, True),        # a number then 港幣 / 港元: the Han word after the 港
+    ({"note": "100 港元"}, "HKD", 10000, True),
+    ({"note": "330新台幣"}, "TWD", 33000, True),
+    ({**MEASURED_CARD, "shipping": {"email": EMAIL, "city": "Kowloon", "country": "HK"}}, "HKD", 10000, False),
     (MEASURED_CARD, "JPY", 1500, False),                         # nothing money-like: the token cap decides
     ({**MEASURED_CARD, "shipping": {**MEASURED_CARD["shipping"], "address1": "1-2 円山町"}}, "JPY", 1500, False),
     ({"total": "15.00", "currency": "USD"}, "USD", 1500, False),  # USD unchanged: S1 within the ceiling
@@ -5008,6 +5041,10 @@ def test_outside_usd_a_card_with_any_amount_is_refused(data, currency, ceiling, 
     ("お支払い 1500円です", "JPY", 1500, True),
     ("Total JPY 1500", "JPY", 1500, True),
     ("15,000원 결제", "KRW", 15000, True),
+    ("Total: HK$100.00", "HKD", 10000, True),
+    ("共 100 港幣", "HKD", 10000, True),
+    ("Deliver to 1 Example Road, Kowloon", "HKD", 10000, False),
+    ("Ship to 3 台中市", "TWD", 33000, False),  # 台 is not a currency word alone
     ("Total: CA$24.00", "CAD", 2500, True),
     ("Your order is ready to confirm.", "JPY", 1500, False),
     ("Ship to 1-2 円山町, 150-0044", "JPY", 1500, False),
@@ -5016,6 +5053,32 @@ def test_outside_usd_a_card_with_any_amount_is_refused(data, currency, ceiling, 
 ])
 def test_outside_usd_prose_with_any_amount_is_refused(text, currency, ceiling, refused):
     assert a2a_rail._text_parts_refused(_text_only(text), None, ceiling, currency) is refused
+
+
+@pytest.mark.parametrize("text,shaped", [
+    # F1: a prefixed Han currency word is money whatever follows it; a bare 元 may begin a place name.
+    ("100 港元整", True), ("100 港幣整", True), ("100 台幣元", True), ("100港幣", True), ("2 元朗", False),
+    ("1-2 元町", False), ("1500 円", True),
+    # F2: a currency word before the number, NTD, a market's code in any case, 蚊, and more total words.
+    ("港幣 100", True), ("新台幣 330", True), ("新台幣330元", True), ("NTD 330", True), ("330 NTD", True),
+    ("100 hkd", True), ("twd330", True), ("100蚊", True), ("總數 100", True), ("收費 50", True), ("運費 30", True),
+    ("add 2 all", False), ("3 top picks", False), ("Ship to 3 台中市", False), ("香港 2 號", False),
+    # A spaced 蚊 is money only when no Han character follows it (蚊帳 a mosquito net, 蚊子街 a street).
+    ("1 蚊帳", False), ("No. 5 蚊子街", False), ("100 蚊", True), ("100 蚊 total", True), ("5蚊帳", True),
+])
+def test_outside_usd_the_hong_kong_and_taiwan_amount_shapes(text, shaped):
+    assert amounts.text_amount_shaped(text) is shaped
+
+
+def test_the_relay_carries_a_region_and_postcode_as_the_buyer_gave_them():
+    # No address rules of ours: the store's checkout and Visa judge the address.
+    row = {"id": "ap_0123456789abcdef01234567", "buyer_email": EMAIL, "checkout_url": "https://merchant.example/c",
+           "currency": "USD", "quoted_total_minor": 5000, "merchant_domain": "merchant.example"}
+    for over in ({"region": "ON"}, {"postalCode": "K1A 0B1"}, {"region": "Texas", "postalCode": "787011234"}):
+        setup = worker._checkout_setup({**row, "shipping_address": {**ADDRESS, **over}})
+        assert setup is not None, over
+        sent = {"region": setup.shipping.get("state"), "postalCode": setup.shipping.get("zip_code")}
+        assert {k: sent[k] for k in over} == over
 
 
 @pytest.mark.parametrize("text,currency", [("CA$12.00 USD", "CAD"), ("CA$12.00 USD", "USD"), ("$12.00 CAD", "USD"),

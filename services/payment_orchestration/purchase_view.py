@@ -56,6 +56,8 @@ def unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Option
     required = detail.get("shipping_address_required")
     if "next_action" not in body and isinstance(required, Mapping) and required.get("fields_missing"):
         body["next_action"] = {"kind": "shipping_address", "fields_missing": list(required["fields_missing"])}
+        if isinstance(required.get("country"), str):
+            body["next_action"]["country"] = required["country"]
         if required.get("expires_at") is not None:
             body["next_action"]["expires_at"] = required["expires_at"]
     if ("next_action" not in body and isinstance(marker, Mapping) and marker.get("kind") == "shipping_address"

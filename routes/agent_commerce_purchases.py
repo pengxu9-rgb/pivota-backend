@@ -74,6 +74,13 @@ class _LedgerUnavailable(Exception):
     """The agent_purchases table could not be read (missing, or the database refused)."""
 
 
+def _purchase_market_currency() -> Dict[str, str]:
+    """Market -> currency for a purchase with no address: the Reap lane's markets and the A2A rail's
+    (a2a_markets.MARKETS), each currency naming one market. A market only the A2A rail prices (KR, TW) that is not
+    switched on goes to Reap, which refuses it without an address."""
+    return {**reap_routes._MARKET_CURRENCY, **{m: a2a_markets.currency_for(m) for m in a2a_markets.MARKETS}}
+
+
 def _ledger_unavailable() -> JSONResponse:
     return JSONResponse(status_code=503, content={"error": "ledger_unavailable"})
 
@@ -414,7 +421,7 @@ async def create_purchase(
             if market_country is None:
                 raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
         else:
-            market_country = shipping_capture.market_for_currency(req.expected_currency, reap_routes._MARKET_CURRENCY)
+            market_country = shipping_capture.market_for_currency(req.expected_currency, _purchase_market_currency())
             if market_country is None:
                 raise reap_svc.PurchaseRefused(
                     shipping_capture.SHIPPING_MARKET_UNKNOWN, "no shipping address and no currency naming one market")
@@ -517,17 +524,17 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
-        if market_country != "US":
-            # Outside the US the market's own region and postcode rules apply with capture off too (the US keeps
-            # today's capture-off rules exactly).
-            stored_address = shipping_capture.door_address(stored_address)
+        # The same door rules as with capture on (the length caps, the country upper-cased). No address rules of
+        # ours beyond the Reap client's required fields: a region or postcode is the buyer's as written, and the
+        # store's platform (its checkout answer) and Visa judge the address.
+        stored_address = shipping_capture.door_address(stored_address)
     else:
-        # Capture on: each part is optional; one that is given is read by the same rules (the address also by
-        # the US rules: a real state or DC, and a ZIP). What is missing, AgenPas asks the buyer for.
+        # Capture on: each part is optional; one that is given is read by the same rules (printable text, the
+        # required fields). What is missing, AgenPas asks the buyer for.
         stored_email = shipping_capture.door_email(buyer_email) if buyer_email else None
         stored_address = shipping_capture.door_address(shipping_address) if shipping_address else None
         if stored_email is not None and stored_address is not None:
-            # Both given: exactly the stored values the capture-off path stores, plus the US rules above.
+            # Both given: exactly the stored values the capture-off path stores.
             stored_email, stored_address = reap_svc._validated_buyer(
                 reap_svc.BuyerContact(email=stored_email, shipping_address=dict(stored_address)))
     # The same purchasability gate as the Reap route (dark unless enforced; fails closed).
@@ -551,7 +558,8 @@ async def _open_a2a_purchase(
             variant_id=req.variant_id, market_country=market_country)
     reap_routes._refuse_named_placeholder(variant_key, product_key)
     facts, seller_ref, variant_id, seed_kind = await reap_routes._load_cart_link_item(
-        merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country)
+        merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country,
+        market_currency=a2a_markets.currency_for(market_country))
     # A selected variant is bought as itself or not at all (`variant_id` above is the PROVEN one).
     reap_routes._require_selected_variant(variant_id, req.variant_id)
     unit_minor, currency = facts["our_price_minor"], facts["currency"]

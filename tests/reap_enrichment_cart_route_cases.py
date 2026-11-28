@@ -1784,3 +1784,31 @@ async def test_a_table_completed_during_the_retry_window_is_read_at_once(monkeyp
     proofs._reset_for_tests()
     proofs._FETCH_DDL_FAILED_AT = clock[0] - 1
     assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None and ddl_calls == []
+
+
+# ── a market only the A2A rail prices (KR): the loader takes the caller's market currency ─────────────────
+
+
+async def _seed_won_storefront() -> None:
+    """The SGD storefront's fixture, priced in KRW instead (whole won)."""
+    await seed_product(pk=JSM_PK, merchant=JSM_MERCHANT, brand="Jungsaemmool", domain=JSM_HOST,
+                       url=JSM_URL, title="Essential Mool Stick Glow")
+    await seed_sku(pk=JSM_PK, sku_key=f"{JSM_PK}::canonical", merchant=JSM_MERCHANT, svid=JSM_PK,
+                   title="Essential Mool Stick Glow")
+    await seed_sku(pk=JSM_PK, sku_key=JSM_SKU, merchant=JSM_MERCHANT, svid=JSM_VARIANT, title="Default Title")
+    await seed_offer(oid="off_jsm_v", pk=JSM_PK, sku_key=JSM_SKU, merchant=JSM_OFFER_MERCHANT,
+                     price="32000", currency="KRW", source_ref=JSM_URL)
+    await seed_proof(pk=JSM_PK, sku_key=JSM_SKU, shop_host=JSM_HOST, handle=JSM_HANDLE,
+                     variant_id=JSM_VARIANT, price_minor=32000, currency="KRW")
+
+
+async def test_a_won_enrichment_listing_is_priced_only_when_the_caller_names_the_markets_currency(client):
+    await _seed_won_storefront()
+    assert "KR" not in routes_reap._MARKET_CURRENCY  # the Reap lane does not sell in KR
+    facts, _seller, variant, _kind = await routes_reap._load_cart_link_item(
+        merchant_domain=JSM_HOST, product_key=JSM_PK, variant_key=None, market_country="KR", market_currency="KRW")
+    assert (facts["currency"], facts["our_price_minor"], variant) == ("KRW", 32000, JSM_VARIANT)
+    with pytest.raises(svc.PurchaseRefused) as refused:  # this lane's own call: no KR currency, refused
+        await routes_reap._load_cart_link_item(
+            merchant_domain=JSM_HOST, product_key=JSM_PK, variant_key=None, market_country="KR")
+    assert refused.value.reason == "row_currency_mismatch"

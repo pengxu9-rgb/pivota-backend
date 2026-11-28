@@ -1937,6 +1937,9 @@ _TOTAL_MARKS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
     "NZD": (("NZ$", "NZD"), ("NZD",)),
     "SGD": (("SG$", "S$", "SGD"), ("SGD",)),
     "JPY": (("JP¥", "JPY"), ("JPY", "円")),
+    "KRW": (("₩", "KRW"), ("KRW", "원")),
+    "TWD": (("NT$", "TWD"), ("TWD",)),
+    "HKD": (("HK$", "HKD"), ("HKD",)),
 }
 
 
@@ -1957,8 +1960,8 @@ _TOTAL_RES = {currency: _total_re(currency) for currency in _TOTAL_MARKS}
 def checkout_total_minor(value: Any, currency: Any) -> Optional[int]:
     """The checkout's display total (`total`, a string) in minor units, or None when it does not read
     as an amount in `currency`. A currency mark is required (`_USD_TOTAL_RE` for USD, `_TOTAL_MARKS` for the
-    others); a total in any other spelling or currency is None, never a guess. The yen has no minor
-    unit: "¥" is not read, "JPY 1,500" is 1500, and "JPY 1,500.00" is None."""
+    others); a total in any other spelling or currency is None, never a guess. The yen and the won have
+    no minor unit: "¥" is not read, "JPY 1,500" is 1500, and "JPY 1,500.00" is None."""
     code = str(currency or "").upper()
     if not isinstance(value, str):
         return None
@@ -2076,7 +2079,7 @@ def checkout_ceiling(row: Mapping[str, Any]) -> Tuple[int, str]:
     (A2A_RAIL_CHECKOUT_SHIPPING_ALLOWANCE_MINOR, USD default 1000), at most A2A_RAIL_CHECKOUT_CEILING_MAX_MINOR
     (USD default 20000) and within the rail's own cap for the currency. All three are per currency
     (`_allowance`); a currency other than USD with any of them unset is refused, `checkout_ceiling_unconfigured`.
-    Amounts are the currency's minor units (yen are whole units). A merchant's own all-in quote (its UCP
+    Amounts are the currency's minor units (yen and won are whole units). A merchant's own all-in quote (its UCP
     checkout) replaces this function and nothing else. Raises `CeilingRefused`; never guesses a price."""
     currency = str(row.get("currency") or "").upper()
     if currency not in a2a_markets.enabled_currencies():

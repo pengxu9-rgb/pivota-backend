@@ -152,13 +152,15 @@ class Stubs:
     def __init__(self):
         self.reap = []
         self.clicks = []
+        self.catalog_currency = []  # the `market_currency` the A2A route priced the cart link in
 
 
 @pytest.fixture(autouse=True)
 def stubs(monkeypatch):
     s = Stubs()
 
-    async def _catalog(*, merchant_domain, product_key, variant_key, market_country):
+    async def _catalog(*, merchant_domain, product_key, variant_key, market_country, market_currency=None):
+        s.catalog_currency.append(market_currency)
         return dict(FACTS), "merch_obs_shop_a", VARIANT, "brand_official"
 
     async def _click(click):
@@ -279,7 +281,7 @@ async def test_with_capture_on_the_a2a_door_opens_a_purchase_without_email_or_ad
     assert (row["state"], row["buyer_email"], row["shipping_address"]) == ("opened", None, None)
     got = await _http("GET", f"{BASE}/{pid}")
     assert got.status_code == 200, got.text
-    assert got.json()["next_action"] == {"kind": "shipping_address",
+    assert got.json()["next_action"] == {"kind": "shipping_address", "country": "US",
                                          "fields_missing": shipping_capture.fields_missing(None, None)}
     assert got.json()["next_action"]["fields_missing"][0] == "email"
 
@@ -299,18 +301,24 @@ async def test_a_full_contact_at_create_is_stored_as_before_and_asks_for_nothing
     assert "next_action" not in (await _http("GET", f"{BASE}/{pid}")).json()
 
 
-@pytest.mark.parametrize("address", [
-    {k: v for k, v in ADDRESS.items() if k != "region"},
-    {k: v for k, v in ADDRESS.items() if k != "postalCode"},
-    {**ADDRESS, "region": "PR"},           # a territory
-    {**ADDRESS, "postalCode": "7879"},
-], ids=["no_region", "no_postal_code", "territory", "bad_zip"])
-async def test_a_given_us_address_needs_a_real_state_and_a_zip(address, monkeypatch):
-    resp = await _http("POST", BASE, json=_body(address=address))
-    assert resp.status_code == 400 and "invalid_address" in resp.text
-    for value in ADDRESS.values():
-        assert value not in resp.text
-    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+@pytest.mark.parametrize("over", [
+    {"region": "PR"}, {"region": "Texas"}, {"region": "AE"}, {"postalCode": "7879"}, {"postalCode": "787011234"},
+    {"region": "ON", "postalCode": "K1A 0B1"},
+], ids=["territory", "full_name", "military", "short_zip", "zip_no_dash", "another_markets"])
+async def test_a_given_state_and_zip_are_the_buyers_as_written(over, monkeypatch):
+    # No address rules of ours: the store platform's checkout and Visa judge the address.
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, **over}))
+    assert resp.status_code == 202, resp.text
+    stored = (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]
+    assert {k: stored[k] for k in over} == over
+
+
+async def test_a_us_address_with_no_state_or_zip_is_taken_the_store_platform_asks_if_it_needs_them():
+    no_zip = {k: v for k, v in ADDRESS.items() if k not in ("postalCode", "region")}
+    resp = await _http("POST", BASE, json=_body(address=no_zip))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert row["shipping_address"] == no_zip
 
 
 @pytest.mark.parametrize("missing", ["email", "address", "both"])
@@ -445,16 +453,15 @@ async def test_two_submits_at_once_one_wins_and_the_other_is_a_conflict():
     ({"email": EMAIL}, {f: "required" for f in shipping_capture.REQUIRED_ADDRESS_FIELDS}),
     (_form(email="not-an-email"), {"email": "invalid"}),
     (_form(country="CA"), {"country": "unsupported"}),
-    (_form(region="PR"), {"region": "invalid"}),
-    (_form(region="ZZ"), {"region": "invalid"}),
-    (_form(postalCode="787"), {"postalCode": "invalid"}),
+    (_form(region="x" * 101), {"region": "too_long"}),
+    (_form(postalCode="1" * 33), {"postalCode": "too_long"}),
     (_form(phone="call me"), {"phone": "invalid"}),
     (_form(addressLine1="x" * 201), {"addressLine1": "too_long"}),
     (_form(city=12), {"city": "invalid"}),
     (_form(firstName="Pat\u2028Example"), {"firstName": "invalid"}),  # unprintable after the door's clean
     (_form(lastName="   "), {"lastName": "required"}),
-], ids=["address_missing", "email", "country", "territory", "region", "zip", "phone", "too_long", "not_a_string",
-        "control_char", "blank"])
+], ids=["address_missing", "email", "country", "region_too_long", "zip_too_long", "phone", "too_long",
+        "not_a_string", "control_char", "blank"])
 async def test_an_invalid_submission_is_a_422_naming_fields_and_codes_never_values(form, errors):
     pid = await _create(email=None)
     resp = await _submit(pid, form)
@@ -466,11 +473,11 @@ async def test_an_invalid_submission_is_a_422_naming_fields_and_codes_never_valu
     assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"] is None
 
 
-async def test_the_normalised_form_reads_upper_case_region_and_country():
+async def test_the_form_reads_the_country_code_in_any_case_and_the_rest_as_written():
     pid = await _create(email=None)
-    assert (await _submit(pid, _form(region="tx", country="us", postalCode="78799-1234"))).status_code == 200
+    assert (await _submit(pid, _form(region="tx", country="us", postalCode="78799 1234"))).status_code == 200
     stored = (await a2a_ledger.get_purchase_internal(pid))["shipping_address"]
-    assert (stored["region"], stored["country"], stored["postalCode"]) == ("TX", "US", "78799-1234")
+    assert (stored["region"], stored["country"], stored["postalCode"]) == ("tx", "US", "78799 1234")
 
 
 async def test_another_agents_purchase_and_no_purchase_are_the_same_404():
@@ -734,9 +741,9 @@ async def test_the_gateway_sees_these_exact_409_and_422_bodies():
                               "details": {"error": "shipping_address_conflict"},
                               "documentation_url": "https://api.pivota.cc/agent/docs/overview"}}
     pid2 = await _create(email=None, idempotency_key="k-422")
-    invalid = await _submit(pid2, _form(postalCode="1"))
+    invalid = await _submit(pid2, _form(phone="1"))
     assert (invalid.status_code, invalid.json()) == (
-        422, {"status": "error", "error": "invalid_shipping_address", "field_errors": {"postalCode": "invalid"}})
+        422, {"status": "error", "error": "invalid_shipping_address", "field_errors": {"phone": "invalid"}})
 
 
 async def test_an_address_line_2_equal_to_the_davv_cancels_before_the_confirm_failing_closed():
@@ -782,7 +789,7 @@ async def test_the_door_refuses_a_market_that_is_not_on_if_the_router_ever_lets_
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []
 
 
-async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch):
+async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_address(monkeypatch, stubs):
     monkeypatch.setenv("A2A_RAIL_MARKETS", "US,JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,JPY:30000")
@@ -793,9 +800,10 @@ async def test_with_its_market_on_the_door_opens_a_yen_purchase_with_a_japanese_
     row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert (row["currency"], row["our_price_minor"]) == ("JPY", 4650)
     assert row["shipping_address"]["region"] == "13" and row["shipping_address"]["country"] == "JP"
-    bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY",
-                                               idempotency_key="key-2"))
-    assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
+    assert stubs.catalog_currency == ["JPY"]  # the cart link is priced in the market's own currency
+    named = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "Tokyo"}, expected_currency="JPY",
+                                                 idempotency_key="key-2"))
+    assert named.status_code == 202, named.text  # the buyer's region as written: no prefecture list of ours
 
 
 CA_FORM_ADDRESS = {"firstName": "Patneedle", "lastName": "Examplenee", "phone": "+16135550199",
@@ -824,17 +832,18 @@ async def test_the_address_write_refuses_another_markets_address_for_a_cad_purch
     assert (await a2a_ledger.get_purchase_internal(pid))["shipping_address"]["country"] == "CA"
 
 
-async def test_with_capture_off_a_non_us_address_still_meets_its_markets_rules(monkeypatch):
+async def test_with_capture_off_a_non_us_address_is_taken_as_written(monkeypatch):
     monkeypatch.delenv("A2A_SHIPPING_CAPTURE_ENABLED", raising=False)
     monkeypatch.setenv("A2A_RAIL_MARKETS", "US,JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:JP")
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,JPY:30000")
     monkeypatch.setitem(FACTS, "currency", "JPY")
     monkeypatch.setitem(FACTS, "market_country", "JP")
-    bad = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY"))
-    assert bad.status_code == 400 and _error(bad) == "invalid_address", bad.text
-    good = await _http("POST", BASE, json=_body(address=JP_ADDRESS, expected_currency="JPY", idempotency_key="key-2"))
-    assert good.status_code == 202, good.text
+    given = await _http("POST", BASE, json=_body(address={**JP_ADDRESS, "region": "48"}, expected_currency="JPY"))
+    assert given.status_code == 202, given.text
+    no_city = {k: v for k, v in JP_ADDRESS.items() if k != "city"}
+    bad = await _http("POST", BASE, json=_body(address=no_city, expected_currency="JPY", idempotency_key="key-2"))
+    assert bad.status_code == 400, bad.text  # the relay's own fields stay required (the request schema's, too)
 
 
 async def test_with_canada_on_a_canadian_address_shown_in_dollars_is_refused_by_the_router(monkeypatch, caplog):
@@ -847,4 +856,104 @@ async def test_with_canada_on_a_canadian_address_shown_in_dollars_is_refused_by_
         resp = await _http("POST", BASE, json=_body(address=CA_FORM_ADDRESS, payment_preference={"rail": "a2a"}))
     assert resp.status_code == 404 and _error(resp) == "not_available_on_this_rail", resp.text
     assert any("currency_market_mismatch" in r.getMessage() for r in caplog.records)
+
+
+KR_ADDRESS = {"firstName": "Minneedle", "lastName": "Examplenee", "phone": "+82212345678",
+              "addressLine1": "1 Needle-ro", "city": "Jongno-gu", "region": "11", "postalCode": "03154",
+              "country": "KR"}
+
+
+def _kr_on(monkeypatch):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,KR")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:KR")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,KRW:300000")
+    monkeypatch.setitem(FACTS, "currency", "KRW")
+    monkeypatch.setitem(FACTS, "market_country", "KR")
+
+
+async def test_a_won_purchase_is_priced_in_won_though_the_reap_lane_does_not_sell_in_korea(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    assert "KR" not in reap_routes._MARKET_CURRENCY  # the Reap lane's markets, and the directory's, are unchanged
+    resp = await _http("POST", BASE, json=_body(address=KR_ADDRESS, expected_currency="KRW"))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert (row["currency"], row["shipping_address"]["country"]) == ("KRW", "KR")
+    assert stubs.catalog_currency == ["KRW"]
+
+
+async def test_with_no_address_a_won_purchase_takes_korea_as_its_market(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    pid = await _create(email=None, expected_currency="KRW")
+    assert (await a2a_ledger.get_purchase_internal(pid))["currency"] == "KRW"
+    assert stubs.catalog_currency == ["KRW"]
+
+
+async def test_while_korea_is_off_a_won_purchase_is_not_taken_by_the_a2a_rail(monkeypatch, stubs):
+    _kr_on(monkeypatch)
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US")
+    resp = await _http("POST", BASE, json=_body(address=KR_ADDRESS, expected_currency="KRW"))
+    # The router drops the rail (currency_unsupported) and hands the request to Reap, as for any market it is off for.
+    assert resp.json().get("handled_by") == "reap", resp.text
+    assert stubs.catalog_currency == []
     assert await database.fetch_all("SELECT id FROM a2a_rail_purchases") == []
+
+
+HK_ADDRESS = {"firstName": "Pat", "lastName": "Example", "phone": "+85221234567", "addressLine1": "1 Example Road",
+              "city": "Kowloon", "country": "HK"}
+
+
+async def test_a_hong_kong_purchase_is_taken_with_no_postcode_and_none_is_stored(monkeypatch, stubs):
+    monkeypatch.setenv("A2A_RAIL_MARKETS", "US,HK")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:HK")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:50000,HKD:50000")
+    monkeypatch.setitem(FACTS, "currency", "HKD")
+    monkeypatch.setitem(FACTS, "market_country", "HK")
+    resp = await _http("POST", BASE, json=_body(address=HK_ADDRESS, expected_currency="HKD"))
+    assert resp.status_code == 202, resp.text
+    row = await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"])
+    assert (row["currency"], row["shipping_address"]["country"]) == ("HKD", "HK")
+    assert "postalCode" not in row["shipping_address"] and "region" not in row["shipping_address"]
+    # A region given in Hong Kong (no ISO 3166-2 subdivision) is the buyer's: stored as written, unchecked.
+    resp = await _http("POST", BASE, json=_body(address={**HK_ADDRESS, "region": "KLN"}, expected_currency="HKD",
+                                                 idempotency_key="key-2"))
+    assert resp.status_code == 202, resp.text
+    assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["region"] == "KLN"
+
+
+async def test_with_capture_off_a_us_address_with_another_markets_region_or_postcode_is_taken_as_written(monkeypatch):
+    monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, "region": "ON", "postalCode": "K1A 0B1"}))
+    assert resp.status_code == 202, resp.text
+    stored = (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]
+    assert (stored["region"], stored["postalCode"], stored["country"]) == ("ON", "K1A 0B1", "US")
+
+
+@pytest.mark.parametrize("capture", ["on", "off"])
+@pytest.mark.parametrize("over", [{"region": "x" * 101}, {"postalCode": "1" * 33}], ids=["region", "postcode"])
+async def test_the_door_applies_the_writes_length_caps_with_capture_on_or_off(monkeypatch, capture, over):
+    # The door stores nothing the write would refuse (a2a_shipping_address.MAX_LENGTH): one rule on every path.
+    if capture == "off":
+        monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, **over}))
+    assert resp.status_code == 400 and _error(resp) == "invalid_address", resp.text
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+    at_cap = {k: v[:shipping_capture.MAX_LENGTH[k]] for k, v in over.items()}
+    ok = await _http("POST", BASE, json=_body(address={**ADDRESS, **at_cap}, idempotency_key="key-2"))
+    assert ok.status_code == 202, ok.text
+
+
+@pytest.mark.parametrize("capture", ["on", "off"])
+async def test_the_door_stores_the_country_code_upper_case_with_capture_on_or_off(monkeypatch, capture):
+    if capture == "off":
+        monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, "country": "us"}))
+    assert resp.status_code == 202, resp.text
+    assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["country"] == "US"
+
+
+def test_the_required_fields_are_exactly_the_reap_clients():
+    import services.reap_agentic_client as rc
+
+    assert shipping_capture.REQUIRED_ADDRESS_FIELDS == rc._ADDRESS_REQUIRED
+    # Every key the Reap client's builder can emit has a cap, so the door never refuses a field for having none.
+    assert set(rc._ADDRESS_REQUIRED + rc._ADDRESS_OPTIONAL) <= set(shipping_capture.MAX_LENGTH)

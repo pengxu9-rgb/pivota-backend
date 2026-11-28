@@ -14,6 +14,7 @@
     "KR": {"currency": "KRW", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["ko-KR"], "price_display": "tax_inclusive"},
     "HK": {"currency": "HKD", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["zh-HK", "en-HK"], "price_display": "tax_inclusive"},
     "CA": {"currency": "CAD", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["en-CA", "fr-CA"], "price_display": "tax_exclusive"},
-    "NZ": {"currency": "NZD", "status": "off", "pricing_region": false, "ingest": false, "capture": false, "locales": ["en-NZ"], "price_display": "tax_inclusive"}
+    "NZ": {"currency": "NZD", "status": "off", "pricing_region": false, "ingest": false, "capture": false, "locales": ["en-NZ"], "price_display": "tax_inclusive"},
+    "TW": {"currency": "TWD", "status": "off", "pricing_region": false, "ingest": false, "capture": false, "locales": ["zh-TW"], "price_display": "tax_inclusive"}
   }
 }

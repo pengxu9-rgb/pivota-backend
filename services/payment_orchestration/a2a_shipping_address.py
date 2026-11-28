@@ -4,7 +4,7 @@ The owner's decision: the partner agent sends the buyer's shipping address; when
 asks the buyer for it. Three readers share these rules, so they cannot come to disagree:
 
   the door      routes/agent_commerce_purchases (POST on the A2A rail): email and address are OPTIONAL while
-                capture is on; one that is given is validated here (the Reap rules, plus the US rules below).
+                capture is on; one that is given is validated here (the Reap rules and the length caps).
   the write     routes/agent_internal_commerce_purchases (`POST .../{id}/shipping-address`): the gateway's
                 buyer form, validated field by field (`field_errors`).
   the worker    services/payment_orchestration/a2a_rail_worker._opened: a checkout-path row with a field
@@ -13,10 +13,12 @@ asks the buyer for it. Three readers share these rules, so they cannot come to d
   the view      services/payment_orchestration/a2a_purchase_view: `fields_missing`, never a stored value.
 
 THE FIELDS are the door's own (the Reap client's vocabulary): email, firstName, lastName, phone,
-addressLine1, addressLine2 (optional), city, region, postalCode, country. The country must be a market switched on
-for the rail (a2a_markets.enabled_markets, `A2A_RAIL_MARKETS`, the US only by default). Each market has its own
-region and postcode rules (a2a_markets.MARKETS): the US takes one of the 50 states or DC (territories refused) and
-a ZIP (12345 or 12345-6789); a market with no region (SG) refuses one, and in NZ it is optional.
+addressLine1, addressLine2 (optional), city, region (optional), postalCode (optional), country. The country must be
+a market switched on for the rail (a2a_markets.enabled_markets, `A2A_RAIL_MARKETS`, the US only by default).
+PIVOTA HAS NO ADDRESS RULES OF ITS OWN: the fields required are the ones the checkout relay sends (the Reap
+client's required set, `REQUIRED_ADDRESS_FIELDS`); a region or postcode given is sent as written, in no format of
+ours. Which fields a store needs, and in what format, is the store platform's to say (its quote and checkout
+answer), and Visa validates what it is sent.
 
 CAPTURE (`capture_enabled`) is ONE predicate, read by the door, the view and the worker alike: the internal read's
 dial AGENPAS_INTERNAL_READ_ENABLED (whose router carries the write) AND the checkout step AND the token step AND
@@ -68,16 +70,15 @@ SHIPPING_ADDRESS_EXPIRED = "shipping_address_expired"
 #: tests/test_agenpas_shipping_address.py; not to be relaxed here.
 ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "addressLine2", "city", "region",
                   "postalCode", "country")
-#: Every field a market may require, in order: the list for an address whose country is unknown or not one of
-#: a2a_markets.MARKETS. A known market's own list (`required_address_fields`) drops `region` where it has none
-#: or makes it optional.
-REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "region", "postalCode",
-                           "country")
+#: The fields every address must have, in every market: exactly the Reap client's required set
+#: (services/reap_agentic_client._ADDRESS_REQUIRED) and what the checkout relay sends (a2a_rail.CHECKOUT_SHIPPING_REQUIRED).
+#: `region` and `postalCode` are never required here: the store's platform asks for them if it needs them.
+REQUIRED_ADDRESS_FIELDS = ("firstName", "lastName", "phone", "addressLine1", "city", "country")
 #: Every field the write reads, in the order `fields_missing` lists them (email first: the card binding
 #: needs it before anything else).
 FIELDS = ("email",) + ADDRESS_FIELDS
 MAX_LENGTH = {"email": 254, "firstName": 100, "lastName": 100, "phone": 32, "addressLine1": 200,
-              "addressLine2": 200, "city": 100, "region": 3, "postalCode": 10, "country": 2}
+              "addressLine2": 200, "city": 100, "region": 100, "postalCode": 32, "country": 2}
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9 ().-]{5,30}\Z")
 
 
@@ -125,15 +126,6 @@ def _address(value: Any) -> Any:
     return value
 
 
-def required_address_fields(country: Any) -> Tuple[str, ...]:
-    """The fields an address in `country` must have, in `REQUIRED_ADDRESS_FIELDS` order. A country that is not
-    one of a2a_markets.MARKETS (or none at all) gets the whole list."""
-    code = str(country or "").strip().upper()
-    if code not in a2a_markets.MARKETS or a2a_markets.region_rule(code) == a2a_markets.REGION_REQUIRED:
-        return REQUIRED_ADDRESS_FIELDS
-    return tuple(f for f in REQUIRED_ADDRESS_FIELDS if f != "region")
-
-
 def incomplete_address(value: Any) -> Optional[Dict[str, Any]]:
     """The stored address when it is there but lacks a required field, else None. Such an address counts as
     ABSENT (THE waiting rule, `fields_missing`): the gateway's write may replace it, and the worker's park
@@ -141,7 +133,7 @@ def incomplete_address(value: Any) -> Optional[Dict[str, Any]]:
     address = _address(value)
     if not isinstance(address, Mapping) or not address:
         return None
-    if any(not str(address.get(f) or "").strip() for f in required_address_fields(address.get("country"))):
+    if any(not str(address.get(f) or "").strip() for f in REQUIRED_ADDRESS_FIELDS):
         return dict(address)
     return None
 
@@ -187,18 +179,15 @@ def fields_missing(buyer_email: Any, shipping_address: Any) -> List[str]:
     """The fields a stored contact lacks, by name, email first. Never a value."""
     missing = [] if str(buyer_email or "").strip() else ["email"]
     address = shipping_address if isinstance(shipping_address, Mapping) else {}
-    missing.extend(f for f in required_address_fields(address.get("country")) if not str(address.get(f) or "").strip())
+    missing.extend(f for f in REQUIRED_ADDRESS_FIELDS if not str(address.get(f) or "").strip())
     return missing
 
 
-def _market_errors(address: Mapping[str, Any]) -> Dict[str, str]:
-    """The market's rules on a cleaned address (a2a_markets.address_errors): region and postcode."""
-    return dict(a2a_markets.address_errors(address))
-
-
 def door_address(raw: Mapping[str, Any]) -> Dict[str, str]:
-    """The door's address on the A2A rail with capture on: the Reap rules (reap_svc._validated_buyer's
-    address half), then the market's rules. Raises `PurchaseRefused("invalid_address", <field names only>)`."""
+    """The door's address on the A2A rail, capture on or off: the Reap rules (reap_svc._validated_buyer's address
+    half: printable text, the required fields), the write's length caps (`MAX_LENGTH`), the country upper-cased.
+    Nothing else: a region or postcode is the buyer's as written. Raises `PurchaseRefused("invalid_address",
+    <field names only>)`."""
     cleaned = {key: reap_svc._clean_buyer_text(value) for key, value in dict(raw).items()}
     if not all(reap_svc._is_clean(value) for value in cleaned.values()):
         raise reap_svc.PurchaseRefused("invalid_address", "shipping address contains characters that are not printable")
@@ -209,12 +198,11 @@ def door_address(raw: Mapping[str, Any]) -> Dict[str, str]:
     if not shipping:
         raise reap_svc.PurchaseRefused("invalid_address", "a shipping address is required")
     shipping = dict(shipping)
-    for key in ("region", "postalCode", "country"):
-        if key in shipping:
-            shipping[key] = shipping[key].upper()
-    errors = _market_errors(shipping)
-    if errors:
-        raise reap_svc.PurchaseRefused("invalid_address", "shipping address fields not valid: " + ",".join(sorted(errors)))
+    too_long = sorted(key for key, value in shipping.items() if len(value) > MAX_LENGTH.get(key, 0))
+    if too_long:
+        # The write's caps (`read_submission`), so the door stores nothing the write would refuse.
+        raise reap_svc.PurchaseRefused("invalid_address", "shipping address fields too long: " + ",".join(too_long))
+    shipping["country"] = shipping["country"].upper()
     return shipping
 
 
@@ -240,7 +228,8 @@ def read_submission(
 
     `market` is the purchase's own market (a2a_markets.market_for_currency of its currency): a country other
     than it is `country: unsupported`, so a purchase priced in CAD is never given a US address. The write passes
-    it always; None (no one market for the currency) refuses every country."""
+    it always; None (no one market for the currency) refuses every country. A region or postcode given is read
+    as text (printable, within its length), in no format of ours."""
     if not isinstance(body, Mapping):
         return None, None, {"body": "invalid"}
     market_given = market is not _NO_MARKET
@@ -270,10 +259,9 @@ def read_submission(
     sent_address = any(name in values or name in errors for name in ADDRESS_FIELDS)
     address: Optional[Dict[str, str]] = None
     if sent_address or address_required:
-        for key in ("region", "postalCode", "country"):
-            if key in values:
-                values[key] = values[key].upper()
-        for name in required_address_fields(values.get("country")):
+        if "country" in values:
+            values["country"] = values["country"].upper()
+        for name in REQUIRED_ADDRESS_FIELDS:
             if name not in values and name not in errors:
                 errors[name] = "required"
         if "country" in values and (not a2a_markets.market_enabled(values["country"])
@@ -282,10 +270,6 @@ def read_submission(
         if "phone" in values and (not _PHONE_RE.match(values["phone"])
                                   or not 7 <= sum(ch.isdigit() for ch in values["phone"]) <= 15):
             errors["phone"] = "invalid"
-        if "country" not in errors:
-            # A market that is not on says only that: its own region and postcode rules are not the buyer's.
-            for name, code in _market_errors(values).items():
-                errors.setdefault(name, code)
         if not any(name in errors for name in ADDRESS_FIELDS):
             try:
                 address = door_address(values)
