@@ -20,32 +20,50 @@ PG = "pg_" + "a" * 32
 OTHER_PG = "pg_curated_other"
 
 
-class _Txn:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
 def _db_row(pk, stage=None, group=None, minted=None):
     return {"content_key": CK, "product_key": pk, "merchant_id": f"m_{pk}", "platform": "shopify",
             "source_product_id": f"s_{pk}", "pdp_lifecycle_stage": stage,
             "pivota_signature_minted_at": minted, "current_group_id": group}
 
 
-def _install(monkeypatch, rows):
-    executed: List[Dict[str, Any]] = []
+class _RollbackTxn:
+    """Records whether the transaction ended in an exception (a rollback)."""
+
+    def __init__(self, log):
+        self.log = log
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, *exc):
+        self.log.append("rollback" if exc_type else "commit")
+        return False
+
+
+class _Executed(list):
+    """The writes, plus the primary checks (`checks`) and how each transaction ended (`ends`)."""
+
+
+def _install(monkeypatch, rows, *, primary_landed=True):
+    executed = _Executed()
+    checks: List[Dict[str, Any]] = []
+    ends: List[str] = []
 
     async def fetch_all(sql, params):
         return rows
+
+    async def fetch_one(sql, params=None):
+        checks.append({"sql": str(sql), "params": dict(params or {})})
+        return {"?column?": 1} if primary_landed else None
 
     async def execute(sql, params=None):
         executed.append({"sql": str(sql), "params": dict(params or {})})
 
     monkeypatch.setattr(autogrouper.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(autogrouper.database, "fetch_one", fetch_one)
     monkeypatch.setattr(autogrouper.database, "execute", execute)
-    monkeypatch.setattr(autogrouper.database, "transaction", lambda: _Txn())
+    monkeypatch.setattr(autogrouper.database, "transaction", lambda: _RollbackTxn(ends))
+    executed.checks, executed.ends = checks, ends
     return executed
 
 
@@ -67,8 +85,7 @@ def test_the_upsert_only_updates_a_row_already_in_the_same_group():
     sql = autogrouper._UPSERT_MEMBER_SQL
     assert "WHERE product_group_members.product_group_id = EXCLUDED.product_group_id" in sql
     assert "product_group_id = EXCLUDED.product_group_id,\n" not in sql, "the SET never moves the group"
-    # only raises a primary: lowering is the conditional clear's
-    assert "is_primary = product_group_members.is_primary OR EXCLUDED.is_primary" in sql
+    assert "is_primary = EXCLUDED.is_primary" in sql
 
 
 @pytest.mark.asyncio
@@ -111,9 +128,34 @@ async def test_rows_already_in_the_group_or_unclaimed_all_join_as_before(monkeyp
     assert report.members_kept_total == 0 and report.per_cluster[0].kept_product_keys == []
 
 
-def test_the_primary_clear_needs_the_primary_to_be_in_the_group():
-    sql = autogrouper._CLEAR_OTHER_PRIMARIES_SQL
-    assert "AND EXISTS (" in sql
-    for part in ("p.product_group_id = :product_group_id", "p.merchant_id = :primary_merchant_id",
-                 "p.platform = :primary_platform", "p.platform_product_id = :primary_platform_product_id"):
-        assert part in sql, part
+def test_the_primary_check_reads_the_chosen_primary_in_the_group():
+    sql = " ".join(autogrouper._PRIMARY_IN_GROUP_SQL.split())
+    assert sql == ("SELECT 1 FROM product_group_members WHERE product_group_id = :product_group_id"
+                   " AND merchant_id = :merchant_id AND platform = :platform"
+                   " AND platform_product_id = :platform_product_id")
+
+
+@pytest.mark.asyncio
+async def test_a_landed_primary_commits_and_clears_the_others(monkeypatch):
+    rows = [_db_row("p1", stage="published"), _db_row("p2")]
+    executed = _install(monkeypatch, rows)
+    report = await autogrouper.autogroup_clusters(content_key=CK, apply=True)
+    [check] = executed.checks
+    assert check["params"] == {"product_group_id": PG, "merchant_id": "m_p1", "platform": "shopify",
+                               "platform_product_id": "s_p1"}
+    assert executed.ends == ["commit"]
+    assert [e for e in executed if "SET is_primary = FALSE" in e["sql"]], "the clear runs"
+    [out] = report.per_cluster
+    assert out.raced is False and out.primary_flag_writes == 1 and report.clusters_raced == 0
+
+
+@pytest.mark.asyncio
+async def test_a_primary_claimed_elsewhere_rolls_the_cluster_back(monkeypatch):
+    rows = [_db_row("p1", stage="published"), _db_row("p2"), _db_row("p3")]
+    executed = _install(monkeypatch, rows, primary_landed=False)
+    report = await autogrouper.autogroup_clusters(content_key=CK, apply=True)
+    assert executed.ends == ["rollback"]
+    assert not [e for e in executed if "SET is_primary = FALSE" in e["sql"]], "no clear after a lost primary"
+    [out] = report.per_cluster
+    assert (out.raced, out.members_upserted, out.primary_flag_writes) == (True, 0, 0)
+    assert (report.clusters_raced, report.clusters_grouped, report.members_upserted_total) == (1, 0, 0)

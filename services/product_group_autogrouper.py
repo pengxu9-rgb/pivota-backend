@@ -97,6 +97,8 @@ class ClusterOutcome:
     # Listings left in the other group they are already in (M11 item 3), never moved.
     members_kept_in_other_group: int = 0
     kept_product_keys: List[str] = field(default_factory=list)
+    # The chosen primary was claimed by another group after the read: the cluster was rolled back.
+    raced: bool = False
 
 
 @dataclass
@@ -107,6 +109,8 @@ class AutogroupReport:
     # Clusters with fewer than two listings free to join: nothing written for them.
     clusters_left_alone: int = 0
     members_kept_total: int = 0
+    # Clusters rolled back because their primary was claimed elsewhere during the run.
+    clusters_raced: int = 0
     per_cluster: List[ClusterOutcome] = field(default_factory=list)
 
 
@@ -412,14 +416,28 @@ _UPSERT_MEMBER_SQL = """
     )
     ON CONFLICT (merchant_id, platform, platform_product_id)
     DO UPDATE SET
-      is_primary = product_group_members.is_primary OR EXCLUDED.is_primary,
+      is_primary = EXCLUDED.is_primary,
       updated_at = NOW()
     WHERE product_group_members.product_group_id = EXCLUDED.product_group_id
 """
-# M11 item 3: the WHERE never moves a listing from another group. The upsert only RAISES a primary
-# flag; lowering the others is `_CLEAR_OTHER_PRIMARIES_SQL`'s, which runs only when the new primary
-# is in the group. So when the chosen primary was claimed by another group after the read, nothing
-# is demoted and the group keeps the primary it had.
+# M11 item 3: the WHERE never moves a listing from another group (a row claimed after the read
+# included). Whether the chosen primary actually landed is checked before the cluster commits
+# (_PRIMARY_IN_GROUP_SQL); if it did not, the cluster's writes are rolled back.
+
+
+# The chosen primary is in the group after this transaction's upserts. A row this transaction wrote
+# stays locked until the commit, so the answer holds until then.
+_PRIMARY_IN_GROUP_SQL = """
+    SELECT 1 FROM product_group_members
+    WHERE product_group_id = :product_group_id
+      AND merchant_id = :merchant_id
+      AND platform = :platform
+      AND platform_product_id = :platform_product_id
+"""
+
+
+class _PrimaryClaimedElsewhere(Exception):
+    """The chosen primary was put in another group between the read and the upsert."""
 
 
 _CLEAR_OTHER_PRIMARIES_SQL = """
@@ -431,15 +449,7 @@ _CLEAR_OTHER_PRIMARIES_SQL = """
                AND platform = :primary_platform
                AND platform_product_id = :primary_platform_product_id)
       AND is_primary = TRUE
-      AND EXISTS (
-        SELECT 1 FROM product_group_members p
-        WHERE p.product_group_id = :product_group_id
-          AND p.merchant_id = :primary_merchant_id
-          AND p.platform = :primary_platform
-          AND p.platform_product_id = :primary_platform_product_id
-      )
 """
-# The EXISTS: see the note under _UPSERT_MEMBER_SQL. The new primary in the group is flagged by the upsert just run.
 
 
 def _partition(content_key: str, rows: List[ClusterRow]) -> Tuple[str, List[ClusterRow], List[ClusterRow]]:
@@ -458,40 +468,32 @@ async def _apply_cluster(*, content_key: str, rows: List[ClusterRow]) -> Cluster
 
     Wrapped in a transaction so partial application can't leave a
     cluster with zero or multiple primaries simultaneously visible to
-    readers."""
+    readers. When the chosen primary was claimed by another group after
+    the read (M11 item 3), the cluster's writes are rolled back and the
+    outcome says `raced`: nothing is written, so no group, new or not, is
+    left without a primary. A later run picks the cluster up again.
+
+    `members_upserted` counts the upserts sent; a member claimed elsewhere
+    after the read is among them but was not moved."""
     group_id, joinable, kept = _partition(content_key, rows)
     primary = pick_primary(joinable)
 
     members_upserted = 0
-    async with database.transaction():
-        for r in joinable:
-            is_primary = (
-                r.merchant_id == primary.merchant_id
-                and r.platform == primary.platform
-                and r.source_product_id == primary.source_product_id
-            )
-            await database.execute(
-                _UPSERT_MEMBER_SQL,
-                {
-                    "product_group_id": group_id,
-                    "merchant_id": r.merchant_id,
-                    "platform": r.platform,
-                    "platform_product_id": r.source_product_id,
-                    "is_primary": is_primary,
-                },
-            )
-            members_upserted += 1
-
-        # Clear any lingering primaries elsewhere in the group (handles
-        # the case where primary selection changed between runs).
-        await database.execute(
-            _CLEAR_OTHER_PRIMARIES_SQL,
-            {
-                "product_group_id": group_id,
-                "primary_merchant_id": primary.merchant_id,
-                "primary_platform": primary.platform,
-                "primary_platform_product_id": primary.source_product_id,
-            },
+    try:
+        async with database.transaction():
+            members_upserted = await _write_cluster(group_id, joinable, primary)
+    except _PrimaryClaimedElsewhere:
+        return ClusterOutcome(
+            content_key=content_key,
+            product_group_id=group_id,
+            member_count=len(joinable),
+            primary_product_key=primary.product_key,
+            members_upserted=0,
+            primary_flag_writes=0,
+            dry_run=False,
+            members_kept_in_other_group=len(kept),
+            kept_product_keys=[r.product_key for r in kept],
+            raced=True,
         )
 
     return ClusterOutcome(
@@ -505,6 +507,50 @@ async def _apply_cluster(*, content_key: str, rows: List[ClusterRow]) -> Cluster
         members_kept_in_other_group=len(kept),
         kept_product_keys=[r.product_key for r in kept],
     )
+
+
+async def _write_cluster(group_id: str, joinable: List[ClusterRow], primary: ClusterRow) -> int:
+    """The cluster's writes, inside its transaction. Raises _PrimaryClaimedElsewhere (rolling the
+    transaction back) when the primary's upsert did not land in the group."""
+    members_upserted = 0
+    for r in joinable:
+        is_primary = (
+            r.merchant_id == primary.merchant_id
+            and r.platform == primary.platform
+            and r.source_product_id == primary.source_product_id
+        )
+        await database.execute(
+            _UPSERT_MEMBER_SQL,
+            {
+                "product_group_id": group_id,
+                "merchant_id": r.merchant_id,
+                "platform": r.platform,
+                "platform_product_id": r.source_product_id,
+                "is_primary": is_primary,
+            },
+        )
+        members_upserted += 1
+
+    if await database.fetch_one(_PRIMARY_IN_GROUP_SQL, {
+        "product_group_id": group_id,
+        "merchant_id": primary.merchant_id,
+        "platform": primary.platform,
+        "platform_product_id": primary.source_product_id,
+    }) is None:
+        raise _PrimaryClaimedElsewhere(primary.product_key)
+
+    # Clear any lingering primaries elsewhere in the group (handles
+    # the case where primary selection changed between runs).
+    await database.execute(
+        _CLEAR_OTHER_PRIMARIES_SQL,
+        {
+            "product_group_id": group_id,
+            "primary_merchant_id": primary.merchant_id,
+            "primary_platform": primary.platform,
+            "primary_platform_product_id": primary.source_product_id,
+        },
+    )
+    return members_upserted
 
 
 def _dry_run_outcome(content_key: str, rows: List[ClusterRow]) -> ClusterOutcome:
@@ -566,6 +612,10 @@ async def autogroup_clusters(
             continue
         if apply:
             outcome = await _apply_cluster(content_key=ck, rows=rows)
+            if outcome.raced:
+                report.clusters_raced += 1
+                report.per_cluster.append(outcome)
+                continue
             report.members_upserted_total += outcome.members_upserted
         else:
             outcome = _dry_run_outcome(ck, rows)
