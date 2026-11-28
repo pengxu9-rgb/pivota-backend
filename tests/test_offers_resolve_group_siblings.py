@@ -192,8 +192,12 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
             return [copy.deepcopy(s) for s in fuzzy_seeds]  # the fuzzy ref lane
         if "JOIN catalog_offers" in q:
             al = set(v["aliases"])
-            cks = {m["ck"] for m in by_alias(al)}
-            pks = {m["pk"] for m in members if m["ck"] in cks}
+            if "ANY(:resolved_keys)" in q:
+                # OFFERS_CATALOG_ARM_RESOLVED_ONLY=on: the named listings plus the resolved ones passed in.
+                pks = {m["pk"] for m in members if m["sig"] in al or m["pk"] in al} | set(v["resolved_keys"])
+            else:
+                cks = {m["ck"] for m in by_alias(al)}
+                pks = {m["pk"] for m in members if m["ck"] in cks}
             rows = [dict(r) for r in catalog_rows if r["product_key"] in pks]
             for r in rows:
                 if "o.sku_key AS sku_key" not in q:
