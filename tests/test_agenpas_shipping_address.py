@@ -926,3 +926,32 @@ async def test_with_capture_off_a_us_address_with_another_markets_region_or_post
     assert resp.status_code == 202, resp.text
     stored = (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]
     assert (stored["region"], stored["postalCode"], stored["country"]) == ("ON", "K1A 0B1", "US")
+
+
+@pytest.mark.parametrize("capture", ["on", "off"])
+@pytest.mark.parametrize("over", [{"region": "x" * 101}, {"postalCode": "1" * 33}], ids=["region", "postcode"])
+async def test_the_door_applies_the_writes_length_caps_with_capture_on_or_off(monkeypatch, capture, over):
+    # The door stores nothing the write would refuse (a2a_shipping_address.MAX_LENGTH): one rule on every path.
+    if capture == "off":
+        monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, **over}))
+    assert resp.status_code == 400 and _error(resp) == "invalid_address", resp.text
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_purchases"))["n"] == 0
+    at_cap = {k: v[:shipping_capture.MAX_LENGTH[k]] for k, v in over.items()}
+    ok = await _http("POST", BASE, json=_body(address={**ADDRESS, **at_cap}, idempotency_key="key-2"))
+    assert ok.status_code == 202, ok.text
+
+
+@pytest.mark.parametrize("capture", ["on", "off"])
+async def test_the_door_stores_the_country_code_upper_case_with_capture_on_or_off(monkeypatch, capture):
+    if capture == "off":
+        monkeypatch.delenv(internal_routes.AGENPAS_INTERNAL_READ_ENABLED_ENV)
+    resp = await _http("POST", BASE, json=_body(address={**ADDRESS, "country": "us"}))
+    assert resp.status_code == 202, resp.text
+    assert (await a2a_ledger.get_purchase_internal(resp.json()["purchase_id"]))["shipping_address"]["country"] == "US"
+
+
+def test_the_required_fields_are_exactly_the_reap_clients():
+    import services.reap_agentic_client as rc
+
+    assert shipping_capture.REQUIRED_ADDRESS_FIELDS == rc._ADDRESS_REQUIRED

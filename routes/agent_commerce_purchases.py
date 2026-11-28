@@ -524,15 +524,17 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
-        # No address rules of ours beyond the Reap client's required fields: a region or postcode is the buyer's as
-        # written, and the store's platform (its checkout answer) and Visa judge the address.
+        # The same door rules as with capture on (the length caps, the country upper-cased). No address rules of
+        # ours beyond the Reap client's required fields: a region or postcode is the buyer's as written, and the
+        # store's platform (its checkout answer) and Visa judge the address.
+        stored_address = shipping_capture.door_address(stored_address)
     else:
         # Capture on: each part is optional; one that is given is read by the same rules (printable text, the
         # required fields). What is missing, AgenPas asks the buyer for.
         stored_email = shipping_capture.door_email(buyer_email) if buyer_email else None
         stored_address = shipping_capture.door_address(shipping_address) if shipping_address else None
         if stored_email is not None and stored_address is not None:
-            # Both given: exactly the stored values the capture-off path stores, plus the US rules above.
+            # Both given: exactly the stored values the capture-off path stores.
             stored_email, stored_address = reap_svc._validated_buyer(
                 reap_svc.BuyerContact(email=stored_email, shipping_address=dict(stored_address)))
     # The same purchasability gate as the Reap route (dark unless enforced; fails closed).

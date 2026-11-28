@@ -4,7 +4,7 @@ The owner's decision: the partner agent sends the buyer's shipping address; when
 asks the buyer for it. Three readers share these rules, so they cannot come to disagree:
 
   the door      routes/agent_commerce_purchases (POST on the A2A rail): email and address are OPTIONAL while
-                capture is on; one that is given is validated here (the Reap rules, plus the US rules below).
+                capture is on; one that is given is validated here (the Reap rules and the length caps).
   the write     routes/agent_internal_commerce_purchases (`POST .../{id}/shipping-address`): the gateway's
                 buyer form, validated field by field (`field_errors`).
   the worker    services/payment_orchestration/a2a_rail_worker._opened: a checkout-path row with a field
@@ -184,9 +184,10 @@ def fields_missing(buyer_email: Any, shipping_address: Any) -> List[str]:
 
 
 def door_address(raw: Mapping[str, Any]) -> Dict[str, str]:
-    """The door's address on the A2A rail with capture on: the Reap rules (reap_svc._validated_buyer's address
-    half: printable text, the required fields), the country upper-cased. Nothing else: a region or postcode is
-    the buyer's as written. Raises `PurchaseRefused("invalid_address", <field names only>)`."""
+    """The door's address on the A2A rail, capture on or off: the Reap rules (reap_svc._validated_buyer's address
+    half: printable text, the required fields), the write's length caps (`MAX_LENGTH`), the country upper-cased.
+    Nothing else: a region or postcode is the buyer's as written. Raises `PurchaseRefused("invalid_address",
+    <field names only>)`."""
     cleaned = {key: reap_svc._clean_buyer_text(value) for key, value in dict(raw).items()}
     if not all(reap_svc._is_clean(value) for value in cleaned.values()):
         raise reap_svc.PurchaseRefused("invalid_address", "shipping address contains characters that are not printable")
@@ -197,6 +198,10 @@ def door_address(raw: Mapping[str, Any]) -> Dict[str, str]:
     if not shipping:
         raise reap_svc.PurchaseRefused("invalid_address", "a shipping address is required")
     shipping = dict(shipping)
+    too_long = sorted(key for key, value in shipping.items() if len(value) > MAX_LENGTH.get(key, 0))
+    if too_long:
+        # The write's caps (`read_submission`), so the door stores nothing the write would refuse.
+        raise reap_svc.PurchaseRefused("invalid_address", "shipping address fields too long: " + ",".join(too_long))
     shipping["country"] = shipping["country"].upper()
     return shipping
 
