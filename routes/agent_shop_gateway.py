@@ -7233,15 +7233,26 @@ async def _handle_offers_resolve(
     # request's own reads already named, so the shadow's resolved-group gate costs no query.
     _group_flag = _group_seed_siblings_mode()
     _shadow_cks: set = set()
+    # The group's resolution as read here, for the catalog arm's resolved-only mode to reuse (same
+    # aliases: this lane runs only without a merchant scope, the one case the arm adds a listing key).
+    # Read FIRST and kept even when the seed read after it fails; when the resolution read itself
+    # failed, `_group_read_failed` tells the arm not to spend a second budget reading it again.
+    _group_read: Optional[Dict[str, Any]] = None
+    _group_read_failed = False
     if _group_flag == "on" and not merchant_scope:
         sibling_started = time.perf_counter()
         sibling_deadline = sibling_started + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS
+        _group_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         try:
+            _group_read_failed = True
+            _group_read = await _read_resolved_members(database, aliases=_group_aliases, deadline=sibling_deadline)
+            _group_read_failed = False
             group = await _fetch_resolved_group(
                 database,
-                aliases=[a for a in (product_id_aliases + sku_id_aliases) if a],
+                aliases=_group_aliases,
                 market_hint=market_hint,
                 deadline=sibling_deadline,
+                resolution=_group_read,
             )
             _group_mode = len(group["resolved"]) >= 2
             if _group_mode:
@@ -7341,6 +7352,7 @@ async def _handle_offers_resolve(
     # not a duplicate. So the key is the DESTINATION HOST, not the product: same host means we
     # would send the buyer to the same place twice.
     catalog_started = time.perf_counter()
+    _arm_shadow_snap: Optional[Dict[str, Any]] = None
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         # THE LISTING A MERCHANT-SCOPED CALL NAMES. Search hands out `canonical_product_ref` as
@@ -7366,6 +7378,39 @@ async def _handle_offers_resolve(
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
+        # RESOLVED SIBLINGS ONLY (OFFERS_CATALOG_ARM_RESOLVED_ONLY, ADR-032 M11 item 1): the listings
+        # the call named plus the RESOLVED members of their content_key. `on` reads the resolution
+        # here (inherent: the statement binds it); an unread one is an empty set = fail closed to the
+        # named listings. `shadow` reads NOTHING on the request path: the statement is the off one,
+        # and the count runs after the response (`_schedule_catalog_arm_shadow`, at the return).
+        _arm_mode = _catalog_arm_resolved_only_mode()
+        _arm_resolved: Optional[set] = None
+        _arm_note: Dict[str, Any] = {}
+        _arm_active = _arm_mode != "off" and bool(ident_aliases) and not cohort_a_exact_referrals
+        if _arm_active:
+            _arm_note["resolved_only"] = _arm_mode
+        if _arm_active and _arm_mode == "on":
+            try:
+                read = _group_read
+                if read is None:
+                    if _group_read_failed:
+                        # The group lane's read of this same resolution failed: no second budget.
+                        raise RuntimeError("group lane resolution read failed")
+                    read = await _read_resolved_members(
+                        database, aliases=ident_aliases,
+                        deadline=time.perf_counter() + OFFERS_CATALOG_ARM_RESOLUTION_BUDGET_SECONDS,
+                    )
+                _arm_resolved = {str(m.get("product_key")) for m in read["resolved"]}
+                _arm_note["resolved"] = len(_arm_resolved)
+                if read.get("proposals_unread"):
+                    _arm_note["resolution"] = "proposals_unread"
+                if _group_flag == "shadow":
+                    _shadow_cks.update(str(m.get("content_key") or "") for m in read["members"])
+            except Exception as e:  # noqa: BLE001 -- unread resolution: the named listings only
+                logger.info("offers.resolve.catalog_offers.resolution_unread", extra={"error": type(e).__name__})
+                _arm_resolved = set()
+                _arm_note["resolution"] = "unread"
+        _arm_resolved_only = _arm_resolved is not None  # only `on` reads a resolution here
         if cohort_a_exact_referrals:
             # The product-grain statement can rank another shade before the caller's limit.
             catalog_rows = await exact_retailer_shades.read_offers(
@@ -7379,17 +7424,27 @@ async def _handle_offers_resolve(
                 database.fetch_all(
                     # The statement text is built by `_catalog_offers_statement`, which the group
                     # shadow (`_group_shadow_answer`) sends too: one statement, never two copies.
-                    _catalog_offers_statement(_price_select, _price_order),
+                    _catalog_offers_statement(_price_select, _price_order, resolved_only=_arm_resolved_only),
                     {"aliases": ident_aliases, "limit": max(limit, 1),
                      "market": market_hint,
                      "buyer_currency": _declared_buyer_currency(market_hint),
                      "unavailable": _catalog_unavailable_spellings(),
+                     # An empty list matches nothing (Postgres takes `= ANY` of an empty text[] bind).
+                     **({"resolved_keys": sorted(_arm_resolved)} if _arm_resolved_only else {}),
                      **_price_params},
                 ),
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
             )
             if _group_flag == "shadow":
                 _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
+            # SHADOW: what the off statement read, for the count after the response. The statement's
+            # rows only: the exact-shade rows merged below serve whatever the flag says.
+            if _arm_active and _arm_mode == "shadow" and catalog_rows:
+                _arm_shadow_snap = {
+                    "product_id": product_id, "sku_id": sku_id, "market": market_hint,
+                    "aliases": list(ident_aliases),
+                    "row_keys": [str(_row_to_dict(row).get("product_key") or "") for row in catalog_rows],
+                }
         if exact_retailer_cohort is not None and not cohort_a_exact_referrals:
             try:
                 exact_rows = await exact_retailer_shades.read_offers(
@@ -7511,9 +7566,10 @@ async def _handle_offers_resolve(
             # `row_count` is what the QUERY found; `emitted` is what this arm actually
             # appended. Reporting only the former let a fully-truncated arm read as
             # "ok, row_count=1" while the buyer saw nothing from it.
-            extra={k: v for k, v in
-                   (("unattributed", unattributed), ("deduped", deduped),
-                    ("emitted", len(catalog_rows or []) - deduped)) if v} or None,
+            extra={**{k: v for k, v in
+                      (("unattributed", unattributed), ("deduped", deduped),
+                       ("emitted", len(catalog_rows or []) - deduped)) if v},
+                   **_arm_note} or None,
         )
     except Exception as e:
         logger.info("offers.resolve.catalog_offers.failed", extra={"error": str(e)})
@@ -7913,6 +7969,10 @@ async def _handle_offers_resolve(
             external=external_offers,
             considered_seed_ids=_considered_seed_ids,
         )
+    # CATALOG ARM SHADOW (OFFERS_CATALOG_ARM_RESOLVED_ONLY=shadow): the same deal -- the response is the
+    # off answer, untouched; this only schedules the count, which runs after it has been sent.
+    if _arm_shadow_snap is not None:
+        _schedule_catalog_arm_shadow(background_tasks, _arm_shadow_snap)
     return _response
 
 
@@ -10406,20 +10466,13 @@ def _seed_row_host(row: Dict[str, Any]) -> str:
     )
 
 
-async def _fetch_resolved_group(
-    db: Any,
-    *,
-    aliases: List[str],
-    market_hint: Optional[str],
-    deadline: float,
-) -> Dict[str, Any]:
-    """{members, resolved, matched_offers, matched_seeds, rows}: the caller's content_key group, its
-    RESOLVED members, the catalog offers and seeds their matcher verdicts matched, and the
-    active seeds of those members (the seed lane's three joins -- `source_ref`, `source_product_id`
-    = `external_product_id`, `attached_product_key` -- plus its status, quarantine and, as the
-    identity and fuzzy fallbacks do, the buyer market's serving currency: a caller with no market is
-    a US buyer, and a seed it never named must not set its currency)."""
-    out: Dict[str, Any] = {"members": [], "resolved": [], "rows": [], "matched_offers": set(), "matched_seeds": {}}
+async def _read_resolved_members(db: Any, *, aliases: List[str], deadline: float) -> Dict[str, Any]:
+    """{members, resolved, matched_offers, matched_seeds}: the listings on the caller's content_key(s)
+    (each with `is_anchor`: the call named it by signature or product_key) and the RESOLVED ones among
+    them (`_resolved_group_members`). The two reads the sibling lane and the catalog arm's
+    resolved-only mode share. A failed listings read raises; a failed proposals read is "no engine
+    evidence", so nothing beyond the named listings resolves."""
+    out: Dict[str, Any] = {"members": [], "resolved": [], "matched_offers": set(), "matched_seeds": {}}
     if not aliases:
         return out
     cap = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
@@ -10488,8 +10541,34 @@ async def _fetch_resolved_group(
     except Exception as e:  # noqa: BLE001 -- no engine evidence read is "not engine-resolved"
         logger.info("offers.resolve.group_siblings.proposals_unread", extra={"error": type(e).__name__})
         proposals = []
-    resolved, out["matched_offers"], out["matched_seeds"] = _resolved_group_members(members, proposals)
-    out["resolved"] = resolved
+        # Said, not just logged: "nothing resolved" here is no judgement, and a count built on it
+        # (the catalog arm's shadow) would read as one.
+        out["proposals_unread"] = True
+    out["resolved"], out["matched_offers"], out["matched_seeds"] = _resolved_group_members(members, proposals)
+    return out
+
+
+async def _fetch_resolved_group(
+    db: Any,
+    *,
+    aliases: List[str],
+    market_hint: Optional[str],
+    deadline: float,
+    resolution: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """{members, resolved, matched_offers, matched_seeds, rows}: the caller's content_key group, its
+    RESOLVED members, the catalog offers and seeds their matcher verdicts matched, and the
+    active seeds of those members (the seed lane's three joins -- `source_ref`, `source_product_id`
+    = `external_product_id`, `attached_product_key` -- plus its status, quarantine and, as the
+    identity and fuzzy fallbacks do, the buyer market's serving currency: a caller with no market is
+    a US buyer, and a seed it never named must not set its currency)."""
+    # `resolution`: `_read_resolved_members` already run for these aliases (the handler keeps it, so a
+    # failed seed read below still leaves the catalog arm a resolution it need not read again).
+    if resolution is None:
+        resolution = await _read_resolved_members(db, aliases=aliases, deadline=deadline)
+    out: Dict[str, Any] = {**resolution, "rows": []}
+    resolved = out["resolved"]
+    cap = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
     serving_currency = seed_serving_currency(market_hint)
     if len(resolved) < 2 or serving_currency is None:
         return out
@@ -10720,9 +10799,77 @@ async def _merchant_scoped_listing_product_key(db: Any, *, merchant_id: str, ali
     return keys[0] if len(rows or []) == 1 and len(keys) == 1 else None
 
 
-def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
+# ── offers.resolve: the catalog arm serves RESOLVED siblings only (ADR-032 M11 item 1) ──────────
+#
+# OFF by default. Read per request, so it flips without a restart. With it off the arm sends the
+# statement it always has, byte for byte: a listing id widens to EVERY listing sharing its content_key,
+# and a bare content_key reaches every listing on it. A content_key is sha(brand::title::gtin) and
+# proves nothing about size or shade (see the RESOLVED group notes above), so that widening can serve
+# another seller's 30 ml beside the 50 ml the caller named, with no identity check at all.
+#
+#   on     -- the arm serves the listing(s) the call NAMED (a signature or product_key, as the sibling
+#             lane's `is_anchor` reads them) plus only the RESOLVED members of their content_key, by the
+#             sibling lane's own rule (`_resolved_group_members`): an applied cross_merchant_same_size
+#             move with a valid matcher verdict, one size per key, and a named listing that is itself
+#             resolved. A bare content_key names no listing: its resolved members only. When the
+#             resolution cannot be read, it FAILS CLOSED to the named listings.
+#   shadow -- the answer is the OFF answer; the source entry counts the rows `on` would withhold.
+#   off    -- unset, 0 / false / no / off, and ANY other value.
+OFFERS_CATALOG_ARM_RESOLVED_ONLY_ENV = "OFFERS_CATALOG_ARM_RESOLVED_ONLY"
+# The resolution's two reads (the key's listings, then the engine's applied moves) share this budget.
+OFFERS_CATALOG_ARM_RESOLUTION_BUDGET_SECONDS = 1.0
+
+
+def _catalog_arm_resolved_only_mode() -> str:
+    """"off" | "on" | "shadow", read per request, spelled as `_group_seed_siblings_mode` reads them."""
+    raw = (os.getenv(OFFERS_CATALOG_ARM_RESOLVED_ONLY_ENV) or "").strip().lower()
+    if raw == "shadow":
+        return "shadow"
+    if raw in {"1", "true", "yes", "on"}:
+        return "on"
+    return "off"
+
+
+# The listings the arm reads offers from. WIDENED is the text the arm has always sent (flag off).
+# RESOLVED_ONLY names the call's own listings and the resolved members passed in `:resolved_keys`;
+# it matches no content_key, so neither a listing id nor a bare content_key widens by key alone.
+_CATALOG_ARM_LISTINGS_WIDENED = """
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.content_key = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
+                           -- widens to every listing sharing its content_key, so asking by
+                           -- ANY seller's listing returns every seller of the product — the
+                           -- same set a `ck_` id already returns. Without this the second
+                           -- retailer is reachable only by a content_key that search, the PDP
+                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
+                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
+                           -- The anchor must itself be live: a withdrawn listing id answers
+                           -- nothing, exactly as it did before this widening.
+                           UNION
+                           SELECT s.product_key
+                             FROM catalog_products a
+                             JOIN catalog_products s ON s.content_key = a.content_key
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)"""
+_CATALOG_ARM_LISTINGS_RESOLVED_ONLY = """
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                               OR d.product_key = ANY(:resolved_keys))"""
+
+
+def _catalog_offers_statement(_price_select: str, _price_order: str, *, resolved_only: bool = False) -> str:
     """The catalog arm's statement (see CATALOG OFFERS in `_handle_offers_resolve`), byte for byte as
-    the handler sent it inline before it moved here. `_price_select` / `_price_order` are the
+    the handler sent it inline before it moved here.
+
+    `resolved_only` (OFFERS_CATALOG_ARM_RESOLVED_ONLY=on) swaps ONLY the listing subquery for
+    `_CATALOG_ARM_LISTINGS_RESOLVED_ONLY`, which binds `:resolved_keys` too; False sends the text above
+    unchanged, so the flag-off statement and its Query Insights digest stay what they were. `_price_select` / `_price_order` are the
     `_catalog_price_freshness_sql` fragments in a merged group, empty otherwise (plus the
     `o.sku_key` column the handler appends in a group). Shared with the group shadow
     (`_group_shadow_answer`) so the shadow reads exactly the rows group mode would.
@@ -10741,6 +10888,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
         "o", "o.product_key", prefix="\n                       "
     )
     exact_only_listing_keys = ", ".join(f"'{key}'" for key in sorted(EXACT_ONLY_LISTING_KEYS))
+    _listings = _CATALOG_ARM_LISTINGS_RESOLVED_ONLY if resolved_only else _CATALOG_ARM_LISTINGS_WIDENED
     return f"""
                     SELECT ranked.* FROM (
                     SELECT twins.*,
@@ -10805,29 +10953,7 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
                       FROM catalog_products p
                       JOIN catalog_offers o ON o.product_key = p.product_key
                       LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
-                     WHERE p.product_key IN (
-                           SELECT d.product_key FROM catalog_products d
-                            WHERE d.pivota_signature_id = ANY(:aliases)
-                               OR d.content_key = ANY(:aliases)
-                               OR d.product_key = ANY(:aliases)
-                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
-                           -- widens to every listing sharing its content_key, so asking by
-                           -- ANY seller's listing returns every seller of the product — the
-                           -- same set a `ck_` id already returns. Without this the second
-                           -- retailer is reachable only by a content_key that search, the PDP
-                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
-                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
-                           -- The anchor must itself be live: a withdrawn listing id answers
-                           -- nothing, exactly as it did before this widening.
-                           UNION
-                           SELECT s.product_key
-                             FROM catalog_products a
-                             JOIN catalog_products s ON s.content_key = a.content_key
-                            WHERE (a.pivota_signature_id = ANY(:aliases)
-                                   OR a.product_key = ANY(:aliases))
-                              AND a.content_key IS NOT NULL
-                              AND a.suppressed_at IS NULL
-                              AND a.suppression_reason IS NULL)
+                     WHERE p.product_key IN ({_listings}
                        -- The PRODUCT's own suppression, not just the offer's. Every serving
                        -- read in services/pivot_query_service.py applies this pair, and
                        -- scripts/withdraw_catalog_rows.py takes a product down by setting
@@ -11682,6 +11808,8 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
         price_select, price_order, price_params = _catalog_price_freshness_fragments(present)
         record["price_column"] = present
         price_select += "\n                           o.sku_key AS sku_key,"
+        # The WIDENED statement whatever OFFERS_CATALOG_ARM_RESOLVED_ONLY says: this line measures group
+        # mode over the arm as it is off, so read its numbers as arm-off.
         rows = await reader.fetch_all(
             _catalog_offers_statement(price_select, price_order),
             {"aliases": snap["aliases"], "limit": max(snap["limit"], 1),
@@ -11754,6 +11882,15 @@ def _group_shadow_task_done(task: "asyncio.Task[Any]", state: Dict[str, Any]) ->
 async def _run_group_shadow(snap: Dict[str, Any]) -> None:
     """The BackgroundTasks callable. SPAWNS the shadow and returns at once -- it never awaits it, so
     the next request on this keep-alive connection is not held behind it. Never raises."""
+    _spawn_shadow(snap, task_fn=_group_shadow_task, budget_fn=_group_shadow_budget_spent,
+                  budget_seconds=OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS)
+
+
+def _spawn_shadow(snap: Dict[str, Any], *, task_fn: Any, budget_fn: Any, budget_seconds: float) -> None:
+    """Spawn one detached shadow (`task_fn(snap, state)`) under the shadows' shared limits: the
+    in-flight cap and the pool reserve (both SKIP, never wait), a FRESH Context (its own pool
+    connection), and a budget timer that calls `budget_fn(task, snap, state)`. Shared by the group
+    shadow and the catalog arm's shadow, so the two together never hold more than the cap. Never raises."""
     try:
         if len(_GROUP_SHADOW_IN_FLIGHT) >= OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT:
             _group_shadow_skip("cap")
@@ -11779,13 +11916,11 @@ async def _run_group_shadow(snap: Dict[str, Any]) -> None:
         state: Dict[str, Any] = {"started": time.perf_counter(), "record": {}, "done": False, "timer": None}
         # A FRESH Context: `databases` 0.7 keeps the task's connection in a ContextVar, and a task
         # created the usual way copies the caller's context -- i.e. the request's connection.
-        task = loop.create_task(_group_shadow_task(snap, state), context=contextvars.Context())
+        task = loop.create_task(task_fn(snap, state), context=contextvars.Context())
         _GROUP_SHADOW_IN_FLIGHT.add(task)
         # The done callback FIRST: whatever happens below, the task leaves the in-flight set when done.
         task.add_done_callback(lambda t: _group_shadow_task_done(t, state))
-        state["timer"] = loop.call_later(
-            OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS, _group_shadow_budget_spent, task, snap, state,
-        )
+        state["timer"] = loop.call_later(budget_seconds, budget_fn, task, snap, state)
     except Exception:  # noqa: BLE001
         pass
 
@@ -11832,6 +11967,120 @@ def _schedule_group_shadow(
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+# ── CATALOG ARM SHADOW: OFFERS_CATALOG_ARM_RESOLVED_ONLY=shadow ───────────────────────────────────
+#
+# WHAT IT ANSWERS. Before the arm serves resolved siblings only, how many catalog offers -- and on how
+# many listings -- would `on` withhold from what the off statement served? Shadow serves the OFF
+# answer, sends no extra query on the request path, and logs ONE line (`offers_catalog_arm_shadow`,
+# WARNING, `utils.logger`) per request whose off statement read any row.
+#
+# WHAT IT RUNS: the group shadow's machinery (`_spawn_shadow`): a detached task in a fresh Context
+# under the shared in-flight cap and pool reserve, every statement through `_GroupShadowReader` in ONE
+# READ ONLY transaction, bounded by OFFERS_CATALOG_ARM_SHADOW_BUDGET_SECONDS (`budget_exceeded`). Its
+# reads are exactly `on`'s inputs: the listings the call NAMES, by every alias (as the resolved-only
+# statement names them: signature or product_key, whatever their content_key), and the resolution
+# (`_read_resolved_members`). A row is withheld when its listing is neither. When the engine's moves
+# cannot be read, the line says `resolution: proposals_unread` and counts nothing.
+OFFERS_CATALOG_ARM_SHADOW_EVENT = "offers_catalog_arm_shadow"
+OFFERS_CATALOG_ARM_SHADOW_BUDGET_SECONDS = 1.0
+# The resolved-only statement's own-listing match, as one read (a handful of aliases; bounded anyway).
+_CATALOG_ARM_NAMED_LISTINGS_SQL = """
+    SELECT d.product_key FROM catalog_products d
+     WHERE d.pivota_signature_id = ANY(:aliases)
+        OR d.product_key = ANY(:aliases)
+     LIMIT 200
+"""
+
+
+def _schedule_catalog_arm_shadow(background_tasks: Optional[BackgroundTasks], snap: Dict[str, Any]) -> bool:
+    """On the request path: hand `_run_catalog_arm_shadow` the snapshot. No I/O. Never raises. True when
+    a task was scheduled. Our own eval traffic schedules none (as the group shadow)."""
+    try:
+        if background_tasks is None or is_synthetic_call():
+            return False
+        background_tasks.add_task(_run_catalog_arm_shadow, dict(snap))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _run_catalog_arm_shadow(snap: Dict[str, Any]) -> None:
+    """The BackgroundTasks callable: SPAWNS the shadow and returns at once. Never raises."""
+    _spawn_shadow(snap, task_fn=_catalog_arm_shadow_task, budget_fn=_catalog_arm_shadow_budget_spent,
+                  budget_seconds=OFFERS_CATALOG_ARM_SHADOW_BUDGET_SECONDS)
+
+
+def _catalog_arm_shadow_count(row_keys: List[str], named: set, read: Dict[str, Any]) -> Dict[str, Any]:
+    """PURE: what `on` would withhold of the rows the off statement served."""
+    resolved = {str(m.get("product_key")) for m in read.get("resolved") or []}
+    out: Dict[str, Any] = {"rows": len(row_keys), "named": len(named), "resolved": len(resolved)}
+    if read.get("proposals_unread"):
+        out["resolution"] = "proposals_unread"
+        return out
+    withheld = [pk for pk in row_keys if pk not in named and pk not in resolved]
+    out["would_withhold"] = len(withheld)
+    out["would_withhold_listings"] = len(set(withheld))
+    return out
+
+
+async def _catalog_arm_shadow_answer(snap: Dict[str, Any], *, deadline: float, record: Dict[str, Any]) -> None:
+    """The shadow's two reads and its count, filling `record`. Raises on any failure; the task turns
+    that into the line's `error`."""
+    from db.database import database
+
+    is_pg = str(getattr(database, "url", "")).lower().startswith(("postgresql://", "postgres://"))
+    reader = _GroupShadowReader(database, deadline=deadline, is_pg=is_pg)
+    record["_reader"] = reader
+    async with _group_shadow_transaction(database, is_pg):
+        named_rows = await reader.fetch_all(_CATALOG_ARM_NAMED_LISTINGS_SQL, {"aliases": snap["aliases"]})
+        read = await _read_resolved_members(reader, aliases=snap["aliases"], deadline=deadline)
+    named = {str(_row_to_dict(r).get("product_key") or "") for r in named_rows or []} - {""}
+    record.update(_catalog_arm_shadow_count(list(snap["row_keys"]), named, read))
+
+
+def _catalog_arm_shadow_emit(snap: Dict[str, Any], state: Dict[str, Any], error: Optional[str]) -> None:
+    """The ONE line of a catalog arm shadow. Never raises."""
+    record = dict(state["record"])
+    reader = record.pop("_reader", None)
+    _pivota_warning_line(OFFERS_CATALOG_ARM_SHADOW_EVENT, {
+        "product_id": snap.get("product_id"),
+        "sku_id": snap.get("sku_id"),
+        "market": snap.get("market"),
+        **record,
+        "shadow_ms": int((time.perf_counter() - state["started"]) * 1000),
+        "shadow_db_ms": int((reader.db_seconds if reader else 0.0) * 1000),
+        "shadow_statements": reader.statements if reader else 0,
+        **({"error": error} if error else {}),
+    })
+
+
+async def _catalog_arm_shadow_task(snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The detached shadow. Logs one line, and none once the budget timer has spoken."""
+    error: Optional[str] = None
+    try:
+        await _catalog_arm_shadow_answer(
+            snap, deadline=state["started"] + OFFERS_CATALOG_ARM_SHADOW_BUDGET_SECONDS, record=state["record"],
+        )
+    except asyncio.CancelledError:
+        state["done"] = True  # the budget timer (which has logged) or shutdown: unwind, say nothing
+        raise
+    except Exception as exc:  # noqa: BLE001 -- swallowed: the shadow never reaches the response
+        error = f"{type(exc).__name__}: {str(exc)[:200]}"
+    if state["done"]:
+        return
+    state["done"] = True
+    _catalog_arm_shadow_emit(snap, state, error)
+
+
+def _catalog_arm_shadow_budget_spent(task: "asyncio.Task[Any]", snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The budget timer: log `budget_exceeded` now and cancel the task (it stays in flight until unwound)."""
+    if state["done"] or task.done():
+        return
+    state["done"] = True
+    _catalog_arm_shadow_emit(snap, state, "budget_exceeded")
+    task.cancel()
 
 
 def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
