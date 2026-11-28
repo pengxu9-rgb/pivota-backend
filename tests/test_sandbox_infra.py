@@ -2235,7 +2235,7 @@ def test_a_symlinked_local_config_is_judged_by_its_target(tmp_path, target_mode,
 EXPORT_IMG = "us-west1-docker.pkg.dev/pivota-shared/pivota/backend@sha256:" + "e" * 64
 
 
-def _export_run(tmp_path, fail_on=(), apply=True, img=EXPORT_IMG, version="7", executions=""):
+def _export_run(tmp_path, fail_on=(), apply=True, img=EXPORT_IMG, version="7", executions="", extra_env=None):
     log = tmp_path / "calls.jsonl"
     fake = tmp_path / "gcloud"
     fake.write_text(f"""#!{sys.executable}
@@ -2247,7 +2247,7 @@ if "executions" in a and "list" in a:
 sys.exit(1 if any(f in a for f in {list(fail_on)!r}) else 0)
 """)
     fake.chmod(0o755)
-    env = {**os.environ, "GCLOUD": str(fake)}
+    env = {**os.environ, "GCLOUD": str(fake), **(extra_env or {})}
     env.pop("APPLY", None)
     if apply:
         env["APPLY"] = "1"
@@ -2272,7 +2272,7 @@ def _export_verbs(calls):
 
 @pytest.mark.parametrize("fail_on,want,rc", [
     ((), ["grant", "deploy", "execute", "ungrant", "delete-job"], 0),
-    (("execute",), ["grant", "deploy", "execute", "list", "ungrant", "delete-job"], 1),
+    (("execute",), ["grant", "deploy", "execute", "ungrant", "list", "delete-job"], 1),
     (("deploy",), ["grant", "deploy", "ungrant", "delete-job"], 1),
     (("add-iam-policy-binding",), ["grant", "ungrant"], 1),
 ])
@@ -2298,12 +2298,29 @@ def test_export_job_is_exactly_the_reviewed_run(tmp_path):
     assert arg(deploy, "--image") == EXPORT_IMG
     assert arg(deploy, "--service-account") == "sa-sandbox-export@pivota-prod.iam.gserviceaccount.com"
     assert arg(deploy, "--set-secrets") == "DATABASE_URL=CATALOG_EXPORT_DATABASE_URL:7"  # the number, never latest
-    assert arg(deploy, "--set-env-vars") == "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://pivota-sandbox-catalog-drop/catalog"
+    assert arg(deploy, "--set-env-vars") == ("PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://pivota-sandbox-catalog-drop/catalog,"
+                                             "CATALOG_EXPORT_DEADLINE_SECONDS=4500,CATALOG_EXPORT_STATEMENT_TIMEOUT=30min")
     assert arg(deploy, "--command") == "python" and "--args=-m,jobs.sandbox_catalog_copy,export" in deploy
-    assert arg(deploy, "--max-retries") == "0" and arg(deploy, "--task-timeout") == "3600s"
+    assert arg(deploy, "--max-retries") == "0" and arg(deploy, "--task-timeout") == "5400s"
     assert arg(deploy, "--vpc-egress") == "all-traffic"
     assert execute[:4] == ["run", "jobs", "execute", "sandbox-catalog-export"] and "--wait" in execute
     assert delete[:4] == ["run", "jobs", "delete", "sandbox-catalog-export"]
+
+
+def test_export_limits_the_script_sets_parse_and_the_task_outlives_the_deadline(tmp_path):
+    """The env the job gets must pass the job's own parser (else the run refuses at start), and Cloud
+    Run's task timeout must exceed the export's deadline, so a slow run ends in the export's own
+    refusal (which aborts every upload) rather than a killed task."""
+    from jobs.sandbox_catalog_copy import export_limits_from_env
+
+    res, calls = _export_run(tmp_path)
+    deploy = [c for c in calls if "deploy" in c][0]
+    env = dict(kv.split("=", 1) for kv in deploy[deploy.index("--set-env-vars") + 1].split(","))
+    limits = export_limits_from_env(env)
+    assert limits == {"deadline_seconds": 4500, "statement_timeout": "30min"}
+    task = deploy[deploy.index("--task-timeout") + 1]
+    assert task.endswith("s") and int(task[:-1]) >= limits["deadline_seconds"] + 10 * 60
+    assert limits["deadline_seconds"] >= 3755  # the 11-27 sizing's plan
 
 
 @pytest.mark.parametrize("fail_on,needle", [
@@ -2344,12 +2361,13 @@ def test_export_wants_an_image_by_digest_and_a_version_number(tmp_path, img, ver
 
 
 
-def test_export_a_failed_execute_cancels_this_jobs_executions_before_the_delete(tmp_path):
+def test_export_a_failed_execute_removes_the_grant_then_cancels_this_jobs_executions_before_the_delete(tmp_path):
     res, calls = _export_run(tmp_path, fail_on=("execute",), executions="sandbox-catalog-export-abc12")
     assert res.returncode == 1
-    assert _export_verbs(calls) == ["grant", "deploy", "execute", "list", "cancel", "ungrant", "delete-job"]
+    assert _export_verbs(calls) == ["grant", "deploy", "execute", "ungrant", "list", "cancel", "delete-job"]
     cancel = [c for c in calls if "cancel" in c][0]
     assert cancel[:5] == ["run", "jobs", "executions", "cancel", "sandbox-catalog-export-abc12"]
+    assert "--async" in cancel  # ask for the cancel, don't wait on it before the delete
     listing = [c for c in calls if "list" in c][0]
     assert "--job" in listing and listing[listing.index("--job") + 1] == "sandbox-catalog-export"
 
@@ -2357,6 +2375,29 @@ def test_export_a_failed_execute_cancels_this_jobs_executions_before_the_delete(
 def test_export_a_good_run_cancels_nothing(tmp_path):
     res, calls = _export_run(tmp_path, executions="sandbox-catalog-export-abc12")
     assert res.returncode == 0 and "list" not in _export_verbs(calls) and "cancel" not in _export_verbs(calls)
+
+
+# bash imports an exported function, which shadows the builtin: this `echo` fails on the line the
+# script prints right after the execute, so the run fails (set -e) with the execute already started.
+_FAIL_AFTER_EXECUTE = {"BASH_FUNC_echo%%": '() { case "$*" in *"export executed"*) return 1;; esac; builtin echo "$@"; }'}
+
+
+def test_export_a_dry_run_that_fails_after_the_execute_reads_nothing_on_prod(tmp_path):
+    res, calls = _export_run(tmp_path, apply=False, executions="sandbox-catalog-export-abc12",
+                             extra_env=_FAIL_AFTER_EXECUTE)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert calls == []  # not even the executions listing reaches gcloud
+    out = res.stdout + res.stderr
+    order = [out.index(s) for s in ("run jobs execute sandbox-catalog-export", "secrets remove-iam-policy-binding",
+                                     "run jobs executions list --job sandbox-catalog-export",
+                                     "run jobs delete sandbox-catalog-export")]
+    assert order == sorted(order), out
+
+
+def test_export_the_same_failure_applied_cancels_after_removing_the_grant(tmp_path):
+    res, calls = _export_run(tmp_path, executions="sandbox-catalog-export-abc12", extra_env=_FAIL_AFTER_EXECUTE)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert _export_verbs(calls) == ["grant", "deploy", "execute", "ungrant", "list", "cancel", "delete-job"]
 
 
 def _interrupt_twice(tmp_path, script, args):
@@ -2405,7 +2446,7 @@ def test_export_a_second_interrupt_during_cleanup_does_not_skip_it(tmp_path):
     rc, calls, err = _interrupt_twice(tmp_path, "catalog_export_prod.sh", [EXPORT_IMG, "7"])
     assert rc == 130, err
     done = [c for c in calls if c and c[0] not in ("started", "removing")]
-    assert _export_verbs(done)[-4:] == ["list", "cancel", "ungrant", "delete-job"], done
+    assert _export_verbs(done)[-4:] == ["ungrant", "list", "cancel", "delete-job"], done
     assert "STILL ON" not in err
 
 

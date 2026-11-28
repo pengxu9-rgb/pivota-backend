@@ -21,6 +21,13 @@ set -euo pipefail
 PROD=pivota-prod
 SECRET=CATALOG_EXPORT_DATABASE_URL
 JOB=sandbox-catalog-export
+# Prod's size (the 11-27 sizing: 49 tables, ~6.3 GB of CSV, an estimated 35 min of scrub; the largest
+# table alone an estimated 17.9 min). The export's own deadline is 75 min (the plan needs 63), each
+# statement (one table's COPY) may take 30 min (1.5 x the largest), and the Cloud Run task outlives
+# the deadline by 15 min so the export, not Cloud Run, is what ends a slow run, and its refusal is logged.
+DEADLINE_SECONDS=4500
+STATEMENT_TIMEOUT=30min
+TASK_TIMEOUT=5400s
 IMG="${1:-}"
 VERSION="${2:-}"
 [[ "$IMG" =~ ^us-west1-docker\.pkg\.dev/pivota-shared/pivota/backend@sha256:[0-9a-f]{64}$ ]] \
@@ -34,19 +41,20 @@ else
   echo "dry run (APPLY=0): nothing will be changed in $PROD; mutating commands are printed only"
 fi
 
+# This job's executions, by name. A dry run deployed nothing, so it prints the listing instead of
+# reading prod (the dry-run guard covers this read too).
+job_executions(){
+  if [ "$APPLY" = 1 ]; then
+    "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
+      --format='value(metadata.name)' --quiet 2>/dev/null
+  else
+    run "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
+      --format='value(metadata.name)' --quiet
+  fi
+}
 cleanup(){
   local rc=$1 failed=0 name
-  if [ "$rc" != 0 ] && [ "${EXECUTE_STARTED:-0}" = 1 ]; then
-    # An interrupted or failed `execute --wait` can leave the execution RUNNING on prod (it keeps
-    # its mounted secret after the grant goes). This job exists only for this run, so every one of
-    # its executions is this run's: cancel them before the job is deleted. A finished one refuses
-    # the cancel, which is harmless.
-    for name in $("$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
-                    --format='value(metadata.name)' --quiet 2>/dev/null); do
-      run "$GCLOUD" run jobs executions cancel "$name" --project "$PROD" --region "$REGION" --quiet >/dev/null 2>&1 \
-        && echo "  cancelled execution $name" >&2 || echo "  execution $name: cancel refused (finished?)" >&2
-    done
-  fi
+  # The grant goes FIRST: nothing below may lengthen the time the export SA can read the secret.
   run "$GCLOUD" secrets remove-iam-policy-binding "$SECRET" --project "$PROD" \
     --member="serviceAccount:$PROD_EXPORT_SA" --role=roles/secretmanager.secretAccessor --quiet >/dev/null || {
     printf '\n!!! FAILED: could not remove %s access to %s in %s. The grant is STILL ON a prod secret.\n' \
@@ -55,6 +63,16 @@ cleanup(){
       "$SECRET" "$PROD" "$PROD_EXPORT_SA" >&2
     failed=1
   }
+  if [ "$rc" != 0 ] && [ "${EXECUTE_STARTED:-0}" = 1 ]; then
+    # An interrupted or failed `execute --wait` can leave the execution RUNNING on prod (it keeps
+    # the secret it already read after the grant goes). This job exists only for this run, so every
+    # one of its executions is this run's: cancel them (--async: ask, don't wait) before the job is
+    # deleted. A finished one refuses the cancel, which is harmless.
+    for name in $(job_executions); do
+      run "$GCLOUD" run jobs executions cancel "$name" --project "$PROD" --region "$REGION" --async --quiet >/dev/null 2>&1 \
+        && echo "  cancelled execution $name" >&2 || echo "  execution $name: cancel refused (finished?)" >&2
+    done
+  fi
   if [ "${JOB_DEPLOYED:-0}" = 1 ]; then
     run "$GCLOUD" run jobs delete "$JOB" --project "$PROD" --region "$REGION" --quiet >/dev/null || {
       printf '\n!!! FAILED: could not delete job %s in %s (it carries %s). Delete it by hand: gcloud run jobs delete %s --project %s --region %s\n\n' \
@@ -83,8 +101,8 @@ run "$GCLOUD" secrets add-iam-policy-binding "$SECRET" --project "$PROD" \
 JOB_DEPLOYED=1   # set before the deploy: a deploy that half-created the job is still deleted
 run "$GCLOUD" run jobs deploy "$JOB" --project "$PROD" --region "$REGION" --image "$IMG" \
   --service-account "$PROD_EXPORT_SA" \
-  --network default --subnet default --vpc-egress all-traffic --max-retries 0 --task-timeout 3600s \
-  --set-env-vars "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://$DROP_BUCKET/catalog" \
+  --network default --subnet default --vpc-egress all-traffic --max-retries 0 --task-timeout "$TASK_TIMEOUT" \
+  --set-env-vars "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://$DROP_BUCKET/catalog,CATALOG_EXPORT_DEADLINE_SECONDS=$DEADLINE_SECONDS,CATALOG_EXPORT_STATEMENT_TIMEOUT=$STATEMENT_TIMEOUT" \
   --set-secrets "DATABASE_URL=$SECRET:$VERSION" \
   --command python --args=-m,jobs.sandbox_catalog_copy,export --quiet
 EXECUTE_STARTED=1

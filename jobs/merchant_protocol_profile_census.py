@@ -124,6 +124,13 @@ totals, only when storing:
 `skipped` counts rows with no usable domain. The three outcome counts are of WRITTEN rows.
 Without `--store` every line this job prints is what it printed before the option existed.
 
+ON A SCHEDULE TOO (2026-11-28). Besides one-offs, `infra/gcp/setup_merchant_protocol_profile_census_job.sh`
+provisions this module as the Cloud Run Job `merchant-protocol-profile-census`, `--from-directory
+--store --deadline-seconds 690`, fired at 11:47 UTC on the 1st and 15th so a stored positive is never
+near its 30-day age. The job is dark (this module's gate false, trigger paused) until that script is
+run with `--enable`. Nothing in this module changes for it. Runbook:
+docs/runbooks/merchant_agent_checkout_facts.md.
+
 KNOWN LIMITS, deliberately left (review of 2026-11-10):
   * `--from-directory` is the raw content of the two tables, wider than the listed directory (no
     rig, quarantine or operator exclusion is applied); rows carry `d`, so the reader filters.

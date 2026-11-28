@@ -61,7 +61,7 @@ BACKEND_JOBS="external-referral-refresh external-seed-destination-sweep merchant
 tierb-cart-link-eligibility content-canonical-election
 agent-pdp-orphan-reaper derive-offer-market-currency audit-domainless-offer-currency
 store-audit-ucp-reprobe-enqueue store-audit-commerce-reprobe-enqueue brand-official-canonical-promote
-reviews-invitation-send retailer-ingest-drain"
+reviews-invitation-send retailer-ingest-drain merchant-protocol-profile-census"
 GATEWAY_JOBS="relgraph-sync relgraph-health external-seed-sentinel-nongrowth pdp-identity-graph-backfill
 pdp-live-read-promote store-audit-ucp-probe"
 # Rolled only when named and RETAILER_INGEST_DRAIN_WRITER=1.
