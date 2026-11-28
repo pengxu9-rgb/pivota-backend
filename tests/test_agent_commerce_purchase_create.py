@@ -122,6 +122,7 @@ def _no_network(monkeypatch):
 class Stubs:
     def __init__(self):
         self.catalog = []
+        self.catalog_currency = []  # the `market_currency` the A2A route priced the cart link in
         self.clicks = []
         self.reap = []
         self.reap_routing = []  # what the route left on request.state for the Reap route, per hand-over
@@ -133,8 +134,9 @@ class Stubs:
 def stubs(monkeypatch):
     s = Stubs()
 
-    async def _catalog(*, merchant_domain, product_key, variant_key, market_country):
+    async def _catalog(*, merchant_domain, product_key, variant_key, market_country, market_currency=None):
         s.catalog.append((merchant_domain, product_key, variant_key, market_country))
+        s.catalog_currency.append(market_currency)
         return dict(s.facts), "merch_obs_shop_a", VARIANT, "brand_official"
 
     async def _click(click):
