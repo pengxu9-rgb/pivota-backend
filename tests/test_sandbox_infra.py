@@ -2298,12 +2298,29 @@ def test_export_job_is_exactly_the_reviewed_run(tmp_path):
     assert arg(deploy, "--image") == EXPORT_IMG
     assert arg(deploy, "--service-account") == "sa-sandbox-export@pivota-prod.iam.gserviceaccount.com"
     assert arg(deploy, "--set-secrets") == "DATABASE_URL=CATALOG_EXPORT_DATABASE_URL:7"  # the number, never latest
-    assert arg(deploy, "--set-env-vars") == "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://pivota-sandbox-catalog-drop/catalog"
+    assert arg(deploy, "--set-env-vars") == ("PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://pivota-sandbox-catalog-drop/catalog,"
+                                             "CATALOG_EXPORT_DEADLINE_SECONDS=4500,CATALOG_EXPORT_STATEMENT_TIMEOUT=30min")
     assert arg(deploy, "--command") == "python" and "--args=-m,jobs.sandbox_catalog_copy,export" in deploy
-    assert arg(deploy, "--max-retries") == "0" and arg(deploy, "--task-timeout") == "3600s"
+    assert arg(deploy, "--max-retries") == "0" and arg(deploy, "--task-timeout") == "5400s"
     assert arg(deploy, "--vpc-egress") == "all-traffic"
     assert execute[:4] == ["run", "jobs", "execute", "sandbox-catalog-export"] and "--wait" in execute
     assert delete[:4] == ["run", "jobs", "delete", "sandbox-catalog-export"]
+
+
+def test_export_limits_the_script_sets_parse_and_the_task_outlives_the_deadline(tmp_path):
+    """The env the job gets must pass the job's own parser (else the run refuses at start), and Cloud
+    Run's task timeout must exceed the export's deadline, so a slow run ends in the export's own
+    refusal (which aborts every upload) rather than a killed task."""
+    from jobs.sandbox_catalog_copy import export_limits_from_env
+
+    res, calls = _export_run(tmp_path)
+    deploy = [c for c in calls if "deploy" in c][0]
+    env = dict(kv.split("=", 1) for kv in deploy[deploy.index("--set-env-vars") + 1].split(","))
+    limits = export_limits_from_env(env)
+    assert limits == {"deadline_seconds": 4500, "statement_timeout": "30min"}
+    task = deploy[deploy.index("--task-timeout") + 1]
+    assert task.endswith("s") and int(task[:-1]) >= limits["deadline_seconds"] + 10 * 60
+    assert limits["deadline_seconds"] >= 3755  # the 11-27 sizing's plan
 
 
 @pytest.mark.parametrize("fail_on,needle", [

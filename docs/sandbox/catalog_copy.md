@@ -167,13 +167,14 @@ limits, which end with it:
 
 | Setting | Default | Why |
 |---|---|---|
-| `statement_timeout` | 20min | bounds each table's COPY (and its count) |
+| `statement_timeout` | 20min (prod run: 30min, from `CATALOG_EXPORT_STATEMENT_TIMEOUT`) | bounds each table's COPY (and its count) |
 | `lock_timeout` | 5s | never queue behind a migration's `ACCESS EXCLUSIVE` request, which would stall every query queued behind it |
 | `idle_in_transaction_session_timeout` | 2min | a stalled job gives its snapshot back |
 | `client_connection_check_interval` (PG 14+) | 5s | a terminated session stops even inside a scan that sends nothing |
 | `application_name` | `sandbox_catalog_export` | visible in `pg_stat_activity` |
 
-A client-side deadline (45 min, at most 2 h) **terminates** the connection, which ends the session,
+A client-side deadline (45 min by default, at most 2 h; `CATALOG_EXPORT_DEADLINE_SECONDS` sets it, and the prod run script sets
+75 min with a 90 min Cloud Run task timeout, from the 11-27 sizing) **terminates** the connection, which ends the session,
 its transaction and its snapshot on the server at once. The deadline bounds the source, not the
 job: a block already being scrubbed in its worker thread runs to its end (one COPY chunk's records,
 at most one 256 MiB record), is dropped unwritten, and then the job refuses. A limit reached on the server is a refusal

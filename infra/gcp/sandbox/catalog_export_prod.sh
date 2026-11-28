@@ -21,6 +21,13 @@ set -euo pipefail
 PROD=pivota-prod
 SECRET=CATALOG_EXPORT_DATABASE_URL
 JOB=sandbox-catalog-export
+# Prod's size (the 11-27 sizing: 49 tables, ~6.3 GB of CSV, an estimated 35 min of scrub; the largest
+# table alone an estimated 17.9 min). The export's own deadline is 75 min (the plan needs 63), each
+# statement (one table's COPY) may take 30 min (1.5 x the largest), and the Cloud Run task outlives
+# the deadline by 15 min so the export, not Cloud Run, is what ends a slow run, and its refusal is logged.
+DEADLINE_SECONDS=4500
+STATEMENT_TIMEOUT=30min
+TASK_TIMEOUT=5400s
 IMG="${1:-}"
 VERSION="${2:-}"
 [[ "$IMG" =~ ^us-west1-docker\.pkg\.dev/pivota-shared/pivota/backend@sha256:[0-9a-f]{64}$ ]] \
@@ -94,8 +101,8 @@ run "$GCLOUD" secrets add-iam-policy-binding "$SECRET" --project "$PROD" \
 JOB_DEPLOYED=1   # set before the deploy: a deploy that half-created the job is still deleted
 run "$GCLOUD" run jobs deploy "$JOB" --project "$PROD" --region "$REGION" --image "$IMG" \
   --service-account "$PROD_EXPORT_SA" \
-  --network default --subnet default --vpc-egress all-traffic --max-retries 0 --task-timeout 3600s \
-  --set-env-vars "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://$DROP_BUCKET/catalog" \
+  --network default --subnet default --vpc-egress all-traffic --max-retries 0 --task-timeout "$TASK_TIMEOUT" \
+  --set-env-vars "PIVOTA_ENV=production,CATALOG_COPY_GCS_URI=gs://$DROP_BUCKET/catalog,CATALOG_EXPORT_DEADLINE_SECONDS=$DEADLINE_SECONDS,CATALOG_EXPORT_STATEMENT_TIMEOUT=$STATEMENT_TIMEOUT" \
   --set-secrets "DATABASE_URL=$SECRET:$VERSION" \
   --command python --args=-m,jobs.sandbox_catalog_copy,export --quiet
 EXECUTE_STARTED=1
