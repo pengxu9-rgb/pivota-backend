@@ -37,7 +37,7 @@ from services import identity_live_judge as lj
 from services.llm_fence import PRODUCT_DATA_FENCE
 
 DEFAULT_MATCHER_MODEL = "gemini-4-hydrogen"
-DEFAULT_SCEPTIC_MODEL = "gemini-4-carbon"
+DEFAULT_SCEPTIC_MODEL = "gemini-4-hydrogen"  # with sceptic prompt p2 (lj.PROMPT_VERSIONS)
 THINKING_LEVELS = ("LOW", "MEDIUM", "HIGH")  # MINIMAL is refused by gemini-4-carbon
 DEFAULT_THINKING = "MEDIUM"
 MAX_OUTPUT_TOKENS = 8192  # thinking counts against it; the answer itself is small
