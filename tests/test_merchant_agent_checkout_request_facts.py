@@ -130,9 +130,9 @@ class _StatementSpy:
 
 
 async def test_a_first_positive_is_written_with_source_request(_request_facts_db):
-    assert await request_facts.record_request_check("www.Brand-A.example", POSITIVE_UCP) is True
+    assert await request_facts.record_request_check("brand-a.example", POSITIVE_UCP) is True
     row = await request_facts.get_request_fact("brand-a.example")
-    assert row["merchant_domain"] == "brand-a.example", "the census key: lower case, no www."
+    assert row["merchant_domain"] == "brand-a.example"
     assert (row["last_outcome"], row["last_code"], row["ucp_version"], row["source"]) == (
         "publishes", "ok", "2026-08-25", "request")
     assert row["ucp_checkout_at"] is not None and row["acp_checkout_at"] is None and row["negative_at"] is None
@@ -167,6 +167,23 @@ async def test_an_unreadable_check_never_touches_an_existing_positive(_request_f
 @pytest.mark.parametrize("domain", [None, "", "   ", 7])
 async def test_an_unusable_domain_is_refused(_request_facts_db, domain):
     assert await request_facts.record_request_check(domain, POSITIVE_UCP) is False
+    assert await _count() == 0
+
+
+@pytest.mark.parametrize("domain", [
+    "www.brand-a.example", "www.www.brand-a.example", "Brand-A.example", "brand-a.example.",
+    " brand-a.example", "https://brand-a.example/", "brand-a.example:443",
+])
+async def test_a_key_that_is_not_already_normalized_is_refused_not_repaired(_request_facts_db, monkeypatch, domain):
+    """The caller normalizes once; the store never normalizes again. A key the census key rule would
+    change is refused by every function, and no statement is sent."""
+    spy = _StatementSpy()
+    monkeypatch.setattr(request_facts, "database", spy)
+    assert await request_facts.record_request_check(domain, POSITIVE_UCP) is False
+    assert await request_facts.is_held_domain(domain) is False
+    assert await request_facts.get_request_fact(domain) is None
+    assert spy.statements == []
+    monkeypatch.undo()
     assert await _count() == 0
 
 
@@ -215,7 +232,7 @@ async def test_two_concurrent_first_writes_for_one_domain_leave_one_row(_request
     result. Either way: one row, exactly one True."""
     results = await asyncio.gather(
         request_facts.record_request_check("brand-a.example", POSITIVE_UCP),
-        request_facts.record_request_check("www.brand-a.example", NEGATIVE),
+        request_facts.record_request_check("brand-a.example", NEGATIVE),
     )
     assert sorted(results) == [False, True]
     assert await _count() == 1

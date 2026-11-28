@@ -34,10 +34,15 @@ the census upsert moves them (per path: yes sets, a clean no clears, cannot-tell
 as a gated one-off, after its PR has merged) is a no-op answering False, and its WARNING is
 rate-limited to one per `WARNING_INTERVAL_SECONDS` per process, never one per request.
 
-NO STARTUP HEAL. Nothing in db/schema_guard creates the table, so the code can be deployed before the
-table exists. The SQLite tests build their own copy (tests/test_merchant_agent_checkout_request_facts.py).
+NO STARTUP HEAL. Nothing in db/schema_guard creates the table. A PRODUCTION boot skips db/migrations/,
+so production can run this code before the table exists. A NON-PRODUCTION boot (staging, a local run)
+runs db/migrations/ through db.sql_migrations.run_sql_migrations and so builds the table at boot. The
+SQLite tests build their own copy (tests/test_merchant_agent_checkout_request_facts.py).
 
-THE KEY is `db.merchant_purchasability.normalize_domain`'s form, the one `record_check` writes under.
+THE KEY IS NORMALIZED ONCE, BY THE CALLER. Every function here takes an ALREADY-NORMALIZED key and
+never normalizes it again: a key that `db.merchant_purchasability.normalize_domain` (the form
+`record_check` writes under) would change is refused (False / None), not repaired. Normalizing twice
+would strip a second `www.` and let `www.www.shop.example` land on `shop.example`'s row.
 
 WHO IS HELD. Only a domain we already hold may be written (`is_held_domain`): one in the census
 population (`tierb_cart_link_eligibility.shop_domain`, `merchant_purchasability.merchant_domain`, the
@@ -66,6 +71,16 @@ from db.merchant_agent_checkout_facts import (
     max_age_days,
 )
 from db.merchant_purchasability import normalize_domain
+
+
+def _canonical_key(domain: Any) -> str:
+    """`domain` itself when it is already in the census key form, else "" (refused). Never repairs."""
+    if not isinstance(domain, str) or not domain:
+        return ""
+    try:
+        return domain if normalize_domain(domain) == domain else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 __all__ = [
     "TABLE",
@@ -269,7 +284,7 @@ async def record_request_check(domain: Any, check: Check) -> bool:
     module header leave the row as it is, when the table does not exist, and when the write fails
     or is slow. Never raises."""
     try:
-        key = normalize_domain(domain) if isinstance(domain, str) else ""
+        key = _canonical_key(domain)
         if not key or not _usable(check):
             return False
         if check.outcome not in (PUBLISHES, DOES_NOT_PUBLISH):
@@ -309,7 +324,7 @@ async def record_request_check(domain: Any, check: Check) -> bool:
 
 async def get_request_fact(domain: Any) -> Optional[Dict[str, Any]]:
     """The stored row for an operator or a test, or None. Never raises."""
-    key = normalize_domain(domain) if isinstance(domain, str) else ""
+    key = _canonical_key(domain)
     if not key:
         return None
     try:
@@ -324,7 +339,7 @@ async def is_held_domain(domain: Any) -> bool:
     """True when we already hold this domain: it is in the census population (either directory
     table) or the census stored a fact for it. A read that fails or is slow counts as "not this
     source"; all three failing answers False. Never raises."""
-    key = normalize_domain(domain) if isinstance(domain, str) else ""
+    key = _canonical_key(domain)
     if not key:
         return False
     for statement in _HELD_STATEMENTS:

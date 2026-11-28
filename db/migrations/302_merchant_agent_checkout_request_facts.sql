@@ -25,10 +25,13 @@
 -- NO BUYER DATA AND NO DOCUMENT BODY. `last_code` is a short token from the census reader's own
 -- constants; `ucp_version` is a date. Nothing the merchant's server sent is stored verbatim.
 --
--- THIS TABLE HAS NO STARTUP HEAL, ON PURPOSE (as 294). Production does not run db/migrations/ at
--- boot, and this file is applied there once, by hand, as a gated one-off after its PR has merged.
--- Nothing in db/schema_guard creates it, so a deploy never builds it ahead of that run. The writer
--- treats a missing table as "nothing written" and warns about it at most once per interval.
+-- THIS TABLE HAS NO STARTUP HEAL, ON PURPOSE (as 294). Nothing in db/schema_guard creates it.
+-- PRODUCTION boots skip db/migrations/ (main._should_skip_heavy_startup_init answers is_production()
+-- unless SKIP_HEAVY_STARTUP_INIT says otherwise), so a production deploy never builds it; there this
+-- file is applied once, by hand, as a gated one-off after its PR has merged. A NON-PRODUCTION boot
+-- (staging, a local run) runs db/migrations/ through db.sql_migrations.run_sql_migrations and DOES
+-- build it at boot. The writer treats a missing table as "nothing written" and warns about it at
+-- most once per interval.
 
 CREATE TABLE IF NOT EXISTS merchant_agent_checkout_request_facts (
     merchant_domain VARCHAR(255) PRIMARY KEY,

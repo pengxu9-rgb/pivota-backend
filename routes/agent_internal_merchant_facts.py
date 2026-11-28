@@ -11,16 +11,31 @@ THE CALLER NEVER SENDS A VERDICT. The body schema has no outcome, verdict, code 
 member, and an unknown member is refused (400), so whatever is stored is what the backend's own
 parse of the body says.
 
-ONLY THE UCP DOOR IS READ, SO ONLY A POSITIVE CAN BE WRITTEN. The census needs both paths
+V1 WRITES POSITIVES ONLY; NEGATIVES COME FROM THE CENSUS ONLY. The census needs both paths
 (`/.well-known/ucp` and `/.well-known/acp.json`) to answer cleanly before it calls a merchant a
 negative. The gateway reads the UCP door alone, so the ACP path is "not read" here and a UCP answer
 without checkout (or a 404) classifies as unreadable, which writes nothing. A readable profile that
-lists checkout is a positive.
+lists checkout is a positive. Should the parse ever come back `does_not_publish`, the route still
+writes nothing and answers `negatives_from_census_only`: a request-time read never records a
+negative, and no UCP-only negative rule exists. (The store's own negative rules stay census-shaped.)
+
+`cart_outcome` IS VALIDATED AND DECIDES NOTHING. Its shape is checked (a strict bool and an optional
+short token), and it is then ignored: it never changes the outcome, whether anything is written,
+or the answer.
 
 ORDER: the caller's key (get_agent_context, the dependency routes/agent_storefront_handoffs.py uses:
 401 without a valid key), then the caller must be one of Pivota's own services, the gateway
 (routes.agent_auth._is_service_caller, the check the hand-off routes' partner adoption makes: 403),
 then the flag, then the body (413 / 400), then "do we hold this domain", then the parse and the write.
+
+THE BODY IS READ ONLY AFTER THE FLAG, AND NEVER PAST ITS CAP. A declared Content-Length over
+MAX_REQUEST_BYTES is 413 before a byte is read. Without one (a chunked body) the request is read as a
+stream and reading STOPS as soon as it passes the cap (413); it is never read whole first.
+
+THE DOMAIN IS NORMALIZED ONCE, here (census.normalize_domain: a bare public hostname, lower case, one
+leading `www.` removed), and that key is passed on. The store does not normalize again: a key it
+would change (`www.www.shop.example` arrives here as `www.shop.example`) is refused, so a door host
+can never land on another held domain's row.
 
 DARK BY DEFAULT. `MERCHANT_FACT_REQUEST_WRITE` (off | on, read per request). Off, an authenticated
 call is answered `{"written": false, "reason": "disabled"}` before its body is read, and nothing
@@ -34,9 +49,11 @@ member's location and error type only.
 
 Answers (200 unless said):
     {"written": true,  "outcome": "publishes" | "does_not_publish"}
-    {"written": false, "reason": "disabled" | "not_held" | "unreadable" | "not_written"}
+    {"written": false, "reason": "disabled" | "not_held" | "unreadable" | "negatives_from_census_only"
+                               | "not_written"}
     413 {"error": "payload_too_large"}   the request, or `well_known_body` as UTF-8, is over its cap
     400 {"error": "invalid_body", "fields": [...]} / {"error": "invalid_domain"}
+        (a `well_known_body` UTF-8 cannot encode, a lone surrogate, is `string_unicode` on that member)
     (400, not 422: the app's error middleware turns every 422 into a 400, so the route says 400 itself.)
 """
 
@@ -81,8 +98,8 @@ def request_write_enabled() -> bool:
 
 
 class CartOutcome(BaseModel):
-    """How the gateway's cart build at that door went. Evidence about the cart, not about the
-    protocol: it never decides the stored outcome."""
+    """How the gateway's cart build at that door went. VALIDATED AND THEN IGNORED: it decides
+    nothing (not the outcome, not whether anything is written, not the answer)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -117,6 +134,20 @@ def _invalid_fields(error: ValidationError) -> List[Dict[str, str]]:
     ]
 
 
+class _TooLarge(Exception):
+    pass
+
+
+async def _read_capped(request: Request) -> bytes:
+    """The request body, read as a stream that stops once it passes MAX_REQUEST_BYTES."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_REQUEST_BYTES:
+            raise _TooLarge()
+    return bytes(body)
+
+
 def door_read_check(domain: str, status: int, body: Optional[str]) -> Any:
     """The `Check` the census's own reader makes of this door read. Pure: no I/O.
 
@@ -138,8 +169,9 @@ async def record_door_read(request: Request, caller: AgentContext = Depends(get_
     declared = (request.headers.get("content-length") or "").strip()
     if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
         return _answer(413, {"error": "payload_too_large"})
-    raw = await request.body()
-    if len(raw) > MAX_REQUEST_BYTES:
+    try:
+        raw = await _read_capped(request)
+    except _TooLarge:
         return _answer(413, {"error": "payload_too_large"})
     try:
         payload = json.loads(raw or b"")
@@ -149,8 +181,14 @@ async def record_door_read(request: Request, caller: AgentContext = Depends(get_
         body = DoorReadBody.model_validate(payload)
     except ValidationError as error:
         return _answer(400, {"error": "invalid_body", "fields": _invalid_fields(error)})
-    if body.well_known_body is not None and len(body.well_known_body.encode("utf-8")) > MAX_WELL_KNOWN_BODY_BYTES:
-        return _answer(413, {"error": "payload_too_large"})
+    if body.well_known_body is not None:
+        try:
+            body_bytes = len(body.well_known_body.encode("utf-8"))
+        except UnicodeEncodeError:  # a lone surrogate: JSON carries it, UTF-8 cannot
+            return _answer(400, {"error": "invalid_body",
+                                 "fields": [{"loc": "well_known_body", "type": "string_unicode"}]})
+        if body_bytes > MAX_WELL_KNOWN_BODY_BYTES:
+            return _answer(413, {"error": "payload_too_large"})
 
     domain = census.normalize_domain(body.merchant_domain)
     if not domain:
@@ -159,6 +197,9 @@ async def record_door_read(request: Request, caller: AgentContext = Depends(get_
         return _not_written("not_held")
 
     check = door_read_check(domain, body.well_known_status, body.well_known_body)
+    if check.outcome == request_facts.DOES_NOT_PUBLISH:
+        logger.info("merchant_fact_request: domain=%s outcome=%s written=False", domain, check.outcome)
+        return _not_written("negatives_from_census_only")
     written = await request_facts.record_request_check(domain, check)
     # The domain and the parsed outcome only: never the body, never a header.
     logger.info("merchant_fact_request: domain=%s outcome=%s written=%s", domain, check.outcome, written)

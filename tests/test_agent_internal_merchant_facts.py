@@ -204,7 +204,7 @@ async def test_on_is_read_per_request(world, monkeypatch):
 async def test_a_held_domain_is_written(world, domain):
     res = await post(world, door_read(domain))
     assert (res.status_code, res.json()) == (200, {"written": True, "outcome": "publishes"})
-    row = await request_facts.get_request_fact(domain)
+    row = await request_facts.get_request_fact(census.normalize_domain(domain))
     assert (row["last_outcome"], row["source"], row["ucp_version"]) == ("publishes", "request", "2026-08-25")
 
 
@@ -372,3 +372,138 @@ async def test_the_census_population_does_not_read_the_request_table(world):
     population = census.plan_directory(await census.read_directory_domains())
     assert HELD_TIERB in population and HELD_PURCHASABILITY in population
     assert ONLY_REQUESTED not in population
+
+
+# ── v1 writes positives only ─────────────────────────────────────────────────────────────────
+
+
+async def test_a_negative_parse_is_never_written_negatives_come_from_the_census_only(world, monkeypatch):
+    """No door read the census classifier sees today parses as does_not_publish (the ACP path is not
+    read). Should one ever do so, the route still writes nothing: v1 keeps positives only."""
+    calls = []
+
+    async def spy(*args, **kwargs):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(route, "door_read_check",
+                        lambda *_a: facts.Check(facts.DOES_NOT_PUBLISH, "ok", False, False))
+    monkeypatch.setattr(request_facts, "record_request_check", spy)
+    res = await post(world, door_read())
+    assert (res.status_code, res.json()) == (200, {"written": False, "reason": "negatives_from_census_only"})
+    assert calls == [] and await _request_rows() == 0
+
+
+@pytest.mark.parametrize("status,doc", [(404, None), (410, None), (200, json.dumps(UCP_NO_CHECKOUT))])
+def test_a_clean_ucp_no_is_not_a_negative_here(status, doc):
+    assert route.door_read_check(HELD_TIERB, status, doc).outcome == facts.UNREADABLE
+
+
+# ── input the encoder cannot take ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("doc", ["\ud800", '{"ucp": "\udfff"}'])
+async def test_a_lone_surrogate_in_the_body_is_400_not_500(world, doc):
+    raw = json.dumps(door_read(doc=doc)).encode()  # ensure_ascii: the surrogate travels as \\ud800
+    assert b"\\ud" in raw
+    res = await post(world, None, raw=raw)
+    assert (res.status_code, refusal(res)) == (
+        400, {"error": "invalid_body", "fields": [{"loc": "well_known_body", "type": "string_unicode"}]})
+    assert await _request_rows() == 0
+
+
+# ── the domain is normalized once ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("host", ["www.www.held-tierb.example", "WWW.www.Held-Census.example"])
+async def test_a_door_host_that_normalizes_onto_another_held_domain_is_refused(world, host):
+    res = await post(world, door_read(host))
+    assert (res.status_code, res.json()) == (200, {"written": False, "reason": "not_held"})
+    assert await _request_rows() == 0
+
+
+# ── the body is read only after the flag, and never past its cap ────────────────────────────
+
+
+def _bare_app():
+    """The router alone, auth answered: these tests drive the ASGI receive channel directly."""
+    from fastapi import FastAPI
+
+    bare = FastAPI()
+    bare.include_router(route.router)
+    bare.dependency_overrides[agent_auth.get_agent_context] = lambda: object()
+    return bare
+
+
+async def _asgi_post(asgi_app, chunks, *, headers=()):
+    """POST PATH with the body offered as `chunks`, one per receive. Returns (status, chunks read)."""
+    pulled = [0]
+    source = iter(chunks)
+
+    async def receive():
+        chunk = next(source, None)
+        if chunk is None:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        pulled[0] += 1
+        return {"type": "http.request", "body": chunk, "more_body": True}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+        "scheme": "http", "path": PATH, "raw_path": PATH.encode(), "query_string": b"", "root_path": "",
+        "headers": [(b"content-type", b"application/json"), (b"x-api-key", GATEWAY_KEY.encode()),
+                    *[(k.encode(), v.encode()) for k, v in headers]],
+        "client": ("127.0.0.1", 1), "server": ("test", 80),
+    }
+    await asgi_app(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    return status, pulled[0]
+
+
+@pytest.fixture()
+def bare(monkeypatch):
+    async def service(_key):
+        return True
+
+    monkeypatch.setattr(agent_auth, "_is_service_caller", service)
+    monkeypatch.setenv(FLAG, "on")
+    _store_must_not_be_touched(monkeypatch)
+    return _bare_app()
+
+
+def _endless(chunk_size: int = 64 * 1024, count: int = 1000):
+    return (b"x" * chunk_size for _ in range(count))
+
+
+async def test_an_oversize_content_length_is_413_before_any_byte_is_read(bare):
+    status, pulled = await _asgi_post(
+        bare, _endless(), headers=[("content-length", str(route.MAX_REQUEST_BYTES + 1))])
+    assert (status, pulled) == (413, 0)
+
+
+async def test_a_chunked_oversize_body_stops_reading_at_the_cap(bare):
+    chunk = 64 * 1024
+    status, pulled = await _asgi_post(bare, _endless(chunk))  # no content-length: chunked
+    assert status == 413
+    assert pulled == route.MAX_REQUEST_BYTES // chunk + 1, "stopped at the first chunk past the cap"
+
+
+async def test_flag_off_reads_no_body(bare, monkeypatch):
+    monkeypatch.setenv(FLAG, "off")
+    status, pulled = await _asgi_post(bare, _endless(), headers=[("content-length", "64")])
+    assert (status, pulled) == (200, 0)
+
+
+async def test_a_body_under_the_cap_is_read_whole_in_chunks(bare, monkeypatch):
+    """The stream read reassembles a chunked body: a valid read for a domain we do not hold."""
+    async def not_held(_d):
+        return False
+
+    monkeypatch.setattr(request_facts, "is_held_domain", not_held)
+    raw = json.dumps(door_read(STRANGER)).encode()
+    status, pulled = await _asgi_post(bare, [raw[i:i + 100] for i in range(0, len(raw), 100)])
+    assert status == 200 and pulled == -(-len(raw) // 100)
