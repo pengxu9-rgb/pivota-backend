@@ -444,11 +444,11 @@ def confirm_card_refused(data: Any, ceiling: Any) -> bool:
 
 # ── a purchase in another currency than USD (no measured shape yet) ─────────────────────────────────────
 
-#: The Han currency words. PREFIXED ones (港元, 港幣, 台幣, 新台幣, ...), 幣 / 币 alone and the Cantonese 蚊 are money
-#: wherever they stand; BARE 円 / 圓 / 圆 / 元 may also begin a place name (元町, 元朗, 円山町), so a spaced one is read
-#: as money only when no Han character follows it.
-_HAN_PREFIXED_CURRENCY = r"(?:港|台|臺|新台|新臺)(?:円|圓|圆|元|幣|币)|幣|币|蚊"
-_HAN_BARE_CURRENCY = r"(?:円|圓|圆|元)"
+#: The Han currency words. PREFIXED ones (港元, 港幣, 台幣, 新台幣, ...) and 幣 / 币 alone are money wherever they
+#: stand; BARE 円 / 圓 / 圆 / 元 and the Cantonese 蚊 may also begin a word or a place name (元町, 元朗, 円山町, 蚊帳,
+#: 蚊子街), so a spaced one is read as money only when no Han character follows it.
+_HAN_PREFIXED_CURRENCY = r"(?:港|台|臺|新台|新臺)(?:円|圓|圆|元|幣|币)|幣|币"
+_HAN_BARE_CURRENCY = r"(?:円|圓|圆|元|蚊)"
 #: A number followed by a currency word written in letters, not a symbol: "1,500円", "15,000원", "1万円", "1만원",
 #: "100元", "100港元", "100港幣", "330台幣", "330新台幣", "100蚊". Glued to the number (only digits and grouping commas
 #: between), whatever follows: "1500円送料".

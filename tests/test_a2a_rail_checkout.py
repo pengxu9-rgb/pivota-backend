@@ -5058,6 +5058,8 @@ def test_outside_usd_prose_with_any_amount_is_refused(text, currency, ceiling, r
     ("港幣 100", True), ("新台幣 330", True), ("新台幣330元", True), ("NTD 330", True), ("330 NTD", True),
     ("100 hkd", True), ("twd330", True), ("100蚊", True), ("總數 100", True), ("收費 50", True), ("運費 30", True),
     ("add 2 all", False), ("3 top picks", False), ("Ship to 3 台中市", False), ("香港 2 號", False),
+    # A spaced 蚊 is money only when no Han character follows it (蚊帳 a mosquito net, 蚊子街 a street).
+    ("1 蚊帳", False), ("No. 5 蚊子街", False), ("100 蚊", True), ("100 蚊 total", True), ("5蚊帳", True),
 ])
 def test_outside_usd_the_hong_kong_and_taiwan_amount_shapes(text, shaped):
     assert amounts.text_amount_shaped(text) is shaped

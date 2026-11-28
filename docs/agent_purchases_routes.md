@@ -630,7 +630,8 @@ door, the address write, the router, the worker's token and ceiling steps and th
   any other currency no confirm card or prose shape has been measured, so ANY amount on a card or in the prose,
   in any currency or script, is refused before anything is submitted (`confirm_card_refused_outside_usd`,
   `text_amount_shaped`): a currency symbol or code next to a number ("$15.00", "JPY 1500"); a number followed
-  by 円 / 원 / 元 / 幣 / 蚊 ("1,500円", "1500 円", "100港幣", "100 港元整", "330 新台幣"); 港幣 or 新台幣 before a
+  by 円 / 원 / 元 / 幣 / 蚊 ("1,500円", "1500 円", "100港幣", "100 港元整", "330 新台幣", "100 蚊"; a spaced bare 円 / 元 /
+  蚊 with a Han character after it begins a word or place, "2 元朗", "1 蚊帳", and is not an amount); 港幣 or 新台幣 before a
   number ("港幣 100"); a market's code in any case ("100 hkd", "NTD 330") or by yen / won / dollars ("15 Canadian dollars"); a total word, English
   or CJK, before a number ("合計 1500", "お会計は1500です", "Order value 1500"), on a card also as a key
   ({"合計": "1500"}). Addresses, postcodes, quantities and dates are not amounts ("1-2 円山町", "〒150-0043",
