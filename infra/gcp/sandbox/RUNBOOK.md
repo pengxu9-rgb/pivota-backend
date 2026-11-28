@@ -310,12 +310,12 @@ mappings, servers, roles, grants, or row data in the schema file.
 *10a-image (pivota-shared, own go).* The dump needs `pg_dump` 17 and `curl`, which the backend
 image lacks. Build only from a release whose `scripts/sandbox/dump_prod_schema.sh` is
 sandbox-backend's manifest-format-2 version (DSN off argv, lock wait, deadline, explicit-column
-ledgers). **Do not build yet:** the controller did not approve 77a881c7f (its apply gate had
-bypasses), so the format-2 script will come from a later, fixed sandbox-backend commit, and this
-step waits for it: the sandbox apply accepts only format 2, and the Dockerfile refuses to
-build from an older script. The script's only subcommand, `check <schema.sql> <ledgers.sql>`, runs
-just its refusals and serves the human read below. From a pivota-backend checkout at
-`$BACKEND_SHA` (the release commit):
+ledgers). That version is on main since be#2933 (merged as 9481578ec, the approved successor of
+77a881c7f, whose apply gate had bypasses), so any release cut after it qualifies: the sandbox apply
+accepts only format 2, and the Dockerfile refuses to build from an older script. The build is still
+its own go, after step 9, with `COMMIT_SHA` = the release commit. The script's only subcommand,
+`check <schema.sql> <ledgers.sql>`, runs just its refusals and serves the human read below. From a
+pivota-backend checkout at `$BACKEND_SHA` (the release commit):
 ```bash
 gcloud builds submit --config infra/gcp/sandbox/cloudbuild.schema-dump.yaml --project pivota-shared \
   --substitutions=COMMIT_SHA=$BACKEND_SHA .
