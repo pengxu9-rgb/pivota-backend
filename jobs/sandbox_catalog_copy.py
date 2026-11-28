@@ -1693,18 +1693,45 @@ def check_import_environment(env: Mapping[str, str]) -> None:
         raise CopyRefused(refusal)
 
 
+#: The run script's two knobs for prod's size (the 11-27 sizing: the 45 min deadline and the 20 min
+#: statement_timeout do not fit). Unset means the default; a value that is set must parse.
+EXPORT_DEADLINE_ENV = "CATALOG_EXPORT_DEADLINE_SECONDS"
+EXPORT_STATEMENT_TIMEOUT_ENV = "CATALOG_EXPORT_STATEMENT_TIMEOUT"
+_WHOLE_SECONDS_RE = re.compile(r"^[1-9][0-9]{0,5}$")
+
+
+def export_limits_from_env(env: Mapping[str, str]) -> Dict[str, Any]:
+    """export_catalog's deadline_seconds and statement_timeout from the job's env, checked before
+    the job connects: a bad value refuses the run instead of falling back to a default."""
+    limits: Dict[str, Any] = {}
+    raw = env.get(EXPORT_DEADLINE_ENV)
+    if raw is not None:
+        if not _WHOLE_SECONDS_RE.match(raw) or int(raw) > MAX_EXPORT_DEADLINE_SECONDS:
+            raise CopyRefused("%s must be a whole number of seconds from 1 to %d"
+                              % (EXPORT_DEADLINE_ENV, MAX_EXPORT_DEADLINE_SECONDS))
+        limits["deadline_seconds"] = int(raw)
+    raw = env.get(EXPORT_STATEMENT_TIMEOUT_ENV)
+    if raw is not None:
+        if not _PG_INTERVAL_RE.match(raw):
+            raise CopyRefused("%s must look like 30s, 500ms or 20min" % EXPORT_STATEMENT_TIMEOUT_ENV)
+        limits["statement_timeout"] = raw
+    return limits
+
+
 async def _run(mode: str, env: Mapping[str, str]) -> Dict[str, Any]:
     from config.platform import commit_sha
 
+    limits: Dict[str, Any] = {}
     if mode == "export":
         check_export_environment(env)
+        limits = export_limits_from_env(env)
     else:
         check_import_environment(env)
     store = _store_from_env(env)
     conn = await _connect(env)
     try:
         if mode == "export":
-            manifest = await export_catalog(conn, store, stamp=utc_stamp(), commit=commit_sha(env))
+            manifest = await export_catalog(conn, store, stamp=utc_stamp(), commit=commit_sha(env), **limits)
             return {"stamp": manifest["stamp"],
                     "tables": {t["name"]: t["rows"] for t in manifest["tables"]},
                     "absent_optional_tables": manifest["absent_optional_tables"]}

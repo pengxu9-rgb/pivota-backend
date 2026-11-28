@@ -5,6 +5,8 @@ No database here (tests/test_sandbox_catalog_copy_postgres.py runs the copy itse
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from jobs import sandbox_catalog_copy as C
@@ -134,6 +136,77 @@ def test_main_reports_a_refusal_with_exit_code_2(clean_env, capsys, monkeypatch)
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     assert C.main(["import"]) == 2
     assert "REFUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("env,want", [
+    ({}, {}),
+    ({"CATALOG_EXPORT_DEADLINE_SECONDS": "4500"}, {"deadline_seconds": 4500}),
+    ({"CATALOG_EXPORT_DEADLINE_SECONDS": "7200"}, {"deadline_seconds": 7200}),
+    ({"CATALOG_EXPORT_DEADLINE_SECONDS": "1"}, {"deadline_seconds": 1}),
+    ({"CATALOG_EXPORT_STATEMENT_TIMEOUT": "30min"}, {"statement_timeout": "30min"}),
+    ({"CATALOG_EXPORT_DEADLINE_SECONDS": "4500", "CATALOG_EXPORT_STATEMENT_TIMEOUT": "30min"},
+     {"deadline_seconds": 4500, "statement_timeout": "30min"}),
+])
+def test_the_export_limits_come_from_the_env_when_set(env, want):
+    assert C.export_limits_from_env(env) == want
+
+
+@pytest.mark.parametrize("env", [
+    {"CATALOG_EXPORT_DEADLINE_SECONDS": v} for v in ("7201", "0", "-1", "4500.5", " 4500", "", "045", "1e3", "4500s")
+] + [
+    {"CATALOG_EXPORT_STATEMENT_TIMEOUT": v} for v in ("", "30", "30 min", "30m", "0min", "30min;")
+])
+def test_a_set_export_limit_that_does_not_parse_refuses(env):
+    with pytest.raises(C.CopyRefused, match="CATALOG_EXPORT_"):
+        C.export_limits_from_env(env)
+
+
+def _fake_export_run(monkeypatch, env):
+    seen = {}
+
+    class Conn:
+        async def close(self):
+            seen["closed"] = True
+
+    async def connect(_env):
+        seen["connected"] = True
+        return Conn()
+
+    async def export_catalog(conn, store, **kw):
+        seen["kw"] = kw
+        return {"stamp": kw["stamp"], "tables": [], "absent_optional_tables": []}
+
+    monkeypatch.setattr(C, "_connect", connect)
+    monkeypatch.setattr(C, "_store_from_env", lambda _env: object())
+    monkeypatch.setattr(C, "export_catalog", export_catalog)
+    base = {"PIVOTA_ENV": "production", "CLOUD_RUN_JOB": "sandbox-catalog-export"}
+    return seen, asyncio.run(C._run("export", {**base, **env}))
+
+
+def test_the_export_job_passes_the_env_limits_to_the_export(clean_env, monkeypatch):
+    seen, _ = _fake_export_run(monkeypatch, {"CATALOG_EXPORT_DEADLINE_SECONDS": "4500",
+                                             "CATALOG_EXPORT_STATEMENT_TIMEOUT": "30min"})
+    assert seen["kw"]["deadline_seconds"] == 4500 and seen["kw"]["statement_timeout"] == "30min"
+
+
+def test_the_export_job_keeps_the_defaults_when_no_limit_is_set(clean_env, monkeypatch):
+    seen, _ = _fake_export_run(monkeypatch, {})
+    assert "deadline_seconds" not in seen["kw"] and "statement_timeout" not in seen["kw"]
+
+
+@pytest.mark.parametrize("bad", [{"CATALOG_EXPORT_DEADLINE_SECONDS": "99999"},
+                                 {"CATALOG_EXPORT_STATEMENT_TIMEOUT": "forever"}])
+def test_a_bad_export_limit_refuses_before_the_job_connects(clean_env, monkeypatch, bad):
+    called = []
+
+    async def connect(_env):
+        called.append(1)
+
+    monkeypatch.setattr(C, "_connect", connect)
+    monkeypatch.setattr(C, "_store_from_env", lambda _env: called.append("store"))
+    with pytest.raises(C.CopyRefused, match="CATALOG_EXPORT_"):
+        asyncio.run(C._run("export", {"PIVOTA_ENV": "production", "CLOUD_RUN_JOB": "j", **bad}))
+    assert called == []
 
 
 def test_gcs_store_parses_the_uri():
