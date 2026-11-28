@@ -955,3 +955,5 @@ def test_the_required_fields_are_exactly_the_reap_clients():
     import services.reap_agentic_client as rc
 
     assert shipping_capture.REQUIRED_ADDRESS_FIELDS == rc._ADDRESS_REQUIRED
+    # Every key the Reap client's builder can emit has a cap, so the door never refuses a field for having none.
+    assert set(rc._ADDRESS_REQUIRED + rc._ADDRESS_OPTIONAL) <= set(shipping_capture.MAX_LENGTH)
