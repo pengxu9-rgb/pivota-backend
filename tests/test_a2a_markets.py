@@ -1,10 +1,10 @@
-"""services/payment_orchestration/a2a_markets.py: which markets the A2A rail takes, and each one's address rules.
+"""services/payment_orchestration/a2a_markets.py: which markets the A2A rail takes, and their currency.
 
 Pinned here: unset means the US only (the rail as before); the env is the whole list, and a code outside the table
-turns nothing on; every market's currency is the market registry's; a postcode is never required; KR and TW are
-priced in their own currency without joining the Reap lane's market map; each market's
-region and postcode rules, as the door and the address write read them; and the router takes a currency only
-while its market is on.
+turns nothing on; every market's currency is the market registry's; KR and TW are priced in their own currency
+without joining the Reap lane's market map; NO address rule of ours in any market (a region or postcode given is
+sent as written, neither is ever required: the store platform's checkout and Visa judge the address); and the
+router takes a currency only while its market is on.
 """
 
 from __future__ import annotations
@@ -85,44 +85,21 @@ def test_the_enabled_currencies_follow_the_markets(monkeypatch):
     assert markets.enabled_currencies() == frozenset({"USD", "CAD", "AUD", "NZD", "SGD", "JPY", "KRW", "TWD", "HKD"})
 
 
-@pytest.mark.parametrize("country", sorted(VALID))
-def test_a_valid_address_passes_its_markets_rules(country):
-    assert markets.address_errors(_address(country)) == {}
-
-
-@pytest.mark.parametrize("country,over,errors", [
-    ("US", {"region": "PR"}, {"region": "invalid"}),
-    ("US", {"postalCode": "787"}, {"postalCode": "invalid"}),
-    ("CA", {"region": None}, {}),  # a region is never required, in any market
-    ("CA", {"postalCode": "K1A0B"}, {"postalCode": "invalid"}),
-    ("CA", {"postalCode": "D1A 0B1"}, {"postalCode": "invalid"}),  # no Canadian postcode starts with D
-    ("AU", {"region": "NS"}, {"region": "invalid"}),
-    ("AU", {"postalCode": "200"}, {"postalCode": "invalid"}),
-    ("NZ", {"region": None}, {}),
-    ("NZ", {"region": "ZZZ"}, {"region": "invalid"}),
-    ("SG", {"region": "SG"}, {}),  # no subdivisions: one given is the buyer's, sent unchecked
-    ("SG", {"postalCode": "18989"}, {"postalCode": "invalid"}),
-    ("JP", {"region": "48"}, {"region": "invalid"}),
-    ("JP", {"region": None}, {}),
-    ("US", {"region": None, "postalCode": None}, {}),
-    ("JP", {"postalCode": "1000001"}, {}),
-    ("JP", {"postalCode": None}, {}),  # a postcode is never required, in any market
-    ("KR", {"region": None}, {}),
-    ("KR", {"region": "51"}, {}),
-    ("KR", {"region": "99"}, {"region": "invalid"}),
-    ("KR", {"postalCode": "045240"}, {"postalCode": "invalid"}),
-    ("TW", {"postalCode": "10048"}, {}),
-    ("TW", {"postalCode": "1004"}, {"postalCode": "invalid"}),
-    ("TW", {"region": "TPQ"}, {"region": "invalid"}),
-    ("TW", {"postalCode": None}, {}),
-    ("US", {"postalCode": None}, {}),
-    ("SG", {"postalCode": "not-a-code"}, {"postalCode": "invalid"}),  # one given is still checked
-    ("HK", {"region": "KLN"}, {}),  # no ISO 3166-2 subdivision: sent unchecked, as in SG
-    ("HK", {"postalCode": "000000"}, {}),  # none exists: one given is the buyer's, unchecked
-    ("HK", {"postalCode": "anything"}, {}),
+@pytest.mark.parametrize("country,over", [
+    # Values our own per-market rules used to refuse: each is the buyer's, sent as written.
+    ("US", {"region": "PR"}), ("US", {"region": "Texas"}), ("US", {"region": "US-TX"}), ("US", {"region": "AE"}),
+    ("US", {"postalCode": "787"}), ("US", {"postalCode": "787011234"}), ("US", {"region": "ON", "postalCode": "K1A 0B1"}),
+    ("CA", {"postalCode": "K1A0B"}), ("CA", {"region": "ZZ"}), ("AU", {"region": "NS"}), ("NZ", {"region": "ZZZ"}),
+    ("SG", {"postalCode": "18989"}), ("JP", {"region": "48"}), ("JP", {"region": "Tokyo"}), ("KR", {"region": "99"}),
+    ("TW", {"region": "TPQ"}), ("HK", {"region": "Kowloon"}), ("HK", {"postalCode": "000000"}),
 ])
-def test_each_markets_region_and_postcode_rules(country, over, errors):
-    assert dict(markets.address_errors(_address(country, **over))) == errors
+def test_no_market_has_an_address_rule_of_ours(monkeypatch, country, over):
+    monkeypatch.setenv(markets.MARKETS_ENV, ",".join(markets.MARKETS))
+    email, address, errors = _submit(country, **over)
+    assert errors == {}, errors
+    for key, value in over.items():
+        assert address[key] == value  # as written: not upper-cased, not reformatted
+    assert {k: v for k, v in shipping.door_address(_address(country, **over)).items() if k in over} == over
 
 
 @pytest.mark.parametrize("country", [*sorted(VALID), "GB", None])
@@ -149,22 +126,21 @@ def test_the_address_write_takes_a_market_only_while_it_is_on_and_says_only_that
     monkeypatch.setenv(markets.MARKETS_ENV, "US,JP,SG,CA")
     email, address, errors = _submit("JP")
     assert errors == {} and email == EMAIL and (address["region"], address["postalCode"]) == ("13", "100-0001")
-    assert _submit("JP", region="99")[2] == {"region": "invalid"}
-    assert _submit("SG")[2] == {} and _submit("SG", region="SG")[2] == {}
-    assert _submit("CA", region=None)[2] == {} and _submit("CA", region="ZZ")[2] == {"region": "invalid"}
-    # Read as the door reads it: the postcode upper-cased.
-    assert _submit("CA", postalCode="k1a 0b1")[1]["postalCode"] == "K1A 0B1"
+    assert _submit("SG")[2] == {} and _submit("CA", region=None)[2] == {}
+    lower = shipping.read_submission({"email": EMAIL, **_address("JP"), "country": "jp"}, email_required=True,
+                                     address_required=True)
+    assert lower[1]["country"] == "JP"  # the country code is read in any case
+    assert _submit("US", region="x" * 101)[2] == {"region": "too_long"}  # a length cap only, never a format
 
 
-def test_the_door_reads_an_address_by_its_markets_rules():
+def test_the_door_reads_an_address_as_given():
     assert shipping.door_address(_address("CA", postalCode="k1a 0b1", region="on")) == {
-        **_address("CA"), "postalCode": "K1A 0B1"}
-    with pytest.raises(reap_svc.PurchaseRefused) as refused:
-        shipping.door_address(_address("JP", region="48"))
-    assert refused.value.reason == "invalid_address"
-    assert shipping.door_address(_address("SG", region="SG"))["region"] == "SG"  # sent unchecked
+        **_address("CA"), "postalCode": "k1a 0b1", "region": "on"}
     assert shipping.door_address(_address("NZ", region=None))["country"] == "NZ"
     assert "region" not in shipping.door_address(_address("JP", region=None))
+    with pytest.raises(reap_svc.PurchaseRefused) as refused:
+        shipping.door_address(_address("JP", city=None))  # the relay's own fields stay required
+    assert refused.value.reason == "invalid_address"
 
 
 @pytest.fixture
@@ -247,9 +223,7 @@ def test_a_canadian_purchase_shown_in_dollars_never_takes_the_rail(monkeypatch):
 def test_no_market_asks_for_a_region_or_postcode_and_the_relay_sends_neither_without_one(monkeypatch):
     from services.payment_orchestration import a2a_rail
 
-    for country in (*markets.MARKETS, "GB", "", None):
-        fields = shipping.required_address_fields(country)
-        assert "postalCode" not in fields and "region" not in fields, country
+    assert "postalCode" not in shipping.REQUIRED_ADDRESS_FIELDS and "region" not in shipping.REQUIRED_ADDRESS_FIELDS
     monkeypatch.setenv(markets.MARKETS_ENV, "US,JP")
     for country in ("US", "JP"):
         email, address, errors = _submit(country, postalCode=None)

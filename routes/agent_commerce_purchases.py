@@ -53,7 +53,7 @@ from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import build_shopify_cart_permalink
-from services.payment_orchestration import a2a_address_requirements, a2a_markets
+from services.payment_orchestration import a2a_markets
 from services.payment_orchestration import a2a_purchase_view, agent_run_condition, purchase_consent, purchase_view
 from services.payment_orchestration import a2a_shipping_address as shipping_capture
 from services.payment_orchestration import router as rail_router
@@ -524,18 +524,11 @@ async def _open_a2a_purchase(
     if not capture:
         stored_email, stored_address = reap_svc._validated_buyer(
             reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
-        # The market's own checks on a region and postcode GIVEN apply with capture off too, in every market: a
-        # Canadian province or postcode on a US address is refused here, before the buyer approves.
-        stored_address = shipping_capture.door_address(stored_address)
-        # With capture off nobody asks the buyer later: a field the store's platform requires there is required
-        # here (a2a_address_requirements), in every market, the US included. Field names only.
-        lacking = a2a_address_requirements.missing(merchant_host, stored_address)
-        if lacking:
-            raise reap_svc.PurchaseRefused(
-                "invalid_address", "shipping address fields required by the store: " + ",".join(sorted(lacking)))
+        # No address rules of ours beyond the Reap client's required fields: a region or postcode is the buyer's as
+        # written, and the store's platform (its checkout answer) and Visa judge the address.
     else:
-        # Capture on: each part is optional; one that is given is read by the same rules (its market's checks on a
-        # region and postcode given). What is missing, the store's platform included, AgenPas asks the buyer for.
+        # Capture on: each part is optional; one that is given is read by the same rules (printable text, the
+        # required fields). What is missing, AgenPas asks the buyer for.
         stored_email = shipping_capture.door_email(buyer_email) if buyer_email else None
         stored_address = shipping_capture.door_address(shipping_address) if shipping_address else None
         if stored_email is not None and stored_address is not None:

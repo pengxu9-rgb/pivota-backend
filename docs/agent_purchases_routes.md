@@ -346,14 +346,11 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   Only with capture on does the worker wait for a missing contact, so only then does
   `POST /agent/v2/commerce/purchases` on the A2A rail accept a body without `buyer.email` and/or
   `buyer.shipping_address`, and only then does the view ask for it. One that is given is read by the Reap
-  rules, plus its market's region and postcode rules ("A2A markets" below; for the US, a real state or DC in
-  `region` and a ZIP, 12345 or 12345-6789, in `postalCode`, each when given; required where the store's
-  platform requires them, "Store platform requirements" below) (`invalid_address`). Capture off (any one of them
-  off, e.g. this read dial on before the checkout dial): both stay required and every answer is as before,
-  except that an address lacking a field the store's platform requires, or with a region or postcode that is
-  not its market's (a Canadian province on a US address), is refused `invalid_address` (nobody will ask the
-  buyer later). The worker checks both again before it builds the relay, whatever path stored the address. A request the router hands to Reap is parsed by
-  Reap's own model, which still requires both.
+  rules only: printable text and the required fields (`firstName`, `lastName`, `phone`, `addressLine1`, `city`,
+  `country`), else `invalid_address`. A region or postcode is the buyer's as written, in every market and on
+  every path: Pivota has no address rules of its own ("A2A markets" below). Capture off (any one of them off,
+  e.g. this read dial on before the checkout dial): both stay required and every answer is as before. A request
+  the router hands to Reap is parsed by Reap's own model, which still requires both.
 - **Turn capture on, in this order**: the read dial, the checkout step and the token step (each per its own
   runbook), then the consent gate and its configuration (the section above), and
   `A2A_SHIPPING_CAPTURE_ENABLED` LAST: on the **worker FIRST, then `web`** (with web on and the worker off,
@@ -403,13 +400,13 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
 - **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
   has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
   NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
-  `country`), never a stored value. `region` and `postalCode` are listed only where the purchase's store's
-  platform requires them in that country ("Store platform requirements" below); with no country yet, every
-  other field is listed. The same names sit in `detail.shipping_address_required`.
+  `country`), never a stored value. `region` and `postalCode` are never listed: the store's platform asks for
+  them in its checkout if it needs them. The same names sit in `detail.shipping_address_required`.
 - **Body.** Flat JSON: `email, firstName, lastName, phone, addressLine1, addressLine2, city, region,
   postalCode, country`. A part the purchase already has may be left out (no `email` when `email` is not
   in `fields_missing`); a part that is sent is read whole. The country must be a market switched on for the
-  rail, else `country: unsupported`; region and postcode follow that market's rules ("A2A markets" below).
+  rail, else `country: unsupported`; a region or postcode is read as text (printable, at most 100 / 32
+  characters), in no format of ours.
 - **Write.** A compare-and-swap. It succeeds only while the purchase waits (`opened`, a part empty, the
   deadline not passed, the contact never purged) and fills only an empty part. "Empty" is the waiting
   rule's: a stored address that lacks a required field counts as absent, so the form asks for the whole
@@ -611,14 +608,11 @@ door, the address write, the router, the worker's token and ceiling steps and th
   (`config/market_registry.json`). The rail prices a cart link through the Reap lane's loader with its own
   market's currency, so KR and TW are priced without joining the Reap lane's market map (which is also the
   merchant directory's list of Reap's agentic markets: Reap is not advertised there).
-- **Addresses.** A region and a postcode are asked for exactly where the store's PLATFORM requires them in the
-  buyer's country ("Store platform requirements" below); the payment provider requires neither. A region the buyer gives
-  is the ISO 3166-2 subdivision code without the country prefix, checked against its market's list and sent as
-  `state` (SG and HK have no subdivisions: sent unchecked). A postcode the buyer gives is checked against its
-  market's format (Hong Kong has none: sent unchecked) and sent as `zip_code`. With none, no `state` / `zip_code`
-  is sent. Outside
-  the US these rules apply with shipping-address capture off too. They are our pre-check, so a malformed value
-  is caught before the buyer is asked to approve; the sandbox checkout below is where they meet the store's form.
+- **Addresses: no rules of ours.** Which address fields a purchase needs, and in what format, is the store
+  platform's to say (its checkout answer), and Visa validates what it is sent (VIC: a country code, a postcode
+  where the country has one). The rail requires only the fields its checkout relay sends (`firstName`,
+  `lastName`, `phone`, `addressLine1`, `city`, `country`). A region the buyer gives is sent as `state` and a
+  postcode as `zip_code`, exactly as written; with none, neither is sent.
 - **Money.** A purchase is priced, capped, minted and checked in its market's currency, in that currency's
   minor units (yen and won are whole units). Nothing is converted. `A2A_RAIL_MAX_TOTAL_MINOR` is per currency
   already (`USD:3000,CAD:4000`). The ceiling's three envs (`A2A_RAIL_CHECKOUT_TAX_ALLOWANCE_BPS`,
@@ -647,40 +641,13 @@ door, the address write, the router, the worker's token and ceiling steps and th
 1. One token: the cap the provider echoes equals the `amount_cents` we sent, read in that currency's minor
    units (the yen and won cases decide between ×1 and ×100).
 2. One checkout end to end: the address fills the store's form (a region given as `state`), and the
-   `checkout.result` total reads (`checkout_total_minor`) or is held. It also shows what the store's form
-   does with an address that has no region or postcode (no `state` / `zip_code` sent) and, for Hong Kong, whether it wants a district
-   or area that the table does not ask for.
+   `checkout.result` total reads (`checkout_total_minor`) or is held. A store that refuses the address answers
+   in its checkout, and that answer is what the buyer is shown.
 3. The ceiling's three entries set for its currency, and `A2A_RAIL_MAX_TOTAL_MINOR` too.
-4. The merchant's own facts for that market, as for the US: its `A2A_RAIL_MERCHANTS` entry, its
-   `A2A_RAIL_MERCHANT_PLATFORMS` entry (below), a fresh purchasability fact and the daily cart-link (Tier B)
-   verdict for the market.
+4. The merchant's own facts for that market, as for the US: its `A2A_RAIL_MERCHANTS` entry, a fresh
+   purchasability fact and the daily cart-link (Tier B) verdict for the market.
 
 Then add the market to `A2A_RAIL_MARKETS`, on web and worker, as its own go.
-
-### Store platform requirements (`A2A_RAIL_MERCHANT_PLATFORMS`)
-
-The payment provider's agent fills the STORE's own checkout, whose address rules are its platform's, per country.
-A store that needs a state and is sent none fails after the buyer approved. So the rail asks for exactly what
-the store's platform asks for (`services/payment_orchestration/a2a_address_requirements.py`), before the buyer
-approves: in the view's `fields_missing` (AgenPaz asks), the address write, the door with capture off (refused
-`invalid_address`), and the worker, which never builds the relay without such a field (the purchase fails
-`checkout_contact_incomplete` with nothing sent).
-
-- **The setting.** `A2A_RAIL_MERCHANT_PLATFORMS`, read per call on web and worker: `domain:platform` entries
-  (`store.example:shopify,shop2.example:woocommerce`), the domain folded as `A2A_RAIL_MERCHANTS` folds it.
-  Declare it when a merchant is proven for the rail. A merchant with no entry requires no region or postcode (the
-  store's checkout is then the only judge) and is logged as a WARNING once; a malformed entry or a platform not in
-  the table is ignored and logged.
-- **The table** (read from each platform's published rules on 2026-11-27; R = region, P = postcode):
-
-  | | US | CA | AU | NZ | SG | JP | KR | TW | HK |
-  |---|---|---|---|---|---|---|---|---|---|
-  | shopify | R P | R P | R P | P | P | R P | R P | (none) | R |
-  | woocommerce | R P | R P | R P | P | P | R P | P | R P | R |
-
-  Shopify's from Shopify/worldwide (`zip_required?`, `province_optional?`); WooCommerce's from
-  `class-wc-countries.php` and `i18n/states.php`. A store may set its own form beyond its platform's defaults:
-  each market's sandbox checkout compares the table with real stores.
 
 ## Operations
 
