@@ -137,6 +137,7 @@ def test_the_door_reads_an_address_as_given():
     assert shipping.door_address(_address("CA", postalCode="k1a 0b1", region="on")) == {
         **_address("CA"), "postalCode": "k1a 0b1", "region": "on"}
     assert shipping.door_address(_address("NZ", region=None))["country"] == "NZ"
+    assert shipping.door_address({**_address("JP"), "country": "jp"})["country"] == "JP"  # the relay takes the code upper-case
     assert "region" not in shipping.door_address(_address("JP", region=None))
     with pytest.raises(reap_svc.PurchaseRefused) as refused:
         shipping.door_address(_address("JP", city=None))  # the relay's own fields stay required
