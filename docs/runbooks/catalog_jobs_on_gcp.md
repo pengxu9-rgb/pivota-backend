@@ -116,3 +116,45 @@ and fails if anything else changed. Use `gateway` instead of `backend` for gatew
 3. Push or dispatch on main, and check that `gateway:<sha>` appears in Artifact Registry.
 
 The workflow only builds; the gateway still never deploys on merge.
+
+## Jobs and one-offs that write content keys
+
+Two writers build `content_key` from brand + title + barcode when their intake identity door flag is
+off, instead of resolving it through `services/intake_identity.resolve_or_attach_content_identity`.
+A listing written that way lands on a key no other door mints and leaves the group its barcode-mates
+share (ADR-032 M11 item 2):
+
+| Writer | Door flag |
+|---|---|
+| `services/catalog_sync_service.ingest_standard_products` (the fallback key) | `ENABLE_INTAKE_IDENTITY_SYNC=1` |
+| `services/catalog_enrichment_agent/apply.apply_ingest_plan` (the plan key, written over the stored one) | `ENABLE_INTAKE_IDENTITY_ENRICHMENT=1` |
+
+Web, the worker and the `retailer-ingest-drain` job run all five door flags. A one-off run through
+`scripts/ops/run_oneoff_job.sh` gets none by default, so **pass the flags in `ENV_VARS` for every run of
+the entrypoints below**. Pass the same five that web runs, so the run behaves as web does:
+
+```
+ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,ENABLE_INTAKE_IDENTITY_SYNC=1,ENABLE_INTAKE_IDENTITY_ENRICHMENT=1,ENABLE_INTAKE_IDENTITY_MIRROR=1,ENABLE_INTAKE_IDENTITY_AUDIT=1,ENABLE_INTAKE_IDENTITY_BRAND_AUTHORED=1
+```
+
+(`ENV_VARS` replaces the runner's default, so it repeats the default's three values.)
+
+Reach the enrichment apply (`ENABLE_INTAKE_IDENTITY_ENRICHMENT=1`):
+`scripts/onboard_curated_brands.py`, `scripts/run_catalog_enrichment.py`,
+`scripts/run_catalog_onboard_queue.py`, `scripts/audit_to_catalog_candidates.py`,
+`scripts/ingest_stylekorean_brand.py`, `scripts/stylekorean_hitl.py`,
+`scripts/ops/reviewed_retailer_offers.py`, `scripts/ops/kiokii_us_retailer_offers.py`,
+`scripts/ops/surratt_retailer_offers.py`, `scripts/ops/amuse_us_six_expansion.py`,
+and the `retailer-ingest-drain` job's `jobs/retailer_ingest_drain.py`.
+
+Reach the sync fallback (`ENABLE_INTAKE_IDENTITY_SYNC=1`):
+`scripts/backfill_shopify_storefront_handles.py`, `scripts/validate_fashion_metafield_pipeline.py`,
+`scripts/catalog_backfill_verify.py`.
+
+Folds whatever the flags say (no flag changes it): `scripts/backfill_content_key.py`.
+
+`tests/test_content_key_fold_reach.py` keeps this list honest. It fails when an entrypoint starts or
+stops reaching either writer, and when a job a committed `infra/gcp/*.sh` script defines reaches one
+without its flag set to 1 on the same command. It cannot see web's or the worker's env (their deploy
+scripts preserve it), or a job created by hand outside these scripts: give such a job the flags when it
+is created or re-imaged.
