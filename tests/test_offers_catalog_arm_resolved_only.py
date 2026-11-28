@@ -192,42 +192,214 @@ def test_on_with_the_group_lane_on_reads_the_resolution_once(monkeypatch, client
     assert _catalog_source(body)["resolved"] == 2
 
 
+def test_on_a_failed_proposals_read_is_said_and_fails_closed(monkeypatch, client):  # noqa: F811
+    import tests.test_offers_resolve_group_siblings as harness
+
+    monkeypatch.setattr(harness, "_fake_db", _failing_proposals(harness._fake_db))
+    body = _arm(monkeypatch, client, product_id=RETAILER_SIG, arm="on")
+    assert _catalog_ids(body) == ["of:catalog_offer:of_sk"], "the named listing only"
+    src = _catalog_source(body)
+    assert src["resolution"] == "proposals_unread" and src["resolved"] == 0
+
+
+def _failing_proposals(make_fake, *, also=()):
+    """A `_fake_db` whose proposals read (and any statement containing one of `also`) raises."""
+    def build(**kw):
+        fake = make_fake(**kw)
+
+        async def fetch_all(query, values=None):
+            q = str(query)
+            if "FROM identity_resolution_proposals" in q or any(s in q for s in also):
+                kw["calls"].append(q)
+                raise TimeoutError("read timed out")
+            return await fake(query, values)
+
+        return fetch_all
+    return build
+
+
+def test_on_a_failed_group_seed_read_leaves_the_arm_the_resolution_it_read(monkeypatch, client):  # noqa: F811
+    """The group lane reads the resolution first and keeps it; its seed read failing after that costs
+    the arm no second read."""
+    import tests.test_offers_resolve_group_siblings as harness
+
+    calls: list = []
+    monkeypatch.setattr(harness, "_fake_db", _failing_seed_read(harness._fake_db))
+    body = _arm(monkeypatch, client, product_id=RETAILER_SIG, arm="on", flag="1", calls=calls)
+    assert sum("FROM identity_resolution_proposals" in q for q in calls) == 1
+    assert sum("SELECT s.product_key, s.source_ref, s.source_product_id" in q for q in calls) == 1
+    assert _catalog_ids(body) == ["of:catalog_offer:of_sk"]
+    assert _catalog_source(body)["resolved"] == 2
+
+
+def _failing_seed_read(make_fake):
+    def build(**kw):
+        fake = make_fake(**kw)
+
+        async def fetch_all(query, values=None):
+            if "attached_product_key = ANY(:product_keys)" in str(query):
+                kw["calls"].append(str(query))
+                raise TimeoutError("seed read timed out")
+            return await fake(query, values)
+
+        return fetch_all
+    return build
+
+
+def test_on_a_failed_group_resolution_read_is_not_read_again(monkeypatch, client):  # noqa: F811
+    """When the group lane's own resolution read fails, the arm does not spend a second budget on it."""
+    import tests.test_offers_resolve_group_siblings as harness
+
+    calls: list = []
+    monkeypatch.setattr(harness, "_fake_db", _failing_proposals(
+        harness._fake_db, also=("SELECT s.product_key, s.source_ref, s.source_product_id",)))
+    body = _arm(monkeypatch, client, product_id=RETAILER_SIG, arm="on", flag="1", calls=calls)
+    assert sum("SELECT s.product_key, s.source_ref, s.source_product_id" in q for q in calls) == 1
+    assert _catalog_ids(body) == ["of:catalog_offer:of_sk"], "fail closed to the named listing"
+    assert _catalog_source(body)["resolution"] == "unread"
+
+
 # ------------------------------------------------------------------------------- shadow
 
 
+def _shadow_spy(monkeypatch) -> list:
+    snaps: list = []
+
+    async def spy(snap):
+        snaps.append(snap)
+
+    monkeypatch.setattr(gateway, "_run_catalog_arm_shadow", spy)
+    return snaps
+
+
 @pytest.mark.parametrize("ident", [BRAND_SIG, RETAILER_SIG, OTHER_SIG, CK])
-def test_shadow_answers_as_off_and_counts_what_on_withholds(monkeypatch, client, ident):  # noqa: F811
-    off = _arm(monkeypatch, client, product_id=ident, deterministic=True)
-    shadow = _arm(monkeypatch, client, product_id=ident, arm="shadow", deterministic=True)
-    on = _arm(monkeypatch, client, product_id=ident, arm="on", deterministic=True)
+def test_shadow_answers_as_off_and_reads_nothing_on_the_request_path(monkeypatch, client, ident):  # noqa: F811
+    snaps = _shadow_spy(monkeypatch)
+    off_calls: list = []
+    shadow_calls: list = []
+    off = _arm(monkeypatch, client, product_id=ident, deterministic=True, calls=off_calls)
+    assert snaps == [], "off schedules nothing"
+    shadow = _arm(monkeypatch, client, product_id=ident, arm="shadow", deterministic=True, calls=shadow_calls)
     assert shadow["offers"] == off["offers"], ident
-    src = _catalog_source(shadow)
-    assert src["resolved_only"] == "shadow"
-    withheld = len(_catalog_ids(off)) - len(_catalog_ids(on))
-    assert src["would_withhold"] == withheld, (ident, src)
-    assert src["would_withhold_listings"] == withheld  # one offer per listing in this fixture
+    assert shadow_calls == off_calls, "the same statements, in the same order: no read on the request path"
+    assert _catalog_source(shadow)["resolved_only"] == "shadow"
+    [snap] = snaps
+    assert snap["row_keys"] == [o["source"]["product_key"] for o in off["offers"]
+                                if o["source"]["type"] == "catalog_offer"]
+    assert ident in snap["aliases"] and snap["product_id"] == ident and snap["market"] == "US"
 
 
-def test_shadow_with_an_unread_resolution_counts_nothing(monkeypatch, client):  # noqa: F811
-    async def broken(db, **kw):
-        raise RuntimeError("listings read failed")
-
-    monkeypatch.setattr(gateway, "_read_resolved_members", broken)
-    body = _arm(monkeypatch, client, product_id=BRAND_SIG, arm="shadow")
-    assert _catalog_ids(body) == ["of:catalog_offer:of_other", "of:catalog_offer:of_sk"]
-    src = _catalog_source(body)
-    # Unread is said, and nothing is counted: a count would have to guess which rows were named.
-    assert src["resolution"] == "unread"
-    assert "would_withhold" not in src and "would_withhold_listings" not in src
-
-
-def test_shadow_counts_offers_and_listings_apart(monkeypatch, client):  # noqa: F811
+def test_shadow_schedules_nothing_when_the_statement_read_no_row(monkeypatch, client):  # noqa: F811
+    snaps = _shadow_spy(monkeypatch)
+    _invoke(monkeypatch, client, product_id=BRAND_SIG, members=ARM_MEMBERS, seeds=[_brand_seed()],
+            catalog_rows=[], proposals=RESOLVED)
     monkeypatch.setenv(ARM_FLAG, "shadow")
-    rows = [*ARM_ROWS, _catalog_row("of_other_2", OTHER_PK, "other-retailer-2.example", 10.0)]
-    body = _invoke(monkeypatch, client, product_id=BRAND_SIG, members=ARM_MEMBERS,
-                   seeds=[_brand_seed(), _lone_seed()], catalog_rows=rows, proposals=RESOLVED)
-    src = _catalog_source(body)
-    assert src["would_withhold"] == 2 and src["would_withhold_listings"] == 1, src
+    _invoke(monkeypatch, client, product_id=BRAND_SIG, members=ARM_MEMBERS, seeds=[_brand_seed()],
+            catalog_rows=[], proposals=RESOLVED)
+    assert snaps == []
+
+
+def test_eval_traffic_schedules_no_shadow(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    bt = BackgroundTasks()
+    monkeypatch.setattr(gateway, "is_synthetic_call", lambda: True)
+    assert gateway._schedule_catalog_arm_shadow(bt, {"row_keys": ["x"]}) is False and not bt.tasks
+    monkeypatch.setattr(gateway, "is_synthetic_call", lambda: False)
+    assert gateway._schedule_catalog_arm_shadow(bt, {"row_keys": ["x"]}) is True and len(bt.tasks) == 1
+    assert gateway._schedule_catalog_arm_shadow(None, {"row_keys": ["x"]}) is False
+
+
+def _shadow_answer(monkeypatch, snap, *, members=ARM_MEMBERS, proposals=RESOLVED, fail_proposals=False):
+    """`_catalog_arm_shadow_answer` over the shared fake, its transaction a no-op (SQLite has no READ ONLY)."""
+    import asyncio
+    import contextlib
+
+    import tests.test_offers_resolve_group_siblings as harness
+
+    make = _failing_proposals(harness._fake_db) if fail_proposals else harness._fake_db
+    calls: list = []
+    monkeypatch.setattr(gateway.database, "fetch_all", make(
+        members=members, seeds=[], catalog_rows=[], proposals=proposals, calls=calls))
+
+    @contextlib.asynccontextmanager
+    async def no_txn(db, is_pg):
+        yield
+
+    monkeypatch.setattr(gateway, "_group_shadow_transaction", no_txn)
+    record: dict = {}
+    asyncio.run(gateway._catalog_arm_shadow_answer(snap, deadline=__import__("time").perf_counter() + 5,
+                                                   record=record))
+    record.pop("_reader")
+    return record
+
+
+@pytest.mark.parametrize("ident,withheld", [(BRAND_SIG, 1), (RETAILER_SIG, 1), (OTHER_SIG, 1), (CK, 1)])
+def test_the_shadow_counts_exactly_what_on_withholds(monkeypatch, client, ident, withheld):  # noqa: F811
+    off = _arm(monkeypatch, client, product_id=ident)
+    on = _arm(monkeypatch, client, product_id=ident, arm="on")
+    rows = [o["source"]["product_key"] for o in off["offers"] if o["source"]["type"] == "catalog_offer"]
+    assert len(_catalog_ids(off)) - len(_catalog_ids(on)) == withheld
+    snap = {"aliases": gateway._expand_ref_aliases(ident), "row_keys": rows}
+    rec = _shadow_answer(monkeypatch, snap)
+    assert rec["would_withhold"] == withheld and rec["would_withhold_listings"] == withheld, (ident, rec)
+    assert rec["rows"] == len(rows)
+
+
+def test_the_shadow_counts_offers_and_listings_apart():
+    read = {"resolved": [{"product_key": "pk_r"}]}
+    out = gateway._catalog_arm_shadow_count(["pk_n", "pk_r", "pk_x", "pk_x", "pk_y"], {"pk_n"}, read)
+    assert out == {"rows": 5, "named": 1, "resolved": 1, "would_withhold": 3, "would_withhold_listings": 2}
+
+
+def test_a_named_listing_with_no_content_key_is_never_counted_withheld(monkeypatch):
+    """The resolution's anchors need a content_key; `on` names a listing by its id whatever its key. The
+    shadow names it the same way (its own read), so the listing is kept, not counted (the controller's
+    probe: 2 counted where 1 is true)."""
+    nokey_pk, nokey_sig = "ext:retailer:no-key", "sig_no_key"
+    members = [*ARM_MEMBERS, _member(nokey_pk, nokey_sig, None, "https://shop.example/p", nokey_pk)]
+    rec = _shadow_answer(monkeypatch, {"aliases": [nokey_sig, OTHER_SIG], "row_keys": [nokey_pk, OTHER_PK, RETAILER_PK]},
+                         members=members)
+    assert rec["named"] == 2 and rec["would_withhold"] == 1 and rec["would_withhold_listings"] == 1, rec
+
+
+def test_a_named_listing_past_the_resolution_reads_alias_cap_is_kept(monkeypatch):
+    """The resolution read looks at the first 16 aliases; the named-listings read takes them all."""
+    aliases = [f"sig_filler_{i}" for i in range(16)] + [OTHER_SIG]
+    rec = _shadow_answer(monkeypatch, {"aliases": aliases, "row_keys": [OTHER_PK]})
+    assert rec["named"] == 1 and rec["would_withhold"] == 0, rec
+
+
+def test_the_shadow_counts_nothing_when_the_moves_cannot_be_read(monkeypatch):
+    rec = _shadow_answer(monkeypatch, {"aliases": [BRAND_SIG], "row_keys": [RETAILER_PK, OTHER_PK]},
+                         fail_proposals=True)
+    assert rec["resolution"] == "proposals_unread" and rec["resolved"] == 0
+    assert "would_withhold" not in rec and "would_withhold_listings" not in rec
+
+
+def test_the_shadow_line(monkeypatch):
+    import logging
+
+    lines: list = []
+
+    class H(logging.Handler):
+        def emit(self, r):
+            lines.append(r.getMessage())
+
+    h = H()
+    logging.getLogger("pivota").addHandler(h)
+    try:
+        state = {"started": __import__("time").perf_counter(), "record": {"would_withhold": 1, "rows": 2}}
+        gateway._catalog_arm_shadow_emit({"product_id": "p", "sku_id": None, "market": "US"}, state, None)
+        gateway._catalog_arm_shadow_emit({"product_id": "p"}, {"started": 0.0, "record": {}}, "budget_exceeded")
+    finally:
+        logging.getLogger("pivota").removeHandler(h)
+    import json as _json
+
+    first = _json.loads(lines[0].partition(" ")[2])
+    assert lines[0].startswith("offers_catalog_arm_shadow ")
+    assert first["would_withhold"] == 1 and first["rows"] == 2 and first["market"] == "US" and "error" not in first
+    assert _json.loads(lines[1].partition(" ")[2])["error"] == "budget_exceeded"
 
 
 def test_on_the_group_shadow_still_sees_the_key_the_arm_read_no_row_on(monkeypatch, client):  # noqa: F811

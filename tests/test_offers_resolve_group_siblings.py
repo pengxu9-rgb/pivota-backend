@@ -150,7 +150,10 @@ def _catalog_row(offer_id, product_key, host, price, *, currency="USD", checked:
 
 
 def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
-    by_alias = lambda al: [m for m in members if m["sig"] in al or m["pk"] in al or m["ck"] in al]  # noqa: E731
+    # The ANCHORS of a key read, as the SQL picks them: `a.content_key IS NOT NULL`, so a listing with
+    # no content_key names no key (and no sibling), whatever alias names it.
+    by_alias = lambda al: [m for m in members if m["ck"] and (m["sig"] in al or m["pk"] in al or m["ck"] in al)]  # noqa: E731
+    named = lambda al: {m["pk"] for m in members if m["sig"] in al or m["pk"] in al}  # noqa: E731
 
     async def fake_fetch_all(query: str, values=None):
         q, v = str(query), dict(values or {})
@@ -169,6 +172,9 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
             return [{"product_key": m["pk"], "source_ref": m["source_ref"], "source_product_id": m["source_product_id"],
                      "content_key": m["ck"], "gtin": m["gtin"], "brand": m["brand"], "title": m["title"],
                      "is_anchor": m["sig"] in al or m["pk"] in al} for m in out][: v["limit"]]
+        if "SELECT d.product_key FROM catalog_products d" in q and "JOIN catalog_offers" not in q:
+            # the catalog arm shadow's named-listings read: by signature or product_key, any content_key
+            return [{"product_key": pk} for pk in sorted(named(set(v["aliases"])))]
         if "FROM identity_resolution_proposals" in q:
             # Projected as the SQL projects it: the evidence keys, never subject_product_keys.
             return [{"content_key": p["content_key"], "kind": p["kind"], "keeper_product_key": p["keeper_product_key"],
@@ -194,10 +200,12 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
             al = set(v["aliases"])
             if "ANY(:resolved_keys)" in q:
                 # OFFERS_CATALOG_ARM_RESOLVED_ONLY=on: the named listings plus the resolved ones passed in.
-                pks = {m["pk"] for m in members if m["sig"] in al or m["pk"] in al} | set(v["resolved_keys"])
+                pks = named(al) | set(v["resolved_keys"])
             else:
+                # The widened statement: the named listings (any content_key), every listing on a key the
+                # call names, and every sibling of a named listing that has a key.
                 cks = {m["ck"] for m in by_alias(al)}
-                pks = {m["pk"] for m in members if m["ck"] in cks}
+                pks = named(al) | {m["pk"] for m in members if m["ck"] and m["ck"] in cks}
             rows = [dict(r) for r in catalog_rows if r["product_key"] in pks]
             for r in rows:
                 if "o.sku_key AS sku_key" not in q:
