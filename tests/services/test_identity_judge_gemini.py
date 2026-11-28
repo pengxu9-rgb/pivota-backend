@@ -252,10 +252,13 @@ def test_runner_scores_only_shopify_pairs_records_every_call_and_replays(tmp_pat
     assert printed["by_basis"] == {"silver/different/barcode_collision": {"not_shown": 1},
                                    "silver/same/barcode_clean": {"confirmed": 1}}
     # the vetoed pair (mini on one side) never reached a model: 2 calls, one per role
-    assert sorted(m for m, _ in post.calls) == ["gemini-4-carbon", "gemini-4-hydrogen"]
-    assert printed["recorded"] == 2 and set(printed["usage"]) == {"gemini-4-carbon", "gemini-4-hydrogen"}
+    # both roles default to gemini-4-hydrogen; the sceptic's record names prompt p2
+    assert [m for m, _ in post.calls] == ["gemini-4-hydrogen", "gemini-4-hydrogen"]
+    assert printed["recorded"] == 2 and printed["usage"]["gemini-4-hydrogen"]["calls"] == 2
     rows = ts.read_jsonl(str(rec))
     assert {(r["pair_id"], r["role"]) for r in rows} == {("tsp_same", "matcher"), ("tsp_same", "sceptic")}
+    assert {(r["role"], r["model"], r["prompt"]) for r in rows} == {
+        ("matcher", "gemini-4-hydrogen", "p1"), ("sceptic", "gemini-4-hydrogen", "p2")}
     # the recorded answers replay to the same verdicts with no transport at all
     rc = cli.main(["run", "--truth", str(truth), "--only-shopify", "--matcher", f"replay:{rec}",
                    "--sceptic", f"replay:{rec}", "--out", str(tmp_path / "v2.jsonl")])
@@ -395,7 +398,7 @@ def test_runner_reports_errors_from_the_record(tmp_path, capsys):
                                         response=httpx.Response(403))
         return payload(json.dumps(answer()))(model, request)
     rec = tmp_path / "r.jsonl"
-    cli.main(["run", "--truth", str(_truth(tmp_path)), "--matcher", "gemini", "--sceptic", "gemini",
+    cli.main(["run", "--truth", str(_truth(tmp_path)), "--matcher", "gemini", "--sceptic", "gemini:gemini-4-carbon",
               "--record", str(rec), "--out", str(tmp_path / "v.jsonl")], post=split)
     printed = json.loads(capsys.readouterr().out)
     assert printed["calls"] == {"calls": 2, "errors": 1, "error_rate": 0.5, "attempts": 2,

@@ -7,7 +7,7 @@ Agents:
   rules            the deterministic stand-ins; no model
   replay:FILE      answers recorded elsewhere, JSON lines {pair_id, role, answer}
   gemini[:MODEL]   a Gemini model (services/identity_judge_gemini.py) through services/vertex_gemini.
-                   Default models: matcher gemini-4-hydrogen, sceptic gemini-4-carbon. Vertex needs
+                   Default models: gemini-4-hydrogen for both roles (sceptic prompt p2). Vertex needs
                    VERTEX_AI_ENABLED=true, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION and ADC;
                    otherwise GEMINI_API_KEY. Only pairs whose two listings read as Shopify listings
                    are sent (the one source whose written terms allow a model vendor), so a run with
