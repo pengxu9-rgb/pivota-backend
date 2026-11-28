@@ -16,6 +16,11 @@ Agents:
                    tokens) so the run can be replayed with replay:FILE at no cost.
 `prompts` writes the model prompts for one role.
 
+EVALUATION ONLY: --agents-only skips the vetoes, so the agents (verifier and grounding still on)
+are scored on pairs the rules would have ended; --only-vetoed keeps just those pairs. Every verdict
+row then carries mode "agents_only" and the vetoes it skipped; such a run measures the agents and
+is never a live verdict. "answers" prints how often each role said same, per gold label.
+
 Outputs hold real store and product names, so every output path must be OUTSIDE this public
 repository (identity_truth_set.write_jsonl refuses otherwise). It prints counts only.
 
@@ -73,6 +78,21 @@ def _by_basis(pairs: List[ts.TruthPair], verdicts: Dict[str, str]) -> Dict[str, 
     return dict(sorted(out.items()))
 
 
+def _answers_by_label(pairs: List[ts.TruthPair], records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    """Per role and gold label: how often the agent said same, not same, or gave no answer."""
+    label = {p.pair_id: p.label for p in pairs}
+    out: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for r in records:
+        lab = label.get(str(r.get("pair_id")))
+        if lab is None:
+            continue
+        ans = r.get("answer")
+        said = "no_answer" if not isinstance(ans, dict) else ("same" if ans.get("same") is True else "not_same")
+        row = out.setdefault(str(r.get("role")), {}).setdefault(lab, {"same": 0, "not_same": 0, "no_answer": 0})
+        row[said] += 1
+    return {k: dict(sorted(v.items())) for k, v in sorted(out.items())}
+
+
 def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
     """`post` stands in for the Gemini transport in tests; a real run uses services/vertex_gemini."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -88,6 +108,10 @@ def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
     r.add_argument("--record", help="gemini agents: write every call here, JSON lines (outside the repo)")
     r.add_argument("--workers", type=int, default=4, help="pairs judged at once (gemini agents)")
     r.add_argument("--max-pairs", type=int, help="score at most this many pairs (after the source filter)")
+    r.add_argument("--agents-only", action="store_true",
+                   help="EVALUATION ONLY: skip the vetoes so the agents are measured on vetoed pairs too")
+    r.add_argument("--only-vetoed", action="store_true",
+                   help="with --agents-only: keep only the pairs the rules veto")
     p = sub.add_parser("prompts")
     p.add_argument("--truth", required=True)
     p.add_argument("--role", required=True, choices=lj.ROLES)
@@ -107,12 +131,17 @@ def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
             raise ValueError("a gemini agent needs --record FILE (every call is kept for replay)")
         if args.workers < 1 or (args.max_pairs is not None and args.max_pairs < 1):
             raise ValueError("--workers and --max-pairs must be at least 1")
+        if args.only_vetoed and not args.agents_only:
+            raise ValueError("--only-vetoed needs --agents-only (a vetoed pair never reaches an agent otherwise)")
         left_out = 0
         if uses_model or args.only_shopify:
             from services import identity_judge_gemini as jg
 
             keep = [i for i, v in enumerate(views) if jg.shopify_pair(v)]
             left_out = len(views) - len(keep)
+            pairs, views = [pairs[i] for i in keep], [views[i] for i in keep]
+        if args.only_vetoed:
+            keep = [i for i, v in enumerate(views) if lj.vetoes(lj.normalise(v["a"]), lj.normalise(v["b"]))]
             pairs, views = [pairs[i] for i in keep], [views[i] for i in keep]
         if args.max_pairs is not None:
             pairs, views = pairs[:args.max_pairs], views[:args.max_pairs]
@@ -122,11 +151,12 @@ def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
             ts.write_jsonl(args.record, [])
         matcher = _agent(args.matcher, "matcher", args.thinking, post)
         sceptic = _agent(args.sceptic, "sceptic", args.thinking, post)
+        one = lj.judge_agents_only if args.agents_only else lj.judge
         if uses_model and args.workers > 1:
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                results = list(pool.map(lambda v: lj.judge(v, matcher, sceptic), views))
+                results = list(pool.map(lambda v: one(v, matcher, sceptic), views))
         else:
-            results = lj.judge_all(views, matcher, sceptic)
+            results = lj.judge_all(views, matcher, sceptic, agents_only=args.agents_only)
         written = ts.write_jsonl(args.out, results)
         out: Dict[str, Any] = {}
         if args.record:
@@ -135,10 +165,11 @@ def main(argv: Optional[List[str]] = None, *, post: Any = None) -> int:
             from services import identity_judge_gemini as jg
 
             out = {"recorded": len(records), "usage": jg.usage_totals(records),
-                   "calls": jg.error_summary(records)}
+                   "calls": jg.error_summary(records), "answers": _answers_by_label(pairs, records)}
         verdicts = {str(x["pair_id"]): x["verdict"] for x in results}
         scored = ts.score(pairs, verdicts)
-        _print({"judge_offline": "run", "judge": lj.JUDGE_VERSION, "matcher": args.matcher,
+        _print({"judge_offline": "run", "judge": lj.JUDGE_VERSION,
+                "mode": lj.AGENTS_ONLY if args.agents_only else "with_vetoes", "matcher": args.matcher,
                 "sceptic": args.sceptic, "written": written, "left_out_by_source": left_out, **out,
                 "score": scored, "by_basis": _by_basis(pairs, verdicts), "reasons": lj.reason_counts(results)})
         return 0 if scored["gate"] == "pass" else 1

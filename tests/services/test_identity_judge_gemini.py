@@ -401,3 +401,87 @@ def test_runner_reports_errors_from_the_record(tmp_path, capsys):
     assert printed["calls"] == {"calls": 2, "errors": 1, "error_rate": 0.5, "attempts": 2,
                                 "by_error": {"HTTPStatusError 403": 1}}
     assert len(ts.read_jsonl(str(rec))) == 2  # the failed call is in the record
+
+
+# --- agents-only evaluation (vetoes skipped, never a live verdict) -------------------------------
+
+def test_agents_only_sends_a_vetoed_pair_and_labels_the_result():
+    post = FakePost(payload(json.dumps(answer(same=False, size="differ"))))
+    a, b = shop_side("Glow Serum 30ml"), shop_side("Glow Serum 50ml", host="store-b.example")
+    m = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=post)
+    s = jg.GeminiAgent("sceptic", "gemini-3.8-flash", post=post)
+    assert lj.judge(view(a, b), m, s)["reasons"] == ["veto:size"] and post.calls == []
+    r = lj.judge_agents_only(view(a, b), m, s)
+    assert len(post.calls) == 2
+    assert r["mode"] == "agents_only" and r["vetoes_skipped"] == ["size"] and r["verdict"] == "not_shown"
+
+
+def test_agents_only_still_grounds_a_model_that_says_same_on_a_vetoed_pair():
+    post = FakePost(payload(json.dumps(answer())))  # both say same, every field agree
+    a, b = shop_side("Glow Serum 30ml"), shop_side("Glow Serum 50ml", host="store-b.example")
+    m = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=post)
+    s = jg.GeminiAgent("sceptic", "gemini-3.8-flash", post=post)
+    r = lj.judge_agents_only(view(a, b), m, s)
+    assert r["verdict"] == "likely" and "unknown:size" in r["reasons"]  # grounding still refuses the size
+
+
+def test_agents_only_does_not_change_an_unvetoed_pair():
+    post = FakePost(payload(json.dumps(answer())))
+    m = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=post)
+    s = jg.GeminiAgent("sceptic", "gemini-3.8-flash", post=post)
+    live, ev = lj.judge(view(), m, s), lj.judge_agents_only(view(), m, s)
+    assert ev["verdict"] == live["verdict"] and ev["reasons"] == live["reasons"] and ev["vetoes_skipped"] == []
+    assert "mode" not in live
+
+
+def test_runner_agents_only_on_vetoed_pairs_reports_answers_by_label(tmp_path, capsys):
+    post = FakePost(payload(json.dumps(answer(same=False))))
+    rec, out = tmp_path / "r.jsonl", tmp_path / "v.jsonl"
+    rc = cli.main(["run", "--truth", str(_truth(tmp_path)), "--matcher", "gemini", "--sceptic", "gemini",
+                   "--agents-only", "--only-vetoed", "--record", str(rec), "--out", str(out)], post=post)
+    printed = json.loads(capsys.readouterr().out)
+    assert rc == 0 and printed["mode"] == "agents_only" and printed["written"] == 1  # only tsp_diff is vetoed
+    assert printed["answers"] == {"matcher": {"different": {"same": 0, "not_same": 1, "no_answer": 0}},
+                                  "sceptic": {"different": {"same": 0, "not_same": 1, "no_answer": 0}}}
+    (row,) = ts.read_jsonl(str(out))
+    assert row["pair_id"] == "tsp_diff" and row["mode"] == "agents_only" and row["vetoes_skipped"] == ["conflict:mini"]
+
+
+def test_runner_default_mode_is_with_vetoes_and_only_vetoed_needs_agents_only(tmp_path, capsys):
+    truth = _truth(tmp_path)
+    assert cli.main(["run", "--truth", str(truth), "--out", str(tmp_path / "v.jsonl")]) == 0
+    assert json.loads(capsys.readouterr().out)["mode"] == "with_vetoes"
+    post = FakePost(payload(json.dumps(answer())))
+    assert cli.main(["run", "--truth", str(truth), "--matcher", "gemini", "--sceptic", "gemini", "--only-vetoed",
+                     "--record", str(tmp_path / "r"), "--out", str(tmp_path / "v2")], post=post) == 2
+    assert post.calls == []
+    capsys.readouterr()
+
+
+def test_agents_only_holds_on_the_single_worker_path_too(tmp_path, capsys):
+    out = tmp_path / "v.jsonl"
+    assert cli.main(["run", "--truth", str(_truth(tmp_path)), "--agents-only", "--only-vetoed",
+                     "--out", str(out)]) == 0  # rules agents, judged in one pass (judge_all)
+    capsys.readouterr()
+    (row,) = ts.read_jsonl(str(out))
+    assert row["mode"] == "agents_only" and row["vetoes_skipped"] == ["conflict:mini"]
+    assert lj.judge_all([view()], lambda v: answer(), lambda v: answer(), agents_only=True)[0]["mode"] == "agents_only"
+
+
+# --- prompt p2: the sceptic checks a list of differences -------------------------------------
+
+def test_the_sceptic_prompt_names_each_difference_to_check():
+    text = lj.role_instructions("sceptic")
+    for word in ("eau de parfum", "eau de toilette", "cologne", "refill", "mini", "tester", "set",
+                 "shade", "limited", "SPF", "fl oz", "unknown, never agree", "checked all five"):
+        assert word in text
+    assert "checked all five" not in lj.role_instructions("matcher")
+
+
+def test_every_record_names_its_own_role_prompt_version():
+    post = FakePost(payload(json.dumps(answer())))
+    m = jg.GeminiAgent("matcher", "gemini-4-hydrogen", post=post)
+    s = jg.GeminiAgent("sceptic", "gemini-4-hydrogen", post=post)
+    m(view()), s(view())
+    assert m.records[0]["prompt"] == "p1" and s.records[0]["prompt"] == "p2"
+    assert set(lj.PROMPT_VERSIONS) == set(lj.ROLES)
