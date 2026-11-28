@@ -213,6 +213,9 @@ def _install_fake_db(monkeypatch) -> List[Dict[str, Any]]:
         def transaction(self):
             return _FakeTxn()
 
+        async def fetch_one(self, sql, params=None):
+            return {"?column?": 1}  # the chosen primary landed in the group (M11 item 3 check)
+
     monkeypatch.setattr(autogrouper, "database", _DB())
     return executed
 
@@ -373,6 +376,11 @@ async def test_autogroup_real_world_moyu_cluster_shape(monkeypatch) -> None:
     monkeypatch.setattr(
         autogrouper.database, "transaction", lambda: _FakeTxn(),
     )
+
+    async def fake_fetch_one(sql, params=None):
+        return {"?column?": 1}  # the chosen primary landed in the group (M11 item 3 check)
+
+    monkeypatch.setattr(autogrouper.database, "fetch_one", fake_fetch_one)
 
     report = await autogrouper.autogroup_clusters(
         merchant_id="merch_efbc46b4619cfbdf", apply=True,
