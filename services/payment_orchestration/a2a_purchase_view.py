@@ -16,7 +16,9 @@ re-vetted at read time, because both came from the rail and both are meant to be
                              evidence it is THIS merchant's page, so it is not shown.
   shipping_address_required  an `opened` purchase whose buyer email or shipping address is incomplete
                              (the agent did not send it; AgenPas asks the buyer): `fields_missing` (the
-                             door's field NAMES, email first) and, once the worker has set it, its
+                             door's field NAMES, email first), the `country` the address must be in
+                             (the purchase's own market, a2a_markets.market_for_currency of its currency;
+                             absent when no one market has it) and, once the worker has set it, its
                              `expires_at`. Never a stored value, and no URL.
 """
 
@@ -30,7 +32,7 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail, a2a_shipping_address, purchase_consent
+from services.payment_orchestration import a2a_markets, a2a_rail, a2a_shipping_address, purchase_consent
 
 #: Extra SHA-256 digests (comma-separated, lower-case hex) of hosts the rail serves buyer pages from,
 #: when they are not the API hosts themselves. Configured, not named, like the API host allowlist.
@@ -142,6 +144,10 @@ def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dic
         # which the consent POST applies too, so the read never offers a step the POST then refuses.
         required: Dict[str, Any] = {
             "fields_missing": a2a_shipping_address.fields_missing(row.get("buyer_email"), row.get("shipping_address"))}
+        # The one country the write takes for this purchase (its currency's market): the form offers exactly it.
+        country = a2a_markets.market_for_currency(row.get("currency"))
+        if country is not None:
+            required["country"] = country
         if expires is not None and row.get("buyer_action_kind") is None:
             required["expires_at"] = row.get("buyer_action_expires_at")
         view["shipping_address_required"] = required

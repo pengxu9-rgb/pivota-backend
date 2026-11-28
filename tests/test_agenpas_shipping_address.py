@@ -281,7 +281,7 @@ async def test_with_capture_on_the_a2a_door_opens_a_purchase_without_email_or_ad
     assert (row["state"], row["buyer_email"], row["shipping_address"]) == ("opened", None, None)
     got = await _http("GET", f"{BASE}/{pid}")
     assert got.status_code == 200, got.text
-    assert got.json()["next_action"] == {"kind": "shipping_address",
+    assert got.json()["next_action"] == {"kind": "shipping_address", "country": "US",
                                          "fields_missing": shipping_capture.fields_missing(None, None)}
     assert got.json()["next_action"]["fields_missing"][0] == "email"
 

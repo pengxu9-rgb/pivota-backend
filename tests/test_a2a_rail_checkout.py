@@ -3937,11 +3937,16 @@ def test_the_view_names_the_missing_fields_and_never_a_stored_value():
            "buyer_action_expires_at": deadline, "last_error_code": worker.SHIPPING_ADDRESS_REQUIRED,
            "currency": "USD", "our_price_minor": 4650, "merchant_domain": "merchant.example"}
     detail = view.build_view(row)
-    assert detail["shipping_address_required"] == {"fields_missing": ["city"], "expires_at": deadline}
+    assert detail["shipping_address_required"] == {"fields_missing": ["city"], "country": "US", "expires_at": deadline}
     parent = {"id": "pp_" + "0" * 24, "rail": "a2a", "executor": "rail_managed", "rail_purchase_id": row["id"]}
     body = unified_view.unified_body(parent, detail)
     assert body["state"] == "routing"
-    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["city"], "expires_at": deadline}
+    assert body["next_action"] == {"kind": "shipping_address", "fields_missing": ["city"], "country": "US",
+                                   "expires_at": deadline}
+    # The country is the purchase's own market (G2: the form offers exactly it); none when no one market has the currency.
+    for currency, country in (("HKD", "HK"), ("KRW", "KR"), ("TWD", "TW"), ("JPY", "JP")):
+        assert view.build_view({**row, "currency": currency})["shipping_address_required"]["country"] == country
+    assert "country" not in view.build_view({**row, "currency": "EUR"})["shipping_address_required"]
     assert "url" not in body["next_action"] and "prefill" not in body["next_action"]
     text = json.dumps(body, default=str)
     for value in (EMAIL, *partial.values()):

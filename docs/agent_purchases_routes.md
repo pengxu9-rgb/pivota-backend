@@ -397,7 +397,9 @@ key, the same (agent, purchase id) scoping; `X-Agenpas-Agent-User-Ref` is read a
   (`fields_missing`), never purged, the deadline not passed, capture on. Past the deadline the read offers
   nothing and the consent POST answers 409 `consent_stale`, even before the worker or the sweep ends it. There is no new state and no migration: the deadline sits in
   `buyer_action_expires_at`, with no `buyer_action_kind` / URL.
-- **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "expires_at": ...}`. It
+- **The view.** `next_action: {"kind": "shipping_address", "fields_missing": [...], "country": "US", "expires_at": ...}`.
+  `country` is the one country the write takes for this purchase (its currency's market), so the form offers
+  exactly it; absent when no one market has the currency. It
   has no `url` and no `prefill`; `expires_at` is absent until the worker has looked at the row. Field
   NAMES only (`email`, `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `region`, `postalCode`,
   `country`), never a stored value. `region` and `postalCode` are never listed: the store's platform asks for
