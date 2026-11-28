@@ -41,19 +41,20 @@ else
   echo "dry run (APPLY=0): nothing will be changed in $PROD; mutating commands are printed only"
 fi
 
+# This job's executions, by name. A dry run deployed nothing, so it prints the listing instead of
+# reading prod (the dry-run guard covers this read too).
+job_executions(){
+  if [ "$APPLY" = 1 ]; then
+    "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
+      --format='value(metadata.name)' --quiet 2>/dev/null
+  else
+    run "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
+      --format='value(metadata.name)' --quiet
+  fi
+}
 cleanup(){
   local rc=$1 failed=0 name
-  if [ "$rc" != 0 ] && [ "${EXECUTE_STARTED:-0}" = 1 ]; then
-    # An interrupted or failed `execute --wait` can leave the execution RUNNING on prod (it keeps
-    # its mounted secret after the grant goes). This job exists only for this run, so every one of
-    # its executions is this run's: cancel them before the job is deleted. A finished one refuses
-    # the cancel, which is harmless.
-    for name in $("$GCLOUD" run jobs executions list --job "$JOB" --project "$PROD" --region "$REGION" \
-                    --format='value(metadata.name)' --quiet 2>/dev/null); do
-      run "$GCLOUD" run jobs executions cancel "$name" --project "$PROD" --region "$REGION" --quiet >/dev/null 2>&1 \
-        && echo "  cancelled execution $name" >&2 || echo "  execution $name: cancel refused (finished?)" >&2
-    done
-  fi
+  # The grant goes FIRST: nothing below may lengthen the time the export SA can read the secret.
   run "$GCLOUD" secrets remove-iam-policy-binding "$SECRET" --project "$PROD" \
     --member="serviceAccount:$PROD_EXPORT_SA" --role=roles/secretmanager.secretAccessor --quiet >/dev/null || {
     printf '\n!!! FAILED: could not remove %s access to %s in %s. The grant is STILL ON a prod secret.\n' \
@@ -62,6 +63,16 @@ cleanup(){
       "$SECRET" "$PROD" "$PROD_EXPORT_SA" >&2
     failed=1
   }
+  if [ "$rc" != 0 ] && [ "${EXECUTE_STARTED:-0}" = 1 ]; then
+    # An interrupted or failed `execute --wait` can leave the execution RUNNING on prod (it keeps
+    # the secret it already read after the grant goes). This job exists only for this run, so every
+    # one of its executions is this run's: cancel them (--async: ask, don't wait) before the job is
+    # deleted. A finished one refuses the cancel, which is harmless.
+    for name in $(job_executions); do
+      run "$GCLOUD" run jobs executions cancel "$name" --project "$PROD" --region "$REGION" --async --quiet >/dev/null 2>&1 \
+        && echo "  cancelled execution $name" >&2 || echo "  execution $name: cancel refused (finished?)" >&2
+    done
+  fi
   if [ "${JOB_DEPLOYED:-0}" = 1 ]; then
     run "$GCLOUD" run jobs delete "$JOB" --project "$PROD" --region "$REGION" --quiet >/dev/null || {
       printf '\n!!! FAILED: could not delete job %s in %s (it carries %s). Delete it by hand: gcloud run jobs delete %s --project %s --region %s\n\n' \
